@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// Enums para campos con valores limitados
+enum ConversationEstado {
+  pendiente
+  respondido
+  en_proceso
+  requiere_agente
+  cerrado
+}
+
+enum MessageFrom {
+  client
+  bot
+  agent
+}
+
+model BusinessConfig {
+  id                   Int      @id @default(autoincrement())
+  nombre               String   @db.VarChar(100)
+  descripcion          String   @db.Text // descripción amplia del negocio
+  servicios            String   @db.Text // servicios detallados
+  faq                  String   @db.Text // preguntas frecuentes (FAQ)
+  horarios             String   @db.Text // ampliado desde VarChar(100) a Text
+  escalarSiNoConfia    Boolean // si se debe escalar cuando la IA no tiene contexto
+  escalarPalabrasClave String   @db.Text // palabras clave para escalar (separadas por coma)
+  escalarPorReintentos Int // cuántos intentos fallidos antes de escalar
+  createdAt            DateTime @default(now()) // fecha de creación
+  updatedAt            DateTime @updatedAt // fecha de última actualización
+}
+
+model Conversation {
+  id        Int                @id @default(autoincrement())
+  phone     String
+  nombre    String?
+  estado    ConversationEstado @default(pendiente)
+  mensajes  Message[]
+  createdAt DateTime           @default(now())
+}
+
+model Message {
+  id             Int          @id @default(autoincrement())
+  conversationId Int
+  from           MessageFrom
+  contenido      String       @db.Text
+  timestamp      DateTime     @default(now())
+  Conversation   Conversation @relation(fields: [conversationId], references: [id])
+}
