@@ -152,7 +152,7 @@ export const handleIAReply = async (
             { role: 'user', content: mensaje }
         ],
         temperature: 0.4,
-        max_tokens: 120
+        max_tokens: 200
     } as any)
 
     const respuestaIA = iaResponse.choices[0].message?.content?.trim() ?? ''

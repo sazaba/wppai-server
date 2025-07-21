@@ -7,7 +7,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Enums para campos con valores limitados
+// Enums
 enum ConversationEstado {
   pendiente
   respondido
@@ -22,20 +22,42 @@ enum MessageFrom {
   agent
 }
 
+enum Rol {
+  admin
+  agente
+  invitado
+}
+
+enum Plan {
+  gratis
+  pro
+}
+
+enum Estado {
+  inactivo
+  activo
+  suspendido
+}
+
+// 🧠 Configuración del negocio (asociado a empresa)
 model BusinessConfig {
   id                   Int      @id @default(autoincrement())
   nombre               String   @db.VarChar(100)
-  descripcion          String   @db.Text // descripción amplia del negocio
-  servicios            String   @db.Text // servicios detallados
-  faq                  String   @db.Text // preguntas frecuentes (FAQ)
-  horarios             String   @db.Text // ampliado desde VarChar(100) a Text
-  escalarSiNoConfia    Boolean // si se debe escalar cuando la IA no tiene contexto
-  escalarPalabrasClave String   @db.Text // palabras clave para escalar (separadas por coma)
-  escalarPorReintentos Int // cuántos intentos fallidos antes de escalar
-  createdAt            DateTime @default(now()) // fecha de creación
-  updatedAt            DateTime @updatedAt // fecha de última actualización
+  descripcion          String   @db.Text
+  servicios            String   @db.Text
+  faq                  String   @db.Text
+  horarios             String   @db.Text
+  escalarSiNoConfia    Boolean
+  escalarPalabrasClave String   @db.Text
+  escalarPorReintentos Int
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  empresaId Int
+  empresa   Empresa @relation(fields: [empresaId], references: [id])
 }
 
+// 💬 Conversaciones asociadas a empresa
 model Conversation {
   id        Int                @id @default(autoincrement())
   phone     String
@@ -43,13 +65,55 @@ model Conversation {
   estado    ConversationEstado @default(pendiente)
   mensajes  Message[]
   createdAt DateTime           @default(now())
+
+  empresaId Int
+  empresa   Empresa @relation(fields: [empresaId], references: [id])
 }
 
+// 💬 Mensajes en una conversación
 model Message {
-  id             Int          @id @default(autoincrement())
+  id             Int         @id @default(autoincrement())
   conversationId Int
   from           MessageFrom
-  contenido      String       @db.Text
-  timestamp      DateTime     @default(now())
-  Conversation   Conversation @relation(fields: [conversationId], references: [id])
+  contenido      String      @db.Text
+  timestamp      DateTime    @default(now())
+
+  Conversation Conversation @relation(fields: [conversationId], references: [id])
+}
+
+// 🏢 Empresa
+model Empresa {
+  id              Int              @id @default(autoincrement())
+  nombre          String
+  plan            Plan             @default(gratis)
+  estado          Estado           @default(inactivo)
+  usuarios        Usuario[]
+  configuraciones BusinessConfig[]
+  conversaciones  Conversation[]
+  cuentaWhatsapp  WhatsappAccount?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+}
+
+// 👤 Usuario
+model Usuario {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String
+  rol       Rol
+  empresaId Int
+  empresa   Empresa  @relation(fields: [empresaId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// 📲 Cuenta de WhatsApp vinculada vía OAuth
+model WhatsappAccount {
+  id            Int      @id @default(autoincrement())
+  phoneNumberId String   @unique
+  accessToken   String
+  empresaId     Int      @unique
+  empresa       Empresa  @relation(fields: [empresaId], references: [id])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }

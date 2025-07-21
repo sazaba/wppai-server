@@ -1,27 +1,52 @@
+// src/controllers/receive.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { handleIAReply } from '../utils/handleIAReply'
 import { MessageFrom, ConversationEstado } from '@prisma/client'
+import { sendWhatsappMessage } from '../utils/sendWhatsappMessage'
 
 export const receiveWhatsappMessage = async (req: Request, res: Response) => {
     try {
-        const { from, message } = req.body
+        const body = req.body
 
-        const timestamp = req.body.timestamp
-            ? new Date(req.body.timestamp).toISOString()
+        const phoneNumberId = body?.entry?.[0]?.id // ← llega desde Meta
+        const message = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]
+        const from = message?.from
+        const contenido = message?.text?.body || '[mensaje no soportado]'
+        const timestamp = message?.timestamp
+            ? new Date(parseInt(message.timestamp) * 1000).toISOString()
             : new Date().toISOString()
 
-        let conversation = await prisma.conversation.findFirst({ where: { phone: from } })
+        if (!phoneNumberId || !from) {
+            return res.status(200).json({ ignored: true })
+        }
+
+        // 🔎 Buscar la empresa a partir del número conectado
+        const cuenta = await prisma.whatsappAccount.findUnique({
+            where: { phoneNumberId }
+        })
+
+        if (!cuenta) {
+            console.warn('⚠️ Mensaje recibido de número no vinculado:', phoneNumberId)
+            return res.status(200).json({ ignored: true })
+        }
+
+        const empresaId = cuenta.empresaId
+
+        // 🧠 Buscar o crear conversación asociada a ese número + empresa
+        let conversation = await prisma.conversation.findFirst({
+            where: { phone: from, empresaId }
+        })
 
         if (!conversation) {
             conversation = await prisma.conversation.create({
                 data: {
                     phone: from,
-                    estado: 'pendiente'
+                    estado: 'pendiente',
+                    empresaId
                 }
             })
         } else if (conversation.estado === 'cerrado') {
-            // 🟢 Reabrir si estaba cerrada
             await prisma.conversation.update({
                 where: { id: conversation.id },
                 data: { estado: 'pendiente' }
@@ -29,34 +54,34 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversation.estado = 'pendiente'
         }
 
-        // 📨 Guardar el mensaje del cliente
+        // 💬 Guardar el mensaje entrante
         await prisma.message.create({
             data: {
                 conversationId: conversation.id,
                 from: MessageFrom.client,
-                contenido: message,
+                contenido,
                 timestamp
             }
         })
 
+        // 🔁 Emitir evento WebSocket
         const io = req.app.get('io')
-
-        // 📡 Emitir mensaje del cliente
         io.emit('nuevo_mensaje', {
             conversationId: conversation.id,
             from: 'client',
-            contenido: message,
+            contenido,
             timestamp,
             phone: conversation.phone,
             nombre: conversation.nombre ?? conversation.phone,
             estado: conversation.estado
         })
 
-        // 🤖 Procesar con IA
-        const result = await handleIAReply(conversation.id, message)
+        // 🤖 Generar respuesta con IA
+        const result = await handleIAReply(conversation.id, contenido)
 
-        // 📡 Emitir respuesta de la IA si existe
         if (result?.mensaje) {
+            await sendWhatsappMessage(conversation.phone, result.mensaje)
+
             io.emit('nuevo_mensaje', {
                 conversationId: conversation.id,
                 from: 'bot',
@@ -68,7 +93,24 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
         res.status(200).json({ success: true })
     } catch (error) {
-        console.error(error)
+        console.error('[receiveWhatsappMessage] Error:', error)
         res.status(500).json({ error: 'Error al recibir mensaje' })
+    }
+}
+
+
+export const verifyWebhook = (req: Request, res: Response) => {
+    const VERIFY_TOKEN = 'verificacion-supersecreta'
+
+    const mode = req.query['hub.mode']
+    const token = req.query['hub.verify_token']
+    const challenge = req.query['hub.challenge']
+
+    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+        console.log('🟢 Webhook verificado correctamente')
+        res.status(200).send(challenge)
+    } else {
+        console.warn('🔴 Verificación fallida')
+        res.sendStatus(403)
     }
 }

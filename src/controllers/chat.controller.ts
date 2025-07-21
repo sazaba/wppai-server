@@ -5,9 +5,12 @@ import { ConversationEstado, MessageFrom } from '@prisma/client'
 import { openai } from '../lib/openai'
 import { handleIAReply } from '../utils/handleIAReply'
 
-export const getConversations = async (_req: Request, res: Response) => {
+export const getConversations = async (req: Request, res: Response) => {
+    const empresaId = req.user?.empresaId
+
     try {
         const conversations = await prisma.conversation.findMany({
+            where: { empresaId },
             orderBy: { createdAt: 'desc' },
             include: {
                 mensajes: {
@@ -33,18 +36,27 @@ export const getConversations = async (_req: Request, res: Response) => {
 }
 
 export const getMessagesByConversation = async (req: Request, res: Response) => {
+    const empresaId = req.user?.empresaId
     const { id } = req.params
     const page = parseInt(req.query.page as string) || 1
     const limit = parseInt(req.query.limit as string) || 20
     const skip = (page - 1) * limit
 
     try {
+        const conv = await prisma.conversation.findUnique({
+            where: { id: Number(id) }
+        })
+
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para ver esta conversación' })
+        }
+
         const total = await prisma.message.count({
-            where: { conversationId: parseInt(id) }
+            where: { conversationId: conv.id }
         })
 
         const messages = await prisma.message.findMany({
-            where: { conversationId: parseInt(id) },
+            where: { conversationId: conv.id },
             orderBy: { timestamp: 'asc' },
             skip,
             take: limit
@@ -66,6 +78,7 @@ export const getMessagesByConversation = async (req: Request, res: Response) => 
 }
 
 export const postMessageToConversation = async (req: Request, res: Response) => {
+    const empresaId = req.user?.empresaId
     const { id } = req.params
     const { contenido } = req.body
 
@@ -74,19 +87,24 @@ export const postMessageToConversation = async (req: Request, res: Response) => 
     }
 
     try {
+        const conv = await prisma.conversation.findUnique({ where: { id: Number(id) } })
+
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para responder esta conversación' })
+        }
+
         const message = await prisma.message.create({
             data: {
-                conversationId: parseInt(id),
-                from: MessageFrom.bot, // ← USANDO ENUM MessageFrom
+                conversationId: conv.id,
+                from: MessageFrom.bot,
                 contenido,
                 timestamp: new Date()
             }
         })
 
-        // 🔁 Actualizar estado de la conversación a "respondido"
         await prisma.conversation.update({
-            where: { id: parseInt(id) },
-            data: { estado: ConversationEstado.respondido } // ← USANDO ENUM ConversationEstado
+            where: { id: conv.id },
+            data: { estado: ConversationEstado.respondido }
         })
 
         res.status(201).json(message)
@@ -96,11 +114,17 @@ export const postMessageToConversation = async (req: Request, res: Response) => 
     }
 }
 
-
 export const responderConIA = async (req: Request, res: Response) => {
     const { chatId, mensaje, intentosFallidos = 0 } = req.body
+    const empresaId = req.user?.empresaId
 
     try {
+        const conv = await prisma.conversation.findUnique({ where: { id: Number(chatId) } })
+
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para responder esta conversación' })
+        }
+
         const result = await handleIAReply(chatId, mensaje)
 
         if (!result) {
@@ -114,7 +138,6 @@ export const responderConIA = async (req: Request, res: Response) => {
             })
         }
 
-        // Ya validamos que estado !== requiere_agente, entonces mensaje existe
         return res.json({ mensaje: result.mensaje })
     } catch (err) {
         console.error('Error al responder con IA:', err)
@@ -125,14 +148,21 @@ export const responderConIA = async (req: Request, res: Response) => {
 export const updateConversationEstado = async (req: Request, res: Response) => {
     const { id } = req.params
     const { estado } = req.body
+    const empresaId = req.user?.empresaId
 
     if (!estado || !Object.values(ConversationEstado).includes(estado)) {
         return res.status(400).json({ error: 'Estado inválido' })
     }
 
     try {
+        const conv = await prisma.conversation.findUnique({ where: { id: Number(id) } })
+
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para modificar esta conversación' })
+        }
+
         const updated = await prisma.conversation.update({
-            where: { id: parseInt(id) },
+            where: { id: conv.id },
             data: { estado }
         })
 
@@ -143,17 +173,22 @@ export const updateConversationEstado = async (req: Request, res: Response) => {
     }
 }
 
-// PUT /api/chats/:id/cerrar
 export const cerrarConversacion = async (req: Request, res: Response) => {
     const { id } = req.params
+    const empresaId = req.user?.empresaId
 
     try {
+        const conv = await prisma.conversation.findUnique({ where: { id: Number(id) } })
+
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para cerrar esta conversación' })
+        }
+
         const updated = await prisma.conversation.update({
-            where: { id: Number(id) },
+            where: { id: conv.id },
             data: { estado: 'cerrado' }
         })
 
-        // Emitir evento WebSocket
         const io = req.app.get('io')
         io.emit('chat_actualizado', {
             id: updated.id,
@@ -167,43 +202,78 @@ export const cerrarConversacion = async (req: Request, res: Response) => {
     }
 }
 
-
-// POST /api/chats/:id/responder-manual
 export const responderManual = async (req: Request, res: Response) => {
-    const { id } = req.params;
-    const { contenido } = req.body;
+    const { id } = req.params
+    const { contenido } = req.body
+    const empresaId = req.user?.empresaId
 
     if (!contenido) {
-        return res.status(400).json({ error: 'El contenido del mensaje es requerido' });
+        return res.status(400).json({ error: 'El contenido del mensaje es requerido' })
     }
 
     try {
+        const conv = await prisma.conversation.findUnique({ where: { id: Number(id) } })
+
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para responder esta conversación' })
+        }
+
         const message = await prisma.message.create({
             data: {
-                conversationId: Number(id),
-                from: MessageFrom.agent, // ✅ aquí el cambio
+                conversationId: conv.id,
+                from: MessageFrom.agent,
                 contenido,
                 timestamp: new Date(),
             },
-        });
+        })
 
         await prisma.conversation.update({
-            where: { id: Number(id) },
+            where: { id: conv.id },
             data: { estado: 'requiere_agente' },
-        });
+        })
 
-        const io = req.app.get('io');
+        const io = req.app.get('io')
         io.emit('nuevo_mensaje', {
-            conversationId: Number(id),
+            conversationId: conv.id,
             from: 'agent',
             contenido,
             timestamp: new Date().toISOString(),
             estado: 'requiere_agente',
-        });
+        })
 
-        res.status(200).json({ success: true, message });
+        res.status(200).json({ success: true, message })
     } catch (err) {
-        console.error('Error al guardar respuesta manual:', err);
-        res.status(500).json({ error: 'Error al guardar el mensaje' });
+        console.error('Error al guardar respuesta manual:', err)
+        res.status(500).json({ error: 'Error al guardar el mensaje' })
     }
-};
+}
+
+// POST /api/chats
+export const crearConversacion = async (req: Request, res: Response) => {
+    const { phone, nombre } = req.body
+    const empresaId = req.user?.empresaId
+
+    if (!empresaId) {
+        return res.status(401).json({ error: 'No autorizado' })
+    }
+
+    if (!phone) {
+        return res.status(400).json({ error: 'El número de teléfono es obligatorio' })
+    }
+
+    try {
+        const nueva = await prisma.conversation.create({
+            data: {
+                phone,
+                nombre,
+                estado: 'pendiente',
+                empresaId, // ahora está garantizado como `number`
+            }
+        })
+
+        return res.status(201).json({ message: 'Conversación creada', chat: nueva })
+    } catch (err) {
+        console.error('Error al crear conversación:', err)
+        return res.status(500).json({ error: 'Error al crear la conversación' })
+    }
+}
