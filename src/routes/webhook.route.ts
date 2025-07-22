@@ -4,10 +4,9 @@ import { receiveWhatsappMessage, verifyWebhook } from '../controllers/webhook.co
 
 const router = express.Router()
 
-// Endpoint que Meta usará para enviar mensajes entrantes
-router.post('/webhooks/whatsapp', receiveWhatsappMessage)
+// webhook.route.ts
+router.get('/webhook', verifyWebhook)
+router.post('/webhook', receiveWhatsappMessage)
 
-// Endpoint de verificación del webhook (paso obligatorio para validar en Meta)
-router.get('/webhooks/whatsapp', verifyWebhook)
 
 export default router
