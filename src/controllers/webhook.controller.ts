@@ -95,16 +95,16 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 }
 
 export const verifyWebhook = (req: Request, res: Response) => {
-    const VERIFY_TOKEN = 'verificacion-supersecreta'
+    const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
     const mode = req.query['hub.mode']
     const token = req.query['hub.verify_token']
     const challenge = req.query['hub.challenge']
 
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
         console.log('🟢 Webhook verificado correctamente')
-        res.status(200).send(challenge)
+        return res.status(200).send(challenge)
     } else {
         console.warn('🔴 Verificación fallida')
-        res.sendStatus(403)
+        return res.sendStatus(403)
     }
 }
