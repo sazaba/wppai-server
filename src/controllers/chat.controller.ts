@@ -4,6 +4,7 @@ import { shouldEscalateChat } from '../utils/shouldEscalate'
 import { ConversationEstado, MessageFrom } from '@prisma/client'
 import { openai } from '../lib/openai'
 import { handleIAReply } from '../utils/handleIAReply'
+import { sendWhatsappMessage } from '../utils/sendWhatsappMessage'
 
 export const getConversations = async (req: Request, res: Response) => {
     const empresaId = req.user?.empresaId
@@ -218,6 +219,7 @@ export const responderManual = async (req: Request, res: Response) => {
             return res.status(403).json({ error: 'No autorizado para responder esta conversación' })
         }
 
+        // 1. Guardar mensaje en base de datos
         const message = await prisma.message.create({
             data: {
                 conversationId: conv.id,
@@ -227,11 +229,16 @@ export const responderManual = async (req: Request, res: Response) => {
             },
         })
 
+        // 2. Actualizar estado de la conversación
         await prisma.conversation.update({
             where: { id: conv.id },
             data: { estado: 'requiere_agente' },
         })
 
+        // 3. Enviar mensaje real por WhatsApp
+        await sendWhatsappMessage(conv.phone, contenido)
+
+        // 4. Emitir evento a frontend
         const io = req.app.get('io')
         io.emit('nuevo_mensaje', {
             conversationId: conv.id,
@@ -247,6 +254,7 @@ export const responderManual = async (req: Request, res: Response) => {
         res.status(500).json({ error: 'Error al guardar el mensaje' })
     }
 }
+
 
 // POST /api/chats
 export const crearConversacion = async (req: Request, res: Response) => {

@@ -8,7 +8,8 @@ import {
     responderConIA,
     updateConversationEstado,
     cerrarConversacion,
-    responderManual
+    responderManual,
+    crearConversacion
 } from '../controllers/chat.controller'
 
 import { verificarJWT } from '../middleware/auth.middleware'
@@ -25,5 +26,7 @@ router.post('/responder', responderConIA)
 router.put('/chats/:id/estado', updateConversationEstado)
 router.put('/chats/:id/cerrar', cerrarConversacion)
 router.post('/chats/:id/responder-manual', responderManual)
+router.post('/chats', crearConversacion)
+
 
 export default router
