@@ -17,11 +17,10 @@ const app = express()
 
 // 🌐 Orígenes permitidos
 const allowedOrigins = [
-    'https://www.wasaaa.com', // dominio principal
-    'https://wppai-client-mxea5xdyr-sazabas-projects.vercel.app', // deploy temporal
-    'http://localhost:3000' // desarrollo local
+    'https://wppai-client.vercel.app', // ✅ importante exacto
+    'https://www.wasaaa.com',
+    'http://localhost:3000'
 ]
-
 // 🧠 Servidor HTTP + WebSocket
 const server = http.createServer(app)
 const io = new Server(server, {
