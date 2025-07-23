@@ -6,9 +6,12 @@ import { generarToken } from '../utils/jwt'
 
 // ✅ Login con empresa activa
 export const login = async (req: Request, res: Response) => {
+    console.log('🟡 [LOGIN] Body recibido:', req.body)
+
     const { email, password } = req.body
 
     if (!email || !password) {
+        console.warn('⚠️ [LOGIN] Faltan email o password')
         return res.status(400).json({ error: 'Email y contraseña requeridos' })
     }
 
@@ -19,18 +22,27 @@ export const login = async (req: Request, res: Response) => {
         })
 
         if (!usuario) {
+            console.warn('❌ [LOGIN] Usuario no encontrado:', email)
             return res.status(404).json({ error: 'Usuario no encontrado' })
         }
+
+        console.log('✅ [LOGIN] Usuario encontrado:', usuario.email)
 
         const valido = await bcrypt.compare(password, usuario.password)
 
         if (!valido) {
+            console.warn('❌ [LOGIN] Contraseña incorrecta')
             return res.status(401).json({ error: 'Contraseña incorrecta' })
         }
 
-        if (usuario.empresa.estado !== 'activo') {
+        console.log('✅ [LOGIN] Contraseña válida')
+
+        if (!usuario.empresa || usuario.empresa.estado !== 'activo') {
+            console.warn('❌ [LOGIN] Empresa inactiva o no encontrada')
             return res.status(403).json({ error: 'La empresa aún no está activa. Debes completar el pago.' })
         }
+
+        console.log('✅ [LOGIN] Empresa activa:', usuario.empresa.nombre)
 
         const token = generarToken({
             id: usuario.id,
@@ -39,12 +51,15 @@ export const login = async (req: Request, res: Response) => {
             empresaId: usuario.empresaId
         })
 
-        res.json({ token, empresaId: usuario.empresaId })
+        console.log('✅ [LOGIN] Token generado correctamente')
+
+        return res.json({ token, empresaId: usuario.empresaId })
     } catch (error) {
-        console.error('[login] Error:', error)
-        res.status(500).json({ error: 'Error en el login' })
+        console.error('🔥 [LOGIN] Error inesperado:', error)
+        return res.status(500).json({ error: 'Error en el login' })
     }
 }
+
 
 // ✅ Registro: crea empresa + usuario admin
 export const registrar = async (req: Request, res: Response) => {
