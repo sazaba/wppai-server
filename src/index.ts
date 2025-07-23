@@ -41,8 +41,15 @@ io.on('connection', (socket) => {
 })
 
 // 🌐 Middlewares
+
 app.use(cors({
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true)
+        } else {
+            callback(new Error('❌ No autorizado por CORS'))
+        }
+    },
     credentials: true
 }))
 app.use(express.urlencoded({ extended: true }))
