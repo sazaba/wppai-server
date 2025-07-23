@@ -15,14 +15,22 @@ dotenv.config()
 // 🚀 Inicializar servidor Express
 const app = express()
 
+// 🌐 Orígenes permitidos
+const allowedOrigins = [
+    'https://www.wasaaa.com', // dominio principal
+    'https://wppai-client-mxea5xdyr-sazabas-projects.vercel.app', // deploy temporal
+    'http://localhost:3000' // desarrollo local
+]
+
 // 🧠 Servidor HTTP + WebSocket
 const server = http.createServer(app)
 const io = new Server(server, {
     cors: {
-        origin: '*',
-    },
+        origin: allowedOrigins,
+        credentials: true
+    }
 })
-app.set('io', io) // 👉 Exportable desde otros módulos si lo necesitas
+app.set('io', io)
 
 // 🔌 WebSocket conectado
 io.on('connection', (socket) => {
@@ -34,10 +42,9 @@ io.on('connection', (socket) => {
 
 // 🌐 Middlewares
 app.use(cors({
-    origin: ['https://www.wasaaa.com', 'http://localhost:3000'],
-    credentials: true, // por si en el futuro usas cookies
+    origin: allowedOrigins,
+    credentials: true
 }))
-
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json({ type: 'application/json', limit: '5mb' }))
 
@@ -50,12 +57,11 @@ app.use((req, res, next) => {
 
 // 📌 Rutas públicas
 app.use('/api/auth', authRoutes)       // login, registro, OAuth
-app.use('/api', webhookRoutes)         // recibe mensajes desde WhatsApp (puede mantenerse pública)
+app.use('/api', webhookRoutes)         // mensajes desde WhatsApp (webhook)
 
-// 🔐 Rutas protegidas (verificarJWT dentro de cada archivo de ruta)
+// 🔐 Rutas protegidas (JWT middleware dentro de cada archivo)
 app.use('/api/config', configRoutes)   // configuración del negocio
-app.use('/api', chatRoutes)            // historial, estados, respuesta IA
-
+app.use('/api', chatRoutes)            // historial, estados, IA
 
 // 🏠 Ruta raíz
 app.get('/', (req, res) => {
