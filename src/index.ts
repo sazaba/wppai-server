@@ -33,7 +33,11 @@ io.on('connection', (socket) => {
 })
 
 // 🌐 Middlewares
-app.use(cors())
+app.use(cors({
+    origin: ['https://www.wasaaa.com', 'http://localhost:3000'],
+    credentials: true, // por si en el futuro usas cookies
+}))
+
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json({ type: 'application/json', limit: '5mb' }))
 
