@@ -60,7 +60,6 @@ export const login = async (req: Request, res: Response) => {
     }
 }
 
-
 // ✅ Registro: crea empresa + usuario admin
 export const registrar = async (req: Request, res: Response) => {
     const { nombreEmpresa, email, password } = req.body
@@ -108,10 +107,11 @@ export const registrar = async (req: Request, res: Response) => {
 // ✅ OAuth callback: guarda accessToken y phoneNumberId vinculados a la empresa autenticada
 export const authCallback = async (req: Request, res: Response) => {
     const code = req.query.code as string
-    const empresaId = req.user?.empresaId // ← Debe estar autenticado
+    const state = req.query.state as string
+    const empresaId = parseInt(state)
 
     if (!code || !empresaId) {
-        return res.status(400).send('Falta el código o el token no tiene empresa.')
+        return res.status(400).send('Faltan datos: code o empresaId no válidos.')
     }
 
     try {

@@ -8,6 +8,8 @@ import configRoutes from './routes/config.routes'
 import webhookRoutes from './routes/webhook.route'
 import chatRoutes from './routes/chat.route'
 import authRoutes from './routes/auth.route'
+import whatsappRoutes from './routes/whatsapp.routes'
+
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -69,6 +71,7 @@ app.use('/api', webhookRoutes)         // mensajes desde WhatsApp (webhook)
 // 🔐 Rutas protegidas (JWT middleware dentro de cada archivo)
 app.use('/api/config', configRoutes)   // configuración del negocio
 app.use('/api', chatRoutes)            // historial, estados, IA
+app.use('/api/whatsapp', whatsappRoutes) // conexión de cuenta WhatsApp por empresa
 
 // 🏠 Ruta raíz
 app.get('/', (req, res) => {
