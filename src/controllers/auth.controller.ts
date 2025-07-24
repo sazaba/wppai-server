@@ -3,6 +3,12 @@ import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import bcrypt from 'bcrypt'
 import { generarToken } from '../utils/jwt'
+import jwt, { JwtPayload as DefaultJwtPayload } from 'jsonwebtoken'
+
+interface CustomJwtPayload extends DefaultJwtPayload {
+    empresaId: number
+}
+
 
 // ✅ Login con empresa activa
 export const login = async (req: Request, res: Response) => {
@@ -104,20 +110,34 @@ export const registrar = async (req: Request, res: Response) => {
     }
 }
 
-// ✅ OAuth callback: guarda accessToken y phoneNumberId vinculados a la empresa autenticada
-// ✅ OAuth callback validando JWT + guardando datos
-export const authCallback = async (req: Request, res: Response) => {
-    const code = req.query.code as string
-    const token = req.headers.authorization?.split(' ')[1] || req.query.token
 
-    if (!code || !token) {
+
+
+export const authCallback = async (req: Request, res: Response) => {
+    const { code } = req.body
+    const authHeader = req.headers.authorization
+
+    if (!code || !authHeader) {
         return res.status(400).json({ error: 'Faltan code o token' })
     }
 
-    // Validar el token JWT para extraer empresaId
+    const token = authHeader.split(' ')[1]
+    if (!token) {
+        return res.status(400).json({ error: 'Token no proporcionado' })
+    }
+
+    // ✅ Verificar JWT
     let empresaId: number
     try {
-        const decoded = require('jsonwebtoken').verify(token, process.env.JWT_SECRET as string) as any
+        const decoded = jwt.verify(
+            token,
+            process.env.JWT_SECRET as string
+        ) as CustomJwtPayload
+
+        if (!decoded.empresaId) {
+            return res.status(401).json({ error: 'Token inválido: falta empresaId' })
+        }
+
         empresaId = decoded.empresaId
     } catch (err) {
         console.error('❌ Token inválido en callback')
@@ -125,7 +145,7 @@ export const authCallback = async (req: Request, res: Response) => {
     }
 
     try {
-        // Paso 1: Obtener access token
+        // Paso 1: Obtener access token de Meta
         const tokenRes = await axios.get('https://graph.facebook.com/v20.0/oauth/access_token', {
             params: {
                 client_id: process.env.META_APP_ID,
@@ -137,11 +157,9 @@ export const authCallback = async (req: Request, res: Response) => {
 
         const accessToken = tokenRes.data.access_token
 
-        // Paso 2: Obtener usuario asociado a la sesión
+        // Paso 2: Obtener el userId
         const userRes = await axios.get('https://graph.facebook.com/v20.0/me', {
-            headers: {
-                Authorization: `Bearer ${accessToken}`
-            }
+            headers: { Authorization: `Bearer ${accessToken}` }
         })
 
         const userId = userRes.data.id
@@ -150,31 +168,26 @@ export const authCallback = async (req: Request, res: Response) => {
         const phoneRes = await axios.get(
             `https://graph.facebook.com/v20.0/${userId}/owned_phone_numbers?fields=id`,
             {
-                headers: {
-                    Authorization: `Bearer ${accessToken}`
-                }
+                headers: { Authorization: `Bearer ${accessToken}` }
             }
         )
 
         const phoneNumberId = phoneRes.data?.data?.[0]?.id
 
         if (!phoneNumberId) {
-            return res.status(400).send('No se pudo obtener el phone_number_id del número vinculado.')
+            return res.status(400).json({ error: 'No se encontró phone_number_id' })
         }
 
-        // Paso 4: Guardar en base de datos
-        // Paso 4: Guardar o actualizar la cuenta de WhatsApp vinculada con la empresa
+        // Paso 4: Guardar en DB
         await prisma.whatsappAccount.upsert({
             where: { empresaId },
             update: { phoneNumberId, accessToken },
             create: { empresaId, phoneNumberId, accessToken }
         })
 
-        // ✅ Redirige al frontend al finalizar
-        return res.redirect(`https://wasaaa.com/dashboard/whatsapp?success=1`)
-
+        return res.json({ success: true, phoneNumberId })
     } catch (err: any) {
-        console.error('[authCallback] Error:', err.response?.data || err.message)
-        return res.status(500).send('❌ Error autenticando con Meta.')
+        console.error('[authCallback] Error Meta:', err.response?.data || err.message)
+        return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
     }
 }
