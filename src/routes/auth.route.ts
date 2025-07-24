@@ -25,6 +25,7 @@ router.get('/auth', (req, res) => {
 })
 
 // ✅ Callback del OAuth de Meta
-router.get('/auth/callback', authCallback)
+router.post('/callback', authCallback)
+
 
 export default router
