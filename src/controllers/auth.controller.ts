@@ -105,13 +105,23 @@ export const registrar = async (req: Request, res: Response) => {
 }
 
 // ✅ OAuth callback: guarda accessToken y phoneNumberId vinculados a la empresa autenticada
+// ✅ OAuth callback validando JWT + guardando datos
 export const authCallback = async (req: Request, res: Response) => {
     const code = req.query.code as string
-    const state = req.query.state as string
-    const empresaId = parseInt(state)
+    const token = req.headers.authorization?.split(' ')[1] || req.query.token
 
-    if (!code || !empresaId) {
-        return res.status(400).send('Faltan datos: code o empresaId no válidos.')
+    if (!code || !token) {
+        return res.status(400).json({ error: 'Faltan code o token' })
+    }
+
+    // Validar el token JWT para extraer empresaId
+    let empresaId: number
+    try {
+        const decoded = require('jsonwebtoken').verify(token, process.env.JWT_SECRET as string) as any
+        empresaId = decoded.empresaId
+    } catch (err) {
+        console.error('❌ Token inválido en callback')
+        return res.status(401).json({ error: 'Token inválido' })
     }
 
     try {
@@ -127,16 +137,16 @@ export const authCallback = async (req: Request, res: Response) => {
 
         const accessToken = tokenRes.data.access_token
 
-        // Paso 2: Obtener el ID del usuario o negocio conectado
-        const businessRes = await axios.get('https://graph.facebook.com/v20.0/me', {
+        // Paso 2: Obtener usuario asociado a la sesión
+        const userRes = await axios.get('https://graph.facebook.com/v20.0/me', {
             headers: {
                 Authorization: `Bearer ${accessToken}`
             }
         })
 
-        const userId = businessRes.data.id
+        const userId = userRes.data.id
 
-        // Paso 3: Obtener el phone_number_id del número de WhatsApp conectado
+        // Paso 3: Obtener phone_number_id
         const phoneRes = await axios.get(
             `https://graph.facebook.com/v20.0/${userId}/owned_phone_numbers?fields=id`,
             {
@@ -152,6 +162,7 @@ export const authCallback = async (req: Request, res: Response) => {
             return res.status(400).send('No se pudo obtener el phone_number_id del número vinculado.')
         }
 
+        // Paso 4: Guardar en base de datos
         // Paso 4: Guardar o actualizar la cuenta de WhatsApp vinculada con la empresa
         await prisma.whatsappAccount.upsert({
             where: { empresaId },
@@ -159,7 +170,9 @@ export const authCallback = async (req: Request, res: Response) => {
             create: { empresaId, phoneNumberId, accessToken }
         })
 
-        return res.send(`✅ Número de WhatsApp vinculado correctamente. phone_number_id: ${phoneNumberId}`)
+        // ✅ Redirige al frontend al finalizar
+        return res.redirect(`https://wasaaa.com/dashboard/whatsapp?success=1`)
+
     } catch (err: any) {
         console.error('[authCallback] Error:', err.response?.data || err.message)
         return res.status(500).send('❌ Error autenticando con Meta.')
