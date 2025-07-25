@@ -9,7 +9,6 @@ interface CustomJwtPayload extends DefaultJwtPayload {
     empresaId: number
 }
 
-
 // ✅ Login con empresa activa
 export const login = async (req: Request, res: Response) => {
     console.log('🟡 [LOGIN] Body recibido:', req.body)
@@ -110,9 +109,7 @@ export const registrar = async (req: Request, res: Response) => {
     }
 }
 
-
-
-
+// 🔁 Nuevo flujo authCallback con selección de número
 export const authCallback = async (req: Request, res: Response) => {
     const { code } = req.body
     const authHeader = req.headers.authorization
@@ -126,7 +123,6 @@ export const authCallback = async (req: Request, res: Response) => {
         return res.status(400).json({ error: 'Token no proporcionado' })
     }
 
-    // ✅ Verificar JWT
     let empresaId: number
     try {
         const decoded = jwt.verify(
@@ -145,7 +141,7 @@ export const authCallback = async (req: Request, res: Response) => {
     }
 
     try {
-        // Paso 1: Obtener access token de Meta
+        // 🔐 Paso 1: Obtener access_token
         const tokenRes = await axios.get('https://graph.facebook.com/v20.0/oauth/access_token', {
             params: {
                 client_id: process.env.META_APP_ID,
@@ -157,35 +153,50 @@ export const authCallback = async (req: Request, res: Response) => {
 
         const accessToken = tokenRes.data.access_token
 
-        // Paso 2: Obtener el userId
-        const userRes = await axios.get('https://graph.facebook.com/v20.0/me', {
-            headers: { Authorization: `Bearer ${accessToken}` }
+        // 🔎 Paso 2: Obtener negocios del usuario
+        const businessRes = await axios.get(`https://graph.facebook.com/v20.0/me/businesses`, {
+            params: { access_token: accessToken }
         })
 
-        const userId = userRes.data.id
+        const businesses = businessRes.data.data
+        let availableNumbers: any[] = []
 
-        // Paso 3: Obtener phone_number_id
-        const phoneRes = await axios.get(
-            `https://graph.facebook.com/v20.0/${userId}/owned_phone_numbers?fields=id`,
-            {
-                headers: { Authorization: `Bearer ${accessToken}` }
+        for (const business of businesses) {
+            const businessId = business.id
+
+            // 📦 Obtener cuentas de WhatsApp del negocio
+            const wabaRes = await axios.get(`https://graph.facebook.com/v20.0/${businessId}/owned_whatsapp_business_accounts`, {
+                params: { access_token: accessToken }
+            })
+
+            const wabas = wabaRes.data.data
+
+            for (const waba of wabas) {
+                const wabaId = waba.id
+
+                const phoneRes = await axios.get(`https://graph.facebook.com/v20.0/${wabaId}/phone_numbers`, {
+                    params: { access_token: accessToken }
+                })
+
+                const phoneNumbers = phoneRes.data.data
+
+                for (const phone of phoneNumbers) {
+                    availableNumbers.push({
+                        negocioId: businessId,
+                        wabaId,
+                        phoneNumberId: phone.id,
+                        nombre: phone.name,
+                        displayPhoneNumber: phone.display_phone_number
+                    })
+                }
             }
-        )
-
-        const phoneNumberId = phoneRes.data?.data?.[0]?.id
-
-        if (!phoneNumberId) {
-            return res.status(400).json({ error: 'No se encontró phone_number_id' })
         }
 
-        // Paso 4: Guardar en DB
-        await prisma.whatsappAccount.upsert({
-            where: { empresaId },
-            update: { phoneNumberId, accessToken },
-            create: { empresaId, phoneNumberId, accessToken }
-        })
+        if (availableNumbers.length === 0) {
+            return res.status(400).json({ error: 'No se encontraron números disponibles' })
+        }
 
-        return res.json({ success: true, phoneNumberId })
+        return res.json({ seleccionarNumero: true, availableNumbers, accessToken })
     } catch (err: any) {
         console.error('[authCallback] Error Meta:', err.response?.data || err.message)
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })

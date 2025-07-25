@@ -114,13 +114,16 @@ model BusinessConfig {
 }
 
 model WhatsappAccount {
-  id            Int      @id @default(autoincrement())
-  phoneNumberId String   @unique
-  accessToken   String
-  empresaId     Int      @unique
-  empresa       Empresa  @relation(fields: [empresaId], references: [id])
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id                 Int      @id @default(autoincrement())
+  phoneNumberId      String   @unique
+  wabaId             String
+  businessId         String
+  accessToken        String
+  displayPhoneNumber String // ✅ NUEVO CAMPO
+  empresaId          Int      @unique
+  empresa            Empresa  @relation(fields: [empresaId], references: [id])
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
   @@map("whatsappaccount")
 }
