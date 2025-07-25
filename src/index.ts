@@ -9,6 +9,7 @@ import webhookRoutes from './routes/webhook.route'
 import chatRoutes from './routes/chat.route'
 import authRoutes from './routes/auth.route'
 import whatsappRoutes from './routes/whatsapp.routes'
+import empresaRoutes from './routes/empresa.routes'
 
 
 // 📦 Cargar variables de entorno
@@ -72,6 +73,10 @@ app.use('/api', webhookRoutes)         // mensajes desde WhatsApp (webhook)
 app.use('/api/config', configRoutes)   // configuración del negocio
 app.use('/api', chatRoutes)            // historial, estados, IA
 app.use('/api/whatsapp', whatsappRoutes) // conexión de cuenta WhatsApp por empresa
+
+//empresa
+app.use('/api', empresaRoutes)
+
 
 // 🏠 Ruta raíz
 app.get('/', (req, res) => {
