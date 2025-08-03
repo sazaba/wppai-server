@@ -11,12 +11,20 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
     try {
         const change = req.body?.entry?.[0]?.changes?.[0]
         const value = change?.value
-        const message = value?.messages?.[0]
 
-        if (!value?.metadata?.phone_number_id || !message) {
+        // Ignorar eventos que no contienen mensajes reales (por ejemplo, status de entrega o lectura)
+        if (!value?.messages || !value?.messages[0]) {
+            console.log('ℹ️ Evento recibido sin mensaje de usuario (probablemente "status"). Ignorado.')
+            return res.status(200).json({ ignored: true })
+        }
+
+        const message = value.messages[0]
+
+        if (!value?.metadata?.phone_number_id || !message.from) {
             console.warn('❌ Faltan datos esenciales en el mensaje entrante.')
             return res.status(200).json({ ignored: true })
         }
+
 
         const phoneNumberId = value.metadata.phone_number_id
         const from = message.from
