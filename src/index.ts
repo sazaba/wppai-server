@@ -20,9 +20,10 @@ const app = express()
 
 // 🌐 Orígenes permitidos
 const allowedOrigins = [
-    'https://wppai-client.vercel.app', // ✅ importante exacto
+    'https://wppai-client.vercel.app',
     'https://www.wasaaa.com',
-    'http://localhost:3000'
+    'http://localhost:3000',
+    'https://wasaaa.com'
 ]
 // 🧠 Servidor HTTP + WebSocket
 const server = http.createServer(app)
