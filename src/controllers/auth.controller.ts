@@ -172,7 +172,7 @@ export const authCallback = async (req: Request, res: Response) => {
         console.log(`✅ [authCallback] Número ${numeroTelefono} (${phoneNumberId}) conectado para empresa ${empresaId}`)
 
         // Redirigir con éxito al dashboard
-        return res.redirect(`https://wasaaa.com/dashboard/settings?success=1`)
+        return res.redirect(`https://wasaaa.com/dashboard/callback?success=1`)
     } catch (err: any) {
         console.error('[authCallback] Error Meta:', err.response?.data || err.message)
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
