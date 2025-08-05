@@ -109,94 +109,70 @@ export const registrar = async (req: Request, res: Response) => {
     }
 }
 
-// 🔁 Nuevo flujo authCallback con selección de número
+interface MetaTokenResponse {
+    access_token: string
+    token_type: string
+    expires_in: number
+}
+
+// 🔁 Nuevo flujo authCallback con número y phone_number_id manual
 export const authCallback = async (req: Request, res: Response) => {
-    const { code } = req.body
-    const authHeader = req.headers.authorization
+    const { code, state } = req.query
 
-    if (!code || !authHeader) {
-        return res.status(400).json({ error: 'Faltan code o token' })
+    if (!code || !state) {
+        return res.status(400).json({ error: 'Faltan code o state' })
     }
 
-    const token = authHeader.split(' ')[1]
-    if (!token) {
-        return res.status(400).json({ error: 'Token no proporcionado' })
-    }
-
-    let empresaId: number
     try {
-        const decoded = jwt.verify(
-            token,
-            process.env.JWT_SECRET as string
-        ) as CustomJwtPayload
+        // Extraer empresaId, número y phone_number_id desde el state
+        const [empresaIdStr, numeroTelefono, phoneNumberId] = decodeURIComponent(state as string).split("|")
 
-        if (!decoded.empresaId) {
-            return res.status(401).json({ error: 'Token inválido: falta empresaId' })
+        if (!empresaIdStr || !numeroTelefono || !phoneNumberId) {
+            return res.status(400).json({ error: 'State inválido: falta empresaId, número o phone_number_id' })
         }
 
-        empresaId = decoded.empresaId
-    } catch (err) {
-        console.error('❌ Token inválido en callback')
-        return res.status(401).json({ error: 'Token inválido' })
-    }
+        const empresaId = parseInt(empresaIdStr, 10)
+        if (isNaN(empresaId)) {
+            return res.status(400).json({ error: 'empresaId inválido' })
+        }
 
-    try {
-        // 🔐 Paso 1: Obtener access_token
-        const tokenRes = await axios.get('https://graph.facebook.com/v20.0/oauth/access_token', {
-            params: {
-                client_id: process.env.META_APP_ID,
-                client_secret: process.env.META_APP_SECRET,
-                redirect_uri: process.env.META_REDIRECT_URI,
-                code
-            }
-        })
-
-        const accessToken = tokenRes.data.access_token
-
-        // 🔎 Paso 2: Obtener negocios del usuario
-        const businessRes = await axios.get(`https://graph.facebook.com/v20.0/me/businesses`, {
-            params: { access_token: accessToken }
-        })
-
-        const businesses = businessRes.data.data
-        let availableNumbers: any[] = []
-
-        for (const business of businesses) {
-            const businessId = business.id
-
-            // 📦 Obtener cuentas de WhatsApp del negocio
-            const wabaRes = await axios.get(`https://graph.facebook.com/v20.0/${businessId}/owned_whatsapp_business_accounts`, {
-                params: { access_token: accessToken }
-            })
-
-            const wabas = wabaRes.data.data
-
-            for (const waba of wabas) {
-                const wabaId = waba.id
-
-                const phoneRes = await axios.get(`https://graph.facebook.com/v20.0/${wabaId}/phone_numbers`, {
-                    params: { access_token: accessToken }
-                })
-
-                const phoneNumbers = phoneRes.data.data
-
-                for (const phone of phoneNumbers) {
-                    availableNumbers.push({
-                        negocioId: businessId,
-                        wabaId,
-                        phoneNumberId: phone.id,
-                        nombre: phone.name,
-                        displayPhoneNumber: phone.display_phone_number
-                    })
+        // 🔐 Paso 1: Obtener access_token de Meta
+        const tokenRes = await axios.get<MetaTokenResponse>(
+            'https://graph.facebook.com/v20.0/oauth/access_token',
+            {
+                params: {
+                    client_id: process.env.META_APP_ID,
+                    client_secret: process.env.META_APP_SECRET,
+                    redirect_uri: process.env.META_REDIRECT_URI,
+                    code
                 }
             }
-        }
+        )
 
-        if (availableNumbers.length === 0) {
-            return res.status(400).json({ error: 'No se encontraron números disponibles' })
-        }
+        const accessToken: string = tokenRes.data.access_token
 
-        return res.json({ seleccionarNumero: true, availableNumbers, accessToken })
+        // 💾 Paso 2: Guardar o actualizar en la base de datos
+        await prisma.whatsappAccount.upsert({
+            where: { empresaId },
+            update: {
+                displayPhoneNumber: numeroTelefono,
+                phoneNumberId,
+                accessToken
+            },
+            create: {
+                phoneNumberId,
+                wabaId: "",
+                businessId: "",
+                displayPhoneNumber: numeroTelefono,
+                accessToken,
+                empresaId
+            }
+        })
+
+        console.log(`✅ [authCallback] Número ${numeroTelefono} (${phoneNumberId}) conectado para empresa ${empresaId}`)
+
+        // Redirigir con éxito al dashboard
+        return res.redirect(`https://wasaaa.com/dashboard/settings?success=1`)
     } catch (err: any) {
         console.error('[authCallback] Error Meta:', err.response?.data || err.message)
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
