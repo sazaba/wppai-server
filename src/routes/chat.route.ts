@@ -1,5 +1,3 @@
-// src/routes/chat.routes.ts
-
 import express from 'express'
 import {
     getConversations,
@@ -13,20 +11,26 @@ import {
 } from '../controllers/chat.controller'
 
 import { verificarJWT } from '../middleware/auth.middleware'
+import { checkTrialLimits } from '../middleware/trialLimit.middleware'
 
 const router = express.Router()
 
-// ✅ Todas las rutas ahora requieren token válido
 router.use(verificarJWT)
 
+// 📌 Rutas que NO cuentan para el límite
 router.get('/chats', getConversations)
 router.get('/chats/:id/messages', getMessagesByConversation)
-router.post('/chats/:id/messages', postMessageToConversation)
-router.post('/responder', responderConIA)
-router.put('/chats/:id/estado', updateConversationEstado)
-router.put('/chats/:id/cerrar', cerrarConversacion)
-router.post('/chats/:id/responder-manual', responderManual)
+
+// 📌 Rutas que cuentan mensajes enviados
+router.post('/chats/:id/messages', checkTrialLimits, postMessageToConversation)
+router.post('/responder', checkTrialLimits, responderConIA)
+router.post('/chats/:id/responder-manual', checkTrialLimits, responderManual)
+
+// 📌 Crear conversación no incrementa por sí misma, solo los mensajes que envíe
 router.post('/chats', crearConversacion)
 
+// 📌 Rutas de actualización de estado
+router.put('/chats/:id/estado', updateConversationEstado)
+router.put('/chats/:id/cerrar', cerrarConversacion)
 
 export default router

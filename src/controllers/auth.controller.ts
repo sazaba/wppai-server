@@ -65,7 +65,7 @@ export const login = async (req: Request, res: Response) => {
     }
 }
 
-// ✅ Registro: crea empresa + usuario admin
+// ✅ Registro: crea empresa + usuario admin con prueba gratuita
 export const registrar = async (req: Request, res: Response) => {
     const { nombreEmpresa, email, password } = req.body
 
@@ -76,10 +76,18 @@ export const registrar = async (req: Request, res: Response) => {
     try {
         const hashedPassword = await bcrypt.hash(password, 10)
 
+        const ahora = new Date()
+        const finPrueba = new Date()
+        finPrueba.setDate(ahora.getDate() + 30) // +30 días
+
         const empresa = await prisma.empresa.create({
             data: {
                 nombre: nombreEmpresa,
-                estado: 'inactivo',
+                estado: 'activo', // Activamos directo para que pueda probar
+                plan: 'gratis',   // Plan por defecto
+                trialStart: ahora,
+                trialEnd: finPrueba,
+                conversationsUsed: 0,
                 usuarios: {
                     create: {
                         email,
@@ -108,6 +116,7 @@ export const registrar = async (req: Request, res: Response) => {
         return res.status(500).json({ error: 'Error al registrar empresa' })
     }
 }
+
 
 interface MetaTokenResponse {
     access_token: string

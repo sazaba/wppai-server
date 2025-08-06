@@ -53,10 +53,16 @@ model Usuario {
 }
 
 model Empresa {
-  id              Int              @id @default(autoincrement())
-  nombre          String
-  plan            Plan             @default(gratis)
-  estado          Estado           @default(inactivo)
+  id     Int    @id @default(autoincrement())
+  nombre String
+  plan   Plan   @default(gratis)
+  estado Estado @default(inactivo)
+
+  // ✅ Control de prueba gratuita
+  trialStart        DateTime? // Fecha en la que empieza la prueba
+  trialEnd          DateTime? // Fecha en la que termina la prueba
+  conversationsUsed Int       @default(0) // Contador mensual de conversaciones usadas
+
   usuarios        Usuario[]
   configuraciones BusinessConfig[]
   conversaciones  Conversation[]
