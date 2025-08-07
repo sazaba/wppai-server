@@ -4,6 +4,7 @@ import axios from 'axios'
 
 // ✅ Crear plantilla
 export const crearPlantilla = async (req: Request, res: Response) => {
+    console.log('🔐 Usuario autenticado:', req.user)
     try {
         const empresaId = req.user?.empresaId
         if (!empresaId) return res.status(401).json({ error: 'Unauthorized' })
