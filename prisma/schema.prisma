@@ -63,10 +63,11 @@ model Empresa {
   trialEnd          DateTime? // Fecha en la que termina la prueba
   conversationsUsed Int       @default(0) // Contador mensual de conversaciones usadas
 
-  usuarios        Usuario[]
-  configuraciones BusinessConfig[]
-  conversaciones  Conversation[]
-  cuentaWhatsapp  WhatsappAccount?
+  usuarios         Usuario[]
+  configuraciones  BusinessConfig[]
+  conversaciones   Conversation[]
+  cuentaWhatsapp   WhatsappAccount?
+  messageTemplates MessageTemplate[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -132,4 +133,21 @@ model WhatsappAccount {
   updatedAt          DateTime @updatedAt
 
   @@map("whatsappaccount")
+}
+
+model MessageTemplate {
+  id        Int      @id @default(autoincrement())
+  nombre    String   @db.VarChar(100) // Nombre interno (ej: recordatorio_cita)
+  idioma    String   @db.VarChar(10) // Código de idioma (ej: es, en)
+  categoria String   @db.VarChar(50) // ALERT_UPDATE, MARKETING, TRANSACTIONAL
+  cuerpo    String   @db.Text // Contenido del mensaje con variables {{1}}, {{2}}
+  estado    String   @default("pendiente") // pendiente, aprobado, rechazado
+  variables Int      @default(0) // Número de variables dinámicas ({{1}}, {{2}}, etc.)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresaId Int
+  empresa   Empresa @relation(fields: [empresaId], references: [id])
+
+  @@map("messagetemplate")
 }

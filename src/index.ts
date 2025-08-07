@@ -10,6 +10,7 @@ import chatRoutes from './routes/chat.route'
 import authRoutes from './routes/auth.route'
 import whatsappRoutes from './routes/whatsapp.routes'
 import empresaRoutes from './routes/empresa.routes'
+import messageTemplateRoutes from './routes/template.routes'
 
 
 // 📦 Cargar variables de entorno
@@ -77,6 +78,8 @@ app.use('/api/whatsapp', whatsappRoutes) // conexión de cuenta WhatsApp por emp
 
 //empresa
 app.use('/api', empresaRoutes)
+app.use('/api/templates', messageTemplateRoutes)
+
 
 
 // 🏠 Ruta raíz
