@@ -124,28 +124,15 @@ interface MetaTokenResponse {
     expires_in: number
 }
 
-// 🔁 Nuevo flujo authCallback con número y phone_number_id manual
 export const authCallback = async (req: Request, res: Response) => {
-    const { code, state } = req.query
+    const { code } = req.query
 
-    if (!code || !state) {
-        return res.status(400).json({ error: 'Faltan code o state' })
+    if (!code) {
+        return res.status(400).json({ error: 'Falta el parámetro code' })
     }
 
     try {
-        // Extraer empresaId, número y phone_number_id desde el state
-        const [empresaIdStr, numeroTelefono, phoneNumberId] = decodeURIComponent(state as string).split("|")
-
-        if (!empresaIdStr || !numeroTelefono || !phoneNumberId) {
-            return res.status(400).json({ error: 'State inválido: falta empresaId, número o phone_number_id' })
-        }
-
-        const empresaId = parseInt(empresaIdStr, 10)
-        if (isNaN(empresaId)) {
-            return res.status(400).json({ error: 'empresaId inválido' })
-        }
-
-        // 🔐 Paso 1: Obtener access_token de Meta
+        // 🔐 1. Intercambia el code por el access token
         const tokenRes = await axios.get<MetaTokenResponse>(
             'https://graph.facebook.com/v20.0/oauth/access_token',
             {
@@ -158,30 +145,11 @@ export const authCallback = async (req: Request, res: Response) => {
             }
         )
 
-        const accessToken: string = tokenRes.data.access_token
+        const accessToken = tokenRes.data.access_token
 
-        // 💾 Paso 2: Guardar o actualizar en la base de datos
-        await prisma.whatsappAccount.upsert({
-            where: { empresaId },
-            update: {
-                displayPhoneNumber: numeroTelefono,
-                phoneNumberId,
-                accessToken
-            },
-            create: {
-                phoneNumberId,
-                wabaId: "",
-                businessId: "",
-                displayPhoneNumber: numeroTelefono,
-                accessToken,
-                empresaId
-            }
-        })
+        // ✅ 2. Redirige al frontend pasando el token (temporal) como query param
+        return res.redirect(`https://wasaaa.com/dashboard/callback?token=${accessToken}`)
 
-        console.log(`✅ [authCallback] Número ${numeroTelefono} (${phoneNumberId}) conectado para empresa ${empresaId}`)
-
-        // Redirigir con éxito al dashboard
-        return res.redirect(`https://wasaaa.com/dashboard/callback?success=1`)
     } catch (err: any) {
         console.error('[authCallback] Error Meta:', err.response?.data || err.message)
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
