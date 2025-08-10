@@ -396,3 +396,29 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
         })
     }
 }
+// PÚBLICO: inicia el flujo OAuth → redirige a Meta
+export const iniciarOAuthMeta = (req: Request, res: Response) => {
+    const APP_ID = process.env.META_APP_ID!
+    const REDIRECT = process.env.META_REDIRECT_URI! // debe apuntar a TU callback de backend
+    const version = 'v20.0'
+
+    const auth_type = (req.query.auth_type as string) || '' // ej: rerequest
+    const scope = [
+        'business_management',
+        'whatsapp_business_management',
+        'whatsapp_business_messaging',
+    ].join(',')
+
+    const state = encodeURIComponent(JSON.stringify({ ts: Date.now() })) // opcional
+
+    const url =
+        `https://www.facebook.com/${version}/dialog/oauth` +
+        `?client_id=${APP_ID}` +
+        `&redirect_uri=${encodeURIComponent(REDIRECT)}` +   // 👈 callback de BACKEND
+        `&response_type=code` +
+        `&scope=${encodeURIComponent(scope)}` +
+        (auth_type ? `&auth_type=${encodeURIComponent(auth_type)}` : '') +
+        `&state=${state}`
+
+    return res.redirect(url)
+}
