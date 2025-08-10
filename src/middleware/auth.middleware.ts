@@ -1,5 +1,4 @@
 // src/middleware/auth.middleware.ts
-
 import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
 
@@ -20,9 +19,23 @@ declare global {
     }
 }
 
-export const verificarJWT = (req: Request, res: Response, next: NextFunction) => {
-    const authHeader = req.headers.authorization
+// Rutas que no requieren autenticación
+const OPEN_PATHS = [
+    '/api/auth/register',
+    '/api/auth/login',
+    '/api/auth/whatsapp', // inicio OAuth
+    '/api/auth/callback', // callback OAuth
+    '/api/auth/exchange-code',
+    '/api/auth/wabas'
+]
 
+export const verificarJWT = (req: Request, res: Response, next: NextFunction) => {
+    // Si la ruta está en las públicas, dejar pasar sin token
+    if (OPEN_PATHS.includes(req.path)) {
+        return next()
+    }
+
+    const authHeader = req.headers.authorization
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Token no proporcionado' })
     }
