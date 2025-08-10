@@ -1,24 +1,34 @@
 // src/routes/auth.route.ts
 import { Router } from 'express'
-import { registrar, login, /* authCallback, */ exchangeCode } from '../controllers/auth.controller'
+import {
+    registrar,
+    login,
+    authCallback,
+    exchangeCode,
+    getWabasAndPhones
+} from '../controllers/auth.controller'
 
 const router = Router()
 
 const META_APP_ID = process.env.META_APP_ID!
 const REDIRECT_URI = process.env.META_REDIRECT_URI!
 
-// Registro + login
+// ====================
+// Registro + Login
+// ====================
 router.post('/register', registrar)
 router.post('/login', login)
 
-// Iniciar OAuth desde backend (opcional; usa este o el del frontend, no ambos)
+// ====================
+// Iniciar OAuth desde backend
+// ====================
 router.get('/auth', (req, res) => {
     const scope = [
         'whatsapp_business_messaging',
         'whatsapp_business_management',
         'business_management',
         'public_profile'
-    ].join(',') // ← coma separadas (recomendado por Meta)
+    ].join(',') // coma separadas
 
     const authUrl =
         `https://www.facebook.com/v20.0/dialog/oauth?client_id=${encodeURIComponent(META_APP_ID)}` +
@@ -29,9 +39,19 @@ router.get('/auth', (req, res) => {
     res.redirect(authUrl)
 })
 
-// Callback del OAuth (NO usar en flujo de frontend callback)
-// router.get('/callback', authCallback)
+// ====================
+// Callback del OAuth
+// ====================
+router.get('/callback', authCallback)
 
+// ====================
+// Intercambiar code -> access_token (opcional, si el front lo maneja)
+// ====================
 router.post('/exchange-code', exchangeCode)
+
+// ====================
+// Listar WABAs y teléfonos con fallback
+// ====================
+router.get('/wabas', getWabasAndPhones)
 
 export default router
