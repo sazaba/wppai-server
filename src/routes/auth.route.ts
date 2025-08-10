@@ -1,17 +1,26 @@
 // src/routes/auth.route.ts
 import { Router } from 'express'
-import { iniciarOAuthMeta, authCallback, exchangeCode, registrar, login, getWabasAndPhones } from '../controllers/auth.controller'
+import {
+    registrar,
+    login,
+    authCallback,
+    exchangeCode,
+    getWabasAndPhones,
+    iniciarOAuthMeta
+} from '../controllers/auth.controller'
 
 const router = Router()
 
-// públicas (sin JWT)
-router.get('/auth/whatsapp', iniciarOAuthMeta)
-router.get('/auth/callback', authCallback)
-router.post('/auth/exchange-code', exchangeCode)
+// Públicas
 router.post('/register', registrar)
 router.post('/login', login)
 
-// protegidas (si quieres)
-router.get('/wabas', getWabasAndPhones)
+// OAuth públicas
+router.get('/whatsapp', iniciarOAuthMeta)   // → /api/auth/whatsapp
+router.get('/callback', authCallback)       // → /api/auth/callback
+router.post('/exchange-code', exchangeCode) // → /api/auth/exchange-code
+
+// (Puedes dejar /wabas público mientras pruebas)
+router.get('/wabas', getWabasAndPhones)     // → /api/auth/wabas
 
 export default router
