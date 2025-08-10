@@ -155,3 +155,23 @@ export const authCallback = async (req: Request, res: Response) => {
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
     }
 }
+
+export const exchangeCode = async (req: Request, res: Response) => {
+    const { code } = req.body
+    if (!code) return res.status(400).json({ error: 'Missing code' })
+
+    try {
+        const r = await axios.get('https://graph.facebook.com/v20.0/oauth/access_token', {
+            params: {
+                client_id: process.env.META_APP_ID,
+                client_secret: process.env.META_APP_SECRET,
+                redirect_uri: process.env.META_REDIRECT_URI, // ej: https://wasaaa.com/dashboard/callback
+                code
+            }
+        })
+        return res.json({ access_token: r.data.access_token })
+    } catch (e: any) {
+        console.error('[exchangeCode] Meta error:', e.response?.data || e.message)
+        return res.status(400).json({ error: e.response?.data || e.message })
+    }
+}

@@ -1,7 +1,7 @@
 // src/routes/auth.route.ts
 
 import { Router } from 'express'
-import { registrar, login, authCallback } from '../controllers/auth.controller'
+import { registrar, login, authCallback, exchangeCode } from '../controllers/auth.controller'
 
 const router = Router()
 
@@ -26,6 +26,8 @@ router.get('/auth', (req, res) => {
 
 // ✅ Callback del OAuth de Meta
 router.post('/callback', authCallback)
+
+router.post('/exchange-code', exchangeCode)
 
 
 export default router
