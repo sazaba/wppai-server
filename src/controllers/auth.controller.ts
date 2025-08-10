@@ -141,7 +141,9 @@ export const authCallback = async (req: Request, res: Response) => {
 
         const accessToken = tokenRes.data.access_token
         // Redirige al CallbackPage del front con el token (temporal del usuario)
-        return res.redirect(`${process.env.FRONT_CALLBACK_URL || 'https://wasaaa.com/dashboard/callback'}?token=${accessToken}`)
+        return res.redirect(
+            `${process.env.FRONT_CALLBACK_URL || 'https://wasaaa.com/dashboard/callback'}?token=${accessToken}`
+        )
     } catch (err: any) {
         console.error('[authCallback] Error Meta:', err.response?.data || err.message)
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
@@ -170,68 +172,81 @@ export const exchangeCode = async (req: Request, res: Response) => {
 }
 
 // ==========================
-// LISTAR WABAS + PHONES (con fallback y mensajes claros)
+// LISTAR WABAS + PHONES (vía Business) + fallback
 // ==========================
 
-
-type Waba = { id: string; name?: string }
+type Waba = { id: string; name?: string; owner_business_id?: string }
 type Phone = { id: string; display_phone_number?: string }
 type WabaWithPhones = { waba: Waba; phones: Phone[] }
 
-async function getAssignedWabas(userToken: string) {
-    const t0 = Date.now()
-    const url = `${GRAPH}/me/assigned_whatsapp_business_accounts`
-    const { data } = await axios.get(url, { params: { fields: 'id,name', access_token: userToken } })
-    return { list: data?.data || [], ms: Date.now() - t0, stage: 'assigned_whatsapp_business_accounts' }
+// Helpers HTTP
+async function fbGet(url: string, params: Record<string, any>) {
+    const { data } = await axios.get(url, { params })
+    return data
 }
 
-async function getOwnedWabas(userToken: string) {
-    const t0 = Date.now()
-    const url = `${GRAPH}/me/owned_whatsapp_business_accounts`
-    const { data } = await axios.get(url, { params: { fields: 'id,name', access_token: userToken } })
-    return { list: data?.data || [], ms: Date.now() - t0, stage: 'owned_whatsapp_business_accounts' }
-}
-
+// Edges
 async function getBusinesses(userToken: string) {
     const t0 = Date.now()
-    const url = `${GRAPH}/me/businesses`
-    const { data } = await axios.get(url, { params: { fields: 'id,name', access_token: userToken } })
+    const data = await fbGet(`${GRAPH}/me/businesses`, { fields: 'id,name', access_token: userToken })
     return { list: data?.data || [], ms: Date.now() - t0, stage: 'me.businesses' }
 }
 
 async function getWabasByBusiness(userToken: string, businessId: string) {
     const t0 = Date.now()
-    const url = `${GRAPH}/${businessId}/owned_whatsapp_business_accounts`
-    const { data } = await axios.get(url, { params: { fields: 'id,name', access_token: userToken } })
-    return { list: data?.data || [], ms: Date.now() - t0, stage: `business.${businessId}.owned_wabas` }
+    const data = await fbGet(`${GRAPH}/${businessId}/owned_whatsapp_business_accounts`, {
+        fields: 'id,name',
+        access_token: userToken
+    })
+    // Enriquecer con owner_business_id = businessId
+    const list: Waba[] = (data?.data || []).map((w: any) => ({
+        id: w.id,
+        name: w.name,
+        owner_business_id: businessId
+    }))
+    return { list, ms: Date.now() - t0, stage: `business.${businessId}.owned_wabas` }
 }
 
 async function getPhonesForWaba(userToken: string, wabaId: string) {
     const t0 = Date.now()
-    const url = `${GRAPH}/${wabaId}/phone_numbers`
-    const { data } = await axios.get(url, { params: { fields: 'id,display_phone_number', access_token: userToken } })
+    const data = await fbGet(`${GRAPH}/${wabaId}/phone_numbers`, {
+        fields: 'id,display_phone_number',
+        access_token: userToken
+    })
     return { list: data?.data || [], ms: Date.now() - t0, stage: `waba.${wabaId}.phones` }
 }
 
 async function getPermissions(userToken: string) {
     const t0 = Date.now()
-    const url = `${GRAPH}/me/permissions`
-    const { data } = await axios.get(url, { params: { access_token: userToken } })
+    const data = await fbGet(`${GRAPH}/me/permissions`, { access_token: userToken })
     const list: Array<{ permission: string; status: string }> = data?.data || []
-    const need = ['whatsapp_business_management', 'whatsapp_business_messaging']
+    const need = ['business_management', 'whatsapp_business_management', 'whatsapp_business_messaging']
     const missing = need.filter(p => !list.some(x => x.permission === p && x.status === 'granted'))
     return { all: list, missing, ms: Date.now() - t0, stage: 'me.permissions' }
+}
+
+// (opcionales — fallbacks best-effort; pueden fallar con (#3) / (#100))
+async function getAssignedWabas(userToken: string) {
+    const t0 = Date.now()
+    const data = await fbGet(`${GRAPH}/me/assigned_whatsapp_business_accounts`, {
+        fields: 'id,name',
+        access_token: userToken
+    })
+    return { list: data?.data || [], ms: Date.now() - t0, stage: 'me.assigned_wabas' }
+}
+async function getOwnedWabasAtUser(userToken: string) {
+    const t0 = Date.now()
+    const data = await fbGet(`${GRAPH}/me/owned_whatsapp_business_accounts`, {
+        fields: 'id,name',
+        access_token: userToken
+    })
+    return { list: data?.data || [], ms: Date.now() - t0, stage: 'me.owned_wabas' }
 }
 
 function metaErrorPayload(e: any) {
     const err = e?.response?.data?.error
     return err
-        ? {
-            code: err.code,
-            type: err.type,
-            message: err.message,
-            fbtrace_id: err.fbtrace_id,
-        }
+        ? { code: err.code, type: err.type, message: err.message, fbtrace_id: err.fbtrace_id }
         : { message: e?.message || 'Unknown error' }
 }
 
@@ -243,13 +258,19 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
     const diagnostics: any = { tried: [], timings: {} }
 
     try {
-        // 0) Permisos (para saber qué falta)
+        // 0) Permisos
         try {
             const perms = await getPermissions(token)
             diagnostics.permissions = perms
             diagnostics.timings[perms.stage] = perms.ms
-            if (perms.missing.length && debug) {
-                console.warn('[getWabasAndPhones] Missing permissions:', perms.missing)
+            if (perms.missing.length) {
+                // No cortamos de inmediato para devolver diagnóstico completo si debug=1
+                if (!debug) {
+                    return res.status(403).json({
+                        errorCode: 200,
+                        message: `Missing permissions: ${perms.missing.join(', ')}`,
+                    })
+                }
             }
         } catch (e: any) {
             const meta = metaErrorPayload(e)
@@ -258,89 +279,72 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
             // seguimos; no detenemos aún
         }
 
+        // 1) Camino oficial: /me/businesses → /{business}/owned_whatsapp_business_accounts
         let wabas: Waba[] = []
-
-        // 1) ASSIGNED
         try {
-            const r1 = await getAssignedWabas(token)
-            diagnostics.tried.push(r1.stage)
-            diagnostics.timings[r1.stage] = r1.ms
-            wabas = r1.list
-            console.log(`[getWabasAndPhones] assigned → ${wabas.length} WABAs (${r1.ms}ms)`)
+            const b = await getBusinesses(token)
+            diagnostics.tried.push(b.stage)
+            diagnostics.timings[b.stage] = b.ms
+            console.log(`[getWabasAndPhones] businesses → ${b.list.length} (${b.ms}ms)`)
+
+            for (const biz of b.list) {
+                try {
+                    const ow = await getWabasByBusiness(token, biz.id)
+                    diagnostics.tried.push(ow.stage)
+                    diagnostics.timings[ow.stage] = ow.ms
+                    console.log(
+                        `[getWabasAndPhones] business ${biz.id} owned_wabas → ${ow.list.length} (${ow.ms}ms)`
+                    )
+                    wabas = [...wabas, ...ow.list]
+                } catch (e: any) {
+                    const meta = metaErrorPayload(e)
+                    diagnostics[`business_${biz.id}_owned_wabas_error`] = meta
+                    console.warn(`[getWabasAndPhones] owned_wabas by business ${biz.id} error:`, meta)
+                }
+            }
         } catch (e: any) {
             const meta = metaErrorPayload(e)
-            diagnostics.assigned_error = meta
-            console.warn('[getWabasAndPhones] assigned error:', meta)
-            // continuar
+            diagnostics.businesses_error = meta
+            console.warn('[getWabasAndPhones] businesses error:', meta)
         }
 
-        // 2) OWNED (si vacío)
+        // 2) Fallback best-effort: /me/assigned_* y /me/owned_* (pueden fallar)
         if (!wabas?.length) {
             try {
-                const r2 = await getOwnedWabas(token)
+                const r1 = await getAssignedWabas(token)
+                diagnostics.tried.push(r1.stage)
+                diagnostics.timings[r1.stage] = r1.ms
+                wabas = [...wabas, ...r1.list]
+                console.log(`[getWabasAndPhones] assigned → ${r1.list.length} WABAs (${r1.ms}ms)`)
+            } catch (e: any) {
+                diagnostics.assigned_error = metaErrorPayload(e)
+                console.warn('[getWabasAndPhones] assigned error:', diagnostics.assigned_error)
+            }
+
+            try {
+                const r2 = await getOwnedWabasAtUser(token)
                 diagnostics.tried.push(r2.stage)
                 diagnostics.timings[r2.stage] = r2.ms
-                wabas = r2.list
-                console.log(`[getWabasAndPhones] owned → ${wabas.length} WABAs (${r2.ms}ms)`)
+                wabas = [...wabas, ...r2.list]
+                console.log(`[getWabasAndPhones] owned(user) → ${r2.list.length} WABAs (${r2.ms}ms)`)
             } catch (e: any) {
-                const meta = metaErrorPayload(e)
-                diagnostics.owned_error = meta
-                console.warn('[getWabasAndPhones] owned error:', meta)
-                // continuar
+                diagnostics.owned_user_error = metaErrorPayload(e)
+                console.warn('[getWabasAndPhones] owned(user) error:', diagnostics.owned_user_error)
             }
         }
 
-        // 3) Businesses → owned_wabas (si sigue vacío)
-        if (!wabas?.length) {
-            try {
-                const r3 = await getBusinesses(token)
-                diagnostics.tried.push(r3.stage)
-                diagnostics.timings[r3.stage] = r3.ms
-                console.log(`[getWabasAndPhones] businesses → ${r3.list.length} (${r3.ms}ms)`)
-
-                for (const b of r3.list) {
-                    try {
-                        const r4 = await getWabasByBusiness(token, b.id)
-                        diagnostics.tried.push(r4.stage)
-                        diagnostics.timings[r4.stage] = r4.ms
-                        console.log(`[getWabasAndPhones] business ${b.id} owned_wabas → ${r4.list.length} (${r4.ms}ms)`)
-                        wabas = [...wabas, ...r4.list]
-                    } catch (e: any) {
-                        const meta = metaErrorPayload(e)
-                        diagnostics[`business_${b.id}_error`] = meta
-                        console.warn(`[getWabasAndPhones] owned_wabas by business ${b.id} error:`, meta)
-                    }
-                }
-            } catch (e: any) {
-                const meta = metaErrorPayload(e)
-                diagnostics.businesses_error = meta
-                console.warn('[getWabasAndPhones] businesses error:', meta)
-
-                if (meta.code === 3) {
-                    return res.status(403).json({
-                        errorCode: 3,
-                        message:
-                            'Tu usuario no tiene permisos suficientes en el Business que posee la WABA. ' +
-                            'Asigna el asset “Cuentas de WhatsApp” (control total) o usa Embedded Signup.',
-                        meta: debug ? meta : undefined,
-                        diagnostics: debug ? diagnostics : undefined,
-                    })
-                }
-            }
-        }
-
-        // 4) Si sigue vacío, devolver info clara
+        // 3) Si sigue vacío, devolver info clara
         if (!wabas?.length) {
             return res.status(200).json({
                 items: [],
                 note:
-                    'No se encontraron WABAs para este usuario. Verifica que el usuario pertenezca al Business ' +
-                    'y tenga asignado el asset “Cuentas de WhatsApp”.',
-                diagnostics: debug ? diagnostics : undefined,
+                    'No se encontraron WABAs para este usuario. Verifica que el usuario sea Admin del Business ' +
+                    'y tenga asignado el asset “Cuentas de WhatsApp”. Si la app está en Dev Mode, agrega el usuario como tester.',
+                diagnostics: debug ? diagnostics : undefined
             })
         }
 
-        // 5) Phones por cada WABA
+        // 4) Phones por cada WABA
         const items: WabaWithPhones[] = []
         for (const w of wabas) {
             try {
@@ -357,27 +361,38 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
 
         return res.json({
             items,
-            diagnostics: debug ? diagnostics : undefined,
+            diagnostics: debug ? diagnostics : undefined
         })
     } catch (e: any) {
         const meta = metaErrorPayload(e)
         console.error('[getWabasAndPhones] Fatal error:', meta)
 
+        // Mensajes más claros
         if (meta.code === 3) {
             return res.status(403).json({
                 errorCode: 3,
                 message:
-                    'Este edge sólo está disponible para business user o system user. ' +
-                    'Asegura permisos completos en la WABA o usa Embedded Signup.',
+                    'Este edge solo está disponible para business user o system user. ' +
+                    'Usa el camino /me/businesses o Embedded Signup, o genera un System User token.',
                 meta: debug ? meta : undefined,
-                diagnostics: debug ? diagnostics : undefined,
+                diagnostics: debug ? diagnostics : undefined
+            })
+        }
+        if (meta.code === 200) {
+            return res.status(403).json({
+                errorCode: 200,
+                message:
+                    'Requiere business_management para gestionar el objeto Business. ' +
+                    'Asegura que el usuario re-autorice con ese scope y sea Admin del Business.',
+                meta: debug ? meta : undefined,
+                diagnostics: debug ? diagnostics : undefined
             })
         }
 
         return res.status(500).json({
             error: 'Error listando WABAs y teléfonos',
             meta: debug ? meta : undefined,
-            diagnostics: debug ? diagnostics : undefined,
+            diagnostics: debug ? diagnostics : undefined
         })
     }
 }
