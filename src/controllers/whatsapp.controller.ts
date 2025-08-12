@@ -218,3 +218,36 @@ export const infoNumero = async (req: Request, res: Response) => {
         return res.status(400).json({ ok: false, error: err?.response?.data || err.message })
     }
 }
+
+// controllers/whatsapp.controller.ts
+export const vincularManual = async (req: Request, res: Response) => {
+    try {
+        const empresaId = req.user?.empresaId
+        if (!empresaId) return res.status(401).json({ error: 'No autorizado' })
+
+        const { accessToken, wabaId, phoneNumberId, displayPhoneNumber, businessId } = req.body
+        if (!accessToken) return res.status(400).json({ error: 'accessToken requerido' })
+
+        // Traer lo existente para fusionar
+        const actual = await prisma.whatsappAccount.findUnique({ where: { empresaId } })
+
+        const update: any = {
+            accessToken,
+            wabaId: wabaId ?? actual?.wabaId ?? '',
+            phoneNumberId: phoneNumberId ?? actual?.phoneNumberId ?? '',
+            displayPhoneNumber: displayPhoneNumber ?? actual?.displayPhoneNumber ?? '',
+            businessId: businessId ?? actual?.businessId ?? 'unknown'
+        }
+
+        const cuenta = await prisma.whatsappAccount.upsert({
+            where: { empresaId },
+            update,
+            create: { empresaId, ...update }
+        })
+
+        return res.json({ ok: true, cuenta })
+    } catch (err) {
+        console.error('[vincularManual] error:', err)
+        return res.status(500).json({ error: 'Error al guardar datos de WhatsApp' })
+    }
+}

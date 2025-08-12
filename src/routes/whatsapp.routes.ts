@@ -8,7 +8,8 @@ import {
     // 👇 nuevas
     registrarNumero,
     enviarPrueba,
-    infoNumero
+    infoNumero,
+    vincularManual
 } from '../controllers/whatsapp.controller'
 import { verificarJWT } from '../middleware/auth.middleware'
 
@@ -29,5 +30,7 @@ router.post('/enviar-prueba', verificarJWT, enviarPrueba)
 
 // Info básica del número (display_phone_number, verified_name, name_status)
 router.get('/numero/:phoneNumberId', verificarJWT, infoNumero)
+
+router.post('/vincular-manual', verificarJWT, vincularManual)
 
 export default router
