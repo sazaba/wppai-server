@@ -122,11 +122,11 @@ model BusinessConfig {
 
 model WhatsappAccount {
   id                 Int      @id @default(autoincrement())
-  phoneNumberId      String   @unique
-  wabaId             String
-  businessId         String
-  accessToken        String
-  displayPhoneNumber String // ✅ NUEVO CAMPO
+  phoneNumberId      String   @unique @db.VarChar(64)
+  wabaId             String   @db.VarChar(64)
+  businessId         String   @db.VarChar(64)
+  accessToken        String   @db.Text // ⬅️ clave: ahora TEXT, no VARCHAR
+  displayPhoneNumber String   @db.VarChar(32)
   empresaId          Int      @unique
   empresa            Empresa  @relation(fields: [empresaId], references: [id])
   createdAt          DateTime @default(now())
