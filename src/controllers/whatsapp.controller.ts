@@ -147,6 +147,7 @@ export const actualizarDatosWhatsapp = async (req: Request, res: Response) => {
 
 // POST /api/whatsapp/register
 // Registra el número (si PIN está habilitado, incluir { pin: '123456' })
+// controllers/whatsapp.controller.ts
 export const registrarNumero = async (req: Request, res: Response) => {
     try {
         const empresaId = req.user?.empresaId
@@ -165,13 +166,15 @@ export const registrarNumero = async (req: Request, res: Response) => {
             headers: { Authorization: `Bearer ${accessToken}` }
         })
 
-
-
         return res.json({ ok: true, data })
     } catch (err: any) {
-        return res.status(400).json({ ok: false, error: err?.response?.data || err.message })
+        const status = err?.response?.status || 400
+        const meta = err?.response?.data || { message: err.message }
+        console.error('[registrarNumero] error:', status, JSON.stringify(meta, null, 2))
+        return res.status(status).json({ ok: false, error: meta })
     }
 }
+
 
 // POST /api/whatsapp/send-test
 export const enviarPrueba = async (req: Request, res: Response) => {
