@@ -11,11 +11,10 @@ interface CustomJwtPayload extends DefaultJwtPayload {
 
 const GRAPH = 'https://graph.facebook.com/v20.0'
 
-// ==========================
-// AUTH APLICACIÓN (LOGIN/REGISTER)
-// ==========================
+/* =============================================================================
+ * AUTH APLICACIÓN (LOGIN/REGISTER)
+ * ========================================================================== */
 
-// ✅ Login con empresa activa
 export const login = async (req: Request, res: Response) => {
     console.log('🟡 [LOGIN] Body recibido:', req.body)
 
@@ -46,7 +45,9 @@ export const login = async (req: Request, res: Response) => {
 
         if (!usuario.empresa || usuario.empresa.estado !== 'activo') {
             console.warn('❌ [LOGIN] Empresa inactiva o no encontrada')
-            return res.status(403).json({ error: 'La empresa aún no está activa. Debes completar el pago.' })
+            return res
+                .status(403)
+                .json({ error: 'La empresa aún no está activa. Debes completar el pago.' })
         }
 
         console.log('✅ [LOGIN] Empresa activa:', usuario.empresa.nombre)
@@ -66,7 +67,6 @@ export const login = async (req: Request, res: Response) => {
     }
 }
 
-// ✅ Registro: crea empresa + usuario admin con prueba gratuita
 export const registrar = async (req: Request, res: Response) => {
     const { nombreEmpresa, email, password } = req.body
     if (!nombreEmpresa || !email || !password) {
@@ -78,7 +78,7 @@ export const registrar = async (req: Request, res: Response) => {
 
         const ahora = new Date()
         const finPrueba = new Date()
-        finPrueba.setDate(ahora.getDate() + 30) // +30 días
+        finPrueba.setDate(ahora.getDate() + 30)
 
         const empresa = await prisma.empresa.create({
             data: {
@@ -114,9 +114,9 @@ export const registrar = async (req: Request, res: Response) => {
     }
 }
 
-// ==========================
-// OAUTH META
-// ==========================
+/* =============================================================================
+ * OAUTH META
+ * ========================================================================== */
 
 interface MetaTokenResponse {
     access_token: string
@@ -124,43 +124,104 @@ interface MetaTokenResponse {
     expires_in: number
 }
 
-// 1) Intercambia code -> user access token y redirige al front con ?token=
+/**
+ * 1) Inicia el diálogo OAuth de Meta.
+ *    - Usa redirect_uri de BACKEND (el callback que Meta llamará con ?code=)
+ *    - Puedes sobreescribirlo con ?redirect_uri=... (útil para flows manuales)
+ */
+export const iniciarOAuthMeta = (req: Request, res: Response) => {
+    const APP_ID = process.env.META_APP_ID!
+    const DEFAULT_BACKEND_REDIRECT = process.env.META_REDIRECT_URI! // callback de BACKEND registrado en Meta
+    const version = 'v20.0'
+
+    // Si pasas ?redirect_uri= sobrescribe el callback de BACKEND que Meta usará
+    const backendRedirect = (req.query.redirect_uri as string) || DEFAULT_BACKEND_REDIRECT
+
+    const auth_type = (req.query.auth_type as string) || '' // ej: rerequest
+    const scope = [
+        'business_management',
+        'whatsapp_business_management',
+        'whatsapp_business_messaging'
+    ].join(',')
+
+    const state = encodeURIComponent(JSON.stringify({ ts: Date.now() }))
+
+    const url =
+        `https://www.facebook.com/${version}/dialog/oauth` +
+        `?client_id=${APP_ID}` +
+        `&redirect_uri=${encodeURIComponent(backendRedirect)}` + // 👈 callback de BACKEND que recibirá el code
+        `&response_type=code` +
+        `&scope=${encodeURIComponent(scope)}` +
+        (auth_type ? `&auth_type=${encodeURIComponent(auth_type)}` : '') +
+        `&state=${state}`
+
+    return res.redirect(url)
+}
+
+/**
+ * 2) Callback de BACKEND que recibe ?code= de Meta.
+ *    Intercambia code → access_token de USUARIO y redirige al FRONT.
+ *    - FRONT por defecto: FRONT_CALLBACK_URL
+ *    - Sobrescribible con ?front_redirect=<https://...> (p.ej. callback-manual)
+ *    - Reenvía hints si vienen: waba_hint, phone_hint, display_hint
+ */
 export const authCallback = async (req: Request, res: Response) => {
     const { code } = req.query
     if (!code) return res.status(400).json({ error: 'Falta el parámetro code' })
 
     try {
+        const backendRedirectUsed =
+            (req.query.redirect_uri as string) || process.env.META_REDIRECT_URI!
+
         const tokenRes = await axios.get<MetaTokenResponse>(`${GRAPH}/oauth/access_token`, {
             params: {
                 client_id: process.env.META_APP_ID,
                 client_secret: process.env.META_APP_SECRET,
-                redirect_uri: process.env.META_REDIRECT_URI,
+                redirect_uri: backendRedirectUsed, // debe coincidir EXACTO con el usado para iniciar
                 code
             }
         })
 
         const accessToken = tokenRes.data.access_token
-        // Redirige al CallbackPage del front con el token (temporal del usuario)
-        return res.redirect(
-            `${process.env.FRONT_CALLBACK_URL || 'https://wasaaa.com/dashboard/callback'}?token=${accessToken}`
-        )
+
+        // A dónde enviamos al FRONT:
+        const frontDefault = process.env.FRONT_CALLBACK_URL || 'https://wasaaa.com/dashboard/callback'
+        const frontRedirect = (req.query.front_redirect as string) || frontDefault
+
+        // Reenviamos hints si venían
+        const hintW = (req.query.waba_hint as string) || ''
+        const hintP = (req.query.phone_hint as string) || ''
+        const hintD = (req.query.display_hint as string) || ''
+
+        const url =
+            `${frontRedirect}?token=${encodeURIComponent(accessToken)}` +
+            (hintW ? `&waba_hint=${encodeURIComponent(hintW)}` : '') +
+            (hintP ? `&phone_hint=${encodeURIComponent(hintP)}` : '') +
+            (hintD ? `&display_hint=${encodeURIComponent(hintD)}` : '')
+
+        return res.redirect(url)
     } catch (err: any) {
         console.error('[authCallback] Error Meta:', err.response?.data || err.message)
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
     }
 }
 
-// (opcional si lo usas desde el front)
+/**
+ * 3) Exchange code → token (para usar desde el FRONT).
+ *    Acepta body.redirect_uri para indicar el callback de BACKEND usado.
+ */
 export const exchangeCode = async (req: Request, res: Response) => {
-    const { code } = req.body
+    const { code, redirect_uri } = req.body
     if (!code) return res.status(400).json({ error: 'Missing code' })
 
     try {
+        const backendRedirectUsed = redirect_uri || process.env.META_REDIRECT_URI
+
         const r = await axios.get(`${GRAPH}/oauth/access_token`, {
             params: {
                 client_id: process.env.META_APP_ID,
                 client_secret: process.env.META_APP_SECRET,
-                redirect_uri: process.env.META_REDIRECT_URI,
+                redirect_uri: backendRedirectUsed,
                 code
             }
         })
@@ -171,21 +232,19 @@ export const exchangeCode = async (req: Request, res: Response) => {
     }
 }
 
-// ==========================
-// LISTAR WABAS + PHONES (vía Business) + fallback
-// ==========================
+/* =============================================================================
+ * LISTAR WABAS + PHONES (vía Business) + fallback
+ * ========================================================================== */
 
 type Waba = { id: string; name?: string; owner_business_id?: string }
 type Phone = { id: string; display_phone_number?: string }
 type WabaWithPhones = { waba: Waba; phones: Phone[] }
 
-// Helpers HTTP
 async function fbGet(url: string, params: Record<string, any>) {
     const { data } = await axios.get(url, { params })
     return data
 }
 
-// Edges
 async function getBusinesses(userToken: string) {
     const t0 = Date.now()
     const data = await fbGet(`${GRAPH}/me/businesses`, { fields: 'id,name', access_token: userToken })
@@ -198,7 +257,6 @@ async function getWabasByBusiness(userToken: string, businessId: string) {
         fields: 'id,name',
         access_token: userToken
     })
-    // Enriquecer con owner_business_id = businessId
     const list: Waba[] = (data?.data || []).map((w: any) => ({
         id: w.id,
         name: w.name,
@@ -225,7 +283,6 @@ async function getPermissions(userToken: string) {
     return { all: list, missing, ms: Date.now() - t0, stage: 'me.permissions' }
 }
 
-// (opcionales — fallbacks best-effort; pueden fallar con (#3) / (#100))
 async function getAssignedWabas(userToken: string) {
     const t0 = Date.now()
     const data = await fbGet(`${GRAPH}/me/assigned_whatsapp_business_accounts`, {
@@ -258,28 +315,22 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
     const diagnostics: any = { tried: [], timings: {} }
 
     try {
-        // 0) Permisos
         try {
             const perms = await getPermissions(token)
             diagnostics.permissions = perms
             diagnostics.timings[perms.stage] = perms.ms
-            if (perms.missing.length) {
-                // No cortamos de inmediato para devolver diagnóstico completo si debug=1
-                if (!debug) {
-                    return res.status(403).json({
-                        errorCode: 200,
-                        message: `Missing permissions: ${perms.missing.join(', ')}`,
-                    })
-                }
+            if (perms.missing.length && !debug) {
+                return res.status(403).json({
+                    errorCode: 200,
+                    message: `Missing permissions: ${perms.missing.join(', ')}`
+                })
             }
         } catch (e: any) {
             const meta = metaErrorPayload(e)
             diagnostics.permissions_error = meta
             console.warn('[getWabasAndPhones] me/permissions error:', meta)
-            // seguimos; no detenemos aún
         }
 
-        // 1) Camino oficial: /me/businesses → /{business}/owned_whatsapp_business_accounts
         let wabas: Waba[] = []
         try {
             const b = await getBusinesses(token)
@@ -308,7 +359,6 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
             console.warn('[getWabasAndPhones] businesses error:', meta)
         }
 
-        // 2) Fallback best-effort: /me/assigned_* y /me/owned_* (pueden fallar)
         if (!wabas?.length) {
             try {
                 const r1 = await getAssignedWabas(token)
@@ -333,18 +383,15 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
             }
         }
 
-        // 3) Si sigue vacío, devolver info clara
         if (!wabas?.length) {
             return res.status(200).json({
                 items: [],
                 note:
-                    'No se encontraron WABAs para este usuario. Verifica que el usuario sea Admin del Business ' +
-                    'y tenga asignado el asset “Cuentas de WhatsApp”. Si la app está en Dev Mode, agrega el usuario como tester.',
+                    'No se encontraron WABAs para este usuario. Verifica que el usuario sea Admin del Business y tenga asignado el asset “Cuentas de WhatsApp”. Si la app está en Dev Mode, agrega el usuario como tester.',
                 diagnostics: debug ? diagnostics : undefined
             })
         }
 
-        // 4) Phones por cada WABA
         const items: WabaWithPhones[] = []
         for (const w of wabas) {
             try {
@@ -367,13 +414,11 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
         const meta = metaErrorPayload(e)
         console.error('[getWabasAndPhones] Fatal error:', meta)
 
-        // Mensajes más claros
         if (meta.code === 3) {
             return res.status(403).json({
                 errorCode: 3,
                 message:
-                    'Este edge solo está disponible para business user o system user. ' +
-                    'Usa el camino /me/businesses o Embedded Signup, o genera un System User token.',
+                    'Este edge solo está disponible para business user o system user. Usa el camino /me/businesses o Embedded Signup, o genera un System User token.',
                 meta: debug ? meta : undefined,
                 diagnostics: debug ? diagnostics : undefined
             })
@@ -382,8 +427,7 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
             return res.status(403).json({
                 errorCode: 200,
                 message:
-                    'Requiere business_management para gestionar el objeto Business. ' +
-                    'Asegura que el usuario re-autorice con ese scope y sea Admin del Business.',
+                    'Requiere business_management para gestionar el objeto Business. Asegura que el usuario re-autorice con ese scope y sea Admin del Business.',
                 meta: debug ? meta : undefined,
                 diagnostics: debug ? diagnostics : undefined
             })
@@ -395,30 +439,4 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
             diagnostics: debug ? diagnostics : undefined
         })
     }
-}
-// PÚBLICO: inicia el flujo OAuth → redirige a Meta
-export const iniciarOAuthMeta = (req: Request, res: Response) => {
-    const APP_ID = process.env.META_APP_ID!
-    const REDIRECT = process.env.META_REDIRECT_URI! // debe apuntar a TU callback de backend
-    const version = 'v20.0'
-
-    const auth_type = (req.query.auth_type as string) || '' // ej: rerequest
-    const scope = [
-        'business_management',
-        'whatsapp_business_management',
-        'whatsapp_business_messaging',
-    ].join(',')
-
-    const state = encodeURIComponent(JSON.stringify({ ts: Date.now() })) // opcional
-
-    const url =
-        `https://www.facebook.com/${version}/dialog/oauth` +
-        `?client_id=${APP_ID}` +
-        `&redirect_uri=${encodeURIComponent(REDIRECT)}` +   // 👈 callback de BACKEND
-        `&response_type=code` +
-        `&scope=${encodeURIComponent(scope)}` +
-        (auth_type ? `&auth_type=${encodeURIComponent(auth_type)}` : '') +
-        `&state=${state}`
-
-    return res.redirect(url)
 }
