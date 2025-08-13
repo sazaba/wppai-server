@@ -69,6 +69,9 @@ model Empresa {
   cuentaWhatsapp   WhatsappAccount?
   messageTemplates MessageTemplate[]
 
+  // ✅ Configuración de plantillas fuera de 24 h (1:1)
+  outboundConfig OutboundConfig?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -84,6 +87,7 @@ model Message {
 
   Conversation Conversation @relation(fields: [conversationId], references: [id])
 
+  @@index([conversationId, timestamp])
   @@map("message")
 }
 
@@ -124,9 +128,9 @@ model WhatsappAccount {
   id                 Int      @id @default(autoincrement())
   phoneNumberId      String   @unique @db.VarChar(64)
   wabaId             String   @db.VarChar(64)
-  businessId         String?  @db.VarChar(64) // ← ahora opcional
-  accessToken        String   @db.Text // ← tokens largos
-  displayPhoneNumber String?  @db.VarChar(32) // ← ahora opcional
+  businessId         String?  @db.VarChar(64)
+  accessToken        String   @db.Text
+  displayPhoneNumber String?  @db.VarChar(32)
   empresaId          Int      @unique
   empresa            Empresa  @relation(fields: [empresaId], references: [id])
   createdAt          DateTime @default(now())
@@ -151,4 +155,18 @@ model MessageTemplate {
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
   @@map("messagetemplate")
+}
+
+// ✅ Nueva tabla 1:1 por empresa para fallback de plantillas fuera de 24 h
+model OutboundConfig {
+  id                   Int      @id @default(autoincrement())
+  empresaId            Int      @unique
+  fallbackTemplateName String   @default("hola")
+  fallbackTemplateLang String   @default("es")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  empresa Empresa @relation(fields: [empresaId], references: [id])
+
+  @@map("outboundconfig")
 }
