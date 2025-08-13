@@ -65,6 +65,13 @@ export const registrar = async (req: Request, res: Response) => {
                 usuarios: {
                     create: { email, password: hashed, rol: 'admin' },
                 },
+                // ⬇️ OutboundConfig automático
+                outboundConfig: {
+                    create: {
+                        fallbackTemplateName: 'hola',  // nombre del template en Meta
+                        fallbackTemplateLang: 'es'     // idioma
+                    }
+                }
             },
             include: { usuarios: true },
         })
@@ -83,6 +90,7 @@ export const registrar = async (req: Request, res: Response) => {
         return res.status(500).json({ error: 'Error al registrar empresa' })
     }
 }
+
 
 /* =============================================================================
  * OAUTH META (FLUJO ÚNICO)

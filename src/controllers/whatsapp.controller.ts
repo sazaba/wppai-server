@@ -35,44 +35,77 @@ async function getAccessToken(empresaId: number) {
     return acc.accessToken
 }
 
+/**
+ * OutboundConfig auto (hola/es) si no existe
+ */
+async function ensureOutboundConfig(empresaId: number) {
+    const existing = await prisma.outboundConfig.findUnique({ where: { empresaId } }).catch(() => null)
+    if (!existing) {
+        await prisma.outboundConfig.create({
+            data: { empresaId, fallbackTemplateName: 'hola', fallbackTemplateLang: 'es' }
+        })
+    }
+}
+
+/**
+ * ¿Existe la plantilla en Meta?
+ */
+async function templateExistsInMeta(params: {
+    accessToken: string
+    wabaId: string
+    name: string
+}) {
+    const { accessToken, wabaId, name } = params
+    const url = `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates`
+    const { data } = await axios.get(url, {
+        params: { access_token: accessToken, name, limit: 1 }
+    })
+    const list = Array.isArray(data?.data) ? data.data : []
+    return list.some((t: any) => t.name === name)
+}
+
+/**
+ * Intenta crear la plantilla fallback si no existe (no bloquea si falla).
+ * Por defecto: name='hola', lang='es', categoría MARKETING (válida para proactivos).
+ */
+async function ensureFallbackTemplateInMeta(params: {
+    accessToken: string
+    wabaId: string
+    name: string
+    lang: string
+}) {
+    const { accessToken, wabaId, name, lang } = params
+
+    try {
+        const exists = await templateExistsInMeta({ accessToken, wabaId, name })
+        if (exists) return
+    } catch (e) {
+        console.warn('[ensureFallbackTemplateInMeta] fallo consultando templates:', (e as any)?.response?.data || (e as any)?.message)
+        // seguimos e intentamos crear de todos modos
+    }
+
+    const url = `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates?access_token=${encodeURIComponent(accessToken)}`
+    const payload = {
+        name,
+        category: 'MARKETING',
+        allow_category_change: true,
+        language: lang, // usa 'es' o variante regional si tu WABA lo requiere
+        components: [
+            { type: 'BODY', text: '¡Hola! Gracias por escribirnos. ¿En qué podemos ayudarte?' }
+        ]
+    }
+
+    try {
+        await axios.post(url, payload)
+        console.log(`[Templates] Creada plantilla ${name}/${lang} en WABA ${wabaId}`)
+    } catch (e: any) {
+        console.warn('[Templates] No se pudo crear plantilla fallback:', e?.response?.data || e.message)
+    }
+}
+
 /* =============================================================================
  * CONEXIÓN (flujo único)
  * ========================================================================== */
-
-/**
- * POST /api/whatsapp/vincular
- * Guarda la selección hecha en el callback (token de usuario OAuth + WABA/phone elegidos)
- */
-// export const vincular = async (req: Request, res: Response) => {
-//     try {
-//         const empresaId = (req as any).user?.empresaId
-//         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-//         const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
-
-//         if (!accessToken || !phoneNumberId || !wabaId) {
-//             return res.status(400).json({ ok: false, error: 'Faltan datos requeridos: accessToken, phoneNumberId, wabaId' })
-//         }
-
-//         const cuenta = await prisma.whatsappAccount.upsert({
-//             where: { empresaId },
-//             update: { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber },
-//             create: { empresaId, accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber },
-//         })
-//         // Suscribir la app al WABA del cliente
-//         await axios.post(
-//             `https://graph.facebook.com/v20.0/${wabaId}/subscribed_apps`,
-//             {},
-//             { headers: { Authorization: `Bearer ${accessToken}` } }
-//         )
-
-
-//         return res.json({ ok: true, cuenta })
-//     } catch (err) {
-//         console.error('[vincular] error:', err)
-//         return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
-//     }
-// }
 
 export const vincular = async (req: Request, res: Response) => {
     try {
@@ -96,11 +129,7 @@ export const vincular = async (req: Request, res: Response) => {
             .filter((p: any) => p.status === 'granted')
             .map((p: any) => p.permission)
 
-        const need = [
-            'business_management',
-            'whatsapp_business_management',
-            'whatsapp_business_messaging',
-        ]
+        const need = ['business_management', 'whatsapp_business_management', 'whatsapp_business_messaging']
         const missing = need.filter(p => !granted.includes(p))
         if (missing.length) {
             return res.status(403).json({
@@ -109,8 +138,7 @@ export const vincular = async (req: Request, res: Response) => {
             })
         }
 
-        // 2) (Opcional) Convertir a long‑lived token de usuario (si procede)
-        //    Solo funciona si tu app está en Live y el usuario es válido
+        // 2) (Opcional) Extender token a long-lived si es posible
         let tokenToStore = accessToken
         let tokenExpiresAt: Date | null = null
         try {
@@ -129,64 +157,65 @@ export const vincular = async (req: Request, res: Response) => {
                 }
             }
         } catch (e) {
-            // no es crítico: si falla, guardamos el token corto igualmente
             console.warn('[vincular] No se pudo extender token a long-lived:', (e as any)?.response?.data || (e as any)?.message)
         }
 
-        // 3) Suscribir tu app a la WABA del cliente
+        // 3) Suscribir tu app a la WABA
         try {
             await axios.post(
                 `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
                 {},
-                { headers: { Authorization: `Bearer ${accessToken}` } } // usa el token del usuario admin
+                { headers: { Authorization: `Bearer ${accessToken}` } }
             )
         } catch (e: any) {
             const msg = e?.response?.data?.error?.message || e?.message
-            // error común si el usuario no es admin de esa WABA/Business
             return res.status(403).json({
                 ok: false,
                 error: `No pudimos suscribir tu WABA a la app. Asegúrate de ser administrador del negocio/WABA. Detalle: ${msg}`
             })
         }
 
-        // 4) Guardar/actualizar en tu BD
+        // 4) Guardar/actualizar en tu BD (WhatsappAccount 1:1 por empresa)
         const cuenta = await prisma.whatsappAccount.upsert({
             where: { empresaId },
             update: {
                 accessToken: tokenToStore,
                 phoneNumberId,
                 wabaId,
-                businessId,
-                displayPhoneNumber,
+                businessId: businessId || null,
+                displayPhoneNumber: displayPhoneNumber || null,
                 updatedAt: new Date(),
-                // Si añadiste la columna en tu schema:
-                // tokenExpiresAt: tokenExpiresAt || null,
+                // tokenExpiresAt: tokenExpiresAt || null, // si añadiste el campo
             },
             create: {
                 empresaId,
                 accessToken: tokenToStore,
                 phoneNumberId,
                 wabaId,
-                businessId,
-                displayPhoneNumber,
+                businessId: businessId || null,
+                displayPhoneNumber: displayPhoneNumber || null,
                 // tokenExpiresAt: tokenExpiresAt || null,
             },
         })
 
+        // 5) Asegurar OutboundConfig por empresa (hola/es)
+        await ensureOutboundConfig(empresaId)
+
+        // 6) Asegurar que exista la plantilla fallback en Meta (no bloquea si falla)
+        await ensureFallbackTemplateInMeta({
+            accessToken: tokenToStore,
+            wabaId,
+            name: 'hola',
+            lang: 'es'
+        })
+
         return res.json({ ok: true, cuenta })
     } catch (err) {
-        const e: any = err;
-        // log más claro sin romper TypeScript
-        console.error('[vincular] error:', e?.response?.data || e?.message || e);
-
-        return res.status(500).json({
-            ok: false,
-            error: 'Error al guardar conexión de WhatsApp'
-        });
+        const e: any = err
+        console.error('[vincular] error:', e?.response?.data || e?.message || e)
+        return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
     }
 }
-
-
 
 /**
  * GET /api/whatsapp/estado
@@ -276,8 +305,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
             return res.status(400).json({
                 ok: false,
                 error: {
-                    message:
-                        'El número no está registrado en Cloud API: registra/valida el número desde Meta (no usamos registro manual en el MVP).',
+                    message: 'El número no está registrado en Cloud API: registra/valida el número desde Meta.',
                     code,
                     details: err?.response?.data,
                 },
