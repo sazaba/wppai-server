@@ -80,12 +80,20 @@ app.use('/api/whatsapp', whatsappRoutes) // conexión de cuenta WhatsApp por emp
 app.use('/api', empresaRoutes)
 app.use('/api/templates', messageTemplateRoutes)
 
+//temporal
+app.use((req, _res, _next) => {
+    console.log('[404]', req.method, req.originalUrl)
+    _next()
+})
+
 
 
 // 🏠 Ruta raíz
 app.get('/', (req, res) => {
     res.send('🚀 Backend de Chat IA corriendo correctamente')
 })
+
+
 
 // 🟢 Iniciar servidor
 const PORT = process.env.PORT || 4000

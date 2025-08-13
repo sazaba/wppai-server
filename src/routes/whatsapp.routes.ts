@@ -4,22 +4,27 @@ import { verificarJWT } from '../middleware/auth.middleware'
 import {
     // existentes
     estadoWhatsappAccount,
-
     eliminarWhatsappAccount,
-
     // cloud api
-
     enviarPrueba,
     infoNumero,
-
     // utilidades
-
     debugToken,
     health,
 
 } from '../controllers/whatsapp.controller'
 
 const router = Router()
+
+
+
+// públicas para diagnóstico
+router.get('/ping', (_req, res) => res.json({ ok: true, ping: 'pong' }))
+router.get('/whatsapp/health-public', (_req, res) =>
+    res.json({ ok: true, msg: 'health (public) online' })
+)
+
+
 
 /* ===== Existentes ===== */
 
