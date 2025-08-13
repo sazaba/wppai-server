@@ -198,19 +198,30 @@ export const vincular = async (req: Request, res: Response) => {
         })
 
         // 5) Asegurar OutboundConfig 1:1 y dejar por defecto la NUEVA plantilla
-        await prisma.outboundConfig.upsert({
-            where: { empresaId },
-            update: {
-                fallbackTemplateName: 'saludo_inicial',
-                fallbackTemplateLang: 'es',
-                updatedAt: new Date()
-            },
-            create: {
-                empresaId,
-                fallbackTemplateName: 'saludo_inicial',
-                fallbackTemplateLang: 'es'
+        // 5) Asegurar OutboundConfig 1:1 y dejar por defecto la NUEVA plantilla
+        try {
+            const ocDelegate = (prisma as any).outboundConfig
+            if (ocDelegate?.upsert) {
+                await ocDelegate.upsert({
+                    where: { empresaId },
+                    update: {
+                        fallbackTemplateName: 'saludo_inicial',
+                        fallbackTemplateLang: 'es',
+                        updatedAt: new Date()
+                    },
+                    create: {
+                        empresaId,
+                        fallbackTemplateName: 'saludo_inicial',
+                        fallbackTemplateLang: 'es'
+                    }
+                })
+            } else {
+                console.warn('[vincular] Prisma client aún no tiene OutboundConfig; omito creación (usaremos defaults)')
             }
-        })
+        } catch (e: any) {
+            console.warn('[vincular] Error asegurando OutboundConfig:', e?.response?.data || e?.message)
+        }
+
 
         // 6) Crear la plantilla 'saludo_inicial' (es) si no existe aún
         try {
