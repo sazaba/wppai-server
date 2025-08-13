@@ -36,18 +36,6 @@ async function getAccessToken(empresaId: number) {
 }
 
 /**
- * OutboundConfig auto (hola/es) si no existe
- */
-async function ensureOutboundConfig(empresaId: number) {
-    const existing = await prisma.outboundConfig.findUnique({ where: { empresaId } }).catch(() => null)
-    if (!existing) {
-        await prisma.outboundConfig.create({
-            data: { empresaId, fallbackTemplateName: 'hola', fallbackTemplateLang: 'es' }
-        })
-    }
-}
-
-/**
  * ¿Existe la plantilla en Meta?
  */
 async function templateExistsInMeta(params: {
@@ -58,7 +46,8 @@ async function templateExistsInMeta(params: {
     const { accessToken, wabaId, name } = params
     const url = `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates`
     const { data } = await axios.get(url, {
-        params: { access_token: accessToken, name, limit: 1 }
+        params: { access_token: accessToken, name, limit: 1 },
+        headers: { 'Content-Type': 'application/json' }
     })
     const list = Array.isArray(data?.data) ? data.data : []
     return list.some((t: any) => t.name === name)
@@ -80,7 +69,10 @@ async function ensureFallbackTemplateInMeta(params: {
         const exists = await templateExistsInMeta({ accessToken, wabaId, name })
         if (exists) return
     } catch (e) {
-        console.warn('[ensureFallbackTemplateInMeta] fallo consultando templates:', (e as any)?.response?.data || (e as any)?.message)
+        console.warn(
+            '[ensureFallbackTemplateInMeta] fallo consultando templates:',
+            (e as any)?.response?.data || (e as any)?.message
+        )
         // seguimos e intentamos crear de todos modos
     }
 
@@ -90,13 +82,11 @@ async function ensureFallbackTemplateInMeta(params: {
         category: 'MARKETING',
         allow_category_change: true,
         language: lang, // usa 'es' o variante regional si tu WABA lo requiere
-        components: [
-            { type: 'BODY', text: '¡Hola! Gracias por escribirnos. ¿En qué podemos ayudarte?' }
-        ]
+        components: [{ type: 'BODY', text: '¡Hola! Gracias por escribirnos. ¿En qué podemos ayudarte?' }],
     }
 
     try {
-        await axios.post(url, payload)
+        await axios.post(url, payload, { headers: { 'Content-Type': 'application/json' } })
         console.log(`[Templates] Creada plantilla ${name}/${lang} en WABA ${wabaId}`)
     } catch (e: any) {
         console.warn('[Templates] No se pudo crear plantilla fallback:', e?.response?.data || e.message)
@@ -107,6 +97,7 @@ async function ensureFallbackTemplateInMeta(params: {
  * CONEXIÓN (flujo único)
  * ========================================================================== */
 
+// POST /api/whatsapp/vincular
 export const vincular = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -114,156 +105,60 @@ export const vincular = async (req: Request, res: Response) => {
 
         const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
         if (!accessToken || !phoneNumberId || !wabaId) {
-            return res.status(400).json({
-                ok: false,
-                error: 'Faltan datos requeridos: accessToken, phoneNumberId, wabaId'
-            })
+            return res.status(400).json({ ok: false, error: 'Faltan accessToken, phoneNumberId o wabaId' })
         }
 
-        // 1) Comprobar permisos del token del usuario (debe ser admin de la WABA)
-        const permsResp = await axios.get(
-            `https://graph.facebook.com/${FB_VERSION}/me/permissions`,
-            { params: { access_token: accessToken } }
-        )
-        const granted: string[] = (permsResp.data?.data || [])
+        // 1) Permisos del usuario
+        const perms = await axios.get(`https://graph.facebook.com/${FB_VERSION}/me/permissions`, {
+            params: { access_token: accessToken },
+            headers: { 'Content-Type': 'application/json' }
+        })
+        const granted: string[] = (perms.data?.data || [])
             .filter((p: any) => p.status === 'granted')
             .map((p: any) => p.permission)
         const need = ['business_management', 'whatsapp_business_management', 'whatsapp_business_messaging']
-        const missing = need.filter(p => !granted.includes(p))
-        if (missing.length) {
-            return res.status(403).json({
-                ok: false,
-                error: `El usuario no otorgó permisos necesarios: ${missing.join(', ')}`
-            })
-        }
+        const missing = need.filter((p) => !granted.includes(p))
+        if (missing.length) return res.status(403).json({ ok: false, error: `Faltan permisos: ${missing.join(', ')}` })
 
-        // 2) (Opcional) Extender token a long‑lived si es posible
-        let tokenToStore = accessToken
-        let tokenExpiresAt: Date | null = null
-        try {
-            const ll = await axios.get(`https://graph.facebook.com/${FB_VERSION}/oauth/access_token`, {
-                params: {
-                    grant_type: 'fb_exchange_token',
-                    client_id: process.env.META_APP_ID,
-                    client_secret: process.env.META_APP_SECRET,
-                    fb_exchange_token: accessToken,
-                }
-            })
-            if (ll.data?.access_token) {
-                tokenToStore = ll.data.access_token
-                if (ll.data?.expires_in) {
-                    tokenExpiresAt = new Date(Date.now() + Number(ll.data.expires_in) * 1000)
-                }
-            }
-        } catch (e) {
-            console.warn('[vincular] No se pudo extender token a long-lived:', (e as any)?.response?.data || (e as any)?.message)
-        }
-
-        // 3) Suscribir tu app a la WABA (necesario para recibir webhooks)
-        try {
-            await axios.post(
+        // 2) Suscribir app a la WABA
+        await axios
+            .post(
                 `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
                 {},
-                { headers: { Authorization: `Bearer ${accessToken}` } }
+                { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
             )
-        } catch (e: any) {
-            const msg = e?.response?.data?.error?.message || e?.message
-            return res.status(403).json({
-                ok: false,
-                error: `No pudimos suscribir tu WABA a la app. Asegúrate de ser administrador del negocio/WABA. Detalle: ${msg}`
+            .catch((e) => {
+                const msg = e?.response?.data?.error?.message || e?.message
+                throw new Error(`No pudimos suscribir tu WABA a la app. Detalle: ${msg}`)
             })
-        }
 
-        // 4) Guardar/actualizar en tu BD (WhatsappAccount 1:1 por empresa)
-        const cuenta = await prisma.whatsappAccount.upsert({
+        // 3) Guardar/actualizar credenciales reales por empresa
+        await prisma.whatsappAccount.upsert({
             where: { empresaId },
             update: {
-                accessToken: tokenToStore,
+                accessToken,
                 phoneNumberId,
                 wabaId,
                 businessId: businessId || null,
                 displayPhoneNumber: displayPhoneNumber || null,
                 updatedAt: new Date(),
-                // tokenExpiresAt: tokenExpiresAt || null, // si añadiste el campo
             },
             create: {
                 empresaId,
-                accessToken: tokenToStore,
+                accessToken,
                 phoneNumberId,
                 wabaId,
                 businessId: businessId || null,
                 displayPhoneNumber: displayPhoneNumber || null,
-                // tokenExpiresAt: tokenExpiresAt || null,
             },
         })
 
-        // 5) Asegurar OutboundConfig 1:1 y dejar por defecto la NUEVA plantilla
-        // 5) Asegurar OutboundConfig 1:1 y dejar por defecto la NUEVA plantilla
-        try {
-            const ocDelegate = (prisma as any).outboundConfig
-            if (ocDelegate?.upsert) {
-                await ocDelegate.upsert({
-                    where: { empresaId },
-                    update: {
-                        fallbackTemplateName: 'saludo_inicial',
-                        fallbackTemplateLang: 'es',
-                        updatedAt: new Date()
-                    },
-                    create: {
-                        empresaId,
-                        fallbackTemplateName: 'saludo_inicial',
-                        fallbackTemplateLang: 'es'
-                    }
-                })
-            } else {
-                console.warn('[vincular] Prisma client aún no tiene OutboundConfig; omito creación (usaremos defaults)')
-            }
-        } catch (e: any) {
-            console.warn('[vincular] Error asegurando OutboundConfig:', e?.response?.data || e?.message)
-        }
-
-
-        // 6) Crear la plantilla 'saludo_inicial' (es) si no existe aún
-        try {
-            // 6.1 Verificar existencia por nombre
-            const check = await axios.get(
-                `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates`,
-                { params: { access_token: accessToken, name: 'saludo_inicial', limit: 1 } }
-            )
-            const exists = Array.isArray(check.data?.data) && check.data.data.some((t: any) => t.name === 'saludo_inicial')
-
-            // 6.2 Si no existe, intentar crear (categoría UTILITY, 2 variables)
-            if (!exists) {
-                await axios.post(
-                    `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates`,
-                    {
-                        name: 'saludo_inicial',
-                        language: 'es',
-                        category: 'UTILITY',
-                        components: [
-                            {
-                                type: 'BODY',
-                                text: 'Hola {{1}}, gracias por comunicarte con {{2}}. Por favor, indícanos cómo podemos ayudarte.'
-                            }
-                        ]
-                    },
-                    { headers: { Authorization: `Bearer ${accessToken}` } }
-                )
-                console.log('[vincular] Plantilla saludo_inicial/es creada')
-            }
-        } catch (e: any) {
-            console.warn('[vincular] Error creando/verificando plantilla saludo_inicial:', e?.response?.data || e?.message)
-            // No bloqueamos la vinculación si la creación falla (puede quedar "pending review")
-        }
-
-        return res.json({ ok: true, cuenta })
-    } catch (err) {
-        const e: any = err
+        return res.json({ ok: true })
+    } catch (e: any) {
         console.error('[vincular] error:', e?.response?.data || e?.message || e)
         return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
     }
 }
-
 
 /**
  * GET /api/whatsapp/estado
@@ -331,7 +226,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
         const { data } = await axios.post(
             url,
             { messaging_product: 'whatsapp', to: toSanitized, type: 'text', text: { body } },
-            { headers: { Authorization: `Bearer ${accessToken}` } },
+            { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
         )
 
         return res.json({ ok: true, data })
@@ -381,6 +276,7 @@ export const infoNumero = async (req: Request, res: Response) => {
                 fields: 'display_phone_number,verified_name,name_status,wa_id,account_mode',
                 access_token: accessToken,
             },
+            headers: { 'Content-Type': 'application/json' }
         })
 
         return res.json({ ok: true, data })
@@ -404,6 +300,7 @@ export const debugToken = async (req: Request, res: Response) => {
 
         const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/debug_token`, {
             params: { input_token: token, access_token: appAccessToken },
+            headers: { 'Content-Type': 'application/json' }
         })
         return res.json({ ok: true, data })
     } catch (err) {

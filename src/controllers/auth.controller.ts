@@ -65,13 +65,7 @@ export const registrar = async (req: Request, res: Response) => {
                 usuarios: {
                     create: { email, password: hashed, rol: 'admin' },
                 },
-                // ⬇️ OutboundConfig automático
-                outboundConfig: {
-                    create: {
-                        fallbackTemplateName: 'hola',  // nombre del template en Meta
-                        fallbackTemplateLang: 'es'     // idioma
-                    }
-                }
+                // 👇 OUTBOUND REMOVIDO: ya no se crea outboundConfig por defecto
             },
             include: { usuarios: true },
         })
@@ -85,12 +79,15 @@ export const registrar = async (req: Request, res: Response) => {
         })
 
         return res.status(201).json({ token, empresaId: empresa.id })
-    } catch (e) {
+    } catch (e: any) {
+        // Manejo de email duplicado (P2002)
+        if (e?.code === 'P2002' && e?.meta?.target?.includes('email')) {
+            return res.status(409).json({ error: 'El email ya está registrado' })
+        }
         console.error('[registrar] Error:', e)
         return res.status(500).json({ error: 'Error al registrar empresa' })
     }
 }
-
 
 /* =============================================================================
  * OAUTH META (FLUJO ÚNICO)
@@ -136,7 +133,8 @@ export const authCallback = async (req: Request, res: Response) => {
                 client_secret: process.env.META_APP_SECRET,
                 redirect_uri: REDIRECT_URI, // DEBE coincidir EXACTO
                 code
-            }
+            },
+            headers: { 'Content-Type': 'application/json' }
         })
 
         const accessToken = tokenRes.data.access_token
@@ -161,6 +159,7 @@ export const exchangeCode = async (req: Request, res: Response) => {
                 redirect_uri: process.env.META_REDIRECT_URI,
                 code,
             },
+            headers: { 'Content-Type': 'application/json' }
         })
         return res.json({ access_token: r.data.access_token })
     } catch (e: any) {
@@ -183,6 +182,7 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
     const api = axios.create({
         baseURL: GRAPH,
         params: { access_token: token },
+        headers: { 'Content-Type': 'application/json' }
     })
 
     const diagnostics: any = debug ? {} : undefined

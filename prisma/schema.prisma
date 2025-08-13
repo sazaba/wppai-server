@@ -69,9 +69,6 @@ model Empresa {
   cuentaWhatsapp   WhatsappAccount?
   messageTemplates MessageTemplate[]
 
-  // ✅ Configuración de plantillas fuera de 24 h (1:1)
-  outboundConfig OutboundConfig?
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -155,18 +152,4 @@ model MessageTemplate {
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
   @@map("messagetemplate")
-}
-
-// ✅ Nueva tabla 1:1 por empresa para fallback de plantillas fuera de 24 h
-model OutboundConfig {
-  id                   Int      @id @default(autoincrement())
-  empresaId            Int      @unique
-  fallbackTemplateName String   @default("hola")
-  fallbackTemplateLang String   @default("es")
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-
-  empresa Empresa @relation(fields: [empresaId], references: [id])
-
-  @@map("outboundconfig")
 }

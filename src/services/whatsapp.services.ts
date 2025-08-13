@@ -26,22 +26,35 @@ export async function sendText({ empresaId, to, body }: SendTextArgs) {
     const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
     const payload = { messaging_product: 'whatsapp', to, type: 'text', text: { body } }
 
-    const { data } = await axios.post(url, payload, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-    }).catch((e) => { console.error('[WA sendText] Error:', e?.response?.data || e.message); throw e })
+    const { data } = await axios
+        .post(url, payload, {
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            }
+        })
+        .catch((e) => {
+            console.error('[WA sendText] Error:', e?.response?.data || e.message)
+            throw e
+        })
 
     return data
 }
 
 export async function sendTemplate({
-    empresaId, to, templateName, templateLang, variables = []
+    empresaId,
+    to,
+    templateName,
+    templateLang,
+    variables = []
 }: SendTemplateArgs) {
     const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
     const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
 
-    const components = variables.length
-        ? [{ type: 'body', parameters: variables.map(t => ({ type: 'text', text: t })) }]
-        : undefined
+    const components =
+        variables.length > 0
+            ? [{ type: 'body', parameters: variables.map((t) => ({ type: 'text', text: t })) }]
+            : undefined
 
     const payload = {
         messaging_product: 'whatsapp',
@@ -54,9 +67,17 @@ export async function sendTemplate({
         }
     }
 
-    const { data } = await axios.post(url, payload, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-    }).catch((e) => { console.error('[WA sendTemplate] Error:', e?.response?.data || e.message); throw e })
+    const { data } = await axios
+        .post(url, payload, {
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            }
+        })
+        .catch((e) => {
+            console.error('[WA sendTemplate] Error:', e?.response?.data || e.message)
+            throw e
+        })
 
     return data
 }
@@ -66,42 +87,44 @@ export async function sendOutboundMessage(args: {
     empresaId: number
     to: string
     body?: string
+    /** Forzar envío de plantilla (necesario si está fuera de 24h) */
     forceTemplate?: { name: string; lang: string; variables?: string[] }
 }) {
     const { conversationId, empresaId, to, body, forceTemplate } = args
 
-    // Último entrante (cliente) para validar 24 h
+    // Último mensaje entrante (cliente) para validar 24 h
     const lastInbound = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.client },
         orderBy: { timestamp: 'desc' }
     })
 
-    const within24h = lastInbound
-        ? (Date.now() - new Date(lastInbound.timestamp).getTime()) <= 24 * 60 * 60 * 1000
+    const within24h = !!lastInbound
+        ? Date.now() - new Date(lastInbound.timestamp).getTime() <= 24 * 60 * 60 * 1000
         : false
 
-    // Fallback 1:1 por empresa
-    const oc = await prisma.outboundConfig.findUnique({ where: { empresaId } })
-    const fallbackTemplateName = oc?.fallbackTemplateName ?? 'hola'
-    const fallbackTemplateLang = oc?.fallbackTemplateLang ?? 'es'
-
-    // Envío
+    // Si se fuerza plantilla, siempre se puede enviar (dentro o fuera de 24h)
     if (forceTemplate) {
         return await sendTemplate({
-            empresaId, to,
+            empresaId,
+            to,
             templateName: forceTemplate.name,
             templateLang: forceTemplate.lang,
             variables: forceTemplate.variables || []
         })
     }
 
-    if (within24h && body) {
+    // Dentro de 24h: permitir texto libre si hay body
+    if (within24h) {
+        if (!body || body.trim() === '') {
+            const err: any = new Error('EMPTY_BODY_WITHIN_24H')
+            err.status = 400
+            throw err
+        }
         return await sendText({ empresaId, to, body })
     }
 
-    return await sendTemplate({
-        empresaId, to,
-        templateName: fallbackTemplateName,
-        templateLang: fallbackTemplateLang
-    })
+    // Fuera de 24h y sin plantilla: bloquear
+    const err: any = new Error('OUT_OF_24H_WINDOW')
+    err.status = 409
+    throw err
 }

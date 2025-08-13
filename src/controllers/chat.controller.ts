@@ -296,22 +296,26 @@ export const crearConversacion = async (req: Request, res: Response) => {
  *    POST /api/chats/iniciar
  *    Body: { empresaId, to, templateName?, templateLang?, variables?, conversationId? }
  */
+// src/controllers/chat.controller.ts (o donde definiste iniciarChat)
 export const iniciarChat = async (req: Request, res: Response) => {
     try {
         const { conversationId, empresaId, to, templateName, templateLang, variables } = req.body as {
-            conversationId?: number
-            empresaId: number
-            to: string
-            templateName?: string
-            templateLang?: string
-            variables?: string[]
+            conversationId?: number; empresaId: number; to: string;
+            templateName?: string; templateLang?: string; variables?: string[];
+        }
+
+        // 🚫 Estilo ManyChat: si no viene plantilla explícita, bloquear inicio proactivo
+        if (!templateName || !templateLang) {
+            return res.status(409).json({
+                ok: false,
+                reason: 'template_required',
+                message: 'Para iniciar conversaciones fuera de 24h necesitas una plantilla aprobada.'
+            })
         }
 
         let convId = conversationId
         if (!convId) {
-            const conv = await prisma.conversation.create({
-                data: { empresaId, phone: to, estado: 'pendiente' }
-            })
+            const conv = await prisma.conversation.create({ data: { empresaId, phone: to, estado: 'pendiente' } })
             convId = conv.id
         }
 
@@ -319,12 +323,17 @@ export const iniciarChat = async (req: Request, res: Response) => {
             conversationId: convId!,
             empresaId,
             to,
-            forceTemplate: (templateName && templateLang) ? { name: templateName, lang: templateLang, variables } : undefined
+            forceTemplate: { name: templateName, lang: templateLang, variables }
         })
 
         return res.json({ ok: true, conversationId: convId, result })
-    } catch (err: any) {
-        console.error('[iniciarChat] Error:', err?.response?.data || err.message)
-        return res.status(500).json({ error: 'Error enviando plantilla', detail: err?.response?.data || err.message })
+    } catch (error: any) {
+        if (error?.status === 409 || /OUT_OF_24H_WINDOW/.test(error?.message)) {
+            return res.status(409).json({
+                ok: false,
+                reason: 'out_of_24h',
+                message: 'La ventana de 24h está cerrada; usa una plantilla para responder.'
+            })
+        }
     }
 }
