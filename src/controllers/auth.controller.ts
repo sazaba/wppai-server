@@ -94,13 +94,13 @@ interface MetaTokenResponse {
     expires_in: number
 }
 
-// GET /api/auth/whatsapp  → Redirige al diálogo OAuth
+// 1) Iniciar OAuth (redirige a Meta con redirect_uri FIJO del backend)
 export const iniciarOAuthMeta = (req: Request, res: Response) => {
     const APP_ID = process.env.META_APP_ID!
-    const REDIRECT = process.env.META_REDIRECT_URI! // Callback de BACKEND registrado en Meta
+    const REDIRECT_URI = process.env.META_REDIRECT_URI! // callback del BACKEND registrado en Meta
     const version = 'v20.0'
+    const auth_type = (req.query.auth_type as string) || '' // ej: rerequest
 
-    const auth_type = (req.query.auth_type as string) || '' // p.ej. rerequest
     const scope = [
         'business_management',
         'whatsapp_business_management',
@@ -110,7 +110,7 @@ export const iniciarOAuthMeta = (req: Request, res: Response) => {
     const url =
         `https://www.facebook.com/${version}/dialog/oauth` +
         `?client_id=${APP_ID}` +
-        `&redirect_uri=${encodeURIComponent(REDIRECT)}` +
+        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` + // FIJO
         `&response_type=code` +
         `&scope=${encodeURIComponent(scope)}` +
         (auth_type ? `&auth_type=${encodeURIComponent(auth_type)}` : '')
@@ -118,34 +118,34 @@ export const iniciarOAuthMeta = (req: Request, res: Response) => {
     return res.redirect(url)
 }
 
-// GET /api/auth/callback  → Meta llama aquí con ?code. Redirige al FRONT con ?token
+// 2) Callback del BACKEND: intercambia code -> access_token y redirige al FRONT fijo
 export const authCallback = async (req: Request, res: Response) => {
-    const { code, error, error_description } = req.query as any
-    const FRONT = process.env.FRONT_CALLBACK_URL || 'https://wasaaa.com/dashboard/callback'
-
-    if (error) {
-        return res.redirect(
-            `${FRONT}?error=${encodeURIComponent(error)}&error_description=${encodeURIComponent(error_description || '')}`
-        )
-    }
+    const { code } = req.query
     if (!code) return res.status(400).json({ error: 'Falta el parámetro code' })
 
     try {
-        const r = await axios.get<MetaTokenResponse>(`${GRAPH}/oauth/access_token`, {
+        const GRAPH = 'https://graph.facebook.com/v20.0'
+        const REDIRECT_URI = process.env.META_REDIRECT_URI!        // el mismo de arriba
+        const FRONT_CALLBACK = process.env.FRONT_CALLBACK_URL      // e.g. https://wasaaa.com/dashboard/callback
+
+        const tokenRes = await axios.get(`${GRAPH}/oauth/access_token`, {
             params: {
                 client_id: process.env.META_APP_ID,
                 client_secret: process.env.META_APP_SECRET,
-                redirect_uri: process.env.META_REDIRECT_URI, // Debe coincidir con el usado al iniciar
-                code,
-            },
+                redirect_uri: REDIRECT_URI, // DEBE coincidir EXACTO
+                code
+            }
         })
-        const accessToken = r.data.access_token
-        return res.redirect(`${FRONT}?token=${encodeURIComponent(accessToken)}`)
-    } catch (e: any) {
-        console.error('[authCallback] Meta error:', e.response?.data || e.message)
-        return res.status(400).json({ error: 'Error autenticando con Meta' })
+
+        const accessToken = tokenRes.data.access_token
+        const front = FRONT_CALLBACK || 'https://wasaaa.com/dashboard/callback'
+        return res.redirect(`${front}?token=${encodeURIComponent(accessToken)}`)
+    } catch (err: any) {
+        console.error('[authCallback] Error Meta:', err?.response?.data || err.message)
+        return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
     }
 }
+
 
 // POST /api/auth/exchange-code  → (Opcional si el front recibe ?code)
 export const exchangeCode = async (req: Request, res: Response) => {
