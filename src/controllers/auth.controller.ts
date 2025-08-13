@@ -88,12 +88,6 @@ export const registrar = async (req: Request, res: Response) => {
  * OAUTH META (FLUJO ÚNICO)
  * ========================================================================== */
 
-interface MetaTokenResponse {
-    access_token: string
-    token_type: string
-    expires_in: number
-}
-
 // 1) Iniciar OAuth (redirige a Meta con redirect_uri FIJO del backend)
 export const iniciarOAuthMeta = (req: Request, res: Response) => {
     const APP_ID = process.env.META_APP_ID!
@@ -105,6 +99,7 @@ export const iniciarOAuthMeta = (req: Request, res: Response) => {
         'business_management',
         'whatsapp_business_management',
         'whatsapp_business_messaging',
+        // 'pages_show_list' // opcional
     ].join(',')
 
     const url =
@@ -124,7 +119,6 @@ export const authCallback = async (req: Request, res: Response) => {
     if (!code) return res.status(400).json({ error: 'Falta el parámetro code' })
 
     try {
-        const GRAPH = 'https://graph.facebook.com/v20.0'
         const REDIRECT_URI = process.env.META_REDIRECT_URI!        // el mismo de arriba
         const FRONT_CALLBACK = process.env.FRONT_CALLBACK_URL      // e.g. https://wasaaa.com/dashboard/callback
 
@@ -145,7 +139,6 @@ export const authCallback = async (req: Request, res: Response) => {
         return res.status(500).json({ error: '❌ Error autenticando con Meta.' })
     }
 }
-
 
 // POST /api/auth/exchange-code  → (Opcional si el front recibe ?code)
 export const exchangeCode = async (req: Request, res: Response) => {
@@ -175,49 +168,110 @@ export const exchangeCode = async (req: Request, res: Response) => {
 // GET /api/auth/wabas?token=...&debug=1
 export const getWabasAndPhones = async (req: Request, res: Response) => {
     const token = (req.query.token as string) || ''
-    const debug = req.query.debug === '1'
+    const debug = String(req.query.debug || '') === '1'
     if (!token) return res.status(400).json({ error: 'Missing user access token' })
 
-    const fbGet = async (url: string, params: Record<string, any>) =>
-        (await axios.get(url, { params })).data
+    // helper axios con token por defecto
+    const api = axios.create({
+        baseURL: GRAPH,
+        params: { access_token: token },
+    })
+
+    const diagnostics: any = debug ? {} : undefined
 
     try {
-        // 1) Validar permisos: los 3 obligatorios
-        const perms = await fbGet(`${GRAPH}/me/permissions`, { access_token: token })
-        const granted: string[] = (perms?.data || [])
+        // 1) Validar permisos requeridos
+        const permsResp = await api.get('/me/permissions')
+        const granted: string[] = (permsResp.data?.data || [])
             .filter((p: any) => p.status === 'granted')
             .map((p: any) => p.permission)
+
+        if (diagnostics) diagnostics.granted = granted
+
         const need = ['business_management', 'whatsapp_business_management', 'whatsapp_business_messaging']
         const missing = need.filter((p) => !granted.includes(p))
         if (missing.length) {
-            return res.status(403).json({ error: `Missing permissions: ${missing.join(', ')}` })
+            return res.status(403).json({ error: `Missing permissions: ${missing.join(', ')}`, diagnostics })
         }
 
-        // 2) Businesses del usuario
-        const b = await fbGet(`${GRAPH}/me/businesses`, { fields: 'id,name', access_token: token })
-        const businesses = b?.data || []
+        // 2) Listar negocios donde el usuario tiene rol
+        let businesses: Array<{ id: string; name: string }> = []
+        try {
+            const bizResp = await api.get('/me/businesses', { params: { fields: 'id,name' } })
+            businesses = bizResp.data?.data || []
+        } catch (err: any) {
+            if (diagnostics) diagnostics.businesses_error = err?.response?.data?.error || err?.message
+        }
+        if (diagnostics) diagnostics.businesses_count = businesses.length
 
-        // 3) WABAs y Phones por business
-        const items: { waba: any; phones: any[] }[] = []
+        const items: Array<{ waba: any; phones: any[] }> = []
+
+        // 3) Para cada negocio, obtener sus WABAs y teléfonos (llamadas atómicas)
         for (const biz of businesses) {
-            const wabas = (await fbGet(`${GRAPH}/${biz.id}/owned_whatsapp_business_accounts`, {
-                fields: 'id,name',
-                access_token: token,
-            }))?.data || []
-
-            for (const w of wabas) {
-                const phones = (await fbGet(`${GRAPH}/${w.id}/phone_numbers`, {
-                    fields: 'id,display_phone_number',
-                    access_token: token,
-                }))?.data || []
-                items.push({
-                    waba: { id: w.id, name: w.name, owner_business_id: biz.id },
-                    phones,
+            try {
+                const wabasResp = await api.get(`/${biz.id}/owned_whatsapp_business_accounts`, {
+                    params: { fields: 'id,name' },
                 })
+                const wabas = wabasResp.data?.data || []
+
+                for (const w of wabas) {
+                    try {
+                        const phonesResp = await api.get(`/${w.id}/phone_numbers`, {
+                            params: { fields: 'id,display_phone_number' },
+                        })
+                        const phones = phonesResp.data?.data || []
+                        items.push({
+                            waba: { id: w.id, name: w.name, owner_business_id: biz.id },
+                            phones: phones.map((p: any) => ({
+                                id: p.id,
+                                display_phone_number: p.display_phone_number,
+                            })),
+                        })
+                    } catch (errPhones: any) {
+                        if (diagnostics) {
+                            diagnostics[`phones_error_${w.id}`] = errPhones?.response?.data?.error || errPhones?.message
+                        }
+                    }
+                }
+            } catch (errWabas: any) {
+                if (diagnostics) {
+                    diagnostics[`wabas_error_${biz.id}`] = errWabas?.response?.data?.error || errWabas?.message
+                }
             }
         }
 
-        return res.json({ items, diagnostics: debug ? { businesses: businesses.length } : undefined })
+        // 4) Fallback: algunos setups no exponen businesses pero sí WABAs directas
+        if (!items.length) {
+            try {
+                const ownWabas = await api.get('/me/owned_whatsapp_business_accounts', { params: { fields: 'id,name' } })
+                const wabas = ownWabas.data?.data || []
+                if (diagnostics) diagnostics.fallback_wabas_count = wabas.length
+
+                for (const w of wabas) {
+                    try {
+                        const phonesResp = await api.get(`/${w.id}/phone_numbers`, {
+                            params: { fields: 'id,display_phone_number' },
+                        })
+                        const phones = phonesResp.data?.data || []
+                        items.push({
+                            waba: { id: w.id, name: w.name, owner_business_id: undefined },
+                            phones: phones.map((p: any) => ({
+                                id: p.id,
+                                display_phone_number: p.display_phone_number,
+                            })),
+                        })
+                    } catch (errPhones: any) {
+                        if (diagnostics) {
+                            diagnostics[`phones_error_${w.id}`] = errPhones?.response?.data?.error || errPhones?.message
+                        }
+                    }
+                }
+            } catch (errFallback: any) {
+                if (diagnostics) diagnostics.fallback_error = errFallback?.response?.data?.error || errFallback?.message
+            }
+        }
+
+        return res.json({ items, diagnostics })
     } catch (e: any) {
         const err = e?.response?.data?.error || { message: e.message }
         console.error('[getWabasAndPhones] error:', err)
