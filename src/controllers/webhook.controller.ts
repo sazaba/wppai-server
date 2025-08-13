@@ -39,7 +39,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             msg.interactive?.list_reply?.title ||
             '[mensaje no soportado]'
 
-        const ts = msg.timestamp ? new Date(parseInt(msg.timestamp as string, 10) * 1000) : new Date()
+        const ts: Date = msg.timestamp ? new Date(parseInt(msg.timestamp as string, 10) * 1000) : new Date()
 
         if (!phoneNumberId || !fromWa) return res.status(200).json({ ignored: true })
 
@@ -90,25 +90,26 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             estado: conversation.estado
         })
 
-        // 3) IA → RESPUESTA (anti-duplicado + envío de texto)
+        // 3) IA → RESPUESTA (dedupe relativo al inbound + envío de texto)
         const result: any = await handleIAReply(conversation.id, contenido)
         if (result?.mensaje) {
-            // Anti-duplicado 15s
+            // ✅ DEDUPE SOLO CONTRA MENSAJES DEL BOT CREADOS DESPUÉS DE ESTE INBOUND
             const yaExiste = await prisma.message.findFirst({
                 where: {
                     conversationId: conversation.id,
                     from: MessageFrom.bot,
                     contenido: result.mensaje,
-                    timestamp: { gte: new Date(Date.now() - 15_000) }
+                    // ¡clave!: solo consideramos duplicado si ya hay un bot >= ts (el inbound actual)
+                    timestamp: { gte: ts }
                 }
             })
             if (yaExiste) {
-                console.warn('[BOT] Evitado duplicado (mensaje idéntico reciente).')
+                console.warn('[BOT] Evitado duplicado porque ya respondimos a este inbound.')
                 return res.status(200).json({ success: true, deduped: true })
             }
 
             try {
-                // TEXTO directo. Si Meta detecta ventana cerrada → lanzará error 131047/470
+                // TEXTO directo. Si Meta detecta ventana cerrada → lanzará error (131047/470)
                 const respText = await sendText({
                     empresaId,
                     to: conversation.phone,
