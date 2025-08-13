@@ -120,7 +120,7 @@ export const vincular = async (req: Request, res: Response) => {
             })
         }
 
-        // 1) Comprobar permisos del token del usuario
+        // 1) Comprobar permisos del token del usuario (debe ser admin de la WABA)
         const permsResp = await axios.get(
             `https://graph.facebook.com/${FB_VERSION}/me/permissions`,
             { params: { access_token: accessToken } }
@@ -128,7 +128,6 @@ export const vincular = async (req: Request, res: Response) => {
         const granted: string[] = (permsResp.data?.data || [])
             .filter((p: any) => p.status === 'granted')
             .map((p: any) => p.permission)
-
         const need = ['business_management', 'whatsapp_business_management', 'whatsapp_business_messaging']
         const missing = need.filter(p => !granted.includes(p))
         if (missing.length) {
@@ -138,7 +137,7 @@ export const vincular = async (req: Request, res: Response) => {
             })
         }
 
-        // 2) (Opcional) Extender token a long-lived si es posible
+        // 2) (Opcional) Extender token a long‑lived si es posible
         let tokenToStore = accessToken
         let tokenExpiresAt: Date | null = null
         try {
@@ -160,7 +159,7 @@ export const vincular = async (req: Request, res: Response) => {
             console.warn('[vincular] No se pudo extender token a long-lived:', (e as any)?.response?.data || (e as any)?.message)
         }
 
-        // 3) Suscribir tu app a la WABA
+        // 3) Suscribir tu app a la WABA (necesario para recibir webhooks)
         try {
             await axios.post(
                 `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
@@ -198,16 +197,53 @@ export const vincular = async (req: Request, res: Response) => {
             },
         })
 
-        // 5) Asegurar OutboundConfig por empresa (hola/es)
-        await ensureOutboundConfig(empresaId)
-
-        // 6) Asegurar que exista la plantilla fallback en Meta (no bloquea si falla)
-        await ensureFallbackTemplateInMeta({
-            accessToken: tokenToStore,
-            wabaId,
-            name: 'hola',
-            lang: 'es'
+        // 5) Asegurar OutboundConfig 1:1 y dejar por defecto la NUEVA plantilla
+        await prisma.outboundConfig.upsert({
+            where: { empresaId },
+            update: {
+                fallbackTemplateName: 'saludo_inicial',
+                fallbackTemplateLang: 'es',
+                updatedAt: new Date()
+            },
+            create: {
+                empresaId,
+                fallbackTemplateName: 'saludo_inicial',
+                fallbackTemplateLang: 'es'
+            }
         })
+
+        // 6) Crear la plantilla 'saludo_inicial' (es) si no existe aún
+        try {
+            // 6.1 Verificar existencia por nombre
+            const check = await axios.get(
+                `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates`,
+                { params: { access_token: accessToken, name: 'saludo_inicial', limit: 1 } }
+            )
+            const exists = Array.isArray(check.data?.data) && check.data.data.some((t: any) => t.name === 'saludo_inicial')
+
+            // 6.2 Si no existe, intentar crear (categoría UTILITY, 2 variables)
+            if (!exists) {
+                await axios.post(
+                    `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates`,
+                    {
+                        name: 'saludo_inicial',
+                        language: 'es',
+                        category: 'UTILITY',
+                        components: [
+                            {
+                                type: 'BODY',
+                                text: 'Hola {{1}}, gracias por comunicarte con {{2}}. Por favor, indícanos cómo podemos ayudarte.'
+                            }
+                        ]
+                    },
+                    { headers: { Authorization: `Bearer ${accessToken}` } }
+                )
+                console.log('[vincular] Plantilla saludo_inicial/es creada')
+            }
+        } catch (e: any) {
+            console.warn('[vincular] Error creando/verificando plantilla saludo_inicial:', e?.response?.data || e?.message)
+            // No bloqueamos la vinculación si la creación falla (puede quedar "pending review")
+        }
 
         return res.json({ ok: true, cuenta })
     } catch (err) {
@@ -216,6 +252,7 @@ export const vincular = async (req: Request, res: Response) => {
         return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
     }
 }
+
 
 /**
  * GET /api/whatsapp/estado
