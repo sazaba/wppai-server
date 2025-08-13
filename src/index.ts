@@ -94,27 +94,49 @@ app.get('/', (req, res) => {
     res.send('🚀 Backend de Chat IA corriendo correctamente')
 })
 
-function printRoutes(appOrRouter: any, prefix = '') {
-    const stack = appOrRouter.stack || []
-    for (const layer of stack) {
-        if (layer.route && layer.route.path) {
-            const path = prefix + layer.route.path
-            const methods = Object.keys(layer.route.methods).join(',').toUpperCase()
-            console.log(`➡️  ${methods.padEnd(6)} ${path}`)
-        } else if (layer.name === 'router' && layer.handle.stack) {
-            // subrouter con "mountpath"
-            const subPrefix = prefix + (layer.regexp?.fast_slash ? '' : (layer.regexp?.source?.replace('^\\', '/').split('\\/?(?=\\/|$)')[0] || ''))
-            printRoutes(layer.handle, subPrefix)
+// ✅ Printer de rutas a prueba de producción
+function printRoutesSafe(app: any) {
+    try {
+        const root = app && app._router;
+        if (!root || !root.stack) {
+            console.log('🧭 (no hay _router.stack disponible; omito listado)');
+            return;
         }
+
+        const walk = (layer: any, prefix = '') => {
+            if (layer.route && layer.route.path) {
+                const methods = Object.keys(layer.route.methods || {})
+                    .map((m) => m.toUpperCase())
+                    .join(',');
+                console.log(`➡️  ${methods.padEnd(6)} ${prefix}${layer.route.path}`);
+            } else if (layer.name === 'router' && layer.handle && layer.handle.stack) {
+                // Intento razonable de recuperar el mountpath (sin romper en prod)
+                let mount = '';
+                // Express no expone el path directo; usamos "regexp" si existe
+                if (layer.regexp && layer.regexp.source) {
+                    // ej: ^\/api\/whatsapp\/?(?=\/|$)
+                    const match = layer.regexp.source
+                        .replace(/\\\//g, '/')
+                        .match(/^\^\\?\/(.*)\\\/\?\(\?=\\\/\|\$\)\$/);
+                    mount = match && match[1] ? '/' + match[1] : '';
+                }
+                for (const l of layer.handle.stack) {
+                    walk(l, `${prefix}${mount}`);
+                }
+            }
+        };
+
+        for (const layer of root.stack) walk(layer, '');
+    } catch (e: any) {
+        console.log('🧭 (error imprimiendo rutas, omito):', e?.message || e);
     }
 }
 
+
 // 🟢 Iniciar servidor
-const PORT = process.env.PORT || 4000
+const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
-    console.log(`✅ API escuchando en http://localhost:${PORT}`)
-    console.log('🧭 Rutas registradas:')
-    // imprime todas las rutas montadas
-    // @ts-ignore
-    printRoutes((app as any)._router)
-})
+    console.log(`✅ API escuchando en http://localhost:${PORT}`);
+    console.log('🧭 Rutas registradas:');
+    printRoutesSafe(app);
+});
