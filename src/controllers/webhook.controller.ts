@@ -1,113 +1,84 @@
-// src/controllers/receive.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { handleIAReply } from '../utils/handleIAReply'
 import { MessageFrom, ConversationEstado } from '@prisma/client'
-// ⛔️ Quitar sandbox:
-// import { sendWhatsappMessage } from '../utils/sendWhatsappMessage'
-// ✅ Usar service real (respeta 24h y plantillas por empresa):
 import { sendOutboundMessage, sendTemplate } from '../services/whatsapp.services'
 
 export const receiveWhatsappMessage = async (req: Request, res: Response) => {
     console.log('📩 Webhook recibido:', JSON.stringify(req.body, null, 2))
 
     try {
-        const entry = req.body?.entry?.[0]
-        const change = entry?.changes?.[0]
-        const value = change?.value
+        const entry: any = req.body?.entry?.[0]
+        const change: any = entry?.changes?.[0]
+        const value: any = change?.value
 
-        // ✅ 1) Manejar "statuses" (fallos por 24h → auto-fallback con plantilla)
-        if (value?.statuses && Array.isArray(value.statuses) && value.statuses.length) {
-            const phoneNumberId = value?.metadata?.phone_number_id
-            if (!phoneNumberId) {
-                console.warn('⚠️ status sin phone_number_id; se ignora.')
-                return res.status(200).json({ ignored: true })
-            }
+        // 1) STATUSES (fallas por 24h → fallback con plantilla)
+        if (value?.statuses?.length) {
+            const phoneNumberId: string | undefined = value?.metadata?.phone_number_id
+            if (!phoneNumberId) return res.status(200).json({ ignored: true })
 
             const cuenta = await prisma.whatsappAccount.findUnique({ where: { phoneNumberId } })
             const empresaId = cuenta?.empresaId
 
-            for (const st of value.statuses) {
-                // Solo nos importan fallos
+            for (const st of value.statuses as any[]) {
                 if (st.status !== 'failed') continue
-                const errCodes = (st.errors || []).map((e: any) => e.code)
-                const is24hClosed = errCodes.includes(131047) || errCodes.includes(470)
+                const codes = (st.errors || []).map((e: any) => e.code)
+                const is24hClosed = codes.includes(131047) || codes.includes(470)
+                if (!is24hClosed || !empresaId) continue
 
-                if (is24hClosed && empresaId) {
-                    const to = st.recipient_id // wa_id del cliente
-                    // Buscar conversación de esa empresa y ese destino
-                    const conv = await prisma.conversation.findFirst({
-                        where: { empresaId, phone: to }
-                    })
-                    if (!conv) {
-                        console.warn(`[statuses][${to}] sin conversación asociada; no se hace fallback.`)
-                        continue
-                    }
+                const to: string = st.recipient_id // wa_id del cliente
+                const conv = await prisma.conversation.findFirst({ where: { empresaId, phone: to } })
+                if (!conv) continue
 
-                    // Leer fallback por empresa
-                    const oc = await prisma.outboundConfig.findUnique({ where: { empresaId } })
-                    const templateName = oc?.fallbackTemplateName ?? 'hola'
-                    const templateLang = oc?.fallbackTemplateLang ?? 'es'
+                const templateName = 'hello_world'
+                const templateLang = 'es'
 
-                    try {
-                        // ✅ Reintento automático con plantilla fallback
-                        await sendTemplate({
-                            empresaId,
-                            to,
-                            templateName,
-                            templateLang,
-                            variables: []
-                        })
+                try {
+                    await sendTemplate({ empresaId, to, templateName, templateLang, variables: [] })
 
-                        // Persistir un rastro del fallback (opcional)
-                        await prisma.message.create({
-                            data: {
-                                conversationId: conv.id,
-                                from: MessageFrom.bot,
-                                contenido: `[auto-fallback ${templateName}/${templateLang}]`,
-                                timestamp: new Date()
-                            }
-                        })
-
-                        // Notificar al frontend
-                        const io = req.app.get('io')
-                        io?.emit?.('nuevo_mensaje', {
+                    await prisma.message.create({
+                        data: {
                             conversationId: conv.id,
-                            from: 'bot',
+                            from: MessageFrom.bot,
                             contenido: `[auto-fallback ${templateName}/${templateLang}]`,
-                            timestamp: new Date().toISOString(),
-                            estado: conv.estado
-                        })
+                            timestamp: new Date()
+                        }
+                    })
 
-                        console.log(`[fallback] Enviada plantilla ${templateName}/${templateLang} a ${to}`)
-                    } catch (e: any) {
-                        console.error('[fallback] Error enviando plantilla:', e?.response?.data || e.message)
-                    }
+                    const io: any = req.app.get('io')
+                    io?.emit?.('nuevo_mensaje', {
+                        conversationId: conv.id,
+                        from: 'bot',
+                        contenido: `[auto-fallback ${templateName}/${templateLang}]`,
+                        timestamp: new Date().toISOString(),
+                        estado: conv.estado
+                    })
+                } catch (e: any) {
+                    console.error('[fallback] Error enviando plantilla:', e?.response?.data || e.message)
                 }
             }
-
-            // No es un entrante del usuario; ya procesamos statuses
             return res.status(200).json({ handled: 'statuses' })
         }
 
-        // ✅ 2) Solo continuar si hay "messages" (entrantes reales)
-        if (!value?.messages || !value?.messages[0]) {
-            console.log('ℹ️ Evento sin message (probablemente status ya manejado). Ignorado.')
-            return res.status(200).json({ ignored: true })
-        }
+        // 2) MENSAJES ENTRANTES REALES
+        if (!value?.messages?.[0]) return res.status(200).json({ ignored: true })
 
-        const msg = value.messages[0]
-        const phoneNumberId = value?.metadata?.phone_number_id
-        const from = msg.from
-        const contenido = msg.text?.body || msg.button?.text || msg.interactive?.list_reply?.title || '[mensaje no soportado]'
-        const ts = msg.timestamp ? new Date(parseInt(msg.timestamp, 10) * 1000) : new Date()
+        const msg: any = value.messages[0]
+        const inboundId: string = msg.id // (útil si luego haces idempotencia por DB)
+        const phoneNumberId: string | undefined = value?.metadata?.phone_number_id
+        const fromWa: string | undefined = msg.from
 
-        if (!phoneNumberId || !from) {
-            console.warn('❌ Faltan datos esenciales en el mensaje entrante.')
-            return res.status(200).json({ ignored: true })
-        }
+        const contenido: string =
+            msg.text?.body ||
+            msg.button?.text ||
+            msg.interactive?.list_reply?.title ||
+            '[mensaje no soportado]'
 
-        // Cuenta y empresa
+        const ts = msg.timestamp ? new Date(parseInt(msg.timestamp as string, 10) * 1000) : new Date()
+
+        if (!phoneNumberId || !fromWa) return res.status(200).json({ ignored: true })
+
+        // Empresa/cta
         const cuenta = await prisma.whatsappAccount.findUnique({
             where: { phoneNumberId },
             include: { empresa: true }
@@ -118,14 +89,11 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         }
         const empresaId = cuenta.empresaId
 
-        // Conversación por empresa + wa_id del cliente
-        let conversation = await prisma.conversation.findFirst({
-            where: { phone: from, empresaId }
-        })
-
+        // Conversación
+        let conversation = await prisma.conversation.findFirst({ where: { phone: fromWa, empresaId } })
         if (!conversation) {
             conversation = await prisma.conversation.create({
-                data: { phone: from, estado: ConversationEstado.pendiente, empresaId }
+                data: { phone: fromWa, estado: ConversationEstado.pendiente, empresaId }
             })
         } else if (conversation.estado === ConversationEstado.cerrado) {
             await prisma.conversation.update({
@@ -135,7 +103,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversation.estado = ConversationEstado.pendiente
         }
 
-        // Guardar ENTRANTE real (cliente)
+        // Guardar ENTRANTE (cliente)
         await prisma.message.create({
             data: {
                 conversationId: conversation.id,
@@ -146,7 +114,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         })
 
         // Emitir a frontend
-        const io = req.app.get('io')
+        const io: any = req.app.get('io')
         io?.emit?.('nuevo_mensaje', {
             conversationId: conversation.id,
             from: 'client',
@@ -157,26 +125,41 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             estado: conversation.estado
         })
 
-        // IA responde (opcional). Si quieres que la IA también ENVÍE por WA:
-        const result = await handleIAReply(conversation.id, contenido)
-
+        // 3) IA → RESPUESTA (guard anti-duplicados)
+        const result: any = await handleIAReply(conversation.id, contenido)
         if (result?.mensaje) {
+            const yaExiste = await prisma.message.findFirst({
+                where: {
+                    conversationId: conversation.id,
+                    from: MessageFrom.bot,
+                    contenido: result.mensaje,
+                    timestamp: { gte: new Date(Date.now() - 15_000) }
+                }
+            })
+            if (yaExiste) {
+                console.warn('[BOT] Evitado duplicado por guard (mensaje idéntico reciente).')
+                return res.status(200).json({ success: true, deduped: true })
+            }
+
             try {
-                // ✅ Enviar por 24h vs plantilla (no sandbox)
-                await sendOutboundMessage({
+                const resp = await sendOutboundMessage({
                     conversationId: conversation.id,
                     empresaId,
                     to: conversation.phone,
                     body: result.mensaje
                 })
 
-                // Persistir salida del bot
-                await prisma.message.create({
+                // ← usa el wamid retornado por el service (si lo quieres guardar luego)
+                const outboundId: string | null = resp?.outboundId ?? null
+
+                const creado = await prisma.message.create({
                     data: {
                         conversationId: conversation.id,
                         from: MessageFrom.bot,
                         contenido: result.mensaje,
                         timestamp: new Date()
+                        // externalId: outboundId || undefined,        // habilítalo si agregas la columna
+                        // inReplyToExternalId: inboundId || undefined // habilítalo si agregas la columna
                     }
                 })
 
@@ -184,18 +167,23 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     conversationId: conversation.id,
                     from: 'bot',
                     contenido: result.mensaje,
-                    timestamp: new Date().toISOString(),
+                    timestamp: creado.timestamp.toISOString(),
                     estado: result.estado
+                })
+
+                await prisma.conversation.update({
+                    where: { id: conversation.id },
+                    data: { estado: ConversationEstado.respondido }
                 })
             } catch (e: any) {
                 console.error('[IA->WA] Error enviando respuesta:', e?.response?.data || e.message)
             }
         }
 
-        res.status(200).json({ success: true })
+        return res.status(200).json({ success: true })
     } catch (error) {
         console.error('[receiveWhatsappMessage] Error:', error)
-        res.status(500).json({ error: 'Error al recibir mensaje' })
+        return res.status(500).json({ error: 'Error al recibir mensaje' })
     }
 }
 

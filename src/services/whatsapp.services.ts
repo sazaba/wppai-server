@@ -13,6 +13,17 @@ type SendTemplateArgs = {
     variables?: string[]
 }
 
+type OutboundResult = {
+    type: 'text' | 'template'
+    data: any
+    outboundId: string | null // wamid retornado por Graph
+}
+
+const http = axios.create({
+    timeout: 12000,
+    headers: { 'Content-Type': 'application/json' }
+})
+
 export async function getWhatsappCreds(empresaId: number) {
     const acc = await prisma.whatsappAccount.findUnique({ where: { empresaId } })
     if (!acc?.accessToken || !acc?.phoneNumberId) {
@@ -21,38 +32,29 @@ export async function getWhatsappCreds(empresaId: number) {
     return { accessToken: acc.accessToken, phoneNumberId: acc.phoneNumberId }
 }
 
-export async function sendText({ empresaId, to, body }: SendTextArgs) {
+export async function sendText({ empresaId, to, body }: SendTextArgs): Promise<OutboundResult> {
     const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
     const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
     const payload = { messaging_product: 'whatsapp', to, type: 'text', text: { body } }
 
-    const { data } = await axios
-        .post(url, payload, {
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            }
-        })
-        .catch((e) => {
-            console.error('[WA sendText] Error:', e?.response?.data || e.message)
-            throw e
-        })
-
-    return data
+    try {
+        const { data } = await http.post(url, payload, { headers: { Authorization: `Bearer ${accessToken}` } })
+        const outboundId = data?.messages?.[0]?.id ?? null
+        return { type: 'text', data, outboundId }
+    } catch (e: any) {
+        console.error('[WA sendText] Error:', e?.response?.data || e.message)
+        throw e
+    }
 }
 
 export async function sendTemplate({
-    empresaId,
-    to,
-    templateName,
-    templateLang,
-    variables = []
-}: SendTemplateArgs) {
+    empresaId, to, templateName, templateLang, variables = []
+}: SendTemplateArgs): Promise<OutboundResult> {
     const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
     const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
 
     const components =
-        variables.length > 0
+        variables.length
             ? [{ type: 'body', parameters: variables.map((t) => ({ type: 'text', text: t })) }]
             : undefined
 
@@ -67,32 +69,32 @@ export async function sendTemplate({
         }
     }
 
-    const { data } = await axios
-        .post(url, payload, {
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            }
-        })
-        .catch((e) => {
-            console.error('[WA sendTemplate] Error:', e?.response?.data || e.message)
-            throw e
-        })
-
-    return data
+    try {
+        const { data } = await http.post(url, payload, { headers: { Authorization: `Bearer ${accessToken}` } })
+        const outboundId = data?.messages?.[0]?.id ?? null
+        return { type: 'template', data, outboundId }
+    } catch (e: any) {
+        console.error('[WA sendTemplate] Error:', e?.response?.data || e.message)
+        throw e
+    }
 }
 
+/**
+ * Envío inteligente según ventana de 24h.
+ * - Dentro de 24h: texto libre (requiere "body")
+ * - Fuera de 24h: lanza 409 para que el caller decida plantilla
+ * - Si se pasa `forceTemplate`, envía plantilla siempre
+ */
 export async function sendOutboundMessage(args: {
     conversationId: number
     empresaId: number
     to: string
     body?: string
-    /** Forzar envío de plantilla (necesario si está fuera de 24h) */
     forceTemplate?: { name: string; lang: string; variables?: string[] }
-}) {
+}): Promise<OutboundResult> {
     const { conversationId, empresaId, to, body, forceTemplate } = args
 
-    // Último mensaje entrante (cliente) para validar 24 h
+    // Último inbound del cliente para evaluar 24 horas
     const lastInbound = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.client },
         orderBy: { timestamp: 'desc' }
@@ -102,9 +104,8 @@ export async function sendOutboundMessage(args: {
         ? Date.now() - new Date(lastInbound.timestamp).getTime() <= 24 * 60 * 60 * 1000
         : false
 
-    // Si se fuerza plantilla, siempre se puede enviar (dentro o fuera de 24h)
     if (forceTemplate) {
-        return await sendTemplate({
+        return sendTemplate({
             empresaId,
             to,
             templateName: forceTemplate.name,
@@ -113,17 +114,15 @@ export async function sendOutboundMessage(args: {
         })
     }
 
-    // Dentro de 24h: permitir texto libre si hay body
     if (within24h) {
         if (!body || body.trim() === '') {
             const err: any = new Error('EMPTY_BODY_WITHIN_24H')
             err.status = 400
             throw err
         }
-        return await sendText({ empresaId, to, body })
+        return sendText({ empresaId, to, body })
     }
 
-    // Fuera de 24h y sin plantilla: bloquear
     const err: any = new Error('OUT_OF_24H_WINDOW')
     err.status = 409
     throw err
