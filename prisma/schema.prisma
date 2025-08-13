@@ -59,9 +59,9 @@ model Empresa {
   estado Estado @default(inactivo)
 
   // ✅ Control de prueba gratuita
-  trialStart        DateTime? // Fecha en la que empieza la prueba
-  trialEnd          DateTime? // Fecha en la que termina la prueba
-  conversationsUsed Int       @default(0) // Contador mensual de conversaciones usadas
+  trialStart        DateTime?
+  trialEnd          DateTime?
+  conversationsUsed Int       @default(0)
 
   usuarios         Usuario[]
   configuraciones  BusinessConfig[]
@@ -124,25 +124,26 @@ model WhatsappAccount {
   id                 Int      @id @default(autoincrement())
   phoneNumberId      String   @unique @db.VarChar(64)
   wabaId             String   @db.VarChar(64)
-  businessId         String   @db.VarChar(64)
-  accessToken        String   @db.Text // ⬅️ clave: ahora TEXT, no VARCHAR
-  displayPhoneNumber String   @db.VarChar(32)
+  businessId         String?  @db.VarChar(64) // ← ahora opcional
+  accessToken        String   @db.Text // ← tokens largos
+  displayPhoneNumber String?  @db.VarChar(32) // ← ahora opcional
   empresaId          Int      @unique
   empresa            Empresa  @relation(fields: [empresaId], references: [id])
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
+  @@index([wabaId])
   @@map("whatsappaccount")
 }
 
 model MessageTemplate {
   id        Int      @id @default(autoincrement())
-  nombre    String   @db.VarChar(100) // Nombre interno (ej: recordatorio_cita)
-  idioma    String   @db.VarChar(10) // Código de idioma (ej: es, en)
-  categoria String   @db.VarChar(50) // ALERT_UPDATE, MARKETING, TRANSACTIONAL
-  cuerpo    String   @db.Text // Contenido del mensaje con variables {{1}}, {{2}}
-  estado    String   @default("pendiente") // pendiente, aprobado, rechazado
-  variables Int      @default(0) // Número de variables dinámicas ({{1}}, {{2}}, etc.)
+  nombre    String   @db.VarChar(100)
+  idioma    String   @db.VarChar(10)
+  categoria String   @db.VarChar(50)
+  cuerpo    String   @db.Text
+  estado    String   @default("pendiente")
+  variables Int      @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

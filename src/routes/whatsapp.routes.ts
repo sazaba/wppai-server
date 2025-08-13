@@ -8,13 +8,12 @@ import {
     eliminarWhatsappAccount,
 
     // cloud api
-    registrarNumero,
+
     enviarPrueba,
     infoNumero,
 
     // utilidades
-    requestCode,
-    verifyCode,
+
     debugToken,
     health,
 
@@ -31,8 +30,7 @@ router.delete('/eliminar', verificarJWT, eliminarWhatsappAccount)
 
 
 /* ===== Cloud API ===== */
-// Registrar número (si PIN habilitado, incluir { pin })
-router.post('/registrar', verificarJWT, registrarNumero)
+
 
 // Enviar mensaje de texto de prueba (dentro de 24h o si ya hay sesión)
 router.post('/enviar-prueba', verificarJWT, enviarPrueba)
@@ -43,11 +41,7 @@ router.get('/numero/:phoneNumberId', verificarJWT, infoNumero)
 
 
 /* ===== Utilidades ===== */
-// Solicitar código de verificación (SMS/VOICE)
-router.post('/request-code', verificarJWT, requestCode)
 
-// Verificar el código recibido
-router.post('/verify-code', verificarJWT, verifyCode)
 
 // Depurar token guardado en BD con {APP_ID}|{APP_SECRET}
 router.get('/debug-token', verificarJWT, debugToken)

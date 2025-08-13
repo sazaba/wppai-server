@@ -50,8 +50,8 @@ export const vincular = async (req: Request, res: Response) => {
 
         const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
 
-        if (!accessToken || !phoneNumberId || !wabaId || !businessId || !displayPhoneNumber) {
-            return res.status(400).json({ ok: false, error: 'Faltan datos requeridos' })
+        if (!accessToken || !phoneNumberId || !wabaId) {
+            return res.status(400).json({ ok: false, error: 'Faltan datos requeridos: accessToken, phoneNumberId, wabaId' })
         }
 
         const cuenta = await prisma.whatsappAccount.upsert({
@@ -110,105 +110,11 @@ export const eliminarWhatsappAccount = async (req: Request, res: Response) => {
 }
 
 /* =============================================================================
- * CLOUD API – Registro / Envío / Consulta
+ * CLOUD API – Envío / Consulta (mínimo para MVP)
  * ========================================================================== */
 
 /**
- * POST /api/whatsapp/registrar
- * Completa el registro del número (si Meta exige PIN)
- */
-export const registrarNumero = async (req: Request, res: Response) => {
-    try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-        const { phoneNumberId, pin } = req.body
-        if (!phoneNumberId) return res.status(400).json({ ok: false, error: 'phoneNumberId requerido' })
-
-        const accessToken = await getAccessToken(empresaId)
-        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/register`
-
-        const payload: any = { messaging_product: 'whatsapp' }
-        if (pin && String(pin).length === 6) payload.pin = String(pin)
-
-        const { data } = await axios.post(url, payload, {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        })
-        return res.json({ ok: true, data })
-    } catch (err: any) {
-        logMetaError('registrarNumero', err)
-        const m = err?.response?.data?.error?.message || ''
-        const c = err?.response?.data?.error?.code
-        if (c === 100 && /pin/i.test(m)) {
-            return res.status(400).json({
-                ok: false,
-                error: {
-                    message: 'Meta exige PIN de 6 dígitos para registrar este número.',
-                    code: 100,
-                    details: err?.response?.data,
-                },
-            })
-        }
-        return res.status(400).json(metaError(err))
-    }
-}
-
-/**
- * POST /api/whatsapp/request-code  (SMS/VOICE)
- */
-export const requestCode = async (req: Request, res: Response) => {
-    try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-        const { phoneNumberId, method = 'SMS', locale = 'es_CO' } = req.body
-        if (!phoneNumberId) return res.status(400).json({ ok: false, error: 'phoneNumberId requerido' })
-
-        const accessToken = await getAccessToken(empresaId)
-        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/request_code`
-
-        const { data } = await axios.post(
-            url,
-            { method, locale },
-            { headers: { Authorization: `Bearer ${accessToken}` } },
-        )
-        return res.json({ ok: true, data })
-    } catch (err: any) {
-        logMetaError('requestCode', err)
-        return res.status(400).json(metaError(err))
-    }
-}
-
-/**
- * POST /api/whatsapp/verify-code
- */
-export const verifyCode = async (req: Request, res: Response) => {
-    try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-        const { phoneNumberId, code } = req.body
-        if (!phoneNumberId || !code) {
-            return res.status(400).json({ ok: false, error: 'phoneNumberId y code requeridos' })
-        }
-
-        const accessToken = await getAccessToken(empresaId)
-        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/verify_code`
-
-        const { data } = await axios.post(
-            url,
-            { code: String(code) },
-            { headers: { Authorization: `Bearer ${accessToken}` } },
-        )
-        return res.json({ ok: true, data })
-    } catch (err: any) {
-        logMetaError('verifyCode', err)
-        return res.status(400).json(metaError(err))
-    }
-}
-
-/**
- * POST /api/whatsapp/enviar-prueba  (texto)
+ * POST /api/whatsapp/enviar-prueba  (texto simple)
  */
 export const enviarPrueba = async (req: Request, res: Response) => {
     try {
@@ -250,7 +156,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
                 ok: false,
                 error: {
                     message:
-                        'El número no está registrado en Cloud API: completa request_code → verify_code → register (con PIN si aplica).',
+                        'El número no está registrado en Cloud API: registra/valida el número desde Meta (no usamos registro manual en el MVP).',
                     code,
                     details: err?.response?.data,
                 },
@@ -288,7 +194,7 @@ export const infoNumero = async (req: Request, res: Response) => {
 }
 
 /* =============================================================================
- * Utilidades mínimas
+ * Utilidades mínimas (soporte)
  * ========================================================================== */
 
 export const debugToken = async (req: Request, res: Response) => {
