@@ -5,7 +5,8 @@ import prisma from '../lib/prisma'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
 
-/* ===================== Helpers de error/log ===================== */
+/* ===================== Helpers ===================== */
+
 function metaError(err: any) {
     const e = err?.response?.data?.error || err?.response?.data || err
     return {
@@ -15,7 +16,7 @@ function metaError(err: any) {
             type: e?.type,
             code: e?.code,
             error_subcode: e?.error_subcode,
-            details: e, // cuerpo completo para inspección en frontend
+            details: e,
         },
     }
 }
@@ -25,7 +26,6 @@ function logMetaError(tag: string, err: any) {
     console.error(`[${tag}] Meta error:`, JSON.stringify(e, null, 2))
 }
 
-/** Helper: obtiene el accessToken guardado para la empresa */
 async function getAccessToken(empresaId: number) {
     const acc = await prisma.whatsappAccount.findUnique({
         where: { empresaId },
@@ -35,17 +35,21 @@ async function getAccessToken(empresaId: number) {
     return acc.accessToken
 }
 
-/* =========================================================================================
- * EXISTENTES
- * =======================================================================================*/
+/* =============================================================================
+ * CONEXIÓN (flujo único)
+ * ========================================================================== */
 
-// POST /api/whatsapp/conectar
-export const guardarWhatsappAccount = async (req: Request, res: Response) => {
+/**
+ * POST /api/whatsapp/vincular
+ * Guarda la selección hecha en el callback (token de usuario OAuth + WABA/phone elegidos)
+ */
+export const vincular = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
         const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
+
         if (!accessToken || !phoneNumberId || !wabaId || !businessId || !displayPhoneNumber) {
             return res.status(400).json({ ok: false, error: 'Faltan datos requeridos' })
         }
@@ -58,12 +62,15 @@ export const guardarWhatsappAccount = async (req: Request, res: Response) => {
 
         return res.json({ ok: true, cuenta })
     } catch (err) {
-        console.error('[guardarWhatsappAccount] error:', err)
+        console.error('[vincular] error:', err)
         return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
     }
 }
 
-// GET /api/whatsapp/estado
+/**
+ * GET /api/whatsapp/estado
+ * Devuelve si la empresa tiene un número conectado y los IDs guardados
+ */
 export const estadoWhatsappAccount = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -85,7 +92,10 @@ export const estadoWhatsappAccount = async (req: Request, res: Response) => {
     }
 }
 
-// DELETE /api/whatsapp/eliminar
+/**
+ * DELETE /api/whatsapp/eliminar
+ * Borra la conexión (desvincula el número de la empresa en tu BD)
+ */
 export const eliminarWhatsappAccount = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -99,113 +109,14 @@ export const eliminarWhatsappAccount = async (req: Request, res: Response) => {
     }
 }
 
+/* =============================================================================
+ * CLOUD API – Registro / Envío / Consulta
+ * ========================================================================== */
+
 /**
- * POST /api/whatsapp/actualizar-datos  (requiere business_management)
- * - Corrige uso de /me?fields=business (singular para System User)
- * - Valida que wabaId y phoneNumberId realmente pertenezcan a ese Business/WABA
- * - Permite forzar wabaId/phoneNumberId vía body
+ * POST /api/whatsapp/registrar
+ * Completa el registro del número (si Meta exige PIN)
  */
-export const actualizarDatosWhatsapp = async (req: Request, res: Response) => {
-    try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-        const cuenta = await prisma.whatsappAccount.findUnique({ where: { empresaId } })
-        if (!cuenta) return res.status(404).json({ ok: false, error: 'No hay conexión de WhatsApp para esta empresa' })
-
-        const accessToken = cuenta.accessToken
-
-        // 1) Obtener el Business del token (System User)
-        const meResp = await axios.get(`https://graph.facebook.com/${FB_VERSION}/me`, {
-            params: { fields: 'id,name,business', access_token: accessToken },
-        })
-        const businessId: string | undefined = meResp.data?.business?.id
-        if (!businessId) {
-            return res.status(400).json({ ok: false, error: 'El token no está vinculado a un Business (System User sin business)' })
-        }
-
-        // 2) WABAs pertenecientes al Business
-        const wabaResp = await axios.get(
-            `https://graph.facebook.com/${FB_VERSION}/${businessId}/owned_whatsapp_business_accounts`,
-            { params: { fields: 'id,name', access_token: accessToken } },
-        )
-        const wabas: Array<{ id: string; name?: string }> = wabaResp.data?.data || []
-        if (wabas.length === 0) return res.status(400).json({ ok: false, error: `El Business ${businessId} no posee WABAs` })
-
-        // 3) Elegir WABA: prioriza el enviado por body, sino el ya guardado, sino el primero
-        const desiredWabaId: string =
-            req.body?.wabaId || cuenta.wabaId || wabas[0].id
-
-        const waba = wabas.find(w => String(w.id) === String(desiredWabaId))
-        if (!waba) {
-            return res.status(400).json({
-                ok: false,
-                error: `El WABA ${desiredWabaId} no pertenece al Business del token (${businessId})`,
-            })
-        }
-
-        // 4) Listar números del WABA y validar phoneNumberId
-        const phoneResp = await axios.get(
-            `https://graph.facebook.com/${FB_VERSION}/${desiredWabaId}/phone_numbers`,
-            { params: { fields: 'id,display_phone_number,wa_id,quality_rating', access_token: accessToken } },
-        )
-        const phones: Array<{ id: string; display_phone_number: string; wa_id?: string }> = phoneResp.data?.data || []
-        if (phones.length === 0) return res.status(400).json({ ok: false, error: `El WABA ${desiredWabaId} no tiene números` })
-
-        // Elegir número: prioriza body, sino el ya guardado, sino el primero
-        const desiredPhoneId: string =
-            req.body?.phoneNumberId || cuenta.phoneNumberId || phones[0].id
-
-        const phone = phones.find(p => String(p.id) === String(desiredPhoneId))
-        if (!phone) {
-            return res.status(400).json({
-                ok: false,
-                error: `El phoneNumberId ${desiredPhoneId} no pertenece al WABA ${desiredWabaId}`,
-            })
-        }
-
-        // (doble verificación) ficha directa del número
-        const pnInfo = await axios.get(
-            `https://graph.facebook.com/${FB_VERSION}/${desiredPhoneId}`,
-            { params: { fields: 'id,display_phone_number,wa_id,account_mode', access_token: accessToken } },
-        )
-        const wa_id = pnInfo.data?.wa_id
-        if (wa_id && String(wa_id) !== String(desiredWabaId)) {
-            return res.status(400).json({
-                ok: false,
-                error: `El phone_number_id ${desiredPhoneId} pertenece a WABA ${wa_id}, no a ${desiredWabaId}`,
-            })
-        }
-
-        await prisma.whatsappAccount.update({
-            where: { empresaId },
-            data: {
-                businessId,
-                wabaId: String(desiredWabaId),
-                phoneNumberId: String(desiredPhoneId),
-                displayPhoneNumber: pnInfo.data?.display_phone_number || phone.display_phone_number,
-            },
-        })
-
-        return res.json({
-            ok: true,
-            mensaje: 'Datos de WhatsApp actualizados correctamente',
-            businessId,
-            wabaId: String(desiredWabaId),
-            phoneNumberId: String(desiredPhoneId),
-            displayPhoneNumber: pnInfo.data?.display_phone_number || phone.display_phone_number,
-        })
-    } catch (err: any) {
-        logMetaError('actualizarDatosWhatsapp', err)
-        return res.status(500).json(metaError(err))
-    }
-}
-
-/* =========================================================================================
- * CLOUD API – Registro / Envío / Utilidades
- * =======================================================================================*/
-
-// POST /api/whatsapp/registrar
 export const registrarNumero = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -226,20 +137,25 @@ export const registrarNumero = async (req: Request, res: Response) => {
         return res.json({ ok: true, data })
     } catch (err: any) {
         logMetaError('registrarNumero', err)
-        // Si pin es requerido, devuelve mensaje más claro
         const m = err?.response?.data?.error?.message || ''
         const c = err?.response?.data?.error?.code
         if (c === 100 && /pin/i.test(m)) {
             return res.status(400).json({
                 ok: false,
-                error: { message: 'Meta exige PIN de 6 dígitos para registrar este número.', code: 100, details: err?.response?.data },
+                error: {
+                    message: 'Meta exige PIN de 6 dígitos para registrar este número.',
+                    code: 100,
+                    details: err?.response?.data,
+                },
             })
         }
         return res.status(400).json(metaError(err))
     }
 }
 
-// POST /api/whatsapp/request-code  (SMS/VOICE)
+/**
+ * POST /api/whatsapp/request-code  (SMS/VOICE)
+ */
 export const requestCode = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -263,14 +179,18 @@ export const requestCode = async (req: Request, res: Response) => {
     }
 }
 
-// POST /api/whatsapp/verify-code
+/**
+ * POST /api/whatsapp/verify-code
+ */
 export const verifyCode = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
         const { phoneNumberId, code } = req.body
-        if (!phoneNumberId || !code) return res.status(400).json({ ok: false, error: 'phoneNumberId y code requeridos' })
+        if (!phoneNumberId || !code) {
+            return res.status(400).json({ ok: false, error: 'phoneNumberId y code requeridos' })
+        }
 
         const accessToken = await getAccessToken(empresaId)
         const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/verify_code`
@@ -287,7 +207,9 @@ export const verifyCode = async (req: Request, res: Response) => {
     }
 }
 
-// POST /api/whatsapp/enviar-prueba  (texto libre)
+/**
+ * POST /api/whatsapp/enviar-prueba  (texto)
+ */
 export const enviarPrueba = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -299,11 +221,9 @@ export const enviarPrueba = async (req: Request, res: Response) => {
         }
 
         const accessToken = await getAccessToken(empresaId)
-        // Cloud API espera E.164 sin "+"
         const toSanitized = String(to).replace(/\D+/g, '')
-        console.log('[enviarPrueba] phoneNumberId:', phoneNumberId, 'to:', toSanitized, 'bodyLen:', String(body).length)
-
         const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
+
         const { data } = await axios.post(
             url,
             { messaging_product: 'whatsapp', to: toSanitized, type: 'text', text: { body } },
@@ -313,28 +233,37 @@ export const enviarPrueba = async (req: Request, res: Response) => {
         return res.json({ ok: true, data })
     } catch (err: any) {
         logMetaError('enviarPrueba', err)
-        // Diagnósticos comunes
         const code = err?.response?.data?.error?.code
         const msg = err?.response?.data?.error?.message || ''
-        // Ventana 24h / requiere plantilla
         if (/24|template|message template|HSM|outside the 24/i.test(msg)) {
             return res.status(400).json({
                 ok: false,
-                error: { message: 'El usuario está fuera de la ventana de 24h: usa una plantilla aprobada.', code, details: err?.response?.data },
+                error: {
+                    message: 'El usuario está fuera de la ventana de 24h: usa una plantilla aprobada.',
+                    code,
+                    details: err?.response?.data,
+                },
             })
         }
-        // Número no registrado
         if (/not registered|phone number is not registered/i.test(msg)) {
             return res.status(400).json({
                 ok: false,
-                error: { message: 'El número no está registrado en Cloud API: completa request_code → verify_code → register (con PIN si aplica).', code, details: err?.response?.data },
+                error: {
+                    message:
+                        'El número no está registrado en Cloud API: completa request_code → verify_code → register (con PIN si aplica).',
+                    code,
+                    details: err?.response?.data,
+                },
             })
         }
         return res.status(400).json(metaError(err))
     }
 }
 
-// GET /api/whatsapp/numero/:phoneNumberId
+/**
+ * GET /api/whatsapp/numero/:phoneNumberId
+ * Ficha del número
+ */
 export const infoNumero = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -345,7 +274,10 @@ export const infoNumero = async (req: Request, res: Response) => {
 
         const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}`
         const { data } = await axios.get(url, {
-            params: { fields: 'display_phone_number,verified_name,name_status,wa_id,account_mode', access_token: accessToken },
+            params: {
+                fields: 'display_phone_number,verified_name,name_status,wa_id,account_mode',
+                access_token: accessToken,
+            },
         })
 
         return res.json({ ok: true, data })
@@ -355,41 +287,10 @@ export const infoNumero = async (req: Request, res: Response) => {
     }
 }
 
-// POST /api/whatsapp/vincular-manual
-export const vincularManual = async (req: Request, res: Response) => {
-    try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+/* =============================================================================
+ * Utilidades mínimas
+ * ========================================================================== */
 
-        const { accessToken, wabaId, phoneNumberId, displayPhoneNumber, businessId } = req.body
-        if (!accessToken) return res.status(400).json({ ok: false, error: 'accessToken requerido' })
-
-        const actual = await prisma.whatsappAccount.findUnique({ where: { empresaId } })
-
-        const update: any = {
-            accessToken,
-            wabaId: wabaId ?? actual?.wabaId ?? '',
-            phoneNumberId: phoneNumberId ?? actual?.phoneNumberId ?? '',
-            displayPhoneNumber: displayPhoneNumber ?? actual?.displayPhoneNumber ?? '',
-            businessId: businessId ?? actual?.businessId ?? 'unknown',
-        }
-
-        const cuenta = await prisma.whatsappAccount.upsert({
-            where: { empresaId },
-            update,
-            create: { empresaId, ...update },
-        })
-
-        return res.json({ ok: true, cuenta })
-    } catch (err) {
-        console.error('[vincularManual] error:', err)
-        return res.status(500).json({ ok: false, error: 'Error al guardar datos de WhatsApp' })
-    }
-}
-
-/* ===================== Utilidades de debug & health ===================== */
-
-// GET /api/whatsapp/debug-token  (debug del token guardado en BD)
 export const debugToken = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -408,44 +309,6 @@ export const debugToken = async (req: Request, res: Response) => {
     }
 }
 
-// POST /api/whatsapp/debug-token-inline  (opcional: debug de un token pegado en body)
-export const debugTokenInline = async (req: Request, res: Response) => {
-    try {
-        const { input_token, expected_waba_id } = req.body as { input_token: string; expected_waba_id?: string }
-        if (!input_token) return res.status(400).json({ ok: false, error: 'Falta input_token' })
-
-        const APP_ID = process.env.META_APP_ID
-        const APP_SECRET = process.env.META_APP_SECRET
-        if (!APP_ID || !APP_SECRET) return res.status(500).json({ ok: false, error: 'Faltan META_APP_ID / META_APP_SECRET' })
-
-        const appAccessToken = `${APP_ID}|${APP_SECRET}`
-        const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/debug_token`, {
-            params: { input_token, access_token: appAccessToken },
-        })
-
-        const gs = (data?.data?.granular_scopes || []) as Array<{ scope: string; target_ids?: string[] }>
-        const wabaTargets = gs
-            .filter(g => g.scope.startsWith('whatsapp_business_'))
-            .flatMap(g => g.target_ids || [])
-            .filter((v, i, a) => a.indexOf(v) === i)
-
-        return res.json({
-            ok: true,
-            app_id: data?.data?.app_id,
-            is_valid: data?.data?.is_valid,
-            scopes: data?.data?.scopes,
-            granular_scopes: gs,
-            waba_ids: wabaTargets,
-            matches_expected_waba: expected_waba_id ? wabaTargets.includes(String(expected_waba_id)) : undefined,
-            raw: data,
-        })
-    } catch (err) {
-        logMetaError('debugTokenInline', err)
-        return res.status(400).json(metaError(err))
-    }
-}
-
-// GET /api/whatsapp/health
 export const health = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
