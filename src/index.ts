@@ -88,15 +88,33 @@ app.use((req, _res, _next) => {
 
 
 
+
 // 🏠 Ruta raíz
 app.get('/', (req, res) => {
     res.send('🚀 Backend de Chat IA corriendo correctamente')
 })
 
-
+function printRoutes(appOrRouter: any, prefix = '') {
+    const stack = appOrRouter.stack || []
+    for (const layer of stack) {
+        if (layer.route && layer.route.path) {
+            const path = prefix + layer.route.path
+            const methods = Object.keys(layer.route.methods).join(',').toUpperCase()
+            console.log(`➡️  ${methods.padEnd(6)} ${path}`)
+        } else if (layer.name === 'router' && layer.handle.stack) {
+            // subrouter con "mountpath"
+            const subPrefix = prefix + (layer.regexp?.fast_slash ? '' : (layer.regexp?.source?.replace('^\\', '/').split('\\/?(?=\\/|$)')[0] || ''))
+            printRoutes(layer.handle, subPrefix)
+        }
+    }
+}
 
 // 🟢 Iniciar servidor
 const PORT = process.env.PORT || 4000
 server.listen(PORT, () => {
     console.log(`✅ API escuchando en http://localhost:${PORT}`)
+    console.log('🧭 Rutas registradas:')
+    // imprime todas las rutas montadas
+    // @ts-ignore
+    printRoutes((app as any)._router)
 })

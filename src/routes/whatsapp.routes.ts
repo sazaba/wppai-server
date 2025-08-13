@@ -1,7 +1,8 @@
-// src/routes/whatsapp.routes.ts
 import { Router } from 'express'
 import { verificarJWT } from '../middleware/auth.middleware'
 import {
+    // conexión
+    vincular,
     // existentes
     estadoWhatsappAccount,
     eliminarWhatsappAccount,
@@ -11,49 +12,41 @@ import {
     // utilidades
     debugToken,
     health,
-
 } from '../controllers/whatsapp.controller'
 
 const router = Router()
 
+/**
+ * IMPORTANTE:
+ * Este router debe montarse así:
+ *   app.use('/api/whatsapp', whatsappRoutes)
+ * para que las rutas queden /api/whatsapp/...
+ */
 
+/* ===== Públicas para diagnóstico rápido ===== */
+router.get('/ping', (_req, res) => res.json({ ok: true, from: 'whatsapp.routes', ping: 'pong' }))
+router.get('/health-public', (_req, res) => res.json({ ok: true, msg: 'health (public) online' }))
 
-// públicas para diagnóstico
-router.get('/ping', (_req, res) => res.json({ ok: true, ping: 'pong' }))
-router.get('/whatsapp/health-public', (_req, res) =>
-    res.json({ ok: true, msg: 'health (public) online' })
-)
-
-
+/* ===== Conexión (callback → guardar selección) ===== */
+// POST /api/whatsapp/vincular
+router.post('/vincular', verificarJWT, vincular)
 
 /* ===== Existentes ===== */
-
+// GET    /api/whatsapp/estado
 router.get('/estado', verificarJWT, estadoWhatsappAccount)
+// DELETE /api/whatsapp/eliminar
 router.delete('/eliminar', verificarJWT, eliminarWhatsappAccount)
 
-// 👉 Acepta POST (para el callback) y mantiene PUT por retrocompatibilidad
-
-
 /* ===== Cloud API ===== */
-
-
-// Enviar mensaje de texto de prueba (dentro de 24h o si ya hay sesión)
+// POST   /api/whatsapp/enviar-prueba
 router.post('/enviar-prueba', verificarJWT, enviarPrueba)
-
-// Info básica del número
+// GET    /api/whatsapp/numero/:phoneNumberId
 router.get('/numero/:phoneNumberId', verificarJWT, infoNumero)
 
-
-
 /* ===== Utilidades ===== */
-
-
-// Depurar token guardado en BD con {APP_ID}|{APP_SECRET}
+// GET    /api/whatsapp/debug-token
 router.get('/debug-token', verificarJWT, debugToken)
-
-
-
-// Health check rápido (token length, presencia de phoneNumberId)
+// GET    /api/whatsapp/health
 router.get('/health', verificarJWT, health)
 
 export default router
