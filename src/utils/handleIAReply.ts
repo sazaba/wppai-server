@@ -1,7 +1,7 @@
 import prisma from '../lib/prisma'
 import { shouldEscalateChat } from './shouldEscalate'
 import { openai } from '../lib/openai'
-import { MessageFrom, ConversationEstado } from '@prisma/client'
+import { ConversationEstado } from '@prisma/client'
 
 type IAReplyResult = {
     estado: ConversationEstado
@@ -21,23 +21,10 @@ function normalizarTexto(texto: string): string {
 
 function esRespuestaInvalida(respuesta: string): boolean {
     const prohibidas = [
-        'correo',
-        'email',
-        'teléfono',
-        'llamar',
-        'formulario',
-        'lo siento',
-        'según la información',
-        'de acuerdo a la información',
-        'de acuerdo a los datos',
-        'según el sistema',
-        'lo que tengo',
-        'pondrá en contacto',
-        'me contactará',
-        'no puedo ayudarte',
-        'no puedo procesar',
-        'gracias por tu consulta',
-        'uno de nuestros asesores'
+        'correo', 'email', 'teléfono', 'llamar', 'formulario', 'lo siento',
+        'según la información', 'de acuerdo a la información', 'de acuerdo a los datos',
+        'según el sistema', 'lo que tengo', 'pondrá en contacto', 'me contactará',
+        'no puedo ayudarte', 'no puedo procesar', 'gracias por tu consulta', 'uno de nuestros asesores'
     ]
     const normalizada = normalizarTexto(respuesta)
     return prohibidas.some(p => normalizada.includes(p))
@@ -75,10 +62,8 @@ Responde con frases normales, como si tú fueras parte del equipo humano. No emp
 
 Ejemplo:
 ❌ “Según la información proporcionada, atendemos de lunes a viernes...”
-✅ “Atendemos de lunes a viernes de 8:00 a.m. a 5:00 p.m.”
-`
+✅ “Atendemos de lunes a viernes de 8:00 a. m. a 5:00 p. m.”`
 }
-
 
 export const handleIAReply = async (
     chatId: number,
@@ -90,40 +75,23 @@ export const handleIAReply = async (
         return null
     }
 
-    const conversacion = await prisma.conversation.findUnique({
-        where: { id: chatId }
-    })
-
+    const conversacion = await prisma.conversation.findUnique({ where: { id: chatId } })
     if (!conversacion || conversacion.estado === 'cerrado') {
         console.warn(`[handleIAReply] 🔒 La conversación ${chatId} está cerrada. No se procesará.`)
         return null
     }
 
-    const mensajeEscalamiento = 'Gracias por tu mensaje. En breve uno de nuestros compañeros del equipo te contactará para ayudarte con más detalle.'
+    const mensajeEscalamiento =
+        'Gracias por tu mensaje. En breve uno de nuestros compañeros del equipo te contactará para ayudarte con más detalle.'
 
+    // 1) Reglas previas de escalado (sin escribir DB)
     const motivoInicial = shouldEscalateChat({
         mensaje,
         config,
         iaConfianzaBaja: false,
         intentosFallidos: 0
     })
-
     if (motivoInicial === 'palabra_clave') {
-        console.log('📣 Escalado inmediato por palabra clave')
-
-        await prisma.message.create({
-            data: {
-                conversationId: chatId,
-                contenido: mensajeEscalamiento,
-                from: MessageFrom.bot
-            }
-        })
-
-        await prisma.conversation.update({
-            where: { id: chatId },
-            data: { estado: ConversationEstado.requiere_agente }
-        })
-
         return {
             estado: ConversationEstado.requiere_agente,
             mensaje: mensajeEscalamiento,
@@ -131,12 +99,12 @@ export const handleIAReply = async (
         }
     }
 
+    // 2) Armar historial para el modelo
     const mensajesPrevios = await prisma.message.findMany({
         where: { conversationId: chatId },
         orderBy: { timestamp: 'asc' },
         take: 10
     })
-
     const historial = mensajesPrevios.map((m) => ({
         role: m.from === 'client' ? 'user' : 'assistant',
         content: m.contenido
@@ -152,33 +120,18 @@ export const handleIAReply = async (
             { role: 'user', content: mensaje }
         ],
         temperature: 0.4
-
     } as any)
 
-    const respuestaIA = iaResponse.choices[0].message?.content?.trim() ?? ''
+    const respuestaIA = iaResponse?.choices?.[0]?.message?.content?.trim() ?? ''
     console.log('🧠 Respuesta generada por IA:', respuestaIA)
 
+    // 3) Validaciones de contenido → escalado (sin escribir DB)
     const debeEscalar =
         respuestaIA === mensajeEscalamiento ||
         normalizarTexto(respuestaIA) === normalizarTexto(mensajeEscalamiento) ||
         esRespuestaInvalida(respuestaIA)
 
     if (debeEscalar) {
-        console.log('📣 Escalado automático por respuesta inválida o fallback')
-
-        await prisma.message.create({
-            data: {
-                conversationId: chatId,
-                contenido: mensajeEscalamiento,
-                from: MessageFrom.bot
-            }
-        })
-
-        await prisma.conversation.update({
-            where: { id: chatId },
-            data: { estado: ConversationEstado.requiere_agente }
-        })
-
         return {
             estado: ConversationEstado.requiere_agente,
             mensaje: mensajeEscalamiento,
@@ -186,6 +139,7 @@ export const handleIAReply = async (
         }
     }
 
+    // 4) Reglas finales de escalado
     const iaConfianzaBaja =
         respuestaIA.toLowerCase().includes('no estoy seguro') || respuestaIA.length < 15
 
@@ -197,21 +151,6 @@ export const handleIAReply = async (
     })
 
     if (motivoFinal && motivoFinal !== 'palabra_clave') {
-        console.log(`📣 Escalado por motivo: ${motivoFinal}`)
-
-        await prisma.message.create({
-            data: {
-                conversationId: chatId,
-                contenido: mensajeEscalamiento,
-                from: MessageFrom.bot
-            }
-        })
-
-        await prisma.conversation.update({
-            where: { id: chatId },
-            data: { estado: ConversationEstado.requiere_agente }
-        })
-
         return {
             estado: ConversationEstado.requiere_agente,
             mensaje: mensajeEscalamiento,
@@ -219,19 +158,7 @@ export const handleIAReply = async (
         }
     }
 
-    await prisma.message.create({
-        data: {
-            conversationId: chatId,
-            contenido: respuestaIA,
-            from: MessageFrom.bot
-        }
-    })
-
-    await prisma.conversation.update({
-        where: { id: chatId },
-        data: { estado: ConversationEstado.respondido }
-    })
-
+    // 5) Respuesta final (el controller la guardará y emitirá)
     return {
         estado: ConversationEstado.respondido,
         mensaje: respuestaIA
