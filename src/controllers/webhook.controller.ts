@@ -1,8 +1,9 @@
+// controllers/webhook.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { handleIAReply } from '../utils/handleIAReply'
 import { MessageFrom, ConversationEstado } from '@prisma/client'
-import { sendText } from '../services/whatsapp.services' // usamos texto directo
+import { sendText } from '../services/whatsapp.services' // TEXTO directo
 
 export const receiveWhatsappMessage = async (req: Request, res: Response) => {
     console.log('📩 Webhook recibido:', JSON.stringify(req.body, null, 2))
@@ -12,38 +13,31 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         const change: any = entry?.changes?.[0]
         const value: any = change?.value
 
-        // 1) STATUSES (solo log, sin plantillas)
+        // 1) statuses: solo log (sin plantillas)
         if (value?.statuses?.length) {
             for (const st of value.statuses as any[]) {
-                if (st.status === 'failed') {
-                    const codes = (st.errors || []).map((e: any) => e.code)
-                    console.warn('[WA status][failed]', { recipient: st.recipient_id, codes })
-                    // opcional: emitir evento al frontend para mostrar aviso
-                    // const io: any = req.app.get('io')
-                    // io?.emit?.('wa_policy_error', { waId: st.recipient_id, codes })
-                }
+                const codes = (st.errors || []).map((e: any) => e.code)
+                console.log('[WA status]', { recipient: st.recipient_id, status: st.status, codes })
             }
             return res.status(200).json({ handled: 'statuses' })
         }
 
-        // 2) MENSAJES ENTRANTES REALES
+        // 2) mensaje entrante real
         if (!value?.messages?.[0]) return res.status(200).json({ ignored: true })
 
         const msg: any = value.messages[0]
         const phoneNumberId: string | undefined = value?.metadata?.phone_number_id
         const fromWa: string | undefined = msg.from
-
         const contenido: string =
             msg.text?.body ||
             msg.button?.text ||
             msg.interactive?.list_reply?.title ||
             '[mensaje no soportado]'
-
         const ts: Date = msg.timestamp ? new Date(parseInt(msg.timestamp as string, 10) * 1000) : new Date()
 
         if (!phoneNumberId || !fromWa) return res.status(200).json({ ignored: true })
 
-        // Empresa / cuenta
+        // empresa
         const cuenta = await prisma.whatsappAccount.findUnique({
             where: { phoneNumberId },
             include: { empresa: true }
@@ -54,7 +48,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         }
         const empresaId = cuenta.empresaId
 
-        // Conversación
+        // conversación
         let conversation = await prisma.conversation.findFirst({ where: { phone: fromWa, empresaId } })
         if (!conversation) {
             conversation = await prisma.conversation.create({
@@ -68,7 +62,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversation.estado = ConversationEstado.pendiente
         }
 
-        // Guardar ENTRANTE (cliente)
+        // guardar inbound
         await prisma.message.create({
             data: {
                 conversationId: conversation.id,
@@ -78,7 +72,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             }
         })
 
-        // Emitir a frontend
+        // emitir inbound
         const io: any = req.app.get('io')
         io?.emit?.('nuevo_mensaje', {
             conversationId: conversation.id,
@@ -90,32 +84,23 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             estado: conversation.estado
         })
 
-        // 3) IA → RESPUESTA (dedupe relativo al inbound + envío de texto)
+        // 3) IA → RESPUESTA (SIN guard de duplicado por ahora)
         const result: any = await handleIAReply(conversation.id, contenido)
         if (result?.mensaje) {
-            // ✅ DEDUPE SOLO CONTRA MENSAJES DEL BOT CREADOS DESPUÉS DE ESTE INBOUND
-            const yaExiste = await prisma.message.findFirst({
-                where: {
-                    conversationId: conversation.id,
-                    from: MessageFrom.bot,
-                    contenido: result.mensaje,
-                    // ¡clave!: solo consideramos duplicado si ya hay un bot >= ts (el inbound actual)
-                    timestamp: { gte: ts }
-                }
-            })
-            if (yaExiste) {
-                console.warn('[BOT] Evitado duplicado porque ya respondimos a este inbound.')
-                return res.status(200).json({ success: true, deduped: true })
-            }
-
             try {
-                // TEXTO directo. Si Meta detecta ventana cerrada → lanzará error (131047/470)
+                console.log('[WA TX] Enviando texto →', {
+                    to: conversation.phone,
+                    preview: result.mensaje.slice(0, 80)
+                })
+
                 const respText = await sendText({
                     empresaId,
                     to: conversation.phone,
                     body: result.mensaje
                 })
-                const outboundId: string | null = respText?.outboundId ?? null // por si luego guardas externalId
+
+                const outboundId: string | null = respText?.outboundId ?? null
+                console.log('[WA TX] OK, outboundId:', outboundId)
 
                 const creado = await prisma.message.create({
                     data: {
@@ -123,7 +108,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         from: MessageFrom.bot,
                         contenido: result.mensaje,
                         timestamp: new Date()
-                        // externalId: outboundId || undefined
+                        // externalId: outboundId || undefined   // cuando agregues la columna
                     }
                 })
 
@@ -140,11 +125,12 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     data: { estado: ConversationEstado.respondido }
                 })
             } catch (e: any) {
-                const metaCode = e?.response?.data?.error?.code
-                console.error('[IA->WA] Error al enviar texto:', metaCode, e?.response?.data || e?.message)
+                const meta = e?.response?.data
+                const code = meta?.error?.code
+                console.error('[WA TX] ERROR al enviar texto:', code, meta || e?.message)
 
-                // Opcional: notificar al frontend para que muestre el aviso “sesión de 24h cerrada”
-                // io?.emit?.('wa_policy_error', { conversationId: conversation.id, code: metaCode })
+                // (opcional) Notifica al frontend para mostrar banner de "sesión 24h vencida"
+                // io?.emit?.('wa_policy_error', { conversationId: conversation.id, code })
             }
         }
 
