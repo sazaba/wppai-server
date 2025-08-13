@@ -43,29 +43,150 @@ async function getAccessToken(empresaId: number) {
  * POST /api/whatsapp/vincular
  * Guarda la selección hecha en el callback (token de usuario OAuth + WABA/phone elegidos)
  */
+// export const vincular = async (req: Request, res: Response) => {
+//     try {
+//         const empresaId = (req as any).user?.empresaId
+//         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+
+//         const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
+
+//         if (!accessToken || !phoneNumberId || !wabaId) {
+//             return res.status(400).json({ ok: false, error: 'Faltan datos requeridos: accessToken, phoneNumberId, wabaId' })
+//         }
+
+//         const cuenta = await prisma.whatsappAccount.upsert({
+//             where: { empresaId },
+//             update: { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber },
+//             create: { empresaId, accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber },
+//         })
+//         // Suscribir la app al WABA del cliente
+//         await axios.post(
+//             `https://graph.facebook.com/v20.0/${wabaId}/subscribed_apps`,
+//             {},
+//             { headers: { Authorization: `Bearer ${accessToken}` } }
+//         )
+
+
+//         return res.json({ ok: true, cuenta })
+//     } catch (err) {
+//         console.error('[vincular] error:', err)
+//         return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
+//     }
+// }
+
 export const vincular = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
         const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
-
         if (!accessToken || !phoneNumberId || !wabaId) {
-            return res.status(400).json({ ok: false, error: 'Faltan datos requeridos: accessToken, phoneNumberId, wabaId' })
+            return res.status(400).json({
+                ok: false,
+                error: 'Faltan datos requeridos: accessToken, phoneNumberId, wabaId'
+            })
         }
 
+        // 1) Comprobar permisos del token del usuario
+        const permsResp = await axios.get(
+            `https://graph.facebook.com/${FB_VERSION}/me/permissions`,
+            { params: { access_token: accessToken } }
+        )
+        const granted: string[] = (permsResp.data?.data || [])
+            .filter((p: any) => p.status === 'granted')
+            .map((p: any) => p.permission)
+
+        const need = [
+            'business_management',
+            'whatsapp_business_management',
+            'whatsapp_business_messaging',
+        ]
+        const missing = need.filter(p => !granted.includes(p))
+        if (missing.length) {
+            return res.status(403).json({
+                ok: false,
+                error: `El usuario no otorgó permisos necesarios: ${missing.join(', ')}`
+            })
+        }
+
+        // 2) (Opcional) Convertir a long‑lived token de usuario (si procede)
+        //    Solo funciona si tu app está en Live y el usuario es válido
+        let tokenToStore = accessToken
+        let tokenExpiresAt: Date | null = null
+        try {
+            const ll = await axios.get(`https://graph.facebook.com/${FB_VERSION}/oauth/access_token`, {
+                params: {
+                    grant_type: 'fb_exchange_token',
+                    client_id: process.env.META_APP_ID,
+                    client_secret: process.env.META_APP_SECRET,
+                    fb_exchange_token: accessToken,
+                }
+            })
+            if (ll.data?.access_token) {
+                tokenToStore = ll.data.access_token
+                if (ll.data?.expires_in) {
+                    tokenExpiresAt = new Date(Date.now() + Number(ll.data.expires_in) * 1000)
+                }
+            }
+        } catch (e) {
+            // no es crítico: si falla, guardamos el token corto igualmente
+            console.warn('[vincular] No se pudo extender token a long-lived:', (e as any)?.response?.data || (e as any)?.message)
+        }
+
+        // 3) Suscribir tu app a la WABA del cliente
+        try {
+            await axios.post(
+                `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
+                {},
+                { headers: { Authorization: `Bearer ${accessToken}` } } // usa el token del usuario admin
+            )
+        } catch (e: any) {
+            const msg = e?.response?.data?.error?.message || e?.message
+            // error común si el usuario no es admin de esa WABA/Business
+            return res.status(403).json({
+                ok: false,
+                error: `No pudimos suscribir tu WABA a la app. Asegúrate de ser administrador del negocio/WABA. Detalle: ${msg}`
+            })
+        }
+
+        // 4) Guardar/actualizar en tu BD
         const cuenta = await prisma.whatsappAccount.upsert({
             where: { empresaId },
-            update: { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber },
-            create: { empresaId, accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber },
+            update: {
+                accessToken: tokenToStore,
+                phoneNumberId,
+                wabaId,
+                businessId,
+                displayPhoneNumber,
+                updatedAt: new Date(),
+                // Si añadiste la columna en tu schema:
+                // tokenExpiresAt: tokenExpiresAt || null,
+            },
+            create: {
+                empresaId,
+                accessToken: tokenToStore,
+                phoneNumberId,
+                wabaId,
+                businessId,
+                displayPhoneNumber,
+                // tokenExpiresAt: tokenExpiresAt || null,
+            },
         })
 
         return res.json({ ok: true, cuenta })
     } catch (err) {
-        console.error('[vincular] error:', err)
-        return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
+        const e: any = err;
+        // log más claro sin romper TypeScript
+        console.error('[vincular] error:', e?.response?.data || e?.message || e);
+
+        return res.status(500).json({
+            ok: false,
+            error: 'Error al guardar conexión de WhatsApp'
+        });
     }
 }
+
+
 
 /**
  * GET /api/whatsapp/estado
