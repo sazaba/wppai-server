@@ -1,6 +1,5 @@
 import axios from 'axios'
 import prisma from '../lib/prisma'
-import { MessageFrom } from '@prisma/client'
 
 const FB_VERSION = 'v20.0'
 
@@ -13,7 +12,7 @@ type SendTemplateArgs = {
     variables?: string[]
 }
 
-type OutboundResult = {
+export type OutboundResult = {
     type: 'text' | 'template'
     data: any
     outboundId: string | null // wamid retornado por Graph
@@ -47,6 +46,7 @@ export async function sendText({ empresaId, to, body }: SendTextArgs): Promise<O
     }
 }
 
+/** Queda disponible por si la usas más adelante; NO se usa ahora */
 export async function sendTemplate({
     empresaId, to, templateName, templateLang, variables = []
 }: SendTemplateArgs): Promise<OutboundResult> {
@@ -80,50 +80,20 @@ export async function sendTemplate({
 }
 
 /**
- * Envío inteligente según ventana de 24h.
- * - Dentro de 24h: texto libre (requiere "body")
- * - Fuera de 24h: lanza 409 para que el caller decida plantilla
- * - Si se pasa `forceTemplate`, envía plantilla siempre
+ * Envío simplificado: siempre intenta TEXTO y deja que Meta valide la ventana de 24h.
+ * (Si está fuera, Meta responderá error de política; el controller lo manejará)
  */
 export async function sendOutboundMessage(args: {
-    conversationId: number
+    conversationId: number // mantenemos la firma por compatibilidad (no se usa aquí)
     empresaId: number
     to: string
-    body?: string
-    forceTemplate?: { name: string; lang: string; variables?: string[] }
+    body: string
 }): Promise<OutboundResult> {
-    const { conversationId, empresaId, to, body, forceTemplate } = args
-
-    // Último inbound del cliente para evaluar 24 horas
-    const lastInbound = await prisma.message.findFirst({
-        where: { conversationId, from: MessageFrom.client },
-        orderBy: { timestamp: 'desc' }
-    })
-
-    const within24h = !!lastInbound
-        ? Date.now() - new Date(lastInbound.timestamp).getTime() <= 24 * 60 * 60 * 1000
-        : false
-
-    if (forceTemplate) {
-        return sendTemplate({
-            empresaId,
-            to,
-            templateName: forceTemplate.name,
-            templateLang: forceTemplate.lang,
-            variables: forceTemplate.variables || []
-        })
+    const { empresaId, to, body } = args
+    if (!body?.trim()) {
+        const err: any = new Error('EMPTY_BODY')
+        err.status = 400
+        throw err
     }
-
-    if (within24h) {
-        if (!body || body.trim() === '') {
-            const err: any = new Error('EMPTY_BODY_WITHIN_24H')
-            err.status = 400
-            throw err
-        }
-        return sendText({ empresaId, to, body })
-    }
-
-    const err: any = new Error('OUT_OF_24H_WINDOW')
-    err.status = 409
-    throw err
+    return sendText({ empresaId, to, body })
 }
