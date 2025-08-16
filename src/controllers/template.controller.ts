@@ -8,7 +8,28 @@ import {
 } from '../services/template.service'
 import { getWabaCredsByEmpresa } from '../services/waba-creds'
 
-// ✅ Crear plantilla (DB) y opcionalmente publicar en Meta con ?publicar=true
+// ───────────────────────────────────────────────────────────────────────────────
+// Helper: evita publicar si ya existe name+language en Meta (lanza 409)
+// ───────────────────────────────────────────────────────────────────────────────
+async function ensureTemplateDoesNotExistInMeta(params: {
+    wabaId: string
+    accessToken: string
+    name: string
+    language: string
+}) {
+    const meta = await listTemplatesFromMeta(params.wabaId, params.accessToken)
+    const exists = meta.some(t => t.name === params.name && t.language === params.language)
+    if (exists) {
+        const err: any = new Error('Ya existe una plantilla con ese nombre e idioma en Meta.')
+        err.status = 409
+        err.code = 'DUPLICATE_META_TEMPLATE'
+        throw err
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Crear plantilla (DB) y opcionalmente publicar en Meta con ?publicar=true
+// ───────────────────────────────────────────────────────────────────────────────
 export const crearPlantilla = async (req: Request, res: Response) => {
     try {
         const empresaId = req.user?.empresaId
@@ -21,11 +42,9 @@ export const crearPlantilla = async (req: Request, res: Response) => {
             return res.status(400).json({ error: 'Faltan campos obligatorios' })
         }
 
-        // Contar variables {{n}}
         const matches = cuerpo.match(/{{\d+}}/g)
         const variables = matches ? matches.length : 0
 
-        // Upsert por (empresaId, nombre, idioma) — requiere @@unique([empresaId, nombre, idioma]) en Prisma
         const creada = await prisma.messageTemplate.upsert({
             where: { empresaId_nombre_idioma: { empresaId, nombre, idioma } },
             update: { categoria, cuerpo, variables },
@@ -36,12 +55,15 @@ export const crearPlantilla = async (req: Request, res: Response) => {
             return res.status(201).json(creada)
         }
 
-        // Publicar en Meta
         const { accessToken, wabaId } = await getWabaCredsByEmpresa(empresaId)
+
+        // ⚠️ evita error "Content in This Language Already Exists"
+        await ensureTemplateDoesNotExistInMeta({ wabaId, accessToken, name: nombre, language: idioma })
+
         const created = await createTemplateInMeta(wabaId, accessToken, {
             name: nombre,
-            category: (categoria || '').toUpperCase() as any, // UTILITY | MARKETING | AUTHENTICATION
-            language: idioma, // string simple: 'es', 'es_AR', 'en_US'
+            category: (categoria || '').toUpperCase(),
+            language: idioma,
             bodyText: cuerpo
         })
 
@@ -52,22 +74,29 @@ export const crearPlantilla = async (req: Request, res: Response) => {
 
         return res.status(201).json({ ...creada, meta: created })
     } catch (error: any) {
+        const metaMsg = error?.response?.data?.error?.error_user_msg
+        if (error?.status === 409 || error?.code === 'DUPLICATE_META_TEMPLATE') {
+            return res.status(409).json({ error: 'Ya existe una plantilla con ese nombre e idioma en Meta. Usa otro nombre o idioma.' })
+        }
+        if (metaMsg) return res.status(400).json({ error: metaMsg })
         console.error('❌ Error al crear plantilla:', error?.response?.data || error)
-        return res.status(500).json({ error: error?.response?.data || 'Error interno del servidor' })
+        return res.status(500).json({ error: 'Error interno del servidor' })
     }
 }
 
-// ✅ Listar plantillas: lee Meta (con BODY), sincroniza DB y devuelve desde DB
+// ───────────────────────────────────────────────────────────────────────────────
+// Listar: lee Meta (incluye BODY), sincroniza DB y devuelve desde DB
+// ───────────────────────────────────────────────────────────────────────────────
 export const listarPlantillas = async (req: Request, res: Response) => {
     try {
         const empresaId = req.user?.empresaId
         if (!empresaId) return res.status(401).json({ error: 'Unauthorized' })
 
-        // 1) trae plantillas desde Meta (incluye components → BODY)
         const { accessToken, wabaId } = await getWabaCredsByEmpresa(empresaId)
         const meta = await listTemplatesFromMeta(wabaId, accessToken)
 
-        // 2) sincroniza DB (cuerpo y variables si están disponibles)
+        console.log('[templates] Meta →', meta.map(t => ({ name: t.name, language: t.language, status: t.status, cat: t.category })))
+
         for (const t of meta) {
             let bodyText = ''
             if (Array.isArray(t.components)) {
@@ -96,11 +125,12 @@ export const listarPlantillas = async (req: Request, res: Response) => {
             })
         }
 
-        // 3) devuelve desde DB
         const plantillas = await prisma.messageTemplate.findMany({
             where: { empresaId },
             orderBy: [{ estado: 'asc' }, { createdAt: 'desc' }]
         })
+
+        console.log('[templates] DB →', plantillas.map(p => ({ id: p.id, nombre: p.nombre, idioma: p.idioma, estado: p.estado })))
 
         return res.json(plantillas)
     } catch (error) {
@@ -109,7 +139,7 @@ export const listarPlantillas = async (req: Request, res: Response) => {
     }
 }
 
-// ✅ Obtener una plantilla por ID (DB)
+// ───────────────────────────────────────────────────────────────────────────────
 export const obtenerPlantilla = async (req: Request, res: Response) => {
     try {
         const empresaId = req.user?.empresaId
@@ -126,7 +156,7 @@ export const obtenerPlantilla = async (req: Request, res: Response) => {
     }
 }
 
-// ✅ Eliminar plantilla (DB) y opcionalmente en Meta con ?borrarMeta=true
+// ───────────────────────────────────────────────────────────────────────────────
 export const eliminarPlantilla = async (req: Request, res: Response) => {
     try {
         const empresaId = req.user?.empresaId
@@ -154,7 +184,7 @@ export const eliminarPlantilla = async (req: Request, res: Response) => {
     }
 }
 
-// ✅ Publicar en Meta una plantilla existente (por ID)
+// ───────────────────────────────────────────────────────────────────────────────
 export const enviarPlantillaAMeta = async (req: Request, res: Response) => {
     try {
         const empresaId = req.user?.empresaId
@@ -165,9 +195,13 @@ export const enviarPlantillaAMeta = async (req: Request, res: Response) => {
         if (!plantilla) return res.status(404).json({ error: 'Plantilla no encontrada' })
 
         const { accessToken, wabaId } = await getWabaCredsByEmpresa(empresaId!)
+
+        // ⚠️ evita duplicados en Meta
+        await ensureTemplateDoesNotExistInMeta({ wabaId, accessToken, name: plantilla.nombre, language: plantilla.idioma })
+
         const created = await createTemplateInMeta(wabaId, accessToken, {
             name: plantilla.nombre,
-            category: (plantilla.categoria || '').toUpperCase() as any,
+            category: (plantilla.categoria || '').toUpperCase(),
             language: plantilla.idioma,
             bodyText: plantilla.cuerpo
         })
@@ -179,15 +213,17 @@ export const enviarPlantillaAMeta = async (req: Request, res: Response) => {
 
         return res.json({ mensaje: 'Plantilla enviada correctamente', data: created })
     } catch (error: any) {
-        console.error('❌ Error al enviar plantilla a Meta:', error.response?.data || error)
-        return res.status(400).json({
-            error: 'Meta rechazó la plantilla',
-            details: error.response?.data || error.message
-        })
+        if (error?.status === 409 || error?.code === 'DUPLICATE_META_TEMPLATE') {
+            return res.status(409).json({ error: 'Ya existe una plantilla con ese nombre e idioma en Meta. Usa otro nombre o idioma.' })
+        }
+        const metaMsg = error?.response?.data?.error?.error_user_msg
+        if (metaMsg) return res.status(400).json({ error: metaMsg })
+        console.error('❌ Error al enviar plantilla a Meta:', error?.response?.data || error)
+        return res.status(400).json({ error: 'Meta rechazó la plantilla' })
     }
 }
 
-// ✅ Consultar estado de una plantilla en Meta (por nombre+idioma) y actualizar DB
+// ───────────────────────────────────────────────────────────────────────────────
 export const consultarEstadoPlantilla = async (req: Request, res: Response) => {
     try {
         const empresaId = req.user?.empresaId
@@ -201,10 +237,8 @@ export const consultarEstadoPlantilla = async (req: Request, res: Response) => {
         const { accessToken, wabaId } = await getWabaCredsByEmpresa(empresaId)
         const meta = await listTemplatesFromMeta(wabaId, accessToken)
 
-        const actual = meta.find((t: any) => t.name === plantilla.nombre && t.language === plantilla.idioma)
-        if (!actual) {
-            return res.status(404).json({ error: 'Plantilla no encontrada en Meta' })
-        }
+        const actual = meta.find(t => t.name === plantilla.nombre && t.language === plantilla.idioma)
+        if (!actual) return res.status(404).json({ error: 'Plantilla no encontrada en Meta' })
 
         await prisma.messageTemplate.update({
             where: { id: plantilla.id },
