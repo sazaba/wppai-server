@@ -2,7 +2,10 @@
 import { Request, Response } from 'express'
 import axios from 'axios'
 import prisma from '../lib/prisma'
-import { sendWhatsappMedia as sendMediaSvc } from '../services/whatsapp.services' // ⬅️ NUEVO
+import {
+    sendWhatsappMedia as sendMediaSvc,
+    sendText as sendTextSvc,
+} from '../services/whatsapp.services' // ⬅️ servicio correcto
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
 
@@ -52,7 +55,7 @@ async function templateExistsInMeta(params: {
     const url = `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates`
     const { data } = await axios.get(url, {
         params: { access_token: accessToken, name, limit: 1 },
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json' },
     })
     const list = Array.isArray(data?.data) ? data.data : []
     return list.some((t: any) => t.name === name)
@@ -81,7 +84,9 @@ async function ensureFallbackTemplateInMeta(params: {
         // seguimos e intentamos crear de todos modos
     }
 
-    const url = `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates?access_token=${encodeURIComponent(accessToken)}`
+    const url = `https://graph.facebook.com/${FB_VERSION}/${wabaId}/message_templates?access_token=${encodeURIComponent(
+        accessToken
+    )}`
     const payload = {
         name,
         category: 'MARKETING',
@@ -116,7 +121,7 @@ export const vincular = async (req: Request, res: Response) => {
         // 1) Permisos del usuario
         const perms = await axios.get(`https://graph.facebook.com/${FB_VERSION}/me/permissions`, {
             params: { access_token: accessToken },
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
         })
         const granted: string[] = (perms.data?.data || [])
             .filter((p: any) => p.status === 'granted')
@@ -213,28 +218,34 @@ export const eliminarWhatsappAccount = async (req: Request, res: Response) => {
 
 /**
  * POST /api/whatsapp/enviar-prueba  (texto simple)
+ * body: { phoneNumberId?, to, body, conversationId? }
+ * - Si ya quieres persistir el mensaje, pasa conversationId (opcional).
+ * - Usamos el servicio sendText para que aplique sanitización y (opcional) persistencia.
  */
 export const enviarPrueba = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
-        const { phoneNumberId, to, body } = req.body
-        if (!phoneNumberId || !to || !body) {
-            return res.status(400).json({ ok: false, error: 'phoneNumberId, to y body son requeridos' })
+        const { to, body, conversationId } = req.body as {
+            to: string
+            body: string
+            conversationId?: number
+            phoneNumberId?: string // ignorado aquí: el servicio resuelve con empresaId
+        }
+        if (!to || !body) {
+            return res.status(400).json({ ok: false, error: 'to y body son requeridos' })
         }
 
-        const accessToken = await getAccessToken(empresaId)
         const toSanitized = sanitizePhone(to)
-        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
+        const result = await sendTextSvc({
+            empresaId,
+            to: toSanitized,
+            body,
+            conversationId, // ⬅️ si lo pasas, se guarda en DB (si migraste schema)
+        })
 
-        const { data } = await axios.post(
-            url,
-            { messaging_product: 'whatsapp', to: toSanitized, type: 'text', text: { body } },
-            { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
-        )
-
-        return res.json({ ok: true, data })
+        return res.json({ ok: true, ...result })
     } catch (err: any) {
         logMetaError('enviarPrueba', err)
         const code = err?.response?.data?.error?.code
@@ -265,18 +276,19 @@ export const enviarPrueba = async (req: Request, res: Response) => {
 
 /**
  * POST /api/whatsapp/media  (imagen o video/mp4)
- * body: { to, url, type: 'image' | 'video', caption? }
+ * body: { to, url, type: 'image' | 'video', caption?, conversationId? }
  */
 export const enviarMedia = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
-        const { to, url, type, caption } = req.body as {
+        const { to, url, type, caption, conversationId } = req.body as {
             to: string
             url: string
             type: 'image' | 'video'
             caption?: string
+            conversationId?: number
         }
 
         if (!to || !url || !type) {
@@ -294,18 +306,19 @@ export const enviarMedia = async (req: Request, res: Response) => {
             url,
             type,
             caption,
+            conversationId, // ⬅️ si lo pasas, se guarda en DB (si migraste schema)
         })
 
         return res.json({ ok: true, ...result })
     } catch (err: any) {
         logMetaError('enviarMedia', err)
         const msg = err?.response?.data?.error?.message || ''
-        // Nota: para media, el error por ventana de 24h también puede aparecer
         if (/24|template|message template|HSM|outside the 24/i.test(msg)) {
             return res.status(400).json({
                 ok: false,
                 error: {
-                    message: 'Fuera de la ventana de 24h: debes usar una plantilla aprobada para iniciar la conversación.',
+                    message:
+                        'Fuera de la ventana de 24h: debes usar una plantilla aprobada para iniciar la conversación.',
                     details: err?.response?.data,
                 },
             })
@@ -332,7 +345,7 @@ export const infoNumero = async (req: Request, res: Response) => {
                 fields: 'display_phone_number,verified_name,name_status,wa_id,account_mode',
                 access_token: accessToken,
             },
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
         })
 
         return res.json({ ok: true, data })
@@ -356,7 +369,7 @@ export const debugToken = async (req: Request, res: Response) => {
 
         const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/debug_token`, {
             params: { input_token: token, access_token: appAccessToken },
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
         })
         return res.json({ ok: true, data })
     } catch (err) {

@@ -39,6 +39,11 @@ enum Estado {
   suspendido
 }
 
+enum MediaType {
+  image
+  video
+}
+
 model Usuario {
   id        Int      @id @default(autoincrement())
   email     String   @unique
@@ -69,8 +74,9 @@ model Empresa {
   cuentaWhatsapp   WhatsappAccount?
   messageTemplates MessageTemplate[]
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  Message   Message[]
 
   @@map("empresa")
 }
@@ -81,10 +87,22 @@ model Message {
   from           MessageFrom
   contenido      String      @db.Text
   timestamp      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  // ⬇️ NUEVO: para Cloud API
+  externalId String?    @unique // wamid de Meta
+  mediaType  MediaType? // image | video (opcional)
+  mediaUrl   String?    @db.Text // link a la media (opcional)
+  caption    String?    @db.Text // pie de foto (opcional)
+
+  // ⬇️ NUEVO: relación directa a Empresa (fase multiempresa)
+  empresaId Int
+  empresa   Empresa @relation(fields: [empresaId], references: [id])
 
   Conversation Conversation @relation(fields: [conversationId], references: [id])
 
   @@index([conversationId, timestamp])
+  @@index([empresaId, conversationId, timestamp])
   @@map("message")
 }
 
