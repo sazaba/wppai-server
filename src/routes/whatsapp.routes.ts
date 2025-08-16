@@ -8,6 +8,7 @@ import {
     eliminarWhatsappAccount,
     // cloud api
     enviarPrueba,
+    enviarMedia,        // ⬅️ NUEVO
     infoNumero,
     // utilidades
     debugToken,
@@ -40,6 +41,8 @@ router.delete('/eliminar', verificarJWT, eliminarWhatsappAccount)
 /* ===== Cloud API ===== */
 // POST   /api/whatsapp/enviar-prueba
 router.post('/enviar-prueba', verificarJWT, enviarPrueba)
+// POST   /api/whatsapp/media   ⬅️ NUEVO
+router.post('/media', verificarJWT, enviarMedia)
 // GET    /api/whatsapp/numero/:phoneNumberId
 router.get('/numero/:phoneNumberId', verificarJWT, infoNumero)
 

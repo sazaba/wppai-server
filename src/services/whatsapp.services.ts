@@ -11,9 +11,17 @@ type SendTemplateArgs = {
     templateLang: string
     variables?: string[]
 }
+type MediaType = 'image' | 'video'
+type SendMediaArgs = {
+    empresaId: number
+    to: string
+    url: string
+    type: MediaType
+    caption?: string
+}
 
 export type OutboundResult = {
-    type: 'text' | 'template'
+    type: 'text' | 'template' | 'media'
     data: any
     outboundId: string | null // wamid retornado por Graph
 }
@@ -42,6 +50,37 @@ export async function sendText({ empresaId, to, body }: SendTextArgs): Promise<O
         return { type: 'text', data, outboundId }
     } catch (e: any) {
         console.error('[WA sendText] Error:', e?.response?.data || e.message)
+        throw e
+    }
+}
+
+/** Enviar media (imagen o video/mp4). Para GIFs es mejor usar `type: "video"` con un .mp4 */
+export async function sendWhatsappMedia({
+    empresaId, to, url, type, caption
+}: SendMediaArgs): Promise<OutboundResult> {
+    if (!to) throw new Error('Destino (to) requerido')
+    if (!url) throw new Error('URL de media requerida')
+
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const endpoint = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
+
+    const mediaKey = type // 'image' | 'video'
+    const payload: any = {
+        messaging_product: 'whatsapp',
+        to,
+        type,
+        [mediaKey]: {
+            link: url,
+            ...(caption ? { caption } : {})
+        }
+    }
+
+    try {
+        const { data } = await http.post(endpoint, payload, { headers: { Authorization: `Bearer ${accessToken}` } })
+        const outboundId = data?.messages?.[0]?.id ?? null
+        return { type: 'media', data, outboundId }
+    } catch (e: any) {
+        console.error('[WA sendWhatsappMedia] Error:', e?.response?.data || e.message)
         throw e
     }
 }
@@ -80,11 +119,11 @@ export async function sendTemplate({
 }
 
 /**
- * Envío simplificado: siempre intenta TEXTO y deja que Meta valide la ventana de 24h.
- * (Si está fuera, Meta responderá error de política; el controller lo manejará)
+ * Envío simplificado: intenta TEXTO y deja que Meta valide la ventana de 24h.
+ * (Si está fuera, Meta responderá con error de política; el controller lo maneja)
  */
 export async function sendOutboundMessage(args: {
-    conversationId: number // mantenemos la firma por compatibilidad (no se usa aquí)
+    conversationId: number // firma por compatibilidad
     empresaId: number
     to: string
     body: string
@@ -97,4 +136,3 @@ export async function sendOutboundMessage(args: {
     }
     return sendText({ empresaId, to, body })
 }
-//         const msg = value.messages[0]

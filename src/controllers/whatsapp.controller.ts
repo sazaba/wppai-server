@@ -2,6 +2,7 @@
 import { Request, Response } from 'express'
 import axios from 'axios'
 import prisma from '../lib/prisma'
+import { sendWhatsappMedia as sendMediaSvc } from '../services/whatsapp.services' // ⬅️ NUEVO
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
 
@@ -33,6 +34,10 @@ async function getAccessToken(empresaId: number) {
     })
     if (!acc?.accessToken) throw new Error('No hay accessToken para la empresa')
     return acc.accessToken
+}
+
+function sanitizePhone(to: string | number) {
+    return String(to).replace(/\D+/g, '')
 }
 
 /**
@@ -220,7 +225,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
         }
 
         const accessToken = await getAccessToken(empresaId)
-        const toSanitized = String(to).replace(/\D+/g, '')
+        const toSanitized = sanitizePhone(to)
         const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
 
         const { data } = await axios.post(
@@ -250,6 +255,57 @@ export const enviarPrueba = async (req: Request, res: Response) => {
                 error: {
                     message: 'El número no está registrado en Cloud API: registra/valida el número desde Meta.',
                     code,
+                    details: err?.response?.data,
+                },
+            })
+        }
+        return res.status(400).json(metaError(err))
+    }
+}
+
+/**
+ * POST /api/whatsapp/media  (imagen o video/mp4)
+ * body: { to, url, type: 'image' | 'video', caption? }
+ */
+export const enviarMedia = async (req: Request, res: Response) => {
+    try {
+        const empresaId = (req as any).user?.empresaId
+        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+
+        const { to, url, type, caption } = req.body as {
+            to: string
+            url: string
+            type: 'image' | 'video'
+            caption?: string
+        }
+
+        if (!to || !url || !type) {
+            return res.status(400).json({ ok: false, error: 'to, url y type son requeridos' })
+        }
+        if (type !== 'image' && type !== 'video') {
+            return res.status(400).json({ ok: false, error: 'type inválido: usa image o video' })
+        }
+
+        const toSanitized = sanitizePhone(to)
+
+        const result = await sendMediaSvc({
+            empresaId,
+            to: toSanitized,
+            url,
+            type,
+            caption,
+        })
+
+        return res.json({ ok: true, ...result })
+    } catch (err: any) {
+        logMetaError('enviarMedia', err)
+        const msg = err?.response?.data?.error?.message || ''
+        // Nota: para media, el error por ventana de 24h también puede aparecer
+        if (/24|template|message template|HSM|outside the 24/i.test(msg)) {
+            return res.status(400).json({
+                ok: false,
+                error: {
+                    message: 'Fuera de la ventana de 24h: debes usar una plantilla aprobada para iniciar la conversación.',
                     details: err?.response?.data,
                 },
             })
