@@ -97,3 +97,4 @@ export async function sendOutboundMessage(args: {
     }
     return sendText({ empresaId, to, body })
 }
+//         const msg = value.messages[0]
