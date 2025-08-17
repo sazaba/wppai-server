@@ -13,37 +13,8 @@ import {
 } from '../services/whatsapp.services'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
-
-/* ===================== JWT helpers (robusto) ===================== */
-// Genera variantes seguras de la secret para tolerar espacios/comillas
-function getSecretCandidates() {
-    const raw = process.env.JWT_SECRET ?? 'dev-secret'
-    const trimmed = raw.trim()
-    const unquoted = trimmed.replace(/^['"]|['"]$/g, '') // quita comillas si las hay
-    const set = new Set([raw, trimmed, unquoted])
-    return [...set].filter(Boolean) as string[]
-}
-// Exportada por si otros controladores la necesitan
-export const JWT_SECRETS = getSecretCandidates()
-
-/** Firma token corto para /media/:id */
-export function signMediaToken(empresaId: number, mediaId: string) {
-    // firmamos con la variante más “limpia”
-    const secret = JWT_SECRETS[JWT_SECRETS.length - 1]
-    return jwt.sign({ empresaId, mediaId }, secret, { expiresIn: '10m', algorithm: 'HS256' })
-}
-
-/** Verifica el token probando todas las variantes */
-function verifyWithCandidates(token: string): any | null {
-    for (const s of JWT_SECRETS) {
-        try {
-            return jwt.verify(token, s, { algorithms: ['HS256'] })
-        } catch {
-            // probar siguiente
-        }
-    }
-    return null
-}
+// ✅ normaliza (evita espacios o comillas perdidas de la UI del host)
+const JWT_SECRET = (process.env.JWT_SECRET ?? 'dev-secret').trim()
 
 /* ===================== Types locales ===================== */
 type MulterReq = Request & { file?: Express.Multer.File }
@@ -91,20 +62,40 @@ function guessTypeFromMime(mime: string): 'image' | 'video' | 'audio' | 'documen
     return 'document'
 }
 
-/** 🔎 empresaId desde auth o token corto ?t= */
-function resolveEmpresaIdFromRequest(req: Request): number | null {
+/** 🔏 Firma un token corto para pedir /media/:id desde <img>/<video> */
+export function signMediaToken(empresaId: number, mediaId: string) {
+    return jwt.sign({ empresaId, mediaId }, JWT_SECRET, { expiresIn: '10m' })
+}
+
+/** 🔎 1er intento: obtener empresaId desde (1) auth normal o (2) token ?t= */
+function resolveEmpresaIdFromRequest(req: Request): { empresaId: number | null, why?: string } {
     const authEmpresa = (req as any).user?.empresaId
-    if (authEmpresa) return Number(authEmpresa)
+    if (authEmpresa) return { empresaId: Number(authEmpresa), why: 'req.user' }
 
     const tokenQ = (req.query?.t as string) || ''
-    if (!tokenQ) return null
+    if (!tokenQ) return { empresaId: null, why: 'no_query_token' }
+    try {
+        const decoded = jwt.verify(tokenQ, JWT_SECRET) as any
+        return { empresaId: Number(decoded?.empresaId) || null, why: 'jwt_query' }
+    } catch (e: any) {
+        console.warn('[streamMediaById] JWT inválido:', e?.name, e?.message)
+        return { empresaId: null, why: `jwt_error:${e?.name || 'unknown'}` }
+    }
+}
 
-    const decoded = verifyWithCandidates(tokenQ)
-    if (!decoded) {
-        console.warn('[streamMediaById] JWT inválido con todas las variantes de secret. len(token)=', tokenQ.length, 'secrets=', JWT_SECRETS.map(s => s.length))
+/** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
+async function resolveEmpresaIdByMediaId(mediaId: string): Promise<number | null> {
+    try {
+        const msg = await prisma.message.findFirst({
+            where: { mediaId },
+            select: { empresaId: true },
+            orderBy: { timestamp: 'desc' },
+        })
+        return msg?.empresaId ?? null
+    } catch (e) {
+        console.warn('[resolveEmpresaIdByMediaId] DB error:', (e as any)?.message || e)
         return null
     }
-    return Number((decoded as any)?.empresaId) || null
 }
 
 /**
@@ -276,9 +267,6 @@ export const eliminarWhatsappAccount = async (req: Request, res: Response) => {
  * CLOUD API – Envío / Consulta
  * ========================================================================== */
 
-/**
- * POST /api/whatsapp/enviar-prueba (texto)
- */
 export const enviarPrueba = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
@@ -327,7 +315,6 @@ export const enviarPrueba = async (req: Request, res: Response) => {
 
 /**
  * POST /api/whatsapp/media (por LINK)
- * body: { to?, url, type, caption?, conversationId? }
  */
 export const enviarMedia = async (req: Request, res: Response) => {
     try {
@@ -430,7 +417,6 @@ export const enviarMedia = async (req: Request, res: Response) => {
 
 /**
  * POST /api/whatsapp/media-upload
- * form-data: file, to?, type('image'|'video'|'audio'|'document'), caption?, conversationId?
  */
 export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
     const tmpPath = req.file?.path
@@ -449,7 +435,6 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
         const caption = (body.caption || '').toString()
         const mime = req.file!.mimetype || 'application/octet-stream'
 
-        // type preferente = body.type; si no viene, deducimos por mime
         const waType = (body.type as any) || guessTypeFromMime(mime)
         if (!['image', 'video', 'audio', 'document'].includes(waType)) {
             return res.status(400).json({ ok: false, error: 'type inválido' })
@@ -501,7 +486,7 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
         const token = signMediaToken(empresaId, mediaId)
         const mediaUrl = `/api/whatsapp/media/${mediaId}?t=${encodeURIComponent(token)}`
 
-        // 4) Emitir al frontend para renderizar de inmediato (incluye mediaId)
+        // 4) Emitir al frontend
         const io = req.app.get('io') as any
         if (io && convId) {
             io.emit('nuevo_mensaje', {
@@ -521,10 +506,10 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
                                     : '[documento]'),
                     timestamp: new Date().toISOString(),
                     mediaType: waType,
-                    mediaUrl,            // URL firmada usable en <img>/<video>
+                    mediaUrl,            // URL firmada
                     mimeType: mime ?? null,
                     caption: caption || null,
-                    mediaId,             // fallback por si necesitas reconstruir URL en el front
+                    mediaId,             // incluye mediaId para fallback en el front
                 },
             })
         }
@@ -573,37 +558,51 @@ export const infoNumero = async (req: Request, res: Response) => {
 
 /**
  * GET /api/whatsapp/media/:mediaId
- * - Soporta auth normal (req.user) o token corto en ?t= (firmado por el backend)
- * - Devolver en modo "inline" para que <img>/<video> funcionen.
+ * - Soporta auth normal (req.user) o token corto en ?t=
+ * - Si el token falla, intenta resolver empresaId por DB (Message.mediaId)
+ * - Devuelve en modo "inline".
  */
 export const streamMediaById = async (req: Request, res: Response) => {
     try {
-        const empresaId = resolveEmpresaIdFromRequest(req)
-        if (!empresaId) {
-            console.warn('[streamMediaById] 401 por empresaId nulo. Query.t =', typeof req.query?.t === 'string' ? 'presente' : 'ausente')
-            return res.status(401).json({ ok: false, error: 'No autorizado', reason: 'token_invalid_or_missing' })
-        }
-
         const { mediaId } = req.params as { mediaId: string }
         if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' })
 
+        // 1) Intento por token / req.user
+        const attempt = resolveEmpresaIdFromRequest(req)
+
+        // 2) Fallback por DB si falla
+        let empresaId = attempt.empresaId
+        if (!empresaId) {
+            empresaId = await resolveEmpresaIdByMediaId(mediaId)
+            if (empresaId) {
+                console.log(`[streamMediaById] Fallback DB OK → empresaId=${empresaId} (mediaId=${mediaId})`)
+            }
+        } else {
+            console.log(`[streamMediaById] Auth via ${attempt.why} → empresaId=${empresaId}`)
+        }
+
+        if (!empresaId) {
+            console.warn('[streamMediaById] 401: empresaId nulo. query.t presente?', typeof req.query?.t === 'string')
+            return res.status(401).json({ ok: false, error: 'No autorizado', reason: attempt.why || 'unknown' })
+        }
+
         const accessToken = await getAccessToken(empresaId)
 
-        // 1) Obtener URL firmada
+        // 3) Obtener URL firmada de Graph
         const meta = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
             headers: { Authorization: `Bearer ${accessToken}` },
         })
         const mediaUrl = meta?.data?.url
         if (!mediaUrl) return res.status(404).json({ ok: false, error: 'Media no encontrada' })
 
-        // 2) Descargar y streamear
+        // 4) Descargar y streamear
         const file = await axios.get(mediaUrl, {
             responseType: 'stream',
             headers: { Authorization: `Bearer ${accessToken}` },
         })
 
         res.setHeader('Content-Type', file.headers['content-type'] || 'application/octet-stream')
-        res.setHeader('Content-Disposition', 'inline') // importante para <img>/<video>
+        res.setHeader('Content-Disposition', 'inline')
         if (file.headers['content-length']) {
             res.setHeader('Content-Length', file.headers['content-length'])
         }
