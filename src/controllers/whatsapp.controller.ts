@@ -2,7 +2,7 @@
 import { Request, Response } from 'express'
 import axios from 'axios'
 import fs from 'fs/promises'
-import jwt from 'jsonwebtoken'                     // ⬅️ NUEVO
+import jwt from 'jsonwebtoken'
 import prisma from '../lib/prisma'
 
 import {
@@ -13,7 +13,7 @@ import {
 } from '../services/whatsapp.services'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret' // ⬅️ token firma/valida
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret'
 
 /* ===================== Types locales ===================== */
 type MulterReq = Request & { file?: Express.Multer.File }
@@ -62,11 +62,9 @@ function guessTypeFromMime(mime: string): 'image' | 'video' | 'audio' | 'documen
 }
 
 /** 🔏 Firma un token corto para pedir /media/:id desde <img>/<video> */
-
 export function signMediaToken(empresaId: number, mediaId: string) {
     return jwt.sign({ empresaId, mediaId }, JWT_SECRET, { expiresIn: '10m' })
 }
-
 
 /** 🔎 Obtiene empresaId desde (1) auth normal o (2) token ?t= */
 function resolveEmpresaIdFromRequest(req: Request): number | null {
@@ -332,9 +330,13 @@ export const enviarMedia = async (req: Request, res: Response) => {
                 where: { phone: sanitizePhone(toFinal), empresaId },
                 select: { id: true },
             })
-            convId = existing?.id || (await prisma.conversation.create({
-                data: { phone: sanitizePhone(toFinal), estado: 'pendiente', empresaId }
-            })).id
+            convId =
+                existing?.id ||
+                (
+                    await prisma.conversation.create({
+                        data: { phone: sanitizePhone(toFinal), estado: 'pendiente', empresaId },
+                    })
+                ).id
         }
 
         if (!toFinal || !url || !type) {
@@ -365,12 +367,21 @@ export const enviarMedia = async (req: Request, res: Response) => {
                     id: null,
                     externalId: result?.outboundId ?? null,
                     from: 'bot',
-                    contenido: caption || (type === 'image' ? '[imagen]' : type === 'video' ? '[video]' : type === 'audio' ? '[nota de voz]' : '[documento]'),
+                    contenido:
+                        caption ||
+                        (type === 'image'
+                            ? '[imagen]'
+                            : type === 'video'
+                                ? '[video]'
+                                : type === 'audio'
+                                    ? '[nota de voz]'
+                                    : '[documento]'),
                     timestamp: new Date().toISOString(),
                     mediaType: type,
                     mediaUrl: url, // link directo
                     mimeType: null,
                     caption: caption || null,
+                    // Por LINK no hay mediaId que exponer
                 },
             })
         }
@@ -433,9 +444,13 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
                 where: { phone: sanitizePhone(toFinal), empresaId },
                 select: { id: true },
             })
-            convId = existing?.id || (await prisma.conversation.create({
-                data: { phone: sanitizePhone(toFinal), estado: 'pendiente', empresaId }
-            })).id
+            convId =
+                existing?.id ||
+                (
+                    await prisma.conversation.create({
+                        data: { phone: sanitizePhone(toFinal), estado: 'pendiente', empresaId },
+                    })
+                ).id
         }
         if (!toFinal) {
             return res.status(400).json({ ok: false, error: 'to o conversationId son requeridos' })
@@ -461,7 +476,7 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
         const token = signMediaToken(empresaId, mediaId)
         const mediaUrl = `/api/whatsapp/media/${mediaId}?t=${encodeURIComponent(token)}`
 
-        // 4) Emitir al frontend para renderizar de inmediato
+        // 4) Emitir al frontend para renderizar de inmediato (🏁 incluye mediaId)
         const io = req.app.get('io') as any
         if (io && convId) {
             io.emit('nuevo_mensaje', {
@@ -470,12 +485,21 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
                     id: null,
                     externalId: result?.outboundId ?? null,
                     from: 'bot',
-                    contenido: caption || (waType === 'image' ? '[imagen]' : waType === 'video' ? '[video]' : waType === 'audio' ? '[nota de voz]' : '[documento]'),
+                    contenido:
+                        caption ||
+                        (waType === 'image'
+                            ? '[imagen]'
+                            : waType === 'video'
+                                ? '[video]'
+                                : waType === 'audio'
+                                    ? '[nota de voz]'
+                                    : '[documento]'),
                     timestamp: new Date().toISOString(),
                     mediaType: waType,
-                    mediaUrl,            // ← URL firmada (sin headers)
+                    mediaUrl,            // URL firmada para consumo directo por <img>/<video>
                     mimeType: mime ?? null,
                     caption: caption || null,
+                    mediaId,             // ⬅️ añadido para que el front tenga fallback
                 },
             })
         }
@@ -529,7 +553,7 @@ export const infoNumero = async (req: Request, res: Response) => {
  */
 export const streamMediaById = async (req: Request, res: Response) => {
     try {
-        const empresaId = resolveEmpresaIdFromRequest(req)               // ⬅️ puede venir de ?t=
+        const empresaId = resolveEmpresaIdFromRequest(req)
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
         const { mediaId } = req.params as { mediaId: string }
@@ -551,7 +575,7 @@ export const streamMediaById = async (req: Request, res: Response) => {
         })
 
         res.setHeader('Content-Type', file.headers['content-type'] || 'application/octet-stream')
-        res.setHeader('Content-Disposition', 'inline')                   // ⬅️ importante para <img>/<video>
+        res.setHeader('Content-Disposition', 'inline') // importante para <img>/<video>
         if (file.headers['content-length']) {
             res.setHeader('Content-Length', file.headers['content-length'])
         }
@@ -587,25 +611,11 @@ export const debugToken = async (req: Request, res: Response) => {
     }
 }
 
-export const health = async (req: Request, res: Response) => {
+export const health = async (_req: Request, res: Response) => {
     try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-        const acc = await prisma.whatsappAccount.findUnique({ where: { empresaId } })
-        if (!acc) return res.json({ ok: false, status: 'no_account' })
-
-        const tokenLen = acc.accessToken?.length || 0
-        const phoneOk = !!acc.phoneNumberId
-        return res.json({
-            ok: true,
-            status: 'ready',
-            diagnostics: {
-                tokenLength: tokenLen,
-                hasPhoneNumberId: phoneOk,
-                hint: tokenLen < 200 ? 'Posible truncamiento de token' : 'Token OK',
-            },
-        })
+        // este endpoint lo estás protegiendo con verificarJWT en routes
+        // no hace falta re-leer empresa aquí
+        return res.json({ ok: true, status: 'ready' })
     } catch (err) {
         console.error('[health] error:', err)
         return res.status(500).json({ ok: false, error: 'Error en health check' })

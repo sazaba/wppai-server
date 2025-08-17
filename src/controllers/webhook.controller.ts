@@ -112,7 +112,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         let mediaUrlForFrontend: string | undefined
         let captionForDb: string | undefined
 
-        // 🔊 NOTA DE VOZ / AUDIO: descargar y transcribir
+        // 🔊 NOTA DE VOZ / AUDIO
         if (msg.type === 'audio' && msg.audio?.id) {
             inboundMediaType = MediaType.audio
             inboundMediaId = String(msg.audio.id)
@@ -120,30 +120,22 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             isVoiceNote = Boolean(msg.audio?.voice)
 
             try {
-                // 1) URL firmada corta (Graph) y descarga a Buffer
                 const signedUrl = await getMediaUrl(empresaId, inboundMediaId)
                 const buf = await downloadMediaToBuffer(empresaId, signedUrl)
 
-                // 2) Nombre sugerido para el transcriptor (extensión ayuda al SDK)
                 const guessedName =
                     inboundMime?.includes('mp3') ? 'nota-voz.mp3'
                         : inboundMime?.includes('wav') ? 'nota-voz.wav'
                             : 'nota-voz.ogg'
 
-                // 3) Transcribir
                 const texto = await transcribeAudioBuffer(buf, guessedName)
                 transcription = (texto || '').trim()
             } catch (e) {
                 console.warn('[AUDIO] No se pudo transcribir.', e)
             }
 
-            // Si no hay transcripción, dejamos placeholder
             contenido = transcription || '[nota de voz]'
-
-            // URL firmada para reproducir desde el front
-            if (inboundMediaId) {
-                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
-            }
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
         }
         // 🖼️ IMAGEN
         else if (msg.type === 'image' && msg.image?.id) {
@@ -153,9 +145,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             captionForDb = (msg.image?.caption as string | undefined) || undefined
 
             contenido = captionForDb || '[imagen]'
-            if (inboundMediaId) {
-                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
-            }
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
         }
         // 🎞️ VIDEO
         else if (msg.type === 'video' && msg.video?.id) {
@@ -165,26 +155,21 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             captionForDb = (msg.video?.caption as string | undefined) || undefined
 
             contenido = captionForDb || '[video]'
-            if (inboundMediaId) {
-                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
-            }
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
         }
         // 📎 DOCUMENTO
         else if (msg.type === 'document' && msg.document?.id) {
             inboundMediaType = MediaType.document
             inboundMediaId = String(msg.document.id)
             inboundMime = msg.document?.mime_type as string | undefined
-            // podemos guardar filename en caption si quieres mostrarlo
             const filename = (msg.document?.filename as string | undefined) || undefined
             captionForDb = filename
 
             contenido = filename ? `[documento] ${filename}` : '[documento]'
-            if (inboundMediaId) {
-                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
-            }
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
         }
 
-        // Guardar ENTRANTE (cliente) — tolerante a migración de isVoiceNote
+        // Guardar ENTRANTE
         const inboundData: any = {
             conversationId: conversation.id,
             empresaId,
@@ -197,9 +182,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             transcription: transcription || undefined,
         }
         if (captionForDb) inboundData.caption = captionForDb
-        if (process.env.FEATURE_ISVOICENOTE === '1') {
-            inboundData.isVoiceNote = Boolean(isVoiceNote)
-        }
+        if (process.env.FEATURE_ISVOICENOTE === '1') inboundData.isVoiceNote = Boolean(isVoiceNote)
+
         const inbound = await prisma.message.create({ data: inboundData })
 
         // Emitir ENTRANTE al frontend
@@ -213,18 +197,19 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 contenido,
                 timestamp: inbound.timestamp.toISOString(),
                 mediaType: inboundMediaType,
-                mediaUrl: mediaUrlForFrontend, // ← firmada (si hay media)
+                mediaUrl: mediaUrlForFrontend,
                 mimeType: inboundMime,
                 transcription,
                 isVoiceNote,
                 caption: captionForDb,
+                mediaId: inboundMediaId,   // 🆕 añadido para el front
             },
             phone: conversation.phone,
             nombre: conversation.nombre ?? conversation.phone,
             estado: conversation.estado,
         })
 
-        // ----- Evitar “falso escalado” cuando es audio sin transcripción
+        // ----- Evitar falso escalado con audio sin transcripción
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
         // 3) IA → RESPUESTA
@@ -250,7 +235,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         }
 
         if (result?.mensaje) {
-            // DEDUPE: evita duplicado
             const yaExiste = await prisma.message.findFirst({
                 where: {
                     conversationId: conversation.id,
@@ -285,11 +269,9 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         from: MessageFrom.bot,
                         contenido: result.mensaje,
                         timestamp: new Date(),
-                        // externalId: outboundId || undefined
                     },
                 })
 
-                // Emitir BOT al frontend
                 io?.emit?.('nuevo_mensaje', {
                     conversationId: conversation.id,
                     message: {
@@ -325,7 +307,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
     }
 }
 
-// Ayudante: mapear wa_id (cliente) a conversationId si es posible
+// Ayudante: mapear wa_id (cliente) a conversationId
 async function resolveConversationIdByWaId(_req: Request, waId: string): Promise<number | null> {
     try {
         const conv = await prisma.conversation.findFirst({ where: { phone: waId } })
