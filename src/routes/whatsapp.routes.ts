@@ -20,7 +20,7 @@ import {
     // utilidades
     debugToken,
     health,
-    // ⬅️ NUEVO: stream de media por mediaId
+    // stream de media por mediaId
     streamMediaById,
 } from '../controllers/whatsapp.controller'
 
@@ -28,11 +28,11 @@ const router = Router()
 
 /**
  * IMPORTANTE:
- * Montar así en app.ts:
+ * Montar en app.ts:
  *   app.use('/api/whatsapp', whatsappRoutes)
  */
 
-/* ===== Públicas para diagnóstico rápido ===== */
+/* ===== Públicas de diagnóstico ===== */
 router.get('/ping', (_req, res) => res.json({ ok: true, from: 'whatsapp.routes', ping: 'pong' }))
 router.get('/health-public', (_req, res) => res.json({ ok: true, msg: 'health (public) online' }))
 
@@ -59,42 +59,34 @@ const ALLOWED_MIME = new Set([
 
 const upload = multer({
     storage,
-    limits: {
-        // WhatsApp suele aceptar hasta ~16 MB por media
-        fileSize: 16 * 1024 * 1024,
-    },
+    limits: { fileSize: 16 * 1024 * 1024 }, // ~16 MB
     fileFilter: (_req, file, cb) => {
         if (ALLOWED_MIME.has(file.mimetype)) return cb(null, true)
         cb(new Error('Tipo de archivo no permitido para WhatsApp'))
     },
 })
 
-/* ===== Conexión (callback → guardar selección) ===== */
-// POST /api/whatsapp/vincular
+/* ===== Conexión (guardar selección) ===== */
 router.post('/vincular', verificarJWT, vincular)
 
-/* ===== Existentes ===== */
-// GET    /api/whatsapp/estado
+/* ===== Estado / Eliminar cuenta ===== */
 router.get('/estado', verificarJWT, estadoWhatsappAccount)
-// DELETE /api/whatsapp/eliminar
 router.delete('/eliminar', verificarJWT, eliminarWhatsappAccount)
 
 /* ===== Cloud API ===== */
-// POST   /api/whatsapp/enviar-prueba (texto)
+// Texto
 router.post('/enviar-prueba', verificarJWT, enviarPrueba)
-// POST   /api/whatsapp/media (por LINK)
+// Media por LINK
 router.post('/media', verificarJWT, enviarMedia)
-// POST   /api/whatsapp/media-upload (por ARCHIVO -> /media -> enviar por id)
+// Media por archivo (sube a /media → envia por id)
 router.post('/media-upload', verificarJWT, upload.single('file'), enviarMediaUpload)
-// GET    /api/whatsapp/numero/:phoneNumberId
+// Info del número conectado
 router.get('/numero/:phoneNumberId', verificarJWT, infoNumero)
-// ⬅️ NUEVO: GET /api/whatsapp/media/:mediaId (proxy seguro para reproducir en el front)
+// Stream seguro de media por mediaId (para reproducir en el front)
 router.get('/media/:mediaId', verificarJWT, streamMediaById)
 
 /* ===== Utilidades ===== */
-// GET    /api/whatsapp/debug-token
 router.get('/debug-token', verificarJWT, debugToken)
-// GET    /api/whatsapp/health
 router.get('/health', verificarJWT, health)
 
 export default router

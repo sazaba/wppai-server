@@ -25,7 +25,6 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.0.2",
     "openai": "^5.9.0",
-    "prisma": "^6.11.1",
     "socket.io": "^4.8.1",
     "tmp": "^0.2.5"
   },
@@ -38,6 +37,7 @@
     "@types/multer": "^2.0.0",
     "@types/node": "^24.0.13",
     "@types/tmp": "^0.2.6",
+    "prisma": "^6.11.1",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"
   }

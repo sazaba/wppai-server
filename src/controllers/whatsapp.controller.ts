@@ -100,7 +100,7 @@ async function ensureFallbackTemplateInMeta(params: {
         name,
         category: 'MARKETING',
         allow_category_change: true,
-        language: lang, // usa 'es' o variante regional si tu WABA lo requiere
+        language: lang,
         components: [{ type: 'BODY', text: '¡Hola! Gracias por escribirnos. ¿En qué podemos ayudarte?' }],
     }
 
@@ -283,7 +283,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
 
 /**
  * POST /api/whatsapp/media  (image|video|audio|document por LINK)
- * body: { to, url, type, caption?, conversationId? }
+ * body: { to?, url, type, caption?, conversationId? }
  */
 export const enviarMedia = async (req: Request, res: Response) => {
     try {
@@ -291,21 +291,31 @@ export const enviarMedia = async (req: Request, res: Response) => {
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
         const { to, url, type, caption, conversationId } = req.body as {
-            to: string
+            to?: string
             url: string
             type: 'image' | 'video' | 'audio' | 'document'
             caption?: string
             conversationId?: number
         }
 
-        if (!to || !url || !type) {
+        // ✅ Resolver 'to' desde conversationId si no vino
+        let toFinal = (to || '').trim()
+        if (!toFinal && conversationId) {
+            const conv = await prisma.conversation.findUnique({
+                where: { id: conversationId },
+                select: { phone: true },
+            })
+            toFinal = conv?.phone || ''
+        }
+
+        if (!toFinal || !url || !type) {
             return res.status(400).json({ ok: false, error: 'to, url y type son requeridos' })
         }
         if (!['image', 'video', 'audio', 'document'].includes(type)) {
             return res.status(400).json({ ok: false, error: 'type inválido' })
         }
 
-        const toSanitized = sanitizePhone(to)
+        const toSanitized = sanitizePhone(toFinal)
         const result = await sendMediaSvc({
             empresaId,
             to: toSanitized,
@@ -335,7 +345,7 @@ export const enviarMedia = async (req: Request, res: Response) => {
 
 /**
  * POST /api/whatsapp/media-upload
- * form-data: file, to, type('image'|'video'|'audio'|'document'), caption?, conversationId?
+ * form-data: file, to?, type('image'|'video'|'audio'|'document'), caption?, conversationId?
  * Flujo: sube a /media → obtiene media_id → envía mensaje por id → borra archivo temporal
  */
 export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
@@ -346,26 +356,36 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
         if (!tmpPath) return res.status(400).json({ ok: false, error: 'Archivo requerido (file)' })
 
         const { to, type, caption, conversationId } = (req.body || {}) as {
-            to: string
+            to?: string
             type: 'image' | 'video' | 'audio' | 'document'
             caption?: string
             conversationId?: number
         }
 
-        if (!to || !type) {
+        // ✅ Resolver 'to' desde conversationId si no vino
+        let toFinal = (to || '').trim()
+        if (!toFinal && conversationId) {
+            const conv = await prisma.conversation.findUnique({
+                where: { id: conversationId },
+                select: { phone: true },
+            })
+            toFinal = conv?.phone || ''
+        }
+
+        if (!toFinal || !type) {
             return res.status(400).json({ ok: false, error: 'to y type son requeridos' })
         }
         if (!['image', 'video', 'audio', 'document'].includes(type)) {
             return res.status(400).json({ ok: false, error: 'type inválido' })
         }
 
-        const toSanitized = sanitizePhone(to)
+        const toSanitized = sanitizePhone(toFinal)
         const mime = req.file!.mimetype
 
         // 1) subir archivo a /media
         const mediaId = await uploadToWhatsappMedia(empresaId, tmpPath, mime)
 
-        // 2) enviar mensaje por media_id (pasamos mimeType para persistencia)
+        // 2) enviar mensaje por media_id
         const result = await sendWhatsappMediaById({
             empresaId,
             to: toSanitized,
@@ -373,7 +393,6 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
             mediaId,
             caption,
             conversationId,
-            mimeType: mime,
         })
 
         // 3) limpiar archivo temporal
