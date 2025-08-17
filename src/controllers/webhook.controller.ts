@@ -121,7 +121,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         : inboundMime?.includes('wav') ? 'nota-voz.wav'
                             : 'nota-voz.ogg'
 
-                // 3) Transcribir con tu servicio (Whisper / 4o-mini-transcribe)
+                // 3) Transcribir
                 const texto = await transcribeAudioBuffer(buf, guessedName)
                 transcription = (texto || '').trim()
             } catch (e) {
@@ -137,21 +137,22 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             }
         }
 
-        // Guardar ENTRANTE (cliente)
-        const inbound = await prisma.message.create({
-            data: {
-                conversationId: conversation.id,
-                empresaId,
-                from: MessageFrom.client,
-                contenido,
-                timestamp: ts,
-                mediaType: inboundMediaType,      // enum MediaType
-                mediaId: inboundMediaId,
-                mimeType: inboundMime,
-                isVoiceNote,
-                transcription: transcription || undefined,
-            },
-        })
+        // Guardar ENTRANTE (cliente) — tolerante a migración de isVoiceNote
+        const inboundData: any = {
+            conversationId: conversation.id,
+            empresaId,
+            from: MessageFrom.client,
+            contenido,
+            timestamp: ts,
+            mediaType: inboundMediaType,
+            mediaId: inboundMediaId,
+            mimeType: inboundMime,
+            transcription: transcription || undefined,
+        }
+        if (process.env.FEATURE_ISVOICENOTE === '1') {
+            inboundData.isVoiceNote = Boolean(isVoiceNote)
+        }
+        const inbound = await prisma.message.create({ data: inboundData })
 
         // Emitir ENTRANTE al frontend
         const io = req.app.get('io') as any
@@ -174,8 +175,31 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             estado: conversation.estado,
         })
 
+        // ----- Evitar “falso escalado” cuando es audio sin transcripción
+        const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
+
         // 3) IA → RESPUESTA
-        const result: any = await handleIAReply(conversation.id, contenido)
+        let result: Awaited<ReturnType<typeof handleIAReply>>
+        try {
+            result = await handleIAReply(conversation.id, contenido)
+
+            if (
+                skipEscalateForAudioNoTranscript &&
+                result?.estado === ConversationEstado.requiere_agente &&
+                result?.motivo === 'palabra_clave'
+            ) {
+                result = {
+                    estado: ConversationEstado.en_proceso,
+                    mensaje: 'No pude escuchar bien tu nota de voz. ¿Puedes repetir o escribir lo que necesitas?'
+                }
+            }
+        } catch {
+            result = {
+                estado: ConversationEstado.en_proceso,
+                mensaje: 'Gracias por tu mensaje. ¿Podrías darme un poco más de contexto?'
+            }
+        }
+
         if (result?.mensaje) {
             // DEDUPE: evita duplicado
             const yaExiste = await prisma.message.findFirst({

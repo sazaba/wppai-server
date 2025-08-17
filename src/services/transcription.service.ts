@@ -22,12 +22,13 @@ const OPENROUTER_URL = `${OPENROUTER_BASE}/chat/completions`
 const OPENROUTER_API_KEY =
     process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || '' // alias por si acaso
 
-// Modelos candidatos (primero el que definas en .env)
+// arriba donde defines CANDIDATE_MODELS
 const CANDIDATE_MODELS: string[] = [
-    process.env.IA_TRANSCRIBE_MODEL || '',
-    'openai/gpt-4o-mini-transcribe',
-    'openai/gpt-4o-transcribe',
+    process.env.IA_TRANSCRIBE_MODEL || '',                  // 1) el que pongas en .env
+    'google/gemini-2.0-flash-lite-001',                     // 2) recomendado (barato/rápido)
+    'google/gemini-2.0-flash-001',                          // 3) alternativa
 ].filter(Boolean)
+
 
 // Tamaños razonables (OpenRouter soporta ~25MB por input_audio base64)
 const MAX_BASE64_MB = Number(process.env.STT_MAX_BASE64_MB || 24)

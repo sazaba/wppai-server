@@ -50,6 +50,15 @@ function sanitizePhone(to: string | number) {
     return String(to).replace(/\D+/g, '')
 }
 
+/** Deducir tipo soportado por WhatsApp a partir del MIME */
+function guessTypeFromMime(mime: string): 'image' | 'video' | 'audio' | 'document' {
+    if (!mime) return 'document'
+    if (mime.startsWith('image/')) return 'image'
+    if (mime.startsWith('video/')) return 'video'
+    if (mime.startsWith('audio/')) return 'audio'
+    return 'document'
+}
+
 /**
  * ¿Existe la plantilla en Meta?
  */
@@ -335,49 +344,54 @@ export const enviarMedia = async (req: Request, res: Response) => {
 export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
     const tmpPath = req.file?.path
     try {
-        const empresaId = (req as any).user?.empresaId
+        const empresaId = Number((req as any).user?.empresaId)
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
         if (!tmpPath) return res.status(400).json({ ok: false, error: 'Archivo requerido (file)' })
 
-        const { to, type, caption, conversationId } = (req.body || {}) as {
+        const body = (req.body || {}) as {
             to?: string
-            type: 'image' | 'video' | 'audio' | 'document'
+            type?: 'image' | 'video' | 'audio' | 'document'
             caption?: string
-            conversationId?: number
+            conversationId?: number | string
         }
 
-        // Resolver 'to' desde conversationId si no vino
-        let toFinal = (to || '').trim()
-        if (!toFinal && conversationId) {
+        const caption = (body.caption || '').toString()
+        const mime = req.file!.mimetype || 'application/octet-stream'
+
+        // type preferente = body.type; si no viene, deducimos por mime
+        const waType = (body.type as any) || guessTypeFromMime(mime)
+        if (!['image', 'video', 'audio', 'document'].includes(waType)) {
+            return res.status(400).json({ ok: false, error: 'type inválido' })
+        }
+
+        // Resolver destino
+        let toFinal = (body.to || '').trim()
+        const convIdNum = body.conversationId ? Number(body.conversationId) : undefined
+        if (!toFinal && convIdNum) {
             const conv = await prisma.conversation.findUnique({
-                where: { id: conversationId },
+                where: { id: convIdNum },
                 select: { phone: true },
             })
             toFinal = conv?.phone || ''
         }
-
-        if (!toFinal || !type) {
-            return res.status(400).json({ ok: false, error: 'to y type son requeridos' })
-        }
-        if (!['image', 'video', 'audio', 'document'].includes(type)) {
-            return res.status(400).json({ ok: false, error: 'type inválido' })
+        if (!toFinal) {
+            return res.status(400).json({ ok: false, error: 'to o conversationId son requeridos' })
         }
 
         const toSanitized = sanitizePhone(toFinal)
-        const mime = req.file!.mimetype
 
         // 1) subir archivo a /media
         const mediaId = await uploadToWhatsappMedia(empresaId, tmpPath, mime)
 
-        // 2) enviar por media_id (pasamos mime para persistir)
+        // 2) enviar por media_id (el servicio ya persiste con enums correctos)
         const result = await sendWhatsappMediaById({
             empresaId,
             to: toSanitized,
-            type,
+            type: waType,
             mediaId,
             caption,
-            conversationId,
-            mimeType: mime, // <-- requiere actualización del servicio
+            conversationId: convIdNum,
+            mimeType: mime,
         })
 
         // 3) limpiar archivo temporal
@@ -449,7 +463,10 @@ export const streamMediaById = async (req: Request, res: Response) => {
         })
 
         res.setHeader('Content-Type', file.headers['content-type'] || 'application/octet-stream')
-        res.setHeader('Cache-Control', 'no-store')
+        if (file.headers['content-length']) {
+            res.setHeader('Content-Length', file.headers['content-length'])
+        }
+        res.setHeader('Cache-Control', 'private, max-age=300')
         file.data.pipe(res)
     } catch (err: any) {
         console.error('[streamMediaById] error:', err?.response?.data || err.message)
