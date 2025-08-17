@@ -1,12 +1,13 @@
 // src/routes/webhook.route.ts
-import express from 'express'
+import { Router } from 'express'
 import { receiveWhatsappMessage, verifyWebhook } from '../controllers/webhook.controller'
 
-const router = express.Router()
+const router = Router()
 
-// webhook.route.ts
-router.get('/webhook', verifyWebhook)
-router.post('/webhook', receiveWhatsappMessage)
+// GET para verificación de Meta (hub.challenge)
+router.get('/', verifyWebhook)
 
+// POST para recibir eventos (messages, statuses)
+router.post('/', receiveWhatsappMessage)
 
 export default router

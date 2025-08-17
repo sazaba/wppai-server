@@ -61,15 +61,15 @@ app.use(express.urlencoded({ extended: true }))
 app.use(express.json({ type: 'application/json', limit: '5mb' }))
 
 // 🌍 Establecer encoding UTF-8 por defecto
-app.use((req, res, next) => {
-    res.setHeader('Content-Type', 'application/json; charset=utf-8')
-    req.setEncoding('utf8')
-    next()
-})
+// app.use((req, res, next) => {
+//     res.setHeader('Content-Type', 'application/json; charset=utf-8')
+//     req.setEncoding('utf8')
+//     next()
+// })
 
 // 📌 Rutas públicas
 app.use('/api/auth', authRoutes)       // login, registro, OAuth
-app.use('/api', webhookRoutes)         // mensajes desde WhatsApp (webhook)
+app.use('/api/webhook', webhookRoutes)
 
 // 🔐 Rutas protegidas (JWT middleware dentro de cada archivo)
 app.use('/api/config', configRoutes)   // configuración del negocio

@@ -9,158 +9,158 @@ type IAReplyResult = {
     motivo?: 'confianza_baja' | 'palabra_clave' | 'reintentos'
 }
 
+/* ===== Config IA (OpenRouter) ===== */
+const MODEL = process.env.IA_MODEL || 'google/gemini-2.0-flash-lite'
+const TEMPERATURE = 0.3
+const MAX_COMPLETION_TOKENS = 350 // respuestas cortas (WhatsApp)
+
+/* ========================= Helpers ========================= */
+
 function normalizarTexto(texto: string): string {
-    return texto
+    return (texto || '')
         .toLowerCase()
         .normalize('NFD')
-        .replace(/[̀-ͯ]/g, '')
-        .replace(/[^\w\s]/gi, '')
+        .replace(/[\u0300-\u036f]/g, '') // quita tildes
+        .replace(/[^\w\s]/g, '')
         .replace(/\s+/g, ' ')
         .trim()
 }
 
+const FRASES_PROHIBIDAS = [
+    'correo', 'email', 'telefono', 'llamar', 'formulario', 'lo siento',
+    'segun la informacion', 'de acuerdo a la informacion', 'de acuerdo a los datos',
+    'segun el sistema', 'lo que tengo', 'pondra en contacto', 'me contactara',
+    'no puedo ayudarte', 'no puedo procesar', 'gracias por tu consulta', 'uno de nuestros asesores',
+    'soy una ia', 'soy un asistente', 'modelo de lenguaje', 'inteligencia artificial'
+].map(normalizarTexto)
+
 function esRespuestaInvalida(respuesta: string): boolean {
-    const prohibidas = [
-        'correo', 'email', 'teléfono', 'llamar', 'formulario', 'lo siento',
-        'según la información', 'de acuerdo a la información', 'de acuerdo a los datos',
-        'según el sistema', 'lo que tengo', 'pondrá en contacto', 'me contactará',
-        'no puedo ayudarte', 'no puedo procesar', 'gracias por tu consulta', 'uno de nuestros asesores'
-    ]
-    const normalizada = normalizarTexto(respuesta)
-    return prohibidas.some(p => normalizada.includes(p))
+    const r = normalizarTexto(respuesta)
+    const tieneEmail = /\b[\w.+-]+@[\w-]+\.[\w.-]+\b/.test(respuesta)
+    const tieneLink = /https?:\/\/|www\./i.test(respuesta)
+    const tieneTel = /\+?\d[\d\s().-]{6,}/.test(respuesta)
+    const contiene = FRASES_PROHIBIDAS.some(p => r.includes(p))
+    return tieneEmail || tieneLink || tieneTel || contiene
 }
 
 function buildSystemPrompt(config: any, mensajeEscalamiento: string): string {
-    return `Actúas como si fueras un asesor humano de la empresa ${config.nombre}. 
-  
-Tu función es responder preguntas que estén dentro de la siguiente información:
+    return `Actúas como un asesor humano de la empresa ${config.nombre}.
 
-📌 Descripción: ${config.descripcion}
-📌 Servicios/Productos: ${config.servicios}
-📌 Preguntas frecuentes: ${config.faq}
-📌 Horario de atención: ${config.horarios}
+Responde SOLO con base en:
+- Descripción: ${config.descripcion}
+- Servicios/Productos: ${config.servicios}
+- Preguntas frecuentes: ${config.faq}
+- Horario de atención: ${config.horarios}
 
-🗣️ Habla con un tono profesional, natural y directo, sin sonar como un asistente automatizado. 
-Responde con frases normales, como si tú fueras parte del equipo humano. No empieces con frases como:
-
-- "Según la información proporcionada"
-- "De acuerdo a la información"
-- "Según lo que tengo"
-- "Según el sistema"
-- "De acuerdo a los datos"
-- "Lo que tengo registrado"
-
-❌ Nunca digas que eres una IA. No te refieras al sistema, configuración, o información proporcionada.
-❌ No uses expresiones como “lo siento”, “no puedo ayudarte”, “no tengo esa información”.
-❌ No menciones correo, teléfono, contacto humano o enlaces si no están textualmente en los datos.
-❌ No digas que un asesor se pondrá en contacto contigo.
-❌ No inventes. Si no sabes, responde esto:
-
+Tono: profesional, natural y directo, mensajes cortos para WhatsApp.
+No digas que eres IA, ni menciones "según la información", "de acuerdo a los datos", etc.
+No inventes; si no sabes, responde EXACTAMENTE:
 "${mensajeEscalamiento}"
 
-✅ Sé claro y directo. Usa frases breves y naturales, como si fueras un humano escribiendo por WhatsApp.
-
-Ejemplo:
-❌ “Según la información proporcionada, atendemos de lunes a viernes...”
-✅ “Atendemos de lunes a viernes de 8:00 a. m. a 5:00 p. m.”`
+Formato: una respuesta breve y clara (sin listas salvo que el usuario lo pida).`
 }
+
+/* ========================= Core ========================= */
 
 export const handleIAReply = async (
     chatId: number,
     mensaje: string
 ): Promise<IAReplyResult | null> => {
-    const config = await prisma.businessConfig.findFirst()
-    if (!config) {
-        console.warn('[handleIAReply] ⚠️ No se encontró configuración del negocio')
-        return null
-    }
-
-    const conversacion = await prisma.conversation.findUnique({ where: { id: chatId } })
+    // 0) Conversación y empresa
+    const conversacion = await prisma.conversation.findUnique({
+        where: { id: chatId },
+        select: { id: true, estado: true, empresaId: true },
+    })
     if (!conversacion || conversacion.estado === 'cerrado') {
         console.warn(`[handleIAReply] 🔒 La conversación ${chatId} está cerrada. No se procesará.`)
         return null
     }
 
+    // 1) Config del negocio por empresa (multiempresa)
+    const config = await prisma.businessConfig.findFirst({
+        where: { empresaId: conversacion.empresaId },
+        orderBy: { updatedAt: 'desc' },
+    })
+    if (!config) {
+        console.warn('[handleIAReply] ⚠️ No se encontró configuración del negocio para esta empresa')
+        return {
+            estado: ConversationEstado.requiere_agente,
+            mensaje: 'Gracias por tu mensaje. En breve uno de nuestros compañeros del equipo te contactará para ayudarte con más detalle.',
+            motivo: 'confianza_baja',
+        }
+    }
+
     const mensajeEscalamiento =
         'Gracias por tu mensaje. En breve uno de nuestros compañeros del equipo te contactará para ayudarte con más detalle.'
 
-    // 1) Reglas previas de escalado (sin escribir DB)
+    // 2) Reglas previas de escalado (palabras clave)
     const motivoInicial = shouldEscalateChat({
         mensaje,
         config,
         iaConfianzaBaja: false,
-        intentosFallidos: 0
+        intentosFallidos: 0,
     })
     if (motivoInicial === 'palabra_clave') {
-        return {
-            estado: ConversationEstado.requiere_agente,
-            mensaje: mensajeEscalamiento,
-            motivo: motivoInicial
-        }
+        return { estado: ConversationEstado.requiere_agente, mensaje: mensajeEscalamiento, motivo: motivoInicial }
     }
 
-    // 2) Armar historial para el modelo
+    // 3) Historial (últimos 12 mensajes)
     const mensajesPrevios = await prisma.message.findMany({
         where: { conversationId: chatId },
         orderBy: { timestamp: 'asc' },
-        take: 10
+        take: 12,
+        select: { from: true, contenido: true },
     })
-    const historial = mensajesPrevios.map((m) => ({
-        role: m.from === 'client' ? 'user' : 'assistant',
-        content: m.contenido
-    }))
+    const historial = mensajesPrevios
+        .filter(m => (m.contenido || '').trim().length > 0)
+        .map(m => ({ role: m.from === 'client' ? 'user' : 'assistant', content: m.contenido }))
 
     const systemPrompt = buildSystemPrompt(config, mensajeEscalamiento)
 
+    // 4) Llamada al modelo (OpenRouter)
     const iaResponse = await openai.chat.completions.create({
-        model: 'anthropic/claude-3-haiku',
+        model: MODEL,
         messages: [
             { role: 'system', content: systemPrompt },
             ...historial,
-            { role: 'user', content: mensaje }
+            { role: 'user', content: mensaje },
         ],
-        temperature: 0.4
+        temperature: TEMPERATURE,
+        // compatibilidad SDK v4
+        max_completion_tokens: MAX_COMPLETION_TOKENS as any,
+        // @ts-ignore
+        max_tokens: MAX_COMPLETION_TOKENS,
     } as any)
 
     const respuestaIA = iaResponse?.choices?.[0]?.message?.content?.trim() ?? ''
     console.log('🧠 Respuesta generada por IA:', respuestaIA)
 
-    // 3) Validaciones de contenido → escalado (sin escribir DB)
+    // 5) Validaciones de contenido → escalado
     const debeEscalar =
         respuestaIA === mensajeEscalamiento ||
         normalizarTexto(respuestaIA) === normalizarTexto(mensajeEscalamiento) ||
         esRespuestaInvalida(respuestaIA)
 
     if (debeEscalar) {
-        return {
-            estado: ConversationEstado.requiere_agente,
-            mensaje: mensajeEscalamiento,
-            motivo: 'confianza_baja'
-        }
+        return { estado: ConversationEstado.requiere_agente, mensaje: mensajeEscalamiento, motivo: 'confianza_baja' }
     }
 
-    // 4) Reglas finales de escalado
+    // 6) Reglas finales (longitud/seguridad)
     const iaConfianzaBaja =
-        respuestaIA.toLowerCase().includes('no estoy seguro') || respuestaIA.length < 15
+        respuestaIA.length < 15 ||
+        /no estoy seguro|no tengo certeza|no cuento con esa info/i.test(respuestaIA)
 
     const motivoFinal = shouldEscalateChat({
         mensaje,
         config,
         iaConfianzaBaja,
-        intentosFallidos: 0
+        intentosFallidos: 0,
     })
 
     if (motivoFinal && motivoFinal !== 'palabra_clave') {
-        return {
-            estado: ConversationEstado.requiere_agente,
-            mensaje: mensajeEscalamiento,
-            motivo: motivoFinal
-        }
+        return { estado: ConversationEstado.requiere_agente, mensaje: mensajeEscalamiento, motivo: motivoFinal }
     }
 
-    // 5) Respuesta final (el controller la guardará y emitirá)
-    return {
-        estado: ConversationEstado.respondido,
-        mensaje: respuestaIA
-    }
+    // 7) Respuesta final OK
+    return { estado: ConversationEstado.respondido, mensaje: respuestaIA }
 }

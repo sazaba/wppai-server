@@ -1,7 +1,9 @@
-// src/services/whatsapp.service.ts
+// src/services/whatsapp.services.ts
 import axios from 'axios'
 import prisma from '../lib/prisma'
-import { MessageFrom } from '@prisma/client'
+import { MessageFrom, MediaType as PrismaMediaType } from '@prisma/client'
+import fs from 'fs'
+import FormData from 'form-data'
 
 const FB_VERSION = 'v20.0'
 
@@ -11,7 +13,7 @@ type SendTextArgs = {
     empresaId: number
     to: string
     body: string
-    conversationId?: number // opcional: si lo tienes, se guarda el mensaje en DB
+    conversationId?: number
 }
 
 type SendTemplateArgs = {
@@ -22,21 +24,32 @@ type SendTemplateArgs = {
     variables?: string[]
 }
 
-type MediaType = 'image' | 'video'
+export type MediaType = 'image' | 'video' | 'audio' | 'document'
 
-type SendMediaArgs = {
+type SendMediaByLinkArgs = {
     empresaId: number
     to: string
     url: string
     type: MediaType
     caption?: string
-    conversationId?: number // opcional: si lo tienes, se guarda el mensaje en DB
+    conversationId?: number
+    mimeType?: string // opcional si la conoces
+}
+
+type SendMediaByIdArgs = {
+    empresaId: number
+    to: string
+    type: MediaType
+    mediaId: string
+    caption?: string
+    conversationId?: number
+    mimeType?: string // opcional
 }
 
 export type OutboundResult = {
     type: 'text' | 'template' | 'media'
     data: any
-    outboundId: string | null // wamid retornado por Graph
+    outboundId: string | null
 }
 
 /* ===================== HTTP ===================== */
@@ -60,10 +73,61 @@ function sanitizePhone(to: string | number) {
     return String(to).replace(/\D+/g, '')
 }
 
-// WhatsApp Cloud suele aceptar hasta 1024 chars en caption
 function clampCaption(c?: string) {
     if (!c) return undefined
     return c.length > 1024 ? c.slice(0, 1024) : c
+}
+
+async function persistMediaMessage(opts: {
+    conversationId?: number
+    empresaId: number
+    from: MessageFrom
+    outboundId: string | null
+    type: MediaType
+    mediaId?: string | null
+    mediaUrl?: string | null
+    caption?: string | null
+    mimeType?: string | null
+}) {
+    const {
+        conversationId,
+        empresaId,
+        from,
+        outboundId,
+        type,
+        mediaId = null,
+        mediaUrl = null,
+        caption = null,
+        mimeType = null,
+    } = opts
+    if (!conversationId) return
+
+    try {
+        await prisma.message.create({
+            data: {
+                conversationId,
+                empresaId,
+                from,
+                contenido:
+                    caption ??
+                    (type === 'image'
+                        ? '[imagen]'
+                        : type === 'video'
+                            ? '[video]'
+                            : type === 'audio'
+                                ? '[nota de voz]'
+                                : '[documento]'),
+                externalId: outboundId || undefined,
+                mediaType: type as PrismaMediaType,
+                mediaId,
+                mediaUrl,
+                mimeType,
+                caption,
+            },
+        })
+    } catch (e) {
+        console.warn('[WA persistMediaMessage] No se pudo guardar el mensaje en DB:', e)
+    }
 }
 
 /* ===================== Text ===================== */
@@ -85,7 +149,6 @@ export async function sendText({
         })
         const outboundId = data?.messages?.[0]?.id ?? null
 
-        // (Opcional) Persistir si tienes conversationId y columnas en tu schema
         if (conversationId) {
             try {
                 await prisma.message.create({
@@ -109,7 +172,7 @@ export async function sendText({
     }
 }
 
-/* ===================== Media ===================== */
+/* ===================== Media (por LINK) ===================== */
 
 export async function sendWhatsappMedia({
     empresaId,
@@ -118,7 +181,8 @@ export async function sendWhatsappMedia({
     type,
     caption,
     conversationId,
-}: SendMediaArgs): Promise<OutboundResult> {
+    mimeType,
+}: SendMediaByLinkArgs): Promise<OutboundResult> {
     if (!to) throw new Error('Destino (to) requerido')
     if (!url) throw new Error('URL de media requerida')
 
@@ -143,30 +207,16 @@ export async function sendWhatsappMedia({
         })
         const outboundId = data?.messages?.[0]?.id ?? null
 
-        // (Opcional) Persistir si tienes conversationId y campos en tu schema
-        // Requiere que tu modelo Message tenga: externalId?, mediaType?, mediaUrl?, caption?, empresaId
-        if (conversationId) {
-            try {
-                await prisma.message.create({
-                    data: {
-                        conversationId,
-                        empresaId,
-                        from: 'bot' as MessageFrom,
-                        contenido: safeCaption || (type === 'image' ? '[imagen]' : '[video]'),
-                        externalId: outboundId || undefined,
-                        // Estos campos son opcionales según tu migración:
-                        // @ts-ignore - si aún no migraste, ignora sin romper
-                        mediaType: type,
-                        // @ts-ignore
-                        mediaUrl: url,
-                        // @ts-ignore
-                        caption: safeCaption || null,
-                    } as any,
-                })
-            } catch (e) {
-                console.warn('[WA sendWhatsappMedia] No se pudo guardar el mensaje en DB:', e)
-            }
-        }
+        await persistMediaMessage({
+            conversationId,
+            empresaId,
+            from: 'bot',
+            outboundId,
+            type,
+            mediaUrl: url,
+            caption: safeCaption ?? null,
+            mimeType: mimeType ?? null,
+        })
 
         return { type: 'media', data, outboundId }
     } catch (e: any) {
@@ -175,7 +225,96 @@ export async function sendWhatsappMedia({
     }
 }
 
-/* ===================== Template (opcional) ===================== */
+/* ===================== Media (por MEDIA_ID) ===================== */
+
+export async function sendWhatsappMediaById({
+    empresaId,
+    to,
+    type,
+    mediaId,
+    caption,
+    conversationId,
+    mimeType,
+}: SendMediaByIdArgs): Promise<OutboundResult> {
+    if (!to) throw new Error('Destino (to) requerido')
+    if (!mediaId) throw new Error('mediaId requerido')
+
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const endpoint = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
+    const toSanitized = sanitizePhone(to)
+    const safeCaption = clampCaption(caption)
+
+    const payload: any = {
+        messaging_product: 'whatsapp',
+        to: toSanitized,
+        type,
+        [type]: {
+            id: mediaId,
+            ...(safeCaption ? { caption: safeCaption } : {}),
+        },
+    }
+
+    try {
+        const { data } = await http.post(endpoint, payload, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+        })
+        const outboundId = data?.messages?.[0]?.id ?? null
+
+        await persistMediaMessage({
+            conversationId,
+            empresaId,
+            from: 'bot',
+            outboundId,
+            type,
+            mediaId,
+            caption: safeCaption ?? null,
+            mimeType: mimeType ?? null,
+        })
+
+        return { type: 'media', data, outboundId }
+    } catch (e: any) {
+        console.error('[WA sendWhatsappMediaById] Error:', e?.response?.data || e.message)
+        throw e
+    }
+}
+
+/* ====== Subir archivo a WhatsApp /media (devuelve media_id) ====== */
+
+export async function uploadToWhatsappMedia(empresaId: number, filePath: string, mimeType: string) {
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const form = new FormData()
+    form.append('messaging_product', 'whatsapp')
+    form.append('type', mimeType) // image/jpeg, video/mp4, audio/ogg, application/pdf
+    form.append('file', fs.createReadStream(filePath))
+
+    const { data } = await axios.post(
+        `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/media`,
+        form,
+        { headers: { Authorization: `Bearer ${accessToken}`, ...form.getHeaders() } }
+    )
+    return data?.id as string // media_id
+}
+
+/* ===================== Helpers inbound media ===================== */
+
+export async function getMediaUrl(empresaId: number, mediaId: string): Promise<string> {
+    const { accessToken } = await getWhatsappCreds(empresaId)
+    const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    return data?.url as string // URL firmada (corta vida)
+}
+
+export async function downloadMediaToBuffer(empresaId: number, mediaUrl: string): Promise<Buffer> {
+    const { accessToken } = await getWhatsappCreds(empresaId)
+    const { data } = await axios.get(mediaUrl, {
+        responseType: 'arraybuffer',
+        headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    return Buffer.from(data)
+}
+
+/* ===================== Template ===================== */
 
 export async function sendTemplate({
     empresaId,
@@ -219,7 +358,7 @@ export async function sendTemplate({
 /* ===================== Facade (texto simple) ===================== */
 
 export async function sendOutboundMessage(args: {
-    conversationId?: number // ahora es opcional, por si no lo tienes en ese contexto
+    conversationId?: number
     empresaId: number
     to: string
     body: string
@@ -231,4 +370,38 @@ export async function sendOutboundMessage(args: {
         throw err
     }
     return sendText({ empresaId, to, body, conversationId })
+}
+
+/* ===================== Atajos útiles ===================== */
+
+export async function sendVoiceNoteByLink(opts: {
+    empresaId: number
+    to: string
+    url: string
+    conversationId?: number
+    mimeType?: string
+}) {
+    return sendWhatsappMedia({ ...opts, type: 'audio' })
+}
+
+export async function sendImageByLink(opts: {
+    empresaId: number
+    to: string
+    url: string
+    caption?: string
+    conversationId?: number
+    mimeType?: string
+}) {
+    return sendWhatsappMedia({ ...opts, type: 'image' })
+}
+
+export async function sendVideoByLink(opts: {
+    empresaId: number
+    to: string
+    url: string
+    caption?: string
+    conversationId?: number
+    mimeType?: string
+}) {
+    return sendWhatsappMedia({ ...opts, type: 'video' })
 }

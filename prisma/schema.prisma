@@ -42,6 +42,8 @@ enum Estado {
 enum MediaType {
   image
   video
+  audio
+  document
 }
 
 model Usuario {
@@ -89,13 +91,15 @@ model Message {
   timestamp      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
-  // ⬇️ NUEVO: para Cloud API
-  externalId String?    @unique // wamid de Meta
-  mediaType  MediaType? // image | video (opcional)
-  mediaUrl   String?    @db.Text // link a la media (opcional)
-  caption    String?    @db.Text // pie de foto (opcional)
+  // Cloud API
+  externalId    String?    @unique // wamid de Meta (puede quedar NULL; MySQL permite varios NULL)
+  mediaType     MediaType?
+  mediaId       String?    @db.VarChar(128) // ⬅️ id devuelto por /media (mejor que guardar URL fugaz)
+  mediaUrl      String?    @db.Text // solo si envías por link
+  mimeType      String?    @db.VarChar(64) // útil para pintar correctamente (<audio>, <video>, etc.)
+  caption       String?    @db.Text
+  transcription String?    @db.Text // ⬅️ texto de notas de voz (si aplica)
 
-  // ⬇️ NUEVO: relación directa a Empresa (fase multiempresa)
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
@@ -103,6 +107,7 @@ model Message {
 
   @@index([conversationId, timestamp])
   @@index([empresaId, conversationId, timestamp])
+  @@index([mediaId]) // consultas por mediaId (statuses, trazas)
   @@map("message")
 }
 

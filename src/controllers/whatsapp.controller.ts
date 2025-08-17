@@ -1,13 +1,22 @@
 // src/controllers/whatsapp.controller.ts
 import { Request, Response } from 'express'
 import axios from 'axios'
+import fs from 'fs/promises'
 import prisma from '../lib/prisma'
+
 import {
     sendWhatsappMedia as sendMediaSvc,
     sendText as sendTextSvc,
-} from '../services/whatsapp.services' // ⬅️ servicio correcto
+    uploadToWhatsappMedia,
+    sendWhatsappMediaById,
+} from '../services/whatsapp.services' // servicio correcto
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
+
+/* ===================== Types locales ===================== */
+type MulterReq = Request & {
+    file?: Express.Multer.File
+}
 
 /* ===================== Helpers ===================== */
 
@@ -219,8 +228,6 @@ export const eliminarWhatsappAccount = async (req: Request, res: Response) => {
 /**
  * POST /api/whatsapp/enviar-prueba  (texto simple)
  * body: { phoneNumberId?, to, body, conversationId? }
- * - Si ya quieres persistir el mensaje, pasa conversationId (opcional).
- * - Usamos el servicio sendText para que aplique sanitización y (opcional) persistencia.
  */
 export const enviarPrueba = async (req: Request, res: Response) => {
     try {
@@ -231,7 +238,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
             to: string
             body: string
             conversationId?: number
-            phoneNumberId?: string // ignorado aquí: el servicio resuelve con empresaId
+            phoneNumberId?: string
         }
         if (!to || !body) {
             return res.status(400).json({ ok: false, error: 'to y body son requeridos' })
@@ -242,7 +249,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
             empresaId,
             to: toSanitized,
             body,
-            conversationId, // ⬅️ si lo pasas, se guarda en DB (si migraste schema)
+            conversationId,
         })
 
         return res.json({ ok: true, ...result })
@@ -275,8 +282,8 @@ export const enviarPrueba = async (req: Request, res: Response) => {
 }
 
 /**
- * POST /api/whatsapp/media  (imagen o video/mp4)
- * body: { to, url, type: 'image' | 'video', caption?, conversationId? }
+ * POST /api/whatsapp/media  (image|video|audio|document por LINK)
+ * body: { to, url, type, caption?, conversationId? }
  */
 export const enviarMedia = async (req: Request, res: Response) => {
     try {
@@ -286,7 +293,7 @@ export const enviarMedia = async (req: Request, res: Response) => {
         const { to, url, type, caption, conversationId } = req.body as {
             to: string
             url: string
-            type: 'image' | 'video'
+            type: 'image' | 'video' | 'audio' | 'document'
             caption?: string
             conversationId?: number
         }
@@ -294,19 +301,18 @@ export const enviarMedia = async (req: Request, res: Response) => {
         if (!to || !url || !type) {
             return res.status(400).json({ ok: false, error: 'to, url y type son requeridos' })
         }
-        if (type !== 'image' && type !== 'video') {
-            return res.status(400).json({ ok: false, error: 'type inválido: usa image o video' })
+        if (!['image', 'video', 'audio', 'document'].includes(type)) {
+            return res.status(400).json({ ok: false, error: 'type inválido' })
         }
 
         const toSanitized = sanitizePhone(to)
-
         const result = await sendMediaSvc({
             empresaId,
             to: toSanitized,
             url,
             type,
             caption,
-            conversationId, // ⬅️ si lo pasas, se guarda en DB (si migraste schema)
+            conversationId,
         })
 
         return res.json({ ok: true, ...result })
@@ -323,6 +329,61 @@ export const enviarMedia = async (req: Request, res: Response) => {
                 },
             })
         }
+        return res.status(400).json(metaError(err))
+    }
+}
+
+/**
+ * POST /api/whatsapp/media-upload
+ * form-data: file, to, type('image'|'video'|'audio'|'document'), caption?, conversationId?
+ * Flujo: sube a /media → obtiene media_id → envía mensaje por id → borra archivo temporal
+ */
+export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
+    const tmpPath = req.file?.path
+    try {
+        const empresaId = (req as any).user?.empresaId
+        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+        if (!tmpPath) return res.status(400).json({ ok: false, error: 'Archivo requerido (file)' })
+
+        const { to, type, caption, conversationId } = (req.body || {}) as {
+            to: string
+            type: 'image' | 'video' | 'audio' | 'document'
+            caption?: string
+            conversationId?: number
+        }
+
+        if (!to || !type) {
+            return res.status(400).json({ ok: false, error: 'to y type son requeridos' })
+        }
+        if (!['image', 'video', 'audio', 'document'].includes(type)) {
+            return res.status(400).json({ ok: false, error: 'type inválido' })
+        }
+
+        const toSanitized = sanitizePhone(to)
+        const mime = req.file!.mimetype
+
+        // 1) subir archivo a /media
+        const mediaId = await uploadToWhatsappMedia(empresaId, tmpPath, mime)
+
+        // 2) enviar mensaje por media_id (pasamos mimeType para persistencia)
+        const result = await sendWhatsappMediaById({
+            empresaId,
+            to: toSanitized,
+            type,
+            mediaId,
+            caption,
+            conversationId,
+            mimeType: mime,
+        })
+
+        // 3) limpiar archivo temporal
+        try { await fs.unlink(tmpPath) } catch { /* ignore */ }
+
+        return res.json({ ok: true, mediaId, ...result })
+    } catch (err: any) {
+        // limpia temp en error
+        try { if (tmpPath) await fs.unlink(tmpPath) } catch { /* ignore */ }
+        logMetaError('enviarMediaUpload', err)
         return res.status(400).json(metaError(err))
     }
 }
@@ -352,6 +413,47 @@ export const infoNumero = async (req: Request, res: Response) => {
     } catch (err: any) {
         logMetaError('infoNumero', err)
         return res.status(400).json(metaError(err))
+    }
+}
+
+/* =============================================================================
+ * Stream de media por mediaId (proxy a WhatsApp)
+ * ========================================================================== */
+
+/**
+ * GET /api/whatsapp/media/:mediaId
+ * Devuelve el binario de la media (image/video/audio/document) vía stream.
+ * Requiere JWT (usa empresaId del usuario autenticado).
+ */
+export const streamMediaById = async (req: Request, res: Response) => {
+    try {
+        const empresaId = (req as any).user?.empresaId
+        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+
+        const { mediaId } = req.params as { mediaId: string }
+        if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' })
+
+        const accessToken = await getAccessToken(empresaId)
+
+        // 1) Obtener URL firmada de la media
+        const meta = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+        })
+        const mediaUrl = meta?.data?.url
+        if (!mediaUrl) return res.status(404).json({ ok: false, error: 'Media no encontrada' })
+
+        // 2) Descargar y streamear al cliente
+        const file = await axios.get(mediaUrl, {
+            responseType: 'stream',
+            headers: { Authorization: `Bearer ${accessToken}` },
+        })
+
+        res.setHeader('Content-Type', file.headers['content-type'] || 'application/octet-stream')
+        res.setHeader('Cache-Control', 'no-store')
+        file.data.pipe(res)
+    } catch (err: any) {
+        console.error('[streamMediaById] error:', err?.response?.data || err.message)
+        return res.status(500).json({ ok: false, error: 'No se pudo obtener la media' })
     }
 }
 
