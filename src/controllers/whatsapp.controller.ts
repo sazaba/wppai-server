@@ -13,7 +13,9 @@ import {
 } from '../services/whatsapp.services'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret'
+// ✅ normaliza (evita espacios o comillas perdidas de la UI del host)
+const JWT_SECRET = (process.env.JWT_SECRET ?? 'dev-secret').trim()
+
 
 /* ===================== Types locales ===================== */
 type MulterReq = Request & { file?: Express.Multer.File }
@@ -76,10 +78,12 @@ function resolveEmpresaIdFromRequest(req: Request): number | null {
     try {
         const decoded = jwt.verify(tokenQ, JWT_SECRET) as any
         return Number(decoded?.empresaId) || null
-    } catch {
+    } catch (e: any) {
+        console.warn('[streamMediaById] JWT inválido:', e?.name, e?.message)
         return null
     }
 }
+
 
 /**
  * ¿Existe la plantilla en Meta?
@@ -554,7 +558,10 @@ export const infoNumero = async (req: Request, res: Response) => {
 export const streamMediaById = async (req: Request, res: Response) => {
     try {
         const empresaId = resolveEmpresaIdFromRequest(req)
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+        if (!empresaId) {
+            console.warn('[streamMediaById] 401 por empresaId nulo. Query.t =', typeof req.query?.t === 'string' ? 'presente' : 'ausente')
+            return res.status(401).json({ ok: false, error: 'No autorizado', reason: 'token_invalid_or_missing' })
+        }
 
         const { mediaId } = req.params as { mediaId: string }
         if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' })
