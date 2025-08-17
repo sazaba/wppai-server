@@ -283,7 +283,7 @@ export const enviarPrueba = async (req: Request, res: Response) => {
  */
 export const enviarMedia = async (req: Request, res: Response) => {
     try {
-        const empresaId = (req as any).user?.empresaId
+        const empresaId = (req as any).user?.empresaId as number
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
         const { to, url, type, caption, conversationId } = req.body as {
@@ -294,14 +294,23 @@ export const enviarMedia = async (req: Request, res: Response) => {
             conversationId?: number
         }
 
-        // Resolver 'to' desde conversationId si no vino
+        // Resolver destino y conversationId
         let toFinal = (to || '').trim()
+        let convId = conversationId
         if (!toFinal && conversationId) {
             const conv = await prisma.conversation.findUnique({
                 where: { id: conversationId },
                 select: { phone: true },
             })
             toFinal = conv?.phone || ''
+        } else if (toFinal && !convId) {
+            const existing = await prisma.conversation.findFirst({
+                where: { phone: sanitizePhone(toFinal), empresaId },
+                select: { id: true },
+            })
+            convId = existing?.id || (await prisma.conversation.create({
+                data: { phone: sanitizePhone(toFinal), estado: 'pendiente', empresaId }
+            })).id
         }
 
         if (!toFinal || !url || !type) {
@@ -312,14 +321,50 @@ export const enviarMedia = async (req: Request, res: Response) => {
         }
 
         const toSanitized = sanitizePhone(toFinal)
+
+        // 1) Enviar por LINK
         const result = await sendMediaSvc({
             empresaId,
             to: toSanitized,
             url,
             type,
             caption,
-            conversationId,
+            conversationId: convId,
         })
+
+        // 2) Intentar recuperar el mensaje guardado por externalId
+        let saved = null as any
+        if (result?.outboundId) {
+            saved = await prisma.message.findFirst({
+                where: { externalId: result.outboundId },
+                orderBy: { id: 'desc' },
+            })
+        }
+
+        // 3) Emitir al frontend para renderizar de inmediato
+        const io = req.app.get('io') as any
+        if (io && convId) {
+            io.emit('nuevo_mensaje', {
+                conversationId: convId,
+                message: {
+                    id: saved?.id ?? null,
+                    externalId: result?.outboundId ?? null,
+                    from: 'bot',
+                    contenido: caption || (
+                        type === 'image' ? '[imagen]' :
+                            type === 'video' ? '[video]' :
+                                type === 'audio' ? '[nota de voz]' :
+                                    '[documento]'
+                    ),
+                    timestamp: (saved?.timestamp ?? new Date()).toISOString(),
+                    mediaType: type,
+                    mediaUrl: url,             // ← por LINK mostramos la URL directa
+                    mimeType: saved?.mimeType ?? null,
+                    caption: caption || null,
+                },
+            })
+        }
+
         return res.json({ ok: true, ...result })
     } catch (err: any) {
         logMetaError('enviarMedia', err)
@@ -364,15 +409,23 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
             return res.status(400).json({ ok: false, error: 'type inválido' })
         }
 
-        // Resolver destino
+        // Resolver destino y conversación
         let toFinal = (body.to || '').trim()
-        const convIdNum = body.conversationId ? Number(body.conversationId) : undefined
-        if (!toFinal && convIdNum) {
+        let convId = body.conversationId ? Number(body.conversationId) : undefined
+        if (!toFinal && convId) {
             const conv = await prisma.conversation.findUnique({
-                where: { id: convIdNum },
+                where: { id: convId },
                 select: { phone: true },
             })
             toFinal = conv?.phone || ''
+        } else if (toFinal && !convId) {
+            const existing = await prisma.conversation.findFirst({
+                where: { phone: sanitizePhone(toFinal), empresaId },
+                select: { id: true },
+            })
+            convId = existing?.id || (await prisma.conversation.create({
+                data: { phone: sanitizePhone(toFinal), estado: 'pendiente', empresaId }
+            })).id
         }
         if (!toFinal) {
             return res.status(400).json({ ok: false, error: 'to o conversationId son requeridos' })
@@ -383,18 +436,51 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
         // 1) subir archivo a /media
         const mediaId = await uploadToWhatsappMedia(empresaId, tmpPath, mime)
 
-        // 2) enviar por media_id (el servicio ya persiste con enums correctos)
+        // 2) enviar por media_id
         const result = await sendWhatsappMediaById({
             empresaId,
             to: toSanitized,
             type: waType,
             mediaId,
             caption,
-            conversationId: convIdNum,
+            conversationId: convId,
             mimeType: mime,
         })
 
-        // 3) limpiar archivo temporal
+        // 3) Intentar recuperar el mensaje guardado por externalId
+        let saved = null as any
+        if (result?.outboundId) {
+            saved = await prisma.message.findFirst({
+                where: { externalId: result.outboundId },
+                orderBy: { id: 'desc' },
+            })
+        }
+
+        // 4) Emitir al frontend para renderizar de inmediato
+        const io = req.app.get('io') as any
+        if (io && convId) {
+            io.emit('nuevo_mensaje', {
+                conversationId: convId,
+                message: {
+                    id: saved?.id ?? null,
+                    externalId: result?.outboundId ?? null,
+                    from: 'bot',
+                    contenido: caption || (
+                        waType === 'image' ? '[imagen]' :
+                            waType === 'video' ? '[video]' :
+                                waType === 'audio' ? '[nota de voz]' :
+                                    '[documento]'
+                    ),
+                    timestamp: (saved?.timestamp ?? new Date()).toISOString(),
+                    mediaType: waType,
+                    mediaUrl: `/api/whatsapp/media/${mediaId}`, // ← por MEDIA_ID usamos el proxy seguro
+                    mimeType: saved?.mimeType ?? mime ?? null,
+                    caption: caption || null,
+                },
+            })
+        }
+
+        // 5) limpiar archivo temporal
         try { await fs.unlink(tmpPath) } catch { }
 
         return res.json({ ok: true, mediaId, ...result })
