@@ -9,6 +9,14 @@ import {
     downloadMediaToBuffer,
 } from '../services/whatsapp.services'
 import { transcribeAudioBuffer } from '../services/transcription.service'
+// 🆕: firmador de token corto para URLs de media
+import { signMediaToken } from './whatsapp.controller'
+
+// 🆕 helper: construye URL firmada para que <img>/<video> puedan cargar sin Authorization
+function buildSignedMediaUrl(empresaId: number, mediaId: string) {
+    const t = signMediaToken(empresaId, mediaId)
+    return `/api/whatsapp/media/${mediaId}?t=${encodeURIComponent(t)}`
+}
 
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
@@ -102,6 +110,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         let transcription: string | undefined
         let isVoiceNote = false
         let mediaUrlForFrontend: string | undefined
+        let captionForDb: string | undefined
 
         // 🔊 NOTA DE VOZ / AUDIO: descargar y transcribir
         if (msg.type === 'audio' && msg.audio?.id) {
@@ -131,9 +140,47 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             // Si no hay transcripción, dejamos placeholder
             contenido = transcription || '[nota de voz]'
 
-            // URL para reproducir desde el front (proxy seguro con JWT)
+            // URL firmada para reproducir desde el front
             if (inboundMediaId) {
-                mediaUrlForFrontend = `/api/whatsapp/media/${inboundMediaId}`
+                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
+            }
+        }
+        // 🖼️ IMAGEN
+        else if (msg.type === 'image' && msg.image?.id) {
+            inboundMediaType = MediaType.image
+            inboundMediaId = String(msg.image.id)
+            inboundMime = msg.image?.mime_type as string | undefined
+            captionForDb = (msg.image?.caption as string | undefined) || undefined
+
+            contenido = captionForDb || '[imagen]'
+            if (inboundMediaId) {
+                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
+            }
+        }
+        // 🎞️ VIDEO
+        else if (msg.type === 'video' && msg.video?.id) {
+            inboundMediaType = MediaType.video
+            inboundMediaId = String(msg.video.id)
+            inboundMime = msg.video?.mime_type as string | undefined
+            captionForDb = (msg.video?.caption as string | undefined) || undefined
+
+            contenido = captionForDb || '[video]'
+            if (inboundMediaId) {
+                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
+            }
+        }
+        // 📎 DOCUMENTO
+        else if (msg.type === 'document' && msg.document?.id) {
+            inboundMediaType = MediaType.document
+            inboundMediaId = String(msg.document.id)
+            inboundMime = msg.document?.mime_type as string | undefined
+            // podemos guardar filename en caption si quieres mostrarlo
+            const filename = (msg.document?.filename as string | undefined) || undefined
+            captionForDb = filename
+
+            contenido = filename ? `[documento] ${filename}` : '[documento]'
+            if (inboundMediaId) {
+                mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
             }
         }
 
@@ -149,6 +196,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             mimeType: inboundMime,
             transcription: transcription || undefined,
         }
+        if (captionForDb) inboundData.caption = captionForDb
         if (process.env.FEATURE_ISVOICENOTE === '1') {
             inboundData.isVoiceNote = Boolean(isVoiceNote)
         }
@@ -165,10 +213,11 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 contenido,
                 timestamp: inbound.timestamp.toISOString(),
                 mediaType: inboundMediaType,
-                mediaUrl: mediaUrlForFrontend, // /api/whatsapp/media/:mediaId
+                mediaUrl: mediaUrlForFrontend, // ← firmada (si hay media)
                 mimeType: inboundMime,
                 transcription,
                 isVoiceNote,
+                caption: captionForDb,
             },
             phone: conversation.phone,
             nombre: conversation.nombre ?? conversation.phone,
@@ -186,7 +235,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             if (
                 skipEscalateForAudioNoTranscript &&
                 result?.estado === ConversationEstado.requiere_agente &&
-                result?.motivo === 'palabra_clave'
+                (result as any)?.motivo === 'palabra_clave'
             ) {
                 result = {
                     estado: ConversationEstado.en_proceso,
