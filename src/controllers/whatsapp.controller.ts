@@ -2,6 +2,7 @@
 import { Request, Response } from 'express'
 import axios from 'axios'
 import fs from 'fs/promises'
+import jwt from 'jsonwebtoken'                     // ⬅️ NUEVO
 import prisma from '../lib/prisma'
 
 import {
@@ -9,9 +10,10 @@ import {
     sendText as sendTextSvc,
     uploadToWhatsappMedia,
     sendWhatsappMediaById,
-} from '../services/whatsapp.services' // <-- usa el path donde tengas el servicio
+} from '../services/whatsapp.services'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret' // ⬅️ token firma/valida
 
 /* ===================== Types locales ===================== */
 type MulterReq = Request & { file?: Express.Multer.File }
@@ -57,6 +59,26 @@ function guessTypeFromMime(mime: string): 'image' | 'video' | 'audio' | 'documen
     if (mime.startsWith('video/')) return 'video'
     if (mime.startsWith('audio/')) return 'audio'
     return 'document'
+}
+
+/** 🔏 Firma un token corto para pedir /media/:id desde <img>/<video> */
+function signMediaToken(empresaId: number, mediaId: string) {
+    return jwt.sign({ empresaId, mediaId }, JWT_SECRET, { expiresIn: '10m' })
+}
+
+/** 🔎 Obtiene empresaId desde (1) auth normal o (2) token ?t= */
+function resolveEmpresaIdFromRequest(req: Request): number | null {
+    const authEmpresa = (req as any).user?.empresaId
+    if (authEmpresa) return Number(authEmpresa)
+
+    const tokenQ = (req.query?.t as string) || ''
+    if (!tokenQ) return null
+    try {
+        const decoded = jwt.verify(tokenQ, JWT_SECRET) as any
+        return Number(decoded?.empresaId) || null
+    } catch {
+        return null
+    }
 }
 
 /**
@@ -332,34 +354,20 @@ export const enviarMedia = async (req: Request, res: Response) => {
             conversationId: convId,
         })
 
-        // 2) Intentar recuperar el mensaje guardado por externalId
-        let saved = null as any
-        if (result?.outboundId) {
-            saved = await prisma.message.findFirst({
-                where: { externalId: result.outboundId },
-                orderBy: { id: 'desc' },
-            })
-        }
-
-        // 3) Emitir al frontend para renderizar de inmediato
+        // 2) Emitir al frontend (mediaUrl = url pública)
         const io = req.app.get('io') as any
         if (io && convId) {
             io.emit('nuevo_mensaje', {
                 conversationId: convId,
                 message: {
-                    id: saved?.id ?? null,
+                    id: null,
                     externalId: result?.outboundId ?? null,
                     from: 'bot',
-                    contenido: caption || (
-                        type === 'image' ? '[imagen]' :
-                            type === 'video' ? '[video]' :
-                                type === 'audio' ? '[nota de voz]' :
-                                    '[documento]'
-                    ),
-                    timestamp: (saved?.timestamp ?? new Date()).toISOString(),
+                    contenido: caption || (type === 'image' ? '[imagen]' : type === 'video' ? '[video]' : type === 'audio' ? '[nota de voz]' : '[documento]'),
+                    timestamp: new Date().toISOString(),
                     mediaType: type,
-                    mediaUrl: url,             // ← por LINK mostramos la URL directa
-                    mimeType: saved?.mimeType ?? null,
+                    mediaUrl: url, // link directo
+                    mimeType: null,
                     caption: caption || null,
                 },
             })
@@ -447,14 +455,9 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
             mimeType: mime,
         })
 
-        // 3) Intentar recuperar el mensaje guardado por externalId
-        let saved = null as any
-        if (result?.outboundId) {
-            saved = await prisma.message.findFirst({
-                where: { externalId: result.outboundId },
-                orderBy: { id: 'desc' },
-            })
-        }
+        // 3) Firmar URL del proxy para el frontend
+        const token = signMediaToken(empresaId, mediaId)
+        const mediaUrl = `/api/whatsapp/media/${mediaId}?t=${encodeURIComponent(token)}`
 
         // 4) Emitir al frontend para renderizar de inmediato
         const io = req.app.get('io') as any
@@ -462,19 +465,14 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
             io.emit('nuevo_mensaje', {
                 conversationId: convId,
                 message: {
-                    id: saved?.id ?? null,
+                    id: null,
                     externalId: result?.outboundId ?? null,
                     from: 'bot',
-                    contenido: caption || (
-                        waType === 'image' ? '[imagen]' :
-                            waType === 'video' ? '[video]' :
-                                waType === 'audio' ? '[nota de voz]' :
-                                    '[documento]'
-                    ),
-                    timestamp: (saved?.timestamp ?? new Date()).toISOString(),
+                    contenido: caption || (waType === 'image' ? '[imagen]' : waType === 'video' ? '[video]' : waType === 'audio' ? '[nota de voz]' : '[documento]'),
+                    timestamp: new Date().toISOString(),
                     mediaType: waType,
-                    mediaUrl: `/api/whatsapp/media/${mediaId}`, // ← por MEDIA_ID usamos el proxy seguro
-                    mimeType: saved?.mimeType ?? mime ?? null,
+                    mediaUrl,            // ← URL firmada (sin headers)
+                    mimeType: mime ?? null,
                     caption: caption || null,
                 },
             })
@@ -524,10 +522,12 @@ export const infoNumero = async (req: Request, res: Response) => {
 
 /**
  * GET /api/whatsapp/media/:mediaId
+ * - Soporta auth normal (req.user) o token corto en ?t= (firmado por el backend)
+ * - Devolver en modo "inline" para que <img>/<video> funcionen.
  */
 export const streamMediaById = async (req: Request, res: Response) => {
     try {
-        const empresaId = (req as any).user?.empresaId
+        const empresaId = resolveEmpresaIdFromRequest(req)               // ⬅️ puede venir de ?t=
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
         const { mediaId } = req.params as { mediaId: string }
@@ -549,10 +549,12 @@ export const streamMediaById = async (req: Request, res: Response) => {
         })
 
         res.setHeader('Content-Type', file.headers['content-type'] || 'application/octet-stream')
+        res.setHeader('Content-Disposition', 'inline')                   // ⬅️ importante para <img>/<video>
         if (file.headers['content-length']) {
             res.setHeader('Content-Length', file.headers['content-length'])
         }
         res.setHeader('Cache-Control', 'private, max-age=300')
+
         file.data.pipe(res)
     } catch (err: any) {
         console.error('[streamMediaById] error:', err?.response?.data || err.message)
