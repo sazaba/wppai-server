@@ -62,9 +62,11 @@ function guessTypeFromMime(mime: string): 'image' | 'video' | 'audio' | 'documen
 }
 
 /** 🔏 Firma un token corto para pedir /media/:id desde <img>/<video> */
-function signMediaToken(empresaId: number, mediaId: string) {
+
+export function signMediaToken(empresaId: number, mediaId: string) {
     return jwt.sign({ empresaId, mediaId }, JWT_SECRET, { expiresIn: '10m' })
 }
+
 
 /** 🔎 Obtiene empresaId desde (1) auth normal o (2) token ?t= */
 function resolveEmpresaIdFromRequest(req: Request): number | null {

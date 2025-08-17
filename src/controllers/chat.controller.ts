@@ -4,9 +4,27 @@ import prisma from '../lib/prisma'
 import { ConversationEstado, MessageFrom } from '@prisma/client'
 import { handleIAReply } from '../utils/handleIAReply'
 import { sendOutboundMessage, sendTemplate } from '../services/whatsapp.services'
+// 🆕 importar el firmador de URLs cortas para media
+import { signMediaToken } from './whatsapp.controller'
 
 // Helper para socket
 const getIO = (req: Request) => req.app.get('io')
+
+// 🆕 helper: si hay mediaId y no hay mediaUrl público, genera URL firmada del proxy
+function withSignedMediaUrl<T extends { mediaUrl?: string | null; mediaId?: string | null }>(
+    m: T,
+    empresaId: number
+): T {
+    const mediaUrl = (m.mediaUrl || '').trim()
+    if ((!mediaUrl || mediaUrl.length === 0) && m.mediaId) {
+        const t = signMediaToken(empresaId, String(m.mediaId))
+        return {
+            ...m,
+            mediaUrl: `/api/whatsapp/media/${m.mediaId}?t=${encodeURIComponent(t)}`,
+        }
+    }
+    return m
+}
 
 // ——————————————————————————————
 // GET conversaciones
@@ -63,10 +81,14 @@ export const getMessagesByConversation = async (req: Request, res: Response) => 
             orderBy: { timestamp: 'asc' },
             skip,
             take: limit,
+            // Nota: no cambiamos tu select; asumimos que message incluye mediaId/mediaUrl si existen
         })
 
+        // 🆕: firmar mediaUrl cuando solo tenemos mediaId (necesario para <img>/<video>)
+        const messagesSigned = messages.map((m) => withSignedMediaUrl(m, empresaId))
+
         res.json({
-            messages,
+            messages: messagesSigned,
             pagination: { total, page, limit, hasMore: skip + limit < total },
         })
     } catch (err) {
@@ -340,6 +362,7 @@ export const cerrarConversacion = async (req: Request, res: Response) => {
         res.status(500).json({ error: 'No se pudo cerrar la conversación' })
     }
 }
+
 // ——————————————————————————————
 // Crear conversación (desde dashboard)
 // ——————————————————————————————
