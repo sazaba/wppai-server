@@ -13,9 +13,37 @@ import {
 } from '../services/whatsapp.services'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
-// ✅ normaliza (evita espacios o comillas perdidas de la UI del host)
-const JWT_SECRET = (process.env.JWT_SECRET ?? 'dev-secret').trim()
 
+/* ===================== JWT helpers (robusto) ===================== */
+// Genera variantes seguras de la secret para tolerar espacios/comillas
+function getSecretCandidates() {
+    const raw = process.env.JWT_SECRET ?? 'dev-secret'
+    const trimmed = raw.trim()
+    const unquoted = trimmed.replace(/^['"]|['"]$/g, '') // quita comillas si las hay
+    const set = new Set([raw, trimmed, unquoted])
+    return [...set].filter(Boolean) as string[]
+}
+// Exportada por si otros controladores la necesitan
+export const JWT_SECRETS = getSecretCandidates()
+
+/** Firma token corto para /media/:id */
+export function signMediaToken(empresaId: number, mediaId: string) {
+    // firmamos con la variante más “limpia”
+    const secret = JWT_SECRETS[JWT_SECRETS.length - 1]
+    return jwt.sign({ empresaId, mediaId }, secret, { expiresIn: '10m', algorithm: 'HS256' })
+}
+
+/** Verifica el token probando todas las variantes */
+function verifyWithCandidates(token: string): any | null {
+    for (const s of JWT_SECRETS) {
+        try {
+            return jwt.verify(token, s, { algorithms: ['HS256'] })
+        } catch {
+            // probar siguiente
+        }
+    }
+    return null
+}
 
 /* ===================== Types locales ===================== */
 type MulterReq = Request & { file?: Express.Multer.File }
@@ -63,27 +91,21 @@ function guessTypeFromMime(mime: string): 'image' | 'video' | 'audio' | 'documen
     return 'document'
 }
 
-/** 🔏 Firma un token corto para pedir /media/:id desde <img>/<video> */
-export function signMediaToken(empresaId: number, mediaId: string) {
-    return jwt.sign({ empresaId, mediaId }, JWT_SECRET, { expiresIn: '10m' })
-}
-
-/** 🔎 Obtiene empresaId desde (1) auth normal o (2) token ?t= */
+/** 🔎 empresaId desde auth o token corto ?t= */
 function resolveEmpresaIdFromRequest(req: Request): number | null {
     const authEmpresa = (req as any).user?.empresaId
     if (authEmpresa) return Number(authEmpresa)
 
     const tokenQ = (req.query?.t as string) || ''
     if (!tokenQ) return null
-    try {
-        const decoded = jwt.verify(tokenQ, JWT_SECRET) as any
-        return Number(decoded?.empresaId) || null
-    } catch (e: any) {
-        console.warn('[streamMediaById] JWT inválido:', e?.name, e?.message)
+
+    const decoded = verifyWithCandidates(tokenQ)
+    if (!decoded) {
+        console.warn('[streamMediaById] JWT inválido con todas las variantes de secret. len(token)=', tokenQ.length, 'secrets=', JWT_SECRETS.map(s => s.length))
         return null
     }
+    return Number((decoded as any)?.empresaId) || null
 }
-
 
 /**
  * ¿Existe la plantilla en Meta?
@@ -382,10 +404,9 @@ export const enviarMedia = async (req: Request, res: Response) => {
                                     : '[documento]'),
                     timestamp: new Date().toISOString(),
                     mediaType: type,
-                    mediaUrl: url, // link directo
+                    mediaUrl: url,
                     mimeType: null,
                     caption: caption || null,
-                    // Por LINK no hay mediaId que exponer
                 },
             })
         }
@@ -480,7 +501,7 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
         const token = signMediaToken(empresaId, mediaId)
         const mediaUrl = `/api/whatsapp/media/${mediaId}?t=${encodeURIComponent(token)}`
 
-        // 4) Emitir al frontend para renderizar de inmediato (🏁 incluye mediaId)
+        // 4) Emitir al frontend para renderizar de inmediato (incluye mediaId)
         const io = req.app.get('io') as any
         if (io && convId) {
             io.emit('nuevo_mensaje', {
@@ -500,10 +521,10 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
                                     : '[documento]'),
                     timestamp: new Date().toISOString(),
                     mediaType: waType,
-                    mediaUrl,            // URL firmada para consumo directo por <img>/<video>
+                    mediaUrl,            // URL firmada usable en <img>/<video>
                     mimeType: mime ?? null,
                     caption: caption || null,
-                    mediaId,             // ⬅️ añadido para que el front tenga fallback
+                    mediaId,             // fallback por si necesitas reconstruir URL en el front
                 },
             })
         }
@@ -620,8 +641,6 @@ export const debugToken = async (req: Request, res: Response) => {
 
 export const health = async (_req: Request, res: Response) => {
     try {
-        // este endpoint lo estás protegiendo con verificarJWT en routes
-        // no hace falta re-leer empresa aquí
         return res.json({ ok: true, status: 'ready' })
     } catch (err) {
         console.error('[health] error:', err)
