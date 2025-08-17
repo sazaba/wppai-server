@@ -1,5 +1,12 @@
-import express from 'express'
-import {
+// src/routes/chat.route.ts
+import { Router } from 'express'
+import { verificarJWT } from '../middleware/auth.middleware'
+import { checkTrialLimits } from '../middleware/trialLimit.middleware'
+
+// Importa TODO como objeto y desestructura (evita undefined por default/named)
+import * as ChatCtrl from '../controllers/chat.controller'
+
+const {
     getConversations,
     getMessagesByConversation,
     postMessageToConversation,
@@ -7,29 +14,33 @@ import {
     updateConversationEstado,
     cerrarConversacion,
     responderManual,
-    crearConversacion
-} from '../controllers/chat.controller'
+    crearConversacion,   // <- debe existir/exportarse en el controller
+    iniciarChat,         // <- opcional, si lo usas
+} = ChatCtrl
 
-import { verificarJWT } from '../middleware/auth.middleware'
-import { checkTrialLimits } from '../middleware/trialLimit.middleware'
+const router = Router()
 
-const router = express.Router()
-
+// JWT para todo
 router.use(verificarJWT)
 
-// 📌 Rutas que NO cuentan para el límite
+// 📌 NO cuentan para el límite
 router.get('/chats', getConversations)
 router.get('/chats/:id/messages', getMessagesByConversation)
 
-// 📌 Rutas que cuentan mensajes enviados
+// 📌 Cuentan envío
 router.post('/chats/:id/messages', checkTrialLimits, postMessageToConversation)
 router.post('/responder', checkTrialLimits, responderConIA)
 router.post('/chats/:id/responder-manual', checkTrialLimits, responderManual)
 
-// 📌 Crear conversación no incrementa por sí misma, solo los mensajes que envíe
+// 📌 Crear conversación (no cuenta)
 router.post('/chats', crearConversacion)
 
-// 📌 Rutas de actualización de estado
+// 📌 Iniciar fuera de 24h con plantilla (si lo usas)
+if (iniciarChat) {
+    router.post('/chats/iniciar', iniciarChat)
+}
+
+// 📌 Estados
 router.put('/chats/:id/estado', updateConversationEstado)
 router.put('/chats/:id/cerrar', cerrarConversacion)
 

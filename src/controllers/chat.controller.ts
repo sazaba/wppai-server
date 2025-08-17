@@ -340,3 +340,33 @@ export const cerrarConversacion = async (req: Request, res: Response) => {
         res.status(500).json({ error: 'No se pudo cerrar la conversación' })
     }
 }
+// ——————————————————————————————
+// Crear conversación (desde dashboard)
+// ——————————————————————————————
+export const crearConversacion = async (req: Request, res: Response) => {
+    const { phone, nombre } = req.body as { phone?: string; nombre?: string }
+    const empresaId = (req as any).user?.empresaId
+
+    if (!empresaId) return res.status(401).json({ error: 'No autorizado' })
+    if (!phone?.trim()) return res.status(400).json({ error: 'El número de teléfono es obligatorio' })
+
+    try {
+        const nueva = await prisma.conversation.create({
+            data: {
+                phone,
+                nombre: nombre?.trim() || null,
+                estado: ConversationEstado.pendiente,
+                empresaId,
+            },
+        })
+
+        // Opcional: emite a la lista de chats si quieres que aparezca en tiempo real
+        const io = req.app.get('io')
+        io?.emit?.('chat_actualizado', { id: nueva.id, estado: nueva.estado })
+
+        return res.status(201).json({ message: 'Conversación creada', chat: nueva })
+    } catch (err) {
+        console.error('[crearConversacion] Error:', err)
+        return res.status(500).json({ error: 'Error al crear la conversación' })
+    }
+}
