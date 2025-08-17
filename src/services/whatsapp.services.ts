@@ -33,7 +33,7 @@ type SendMediaByLinkArgs = {
     type: MediaType
     caption?: string
     conversationId?: number
-    mimeType?: string // opcional si la conoces
+    mimeType?: string
 }
 
 type SendMediaByIdArgs = {
@@ -43,7 +43,7 @@ type SendMediaByIdArgs = {
     mediaId: string
     caption?: string
     conversationId?: number
-    mimeType?: string // opcional
+    mimeType?: string
 }
 
 export type OutboundResult = {
@@ -284,7 +284,7 @@ export async function uploadToWhatsappMedia(empresaId: number, filePath: string,
     const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
     const form = new FormData()
     form.append('messaging_product', 'whatsapp')
-    form.append('type', mimeType) // image/jpeg, video/mp4, audio/ogg, application/pdf
+    form.append('type', mimeType)
     form.append('file', fs.createReadStream(filePath))
 
     const { data } = await axios.post(
@@ -292,17 +292,31 @@ export async function uploadToWhatsappMedia(empresaId: number, filePath: string,
         form,
         { headers: { Authorization: `Bearer ${accessToken}`, ...form.getHeaders() } }
     )
-    return data?.id as string // media_id
+    return data?.id as string
 }
 
 /* ===================== Helpers inbound media ===================== */
 
-export async function getMediaUrl(empresaId: number, mediaId: string): Promise<string> {
+type MediaMeta = {
+    id: string
+    url: string
+    mime_type?: string
+    sha256?: string
+    file_size?: number
+}
+
+/** Devuelve metadatos del media-id (incluye url firmada y mime_type) */
+export async function getMediaMeta(empresaId: number, mediaId: string): Promise<MediaMeta> {
     const { accessToken } = await getWhatsappCreds(empresaId)
     const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
         headers: { Authorization: `Bearer ${accessToken}` },
     })
-    return data?.url as string // URL firmada (corta vida)
+    return data as MediaMeta
+}
+
+export async function getMediaUrl(empresaId: number, mediaId: string): Promise<string> {
+    const meta = await getMediaMeta(empresaId, mediaId)
+    return meta.url
 }
 
 export async function downloadMediaToBuffer(empresaId: number, mediaUrl: string): Promise<Buffer> {
@@ -312,6 +326,25 @@ export async function downloadMediaToBuffer(empresaId: number, mediaUrl: string)
         headers: { Authorization: `Bearer ${accessToken}` },
     })
     return Buffer.from(data)
+}
+
+/** Descarga directo a partir de un mediaId (retorna buffer y mime) */
+export async function downloadMediaByIdToBuffer(
+    empresaId: number,
+    mediaId: string
+): Promise<{ buffer: Buffer; mimeType?: string; fileSize?: number }> {
+    const meta = await getMediaMeta(empresaId, mediaId)
+    const { accessToken } = await getWhatsappCreds(empresaId)
+
+    const resp = await axios.get(meta.url, {
+        responseType: 'arraybuffer',
+        headers: { Authorization: `Bearer ${accessToken}` },
+    })
+
+    const mimeType = resp.headers['content-type'] as string | undefined
+    const fileSize = Number(resp.headers['content-length'] || meta.file_size || 0)
+
+    return { buffer: Buffer.from(resp.data), mimeType, fileSize }
 }
 
 /* ===================== Template ===================== */

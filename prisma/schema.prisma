@@ -92,13 +92,17 @@ model Message {
   updatedAt      DateTime    @updatedAt
 
   // Cloud API
-  externalId    String?    @unique // wamid de Meta (puede quedar NULL; MySQL permite varios NULL)
-  mediaType     MediaType?
-  mediaId       String?    @db.VarChar(128) // ⬅️ id devuelto por /media (mejor que guardar URL fugaz)
-  mediaUrl      String?    @db.Text // solo si envías por link
-  mimeType      String?    @db.VarChar(64) // útil para pintar correctamente (<audio>, <video>, etc.)
-  caption       String?    @db.Text
-  transcription String?    @db.Text // ⬅️ texto de notas de voz (si aplica)
+  externalId String?    @unique // wamid de Meta (MySQL permite varios NULL)
+  mediaType  MediaType?
+  mediaId    String?    @db.VarChar(128) // id devuelto por /media
+  mediaUrl   String?    @db.Text // si lo envías por link o cacheas el presigned
+  mimeType   String?    @db.VarChar(64)
+  caption    String?    @db.Text
+
+  // 🔊 Notas de voz
+  isVoiceNote   Boolean? @default(false) // true si msg.audio.voice === true
+  durationSec   Int? // opcional, si lo calculas después
+  transcription String?  @db.Text // texto transcrito (Whisper / 4o-mini-transcribe)
 
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
@@ -107,7 +111,8 @@ model Message {
 
   @@index([conversationId, timestamp])
   @@index([empresaId, conversationId, timestamp])
-  @@index([mediaId]) // consultas por mediaId (statuses, trazas)
+  @@index([mediaId])
+  @@index([empresaId, externalId])
   @@map("message")
 }
 

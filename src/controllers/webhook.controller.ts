@@ -2,7 +2,7 @@
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { handleIAReply } from '../utils/handleIAReply'
-import { MessageFrom, ConversationEstado } from '@prisma/client'
+import { MessageFrom, ConversationEstado, MediaType } from '@prisma/client'
 import {
     sendText as sendTextSvc,
     getMediaUrl,
@@ -45,7 +45,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     io?.emit?.('wa_policy_error', {
                         conversationId: await resolveConversationIdByWaId(req, st.recipient_id),
                         code: codes?.[0],
-                        message: 'Ventana de 24h cerrada o error de política. Se requiere plantilla para iniciar la conversación.',
+                        message:
+                            'Ventana de 24h cerrada o error de política. Se requiere plantilla para iniciar la conversación.',
                     })
                 }
             }
@@ -87,44 +88,50 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversation.estado = ConversationEstado.pendiente
         }
 
-        // --- Contenido base (texto, botones, etc.)
+        // ----- Contenido base (texto/botones)
         let contenido: string =
             msg.text?.body ||
             msg.button?.text ||
             msg.interactive?.list_reply?.title ||
             '[mensaje no soportado]'
 
-        // Campos de media que podemos persistir/emitir
-        let inboundMediaType: 'audio' | 'image' | 'video' | 'document' | undefined
+        // ----- Campos de media a persistir/emitir
+        let inboundMediaType: MediaType | undefined
         let inboundMediaId: string | undefined
         let inboundMime: string | undefined
         let transcription: string | undefined
+        let isVoiceNote = false
         let mediaUrlForFrontend: string | undefined
 
-        // --- Si es NOTA DE VOZ / AUDIO: descargar y transcribir
+        // 🔊 NOTA DE VOZ / AUDIO: descargar y transcribir
         if (msg.type === 'audio' && msg.audio?.id) {
-            inboundMediaType = 'audio'
-            inboundMediaId = msg.audio.id as string
+            inboundMediaType = MediaType.audio
+            inboundMediaId = String(msg.audio.id)
             inboundMime = msg.audio?.mime_type as string | undefined
+            isVoiceNote = Boolean(msg.audio?.voice)
 
             try {
-                const signedUrl = await getMediaUrl(empresaId, inboundMediaId) // URL firmada corta
+                // 1) URL firmada corta (Graph) y descarga a Buffer
+                const signedUrl = await getMediaUrl(empresaId, inboundMediaId)
                 const buf = await downloadMediaToBuffer(empresaId, signedUrl)
+
+                // 2) Nombre sugerido para el transcriptor (extensión ayuda al SDK)
                 const guessedName =
                     inboundMime?.includes('mp3') ? 'nota-voz.mp3'
                         : inboundMime?.includes('wav') ? 'nota-voz.wav'
                             : 'nota-voz.ogg'
 
-                const texto = await transcribeAudioBuffer(buf, guessedName) // puede devolver ''
+                // 3) Transcribir con tu servicio (Whisper / 4o-mini-transcribe)
+                const texto = await transcribeAudioBuffer(buf, guessedName)
                 transcription = (texto || '').trim()
             } catch (e) {
                 console.warn('[AUDIO] No se pudo transcribir.', e)
             }
 
-            // Si no hay transcripción: placeholder amigable
+            // Si no hay transcripción, dejamos placeholder
             contenido = transcription || '[nota de voz]'
 
-            // URL para reproducir desde el front (vía nuestro proxy con JWT)
+            // URL para reproducir desde el front (proxy seguro con JWT)
             if (inboundMediaId) {
                 mediaUrlForFrontend = `/api/whatsapp/media/${inboundMediaId}`
             }
@@ -134,17 +141,16 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         const inbound = await prisma.message.create({
             data: {
                 conversationId: conversation.id,
-                empresaId,                        // requerido por tu schema
+                empresaId,
                 from: MessageFrom.client,
-                contenido,                        // texto/transcripción o placeholder
+                contenido,
                 timestamp: ts,
-                // campos de media (opcionales)
-                // @ts-ignore - los enums/props existen en tu schema
-                mediaType: inboundMediaType,
+                mediaType: inboundMediaType,      // enum MediaType
                 mediaId: inboundMediaId,
                 mimeType: inboundMime,
+                isVoiceNote,
                 transcription: transcription || undefined,
-            } as any,
+            },
         })
 
         // Emitir ENTRANTE al frontend
@@ -153,15 +159,15 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversationId: conversation.id,
             message: {
                 id: inbound.id,
-                externalId: (inbound as any).externalId ?? null,
+                externalId: inbound.externalId ?? null,
                 from: 'client',
                 contenido,
                 timestamp: inbound.timestamp.toISOString(),
-                // para que el front pueda previsualizar el audio
                 mediaType: inboundMediaType,
-                mediaUrl: mediaUrlForFrontend, // <- /api/whatsapp/media/:mediaId (con JWT)
+                mediaUrl: mediaUrlForFrontend, // /api/whatsapp/media/:mediaId
                 mimeType: inboundMime,
                 transcription,
+                isVoiceNote,
             },
             phone: conversation.phone,
             nombre: conversation.nombre ?? conversation.phone,
@@ -171,7 +177,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         // 3) IA → RESPUESTA
         const result: any = await handleIAReply(conversation.id, contenido)
         if (result?.mensaje) {
-            // DEDUPE: evitamos duplicar la misma respuesta del bot a este inbound
+            // DEDUPE: evita duplicado
             const yaExiste = await prisma.message.findFirst({
                 where: {
                     conversationId: conversation.id,
