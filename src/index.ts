@@ -169,10 +169,7 @@ const allowedOrigins = [
 // 🧠 Servidor HTTP + WebSocket
 const server = http.createServer(app)
 const io = new Server(server, {
-    cors: {
-        origin: allowedOrigins,
-        credentials: true,
-    },
+    cors: { origin: allowedOrigins, credentials: true },
 })
 app.set('io', io)
 
@@ -182,44 +179,32 @@ app.set('trust proxy', 1)
 // 🔌 WebSocket conectado
 io.on('connection', (socket) => {
     console.log('🔌 Cliente conectado vía WebSocket')
-    socket.on('disconnect', () => {
-        console.log('❌ Cliente desconectado')
-    })
+    socket.on('disconnect', () => console.log('❌ Cliente desconectado'))
 })
 
 // 🌐 Middlewares
 app.use(
     cors({
-        origin: (origin, callback) => {
-            if (!origin || allowedOrigins.includes(origin)) return callback(null, true)
-            console.warn('❌ [CORS] Origen no permitido:', origin)
-            return callback(new Error('No permitido por CORS'))
-        },
+        origin: (origin, cb) =>
+            !origin || allowedOrigins.includes(origin) ? cb(null, true) : cb(new Error('No permitido por CORS')),
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
         allowedHeaders: ['Content-Type', 'Authorization'],
         exposedHeaders: ['Content-Length'],
+        optionsSuccessStatus: 204,
     }),
 )
 
-// Preflight global para evitar 401 en OPTIONS
-app.options(
-    '*',
-    cors({
-        origin: (origin, callback) => {
-            if (!origin || allowedOrigins.includes(origin)) return callback(null, true)
-            return callback(new Error('No permitido por CORS'))
-        },
-        credentials: true,
-        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization'],
-    }),
-)
+// ✅ Preflight simple sin path-to-regexp (evita el bug de '*')
+app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') return res.sendStatus(204)
+    next()
+})
 
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json({ type: 'application/json', limit: '5mb' }))
 
-/** 🧪 Helper de debug: monta routers con try/catch y loguea el mountpath */
+/** 🧪 Helper: monta routers con try/catch y loguea el mountpath */
 function safeUse(appRef: any, mountPath: string, router: any) {
     try {
         appRef.use(mountPath, router)
@@ -231,22 +216,20 @@ function safeUse(appRef: any, mountPath: string, router: any) {
 }
 
 // 📌 Rutas públicas
-safeUse(app, '/api/auth', authRoutes) // login, registro, OAuth
-safeUse(app, '/api/webhook', webhookRoutes)
+safeUse(app, '/api/auth', authRoutes)        // login, registro, OAuth
+safeUse(app, '/api/webhook', webhookRoutes)  // webhook de Meta
 
 // 🔐 Rutas protegidas (JWT middleware dentro de cada archivo)
-safeUse(app, '/api/config', configRoutes) // configuración del negocio
-safeUse(app, '/api', chatRoutes) // historial, estados, IA
-safeUse(app, '/api/whatsapp', whatsappRoutes) // conexión de cuenta WhatsApp por empresa
-safeUse(app, '/api', empresaRoutes)
-safeUse(app, '/api/templates', messageTemplateRoutes)
+safeUse(app, '/api/config', configRoutes)          // configuración del negocio
+safeUse(app, '/api', chatRoutes)                   // historial, estados, IA
+safeUse(app, '/api/whatsapp', whatsappRoutes)      // WhatsApp
+safeUse(app, '/api', empresaRoutes)                // empresa
+safeUse(app, '/api/templates', messageTemplateRoutes) // plantillas
 
 // 🏠 Ruta raíz
-app.get('/', (_req, res) => {
-    res.send('🚀 Backend de Chat IA corriendo correctamente')
-})
+app.get('/', (_req, res) => res.send('🚀 Backend de Chat IA corriendo correctamente'))
 
-// Temporal: logger 404 (NO imprime la query para no filtrar tokens en ?t=)
+// Logger 404 (NO imprime la query para no filtrar ?t=)
 app.use((req, _res, next) => {
     const url = req.originalUrl.split('?')[0]
     console.log('[404]', req.method, url)
@@ -261,25 +244,19 @@ function printRoutesSafe(app: any) {
             console.log('🧭 (no hay _router.stack disponible; omito listado)')
             return
         }
-
         const walk = (layer: any, prefix = '') => {
-            if (layer.route && layer.route.path) {
-                const methods = Object.keys(layer.route.methods || {})
-                    .map((m) => m.toUpperCase())
-                    .join(',')
+            if (layer.route?.path) {
+                const methods = Object.keys(layer.route.methods || {}).map((m) => m.toUpperCase()).join(',')
                 console.log(`➡️  ${methods.padEnd(6)} ${prefix}${layer.route.path}`)
-            } else if (layer.name === 'router' && layer.handle && layer.handle.stack) {
+            } else if (layer.name === 'router' && layer.handle?.stack) {
                 let mount = ''
-                if (layer.regexp && layer.regexp.source) {
-                    const match = layer.regexp.source
-                        .replace(/\\\//g, '/')
-                        .match(/^\^\\?\/(.*)\\\/\?\(\?=\\\/\|\$\)\$/)
+                if (layer.regexp?.source) {
+                    const match = layer.regexp.source.replace(/\\\//g, '/').match(/^\^\\?\/(.*)\\\/\?\(\?=\\\/\|\$\)\$/)
                     mount = match && match[1] ? '/' + match[1] : ''
                 }
                 for (const l of layer.handle.stack) walk(l, `${prefix}${mount}`)
             }
         }
-
         for (const layer of root.stack) walk(layer, '')
     } catch (e: any) {
         console.log('🧭 (error imprimiendo rutas, omito):', e?.message || e)
