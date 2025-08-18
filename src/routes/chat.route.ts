@@ -1,7 +1,5 @@
 // src/routes/chat.route.ts
-// import { Router } from 'express'
-import { Router } from '../router-debug'
-
+import { Router } from 'express'
 import { verificarJWT } from '../middleware/auth.middleware'
 import { checkTrialLimits } from '../middleware/trialLimit.middleware'
 

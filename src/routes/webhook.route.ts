@@ -1,7 +1,5 @@
 // src/routes/webhook.route.ts
-
-// import { Router } from 'express'
-import { Router } from '../router-debug'
+import { Router } from 'express'
 
 import { receiveWhatsappMessage, verifyWebhook } from '../controllers/webhook.controller'
 
