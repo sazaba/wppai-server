@@ -1,5 +1,7 @@
 // src/routes/auth.route.ts
-import { Router } from 'express'
+// import { Router } from 'express'
+import { Router } from '../router-debug'
+
 import {
     registrar,
     login,

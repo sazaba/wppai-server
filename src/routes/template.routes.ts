@@ -1,5 +1,8 @@
 // src/routes/template.routes.ts
-import { Router } from 'express'
+
+// import { Router } from 'express'
+import { Router } from '../router-debug'
+
 import {
     crearPlantilla,
     listarPlantillas,
