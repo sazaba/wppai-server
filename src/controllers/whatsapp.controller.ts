@@ -68,7 +68,7 @@ export function signMediaToken(empresaId: number, mediaId: string) {
 }
 
 /** 🔎 1er intento: obtener empresaId desde (1) auth normal o (2) token ?t= */
-function resolveEmpresaIdFromRequest(req: Request): { empresaId: number | null, why?: string } {
+function resolveEmpresaIdFromRequest(req: Request): { empresaId: number | null; why?: string } {
     const authEmpresa = (req as any).user?.empresaId
     if (authEmpresa) return { empresaId: Number(authEmpresa), why: 'req.user' }
 
@@ -506,20 +506,24 @@ export const enviarMediaUpload = async (req: MulterReq, res: Response) => {
                                     : '[documento]'),
                     timestamp: new Date().toISOString(),
                     mediaType: waType,
-                    mediaUrl,            // URL firmada
+                    mediaUrl, // URL firmada
                     mimeType: mime ?? null,
                     caption: caption || null,
-                    mediaId,             // incluye mediaId para fallback en el front
+                    mediaId, // incluye mediaId para fallback en el front
                 },
             })
         }
 
         // 5) limpiar archivo temporal
-        try { await fs.unlink(tmpPath) } catch { }
+        try {
+            await fs.unlink(tmpPath)
+        } catch { }
 
         return res.json({ ok: true, mediaId, ...result })
     } catch (err: any) {
-        try { if (tmpPath) await fs.unlink(tmpPath) } catch { }
+        try {
+            if (tmpPath) await fs.unlink(tmpPath)
+        } catch { }
         logMetaError('enviarMediaUpload', err)
         return res.status(400).json(metaError(err))
     }
@@ -588,29 +592,42 @@ export const streamMediaById = async (req: Request, res: Response) => {
 
         const accessToken = await getAccessToken(empresaId)
 
-        // 3) Obtener URL firmada de Graph
+        // 3) Obtener URL firmada de Graph (pide también mime_type)
         const meta = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
+            params: { fields: 'url,mime_type,file_size' },
             headers: { Authorization: `Bearer ${accessToken}` },
+            timeout: 15000,
         })
         const mediaUrl = meta?.data?.url
+        const mime = meta?.data?.mime_type as string | undefined
+
         if (!mediaUrl) return res.status(404).json({ ok: false, error: 'Media no encontrada' })
 
         // 4) Descargar y streamear
         const file = await axios.get(mediaUrl, {
             responseType: 'stream',
             headers: { Authorization: `Bearer ${accessToken}` },
+            timeout: 30000,
         })
 
-        res.setHeader('Content-Type', file.headers['content-type'] || 'application/octet-stream')
+        res.setHeader('Content-Type', mime || file.headers['content-type'] || 'application/octet-stream')
         res.setHeader('Content-Disposition', 'inline')
         if (file.headers['content-length']) {
-            res.setHeader('Content-Length', file.headers['content-length'])
+            res.setHeader('Content-Length', file.headers['content-length'] as string)
         }
+        // Cache corto (5 min) — suficiente para evitar recargas agresivas del mismo media
         res.setHeader('Cache-Control', 'private, max-age=300')
 
         file.data.pipe(res)
     } catch (err: any) {
-        console.error('[streamMediaById] error:', err?.response?.data || err.message)
+        const status = err?.response?.status
+        const data = err?.response?.data
+        if (status === 404) return res.status(404).json({ ok: false, error: 'Media no encontrada' })
+        if (status === 401 || status === 403) {
+            console.warn('[streamMediaById] 401/403 desde Graph:', data)
+            return res.status(401).json({ ok: false, error: 'No autorizado para este media' })
+        }
+        console.error('[streamMediaById] error:', data || err.message || err)
         return res.status(500).json({ ok: false, error: 'No se pudo obtener la media' })
     }
 }

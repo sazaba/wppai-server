@@ -19,14 +19,15 @@ import {
 
 const router = Router()
 
-// --- NUEVO: auth o token firmado (?t=) ---
+// --- Helper: permite token corto en ?t= SOLO para /media,
+//     o pasa a verificarJWT para el resto. No valida aquí el JWT;
+//     lo valida el controlador (y también lo soporta verificarJWT).
 function authOrSignedToken(req: Request, res: Response, next: NextFunction) {
+    if (req.method === 'OPTIONS') return res.sendStatus(204)
     const t = req.query?.t
     if (typeof t === 'string' && t.length > 0) {
-        // streamMediaById verificará internamente el token firmado
         return next()
     }
-    // sin token corto => exigir auth normal
     return verificarJWT(req, res, next)
 }
 
@@ -37,6 +38,7 @@ router.get('/health-public', (_req, res) => res.json({ ok: true, msg: 'health (p
 /* ===== Multer (subidas locales temporales) ===== */
 const uploadDir = path.join(process.cwd(), 'uploads')
 fs.mkdirSync(uploadDir, { recursive: true })
+
 const storage = multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, uploadDir),
     filename: (_req, file, cb) => {
@@ -45,12 +47,14 @@ const storage = multer.diskStorage({
         cb(null, name)
     },
 })
+
 const ALLOWED_MIME = new Set([
     'image/jpeg', 'image/png', 'image/webp',
     'video/mp4', 'video/quicktime',
     'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/amr', 'audio/wav',
     'application/pdf',
 ])
+
 const upload = multer({
     storage,
     limits: { fileSize: 16 * 1024 * 1024 },
@@ -71,7 +75,9 @@ router.post('/media', verificarJWT, enviarMedia)
 router.post('/media-upload', verificarJWT, upload.single('file'), enviarMediaUpload)
 router.get('/numero/:phoneNumberId', verificarJWT, infoNumero)
 
-// ✅ Stream de media: auth normal o token corto (?t=)
+/* ===== Stream de media (GET desde <img>/<video>) =====
+   - Acepta ?t=JWT corto (sin header) o Authorization normal
+*/
 router.get('/media/:mediaId', authOrSignedToken, streamMediaById)
 
 /* ===== Utilidades ===== */

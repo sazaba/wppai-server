@@ -5,7 +5,7 @@ import { MessageFrom, MediaType as PrismaMediaType } from '@prisma/client'
 import fs from 'fs'
 import FormData from 'form-data'
 
-const FB_VERSION = 'v20.0'
+const FB_VERSION = process.env.FB_VERSION || 'v20.0'
 
 /* ===================== Types ===================== */
 
@@ -287,12 +287,20 @@ export async function uploadToWhatsappMedia(empresaId: number, filePath: string,
     form.append('type', mimeType)
     form.append('file', fs.createReadStream(filePath))
 
-    const { data } = await axios.post(
-        `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/media`,
-        form,
-        { headers: { Authorization: `Bearer ${accessToken}`, ...form.getHeaders() } }
-    )
-    return data?.id as string
+    try {
+        const { data } = await axios.post(
+            `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/media`,
+            form,
+            {
+                headers: { Authorization: `Bearer ${accessToken}`, ...form.getHeaders() },
+                timeout: 30000,
+            }
+        )
+        return data?.id as string
+    } catch (e: any) {
+        console.error('[WA uploadToWhatsappMedia] Error:', e?.response?.data || e.message)
+        throw e
+    }
 }
 
 /* ===================== Helpers inbound media ===================== */
@@ -309,7 +317,9 @@ type MediaMeta = {
 export async function getMediaMeta(empresaId: number, mediaId: string): Promise<MediaMeta> {
     const { accessToken } = await getWhatsappCreds(empresaId)
     const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
+        params: { fields: 'url,mime_type,file_size,sha256' },
         headers: { Authorization: `Bearer ${accessToken}` },
+        timeout: 15000,
     })
     return data as MediaMeta
 }
@@ -324,6 +334,7 @@ export async function downloadMediaToBuffer(empresaId: number, mediaUrl: string)
     const { data } = await axios.get(mediaUrl, {
         responseType: 'arraybuffer',
         headers: { Authorization: `Bearer ${accessToken}` },
+        timeout: 30000,
     })
     return Buffer.from(data)
 }
@@ -339,6 +350,7 @@ export async function downloadMediaByIdToBuffer(
     const resp = await axios.get(meta.url, {
         responseType: 'arraybuffer',
         headers: { Authorization: `Bearer ${accessToken}` },
+        timeout: 30000,
     })
 
     const mimeType = resp.headers['content-type'] as string | undefined
@@ -397,13 +409,16 @@ export async function sendOutboundMessage(args: {
     body: string
 }): Promise<OutboundResult> {
     const { empresaId, to, body, conversationId } = args
+
     if (!body?.trim()) {
         const err: any = new Error('EMPTY_BODY')
         err.status = 400
         throw err
     }
+
     return sendText({ empresaId, to, body, conversationId })
 }
+
 
 /* ===================== Atajos útiles ===================== */
 
