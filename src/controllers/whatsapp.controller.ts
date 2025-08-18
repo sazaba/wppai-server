@@ -84,19 +84,25 @@ function resolveEmpresaIdFromRequest(req: Request): { empresaId: number | null; 
 }
 
 /** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
+/** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
 async function resolveEmpresaIdByMediaId(mediaId: string): Promise<number | null> {
     try {
+        // Usamos id (PK) para ordenar; es seguro y existe siempre.
         const msg = await prisma.message.findFirst({
             where: { mediaId },
-            select: { empresaId: true },
-            orderBy: { timestamp: 'desc' },
+            select: { empresaId: true, id: true },
+            orderBy: { id: 'desc' },
         })
         return msg?.empresaId ?? null
-    } catch (e) {
-        console.warn('[resolveEmpresaIdByMediaId] DB error:', (e as any)?.message || e)
+    } catch (e: any) {
+        console.warn(
+            '[resolveEmpresaIdByMediaId] DB error:',
+            e?.message || e
+        )
         return null
     }
 }
+
 
 /**
  * ¿Existe la plantilla en Meta?
