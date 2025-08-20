@@ -215,7 +215,7 @@ model ProductImage {
   url       String // Cloudinary o URL pública
   alt       String @default("")
 
-  product Product @relation(fields: [productId], references: [id])
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 
   @@map("productimage")
 }
