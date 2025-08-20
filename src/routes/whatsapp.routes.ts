@@ -79,7 +79,7 @@ router.get('/numero/:phoneNumberId', verificarJWT, infoNumero)
 /* ===== Stream de media (GET desde <img>/<video>) =====
    - Acepta ?t=JWT corto (sin header) o Authorization normal
 */
-router.get('/media/:mediaId', authOrSignedToken, streamMediaById)
+router.get('/media/:mediaId', streamMediaById)
 
 /* ===== Utilidades ===== */
 router.get('/debug-token', verificarJWT, debugToken)
