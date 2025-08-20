@@ -1,23 +1,14 @@
+
 // src/routes/config.routes.ts
-
-import express from 'express'
-
-import {
-    saveConfig,
-    getAllConfigs,
-    updateConfig,
-    deleteConfig
-} from '../controllers/config.controller'
+import { Router } from "express"
 import { verificarJWT } from '../middleware/auth.middleware'
+import { getConfig, upsertConfig, getAllConfigs, deleteConfig } from "../controllers/config.controller"
 
-const router = express.Router()
+const router = Router()
 
-// 🔐 Todas las rutas protegidas con JWT
-router.use(verificarJWT)
-
-router.post('/', saveConfig)
-router.get('/', getAllConfigs)
-router.put('/:id', updateConfig)
-router.delete('/:id', deleteConfig)
+router.get("/api/config", verificarJWT, getConfig)
+router.put("/api/config", verificarJWT, upsertConfig)         // 👈 sin :id (match con tu frontend)
+router.get("/api/config/all", verificarJWT, getAllConfigs)
+router.delete("/api/config/:id", verificarJWT, deleteConfig)
 
 export default router

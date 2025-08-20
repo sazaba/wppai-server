@@ -1,142 +1,78 @@
 import { Request, Response } from "express"
-import prisma from '../lib/prisma'
+import prisma from "../lib/prisma"
 
-//
-// 👉 CONTROLADOR: Guardar configuración del negocio
-//
-export async function saveConfig(req: Request, res: Response) {
-    const {
-        nombre,
-        descripcion,
-        servicios,
-        faq,
-        horarios,
-        escalarSiNoConfia,
-        escalarPalabrasClave,
-        escalarPorReintentos
-    } = req.body
-    console.log('EMPRESA ID:', req.user?.empresaId)
-
-    const empresaId = req.user?.empresaId as number
-
-
-    if (!nombre || !descripcion || !servicios || !faq || !horarios) {
-        return res.status(400).json({ error: "Todos los campos son requeridos." })
-    }
-
+// GET /api/config  -> trae la config de la empresa autenticada
+export async function getConfig(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
     try {
-        const config = await prisma.businessConfig.create({
-            data: {
-                nombre,
-                descripcion,
-                servicios,
-                faq,
-                horarios,
-                escalarSiNoConfia,
-                escalarPalabrasClave,
-                escalarPorReintentos,
-                empresaId, // 👈 asociar con empresa autenticada
-            },
-        })
-
-        return res.status(201).json({ message: "Configuración guardada", config })
+        const cfg = await prisma.businessConfig.findUnique({ where: { empresaId } })
+        return res.json(cfg)
     } catch (error) {
-        console.error("Error al guardar:", error)
-        return res.status(500).json({ error: "Error interno del servidor" })
+        console.error("[getConfig] error:", error)
+        return res.status(500).json({ error: "No se pudo obtener la configuración" })
     }
 }
 
-//
-// 👉 CONTROLADOR: Obtener configuraciones solo de la empresa autenticada
-//
-export async function getAllConfigs(req: Request, res: Response) {
-    const empresaId = req.user?.empresaId
+// PUT /api/config  -> upsert por empresaId (sin :id)
+export async function upsertConfig(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+
+    const {
+        nombre = "",
+        descripcion = "",
+        servicios = "",
+        faq = "",
+        horarios = "",
+        businessType = "servicios", // 'servicios' | 'productos'
+        disclaimers = "",
+    } = req.body || {}
+
+    // valida mínimos (ajusta si quieres menos estrictos)
+    if (!nombre || !descripcion || !faq || !horarios) {
+        return res.status(400).json({ error: "Faltan campos requeridos." })
+    }
 
     try {
-        const configs = await prisma.businessConfig.findMany({
-            where: { empresaId }, // 👈 solo configs de esta empresa
+        const cfg = await prisma.businessConfig.upsert({
+            where: { empresaId },
+            update: { nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
+            create: { empresaId, nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
+        })
+        return res.json(cfg)
+    } catch (error) {
+        console.error("[upsertConfig] error:", error)
+        return res.status(500).json({ error: "No se pudo guardar la configuración" })
+    }
+}
+
+// GET /api/config/all -> (opcional) todas las configs de esta empresa (aquí devolvería 1)
+export async function getAllConfigs(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+    try {
+        const list = await prisma.businessConfig.findMany({
+            where: { empresaId },
             orderBy: { createdAt: "desc" },
         })
-
-        return res.status(200).json(configs)
+        return res.json(list)
     } catch (error) {
-        console.error("Error al obtener configuraciones:", error)
+        console.error("[getAllConfigs] error:", error)
         return res.status(500).json({ error: "Error al obtener configuraciones" })
     }
 }
 
-//
-// 👉 CONTROLADOR: Actualizar una configuración existente
-//
-export async function updateConfig(req: Request, res: Response) {
-    const { id } = req.params
-    const empresaId = req.user?.empresaId
-
-    const {
-        nombre,
-        descripcion,
-        servicios,
-        faq,
-        horarios,
-        escalarSiNoConfia,
-        escalarPalabrasClave,
-        escalarPorReintentos
-    } = req.body
-
-    try {
-        // Validar si pertenece a la empresa
-        const existente = await prisma.businessConfig.findUnique({
-            where: { id: Number(id) },
-        })
-
-        if (!existente || existente.empresaId !== empresaId) {
-            return res.status(404).json({ error: "No autorizado para modificar esta configuración" })
-        }
-
-        const config = await prisma.businessConfig.update({
-            where: { id: Number(id) },
-            data: {
-                nombre,
-                descripcion,
-                servicios,
-                faq,
-                horarios,
-                escalarSiNoConfia,
-                escalarPalabrasClave,
-                escalarPorReintentos,
-            },
-        })
-
-        return res.status(200).json({ message: "Configuración actualizada", config })
-    } catch (error) {
-        console.error("Error al actualizar configuración:", error)
-        return res.status(500).json({ error: "No se pudo actualizar la configuración" })
-    }
-}
-
-//
-// 👉 CONTROLADOR: Eliminar una configuración
-//
+// DELETE /api/config/:id  -> por si quieres poder borrarla manualmente
 export async function deleteConfig(req: Request, res: Response) {
-    const { id } = req.params
-    const empresaId = req.user?.empresaId
-
+    const empresaId = (req as any).user?.empresaId as number
+    const id = Number(req.params.id)
     try {
-        const existente = await prisma.businessConfig.findUnique({
-            where: { id: Number(id) },
-        })
-
+        const existente = await prisma.businessConfig.findUnique({ where: { id } })
         if (!existente || existente.empresaId !== empresaId) {
             return res.status(404).json({ error: "No autorizado para eliminar esta configuración" })
         }
-
-        await prisma.businessConfig.delete({
-            where: { id: Number(id) },
-        })
-
-        return res.status(200).json({ message: "Configuración eliminada" })
+        await prisma.businessConfig.delete({ where: { id } })
+        return res.json({ message: "Configuración eliminada" })
     } catch (error) {
-        console.error("Error al eliminar configuración:", error)
+        console.error("[deleteConfig] error:", error)
         return res.status(500).json({ error: "No se pudo eliminar la configuración" })
     }
 }

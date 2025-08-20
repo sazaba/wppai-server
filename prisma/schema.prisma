@@ -48,7 +48,7 @@ enum MediaType {
 
 enum BusinessType {
   servicios
-  infoproductos
+  productos
 }
 
 model Usuario {
@@ -139,17 +139,18 @@ model Conversation {
 model BusinessConfig {
   id           Int          @id @default(autoincrement())
   empresaId    Int          @unique
-  nombre       String
-  descripcion  String
-  servicios    String       @default("")
+  nombre       String       @default("")
+  descripcion  String       @default("")
+  servicios    String       @default("") // también sirve para listar productos
   faq          String       @default("")
   horarios     String       @default("")
   businessType BusinessType @default(servicios)
   disclaimers  String       @default("")
-  updatedAt    DateTime     @updatedAt
-  createdAt    DateTime     @default(now())
 
-  empresa Empresa @relation(fields: [empresaId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 }
 
 model WhatsappAccount {

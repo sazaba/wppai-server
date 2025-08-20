@@ -235,7 +235,7 @@ export const handleIAReply = async (
 
     // 3.1) Catálogo relevante SOLO para infoproductos
     let productosRelevantes: any[] = []
-    if (config.businessType === 'infoproductos') {
+    if (config.businessType === 'servicios') {
         try {
             productosRelevantes = await retrieveRelevantProducts(conversacion.empresaId, mensaje, 5)
         } catch (err) {
