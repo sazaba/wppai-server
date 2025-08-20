@@ -151,6 +151,8 @@ model BusinessConfig {
   updatedAt DateTime @updatedAt
 
   Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@map("businessconfig")
 }
 
 model WhatsappAccount {
