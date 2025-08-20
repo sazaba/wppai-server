@@ -64,7 +64,7 @@ function guessTypeFromMime(mime: string): 'image' | 'video' | 'audio' | 'documen
 
 /** 🔏 Firma un token corto para pedir /media/:id desde <img>/<video> */
 export function signMediaToken(empresaId: number, mediaId: string) {
-    return jwt.sign({ empresaId, mediaId }, JWT_SECRET, { expiresIn: '10m' })
+    return jwt.sign({ empresaId, mediaId }, JWT_SECRET, { expiresIn: '24h' })
 }
 
 /** 🔎 1er intento: obtener empresaId desde (1) auth normal o (2) token ?t= */
@@ -84,10 +84,9 @@ function resolveEmpresaIdFromRequest(req: Request): { empresaId: number | null; 
 }
 
 /** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
-/** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
 async function resolveEmpresaIdByMediaId(mediaId: string): Promise<number | null> {
     try {
-        // Usamos id (PK) para ordenar; es seguro y existe siempre.
+        // Usamos id (PK) para ordenar; siempre existe.
         const msg = await prisma.message.findFirst({
             where: { mediaId },
             select: { empresaId: true, id: true },
@@ -95,10 +94,7 @@ async function resolveEmpresaIdByMediaId(mediaId: string): Promise<number | null
         })
         return msg?.empresaId ?? null
     } catch (e: any) {
-        console.warn(
-            '[resolveEmpresaIdByMediaId] DB error:',
-            e?.message || e
-        )
+        console.warn('[resolveEmpresaIdByMediaId] DB error:', e?.message || e)
         return null
     }
 }
@@ -592,9 +588,18 @@ export const streamMediaById = async (req: Request, res: Response) => {
         }
 
         if (!empresaId) {
-            console.warn('[streamMediaById] 401: empresaId nulo. query.t presente?', typeof req.query?.t === 'string')
-            return res.status(401).json({ ok: false, error: 'No autorizado', reason: attempt.why || 'unknown' })
+            console.warn('[streamMediaById] 401: empresaId nulo.', {
+                mediaId,
+                hasQueryToken: typeof req.query?.t === 'string',
+                why: attempt.why,
+            })
+            return res.status(401).json({
+                ok: false,
+                error: 'No autorizado',
+                reason: attempt.why || 'unknown',
+            })
         }
+
 
         const accessToken = await getAccessToken(empresaId)
 
