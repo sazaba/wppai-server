@@ -1,11 +1,12 @@
 import { Request, Response } from "express"
 import prisma from "../lib/prisma"
 
-// GET /api/config  -> trae la config de la empresa autenticada
+// GET /api/config
 export async function getConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
-        const cfg = await prisma.businessConfig.findUnique({ where: { empresaId } })
+        // empresaId no es único -> usa findFirst
+        const cfg = await prisma.businessConfig.findFirst({ where: { empresaId } })
         return res.json(cfg)
     } catch (error) {
         console.error("[getConfig] error:", error)
@@ -13,10 +14,9 @@ export async function getConfig(req: Request, res: Response) {
     }
 }
 
-// PUT /api/config  -> upsert por empresaId (sin :id)
+// PUT /api/config
 export async function upsertConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
-
     const {
         nombre = "",
         descripcion = "",
@@ -27,17 +27,25 @@ export async function upsertConfig(req: Request, res: Response) {
         disclaimers = "",
     } = req.body || {}
 
-    // valida mínimos (ajusta si quieres menos estrictos)
     if (!nombre || !descripcion || !faq || !horarios) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
 
     try {
-        const cfg = await prisma.businessConfig.upsert({
-            where: { empresaId },
-            update: { nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
-            create: { empresaId, nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
-        })
+        const existente = await prisma.businessConfig.findFirst({ where: { empresaId } })
+
+        let cfg
+        if (existente) {
+            cfg = await prisma.businessConfig.update({
+                where: { id: existente.id },
+                data: { nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
+            })
+        } else {
+            cfg = await prisma.businessConfig.create({
+                data: { empresaId, nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
+            })
+        }
+
         return res.json(cfg)
     } catch (error) {
         console.error("[upsertConfig] error:", error)
@@ -45,7 +53,7 @@ export async function upsertConfig(req: Request, res: Response) {
     }
 }
 
-// GET /api/config/all -> (opcional) todas las configs de esta empresa (aquí devolvería 1)
+// (opcional) GET /api/config/all
 export async function getAllConfigs(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
@@ -60,7 +68,7 @@ export async function getAllConfigs(req: Request, res: Response) {
     }
 }
 
-// DELETE /api/config/:id  -> por si quieres poder borrarla manualmente
+// DELETE /api/config/:id
 export async function deleteConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const id = Number(req.params.id)
