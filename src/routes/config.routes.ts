@@ -1,6 +1,6 @@
 import { Router } from "express"
 import { verificarJWT } from "../middleware/auth.middleware"
-import { getConfig, upsertConfig, getAllConfigs, deleteConfig } from "../controllers/config.controller"
+import { getConfig, upsertConfig, getAllConfigs, deleteConfig, resetConfig } from "../controllers/config.controller"
 
 const r = Router()
 
@@ -11,6 +11,7 @@ r.use(verificarJWT)
 r.get("/", getConfig)          // GET    /api/config
 r.put("/", upsertConfig)       // PUT    /api/config
 r.get("/all", getAllConfigs)   // GET    /api/config/all
+r.delete("/", resetConfig)
 r.delete("/:id", deleteConfig) // DELETE /api/config/:id
 
 export default r

@@ -5,8 +5,7 @@ import prisma from "../lib/prisma"
 export async function getConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
-        // empresaId no es único -> usa findFirst
-        const cfg = await prisma.businessConfig.findFirst({ where: { empresaId } })
+        const cfg = await prisma.businessConfig.findUnique({ where: { empresaId } })
         return res.json(cfg)
     } catch (error) {
         console.error("[getConfig] error:", error)
@@ -18,13 +17,8 @@ export async function getConfig(req: Request, res: Response) {
 export async function upsertConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const {
-        nombre = "",
-        descripcion = "",
-        servicios = "",
-        faq = "",
-        horarios = "",
-        businessType = "servicios", // 'servicios' | 'productos'
-        disclaimers = "",
+        nombre = "", descripcion = "", servicios = "", faq = "",
+        horarios = "", businessType = "servicios", disclaimers = "",
     } = req.body || {}
 
     if (!nombre || !descripcion || !faq || !horarios) {
@@ -32,19 +26,12 @@ export async function upsertConfig(req: Request, res: Response) {
     }
 
     try {
-        const existente = await prisma.businessConfig.findFirst({ where: { empresaId } })
+        const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
+        const data = { nombre, descripcion, servicios, faq, horarios, businessType, disclaimers }
 
-        let cfg
-        if (existente) {
-            cfg = await prisma.businessConfig.update({
-                where: { id: existente.id },
-                data: { nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
-            })
-        } else {
-            cfg = await prisma.businessConfig.create({
-                data: { empresaId, nombre, descripcion, servicios, faq, horarios, businessType, disclaimers },
-            })
-        }
+        const cfg = existente
+            ? await prisma.businessConfig.update({ where: { empresaId }, data })
+            : await prisma.businessConfig.create({ data: { empresaId, ...data } })
 
         return res.json(cfg)
     } catch (error) {
@@ -52,6 +39,7 @@ export async function upsertConfig(req: Request, res: Response) {
         return res.status(500).json({ error: "No se pudo guardar la configuración" })
     }
 }
+
 
 // (opcional) GET /api/config/all
 export async function getAllConfigs(req: Request, res: Response) {
@@ -82,5 +70,28 @@ export async function deleteConfig(req: Request, res: Response) {
     } catch (error) {
         console.error("[deleteConfig] error:", error)
         return res.status(500).json({ error: "No se pudo eliminar la configuración" })
+    }
+}
+// DELETE /api/config?withCatalog=1
+export async function resetConfig(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+    const withCatalog = ['1', 'true', 'yes'].includes(String(req.query.withCatalog || '').toLowerCase())
+
+    try {
+        await prisma.$transaction(async (tx) => {
+            // borra config 1:1 (ignora si no existe)
+            await tx.businessConfig.delete({ where: { empresaId } }).catch(() => { })
+
+            if (withCatalog) {
+                // borra imágenes y productos del catálogo de la empresa
+                await tx.productImage.deleteMany({ where: { product: { empresaId } } })
+                await tx.product.deleteMany({ where: { empresaId } })
+            }
+        })
+
+        return res.json({ ok: true, withCatalog })
+    } catch (error) {
+        console.error("[resetConfig] error:", error)
+        return res.status(500).json({ error: "No se pudo reiniciar la configuración" })
     }
 }
