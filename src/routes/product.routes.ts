@@ -13,5 +13,6 @@ r.get('/', ctrl.listProducts)
 r.get('/:id', ctrl.getProduct)
 r.put('/:id', ctrl.updateProduct)
 r.delete('/:id', ctrl.deleteProduct)
+r.delete('/:id/images/:imageId', ctrl.deleteImage)
 
 export default r
