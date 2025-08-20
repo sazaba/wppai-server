@@ -43,20 +43,27 @@ function matchPrefix(url: string, prefixes: string[]) {
     return prefixes.some(p => clean.startsWith(p))
 }
 
+// src/middleware/auth.middleware.ts
 export const verificarJWT = (req: Request, res: Response, next: NextFunction) => {
     // Preflight CORS
     if (req.method === 'OPTIONS') return res.sendStatus(204)
+
+    // ⛔ BYPASS total para el stream de media (el controlador valida t o usa DB)
+    const cleanPath = stripQuery(req.originalUrl)
+    if (req.method === 'GET' && /^\/api\/whatsapp\/media\//.test(cleanPath)) {
+        return next()
+    }
 
     // Permitir rutas públicas
     if (matchPrefix(req.originalUrl, OPEN_PATHS)) {
         return next()
     }
 
-    // 1) Intentar por Authorization: Bearer ...
+    // 1) Authorization: Bearer ...
     const authHeader = req.headers.authorization
     if (authHeader && /^Bearer\s+/i.test(authHeader)) {
-        const token = authHeader.replace(/^Bearer\s+/i, '')
         try {
+            const token = authHeader.replace(/^Bearer\s+/i, '')
             const decoded = jwt.verify(token, JWT_SECRET) as JwtPayload
             if (!decoded?.empresaId || !decoded?.id) {
                 return res.status(401).json({ error: 'Token inválido (payload incompleto)' })
@@ -71,12 +78,10 @@ export const verificarJWT = (req: Request, res: Response, next: NextFunction) =>
         }
     }
 
-    // 2) Si NO hay header, permitir token por query SOLO en rutas habilitadas
+    // 2) Token por query SOLO en rutas habilitadas (no aplica a /media, ya hicimos bypass)
     if (matchPrefix(req.originalUrl, QUERY_TOKEN_PATHS)) {
         const tokenQ = typeof req.query.t === 'string' ? req.query.t : null
-        if (!tokenQ) {
-            return res.status(401).json({ error: 'Token no proporcionado' })
-        }
+        if (!tokenQ) return res.status(401).json({ error: 'Token no proporcionado' })
         try {
             const decoded = jwt.verify(tokenQ, JWT_SECRET) as JwtPayload
             if (!decoded?.empresaId || !decoded?.id) {
@@ -92,6 +97,5 @@ export const verificarJWT = (req: Request, res: Response, next: NextFunction) =>
         }
     }
 
-    // Si llegamos aquí, no hubo token válido
     return res.status(401).json({ error: 'Token no proporcionado' })
 }

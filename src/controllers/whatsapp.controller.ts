@@ -581,6 +581,12 @@ export const infoNumero = async (req: Request, res: Response) => {
  * - Devuelve en modo "inline".
  */
 export const streamMediaById = async (req: Request, res: Response) => {
+    console.log('[streamMediaById] HIT', {
+        path: req.originalUrl,
+        hasT: typeof req.query?.t === 'string',
+        authHdr: req.headers.authorization ? 'yes' : 'no',
+    });
+    res.setHeader('X-Handler', 'streamMediaById');
     try {
         const { mediaId } = req.params as { mediaId: string };
         if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' });
