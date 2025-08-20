@@ -84,20 +84,32 @@ function resolveEmpresaIdFromRequest(req: Request): { empresaId: number | null; 
 }
 
 /** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
+/** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
 async function resolveEmpresaIdByMediaId(mediaId: string): Promise<number | null> {
     try {
-        // Usamos id (PK) para ordenar; siempre existe.
-        const msg = await prisma.message.findFirst({
+        // 1) Coincidencia directa por mediaId (lo normal hoy)
+        const direct = await prisma.message.findFirst({
             where: { mediaId },
             select: { empresaId: true, id: true },
             orderBy: { id: 'desc' },
-        })
-        return msg?.empresaId ?? null
+        });
+        if (direct?.empresaId) return direct.empresaId;
+
+        // 2) Histórico: si alguna vez guardaste en mediaUrl rutas tipo /media/:id
+        const viaUrl = await prisma.message.findFirst({
+            where: { mediaUrl: { contains: `/media/${mediaId}` } },
+            select: { empresaId: true, id: true },
+            orderBy: { id: 'desc' },
+        });
+        if (viaUrl?.empresaId) return viaUrl.empresaId;
+
+        return null;
     } catch (e: any) {
-        console.warn('[resolveEmpresaIdByMediaId] DB error:', e?.message || e)
-        return null
+        console.warn('[resolveEmpresaIdByMediaId] DB error:', e?.message || e);
+        return null;
     }
 }
+
 
 
 /**
@@ -570,21 +582,21 @@ export const infoNumero = async (req: Request, res: Response) => {
  */
 export const streamMediaById = async (req: Request, res: Response) => {
     try {
-        const { mediaId } = req.params as { mediaId: string }
-        if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' })
+        const { mediaId } = req.params as { mediaId: string };
+        if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' });
 
         // 1) Intento por token / req.user
-        const attempt = resolveEmpresaIdFromRequest(req)
+        const attempt = resolveEmpresaIdFromRequest(req);
 
         // 2) Fallback por DB si falla
-        let empresaId = attempt.empresaId
+        let empresaId = attempt.empresaId;
         if (!empresaId) {
-            empresaId = await resolveEmpresaIdByMediaId(mediaId)
+            empresaId = await resolveEmpresaIdByMediaId(mediaId);
             if (empresaId) {
-                console.log(`[streamMediaById] Fallback DB OK → empresaId=${empresaId} (mediaId=${mediaId})`)
+                console.log(`[streamMediaById] Fallback DB OK → empresaId=${empresaId} (mediaId=${mediaId})`);
             }
         } else {
-            console.log(`[streamMediaById] Auth via ${attempt.why} → empresaId=${empresaId}`)
+            console.log(`[streamMediaById] Auth via ${attempt.why} → empresaId=${empresaId}`);
         }
 
         if (!empresaId) {
@@ -592,56 +604,71 @@ export const streamMediaById = async (req: Request, res: Response) => {
                 mediaId,
                 hasQueryToken: typeof req.query?.t === 'string',
                 why: attempt.why,
-            })
+            });
             return res.status(401).json({
                 ok: false,
                 error: 'No autorizado',
-                reason: attempt.why || 'unknown',
-            })
+                reason: attempt.why || 'not_found_in_db',
+                mediaId,
+            });
         }
 
+        const accessToken = await getAccessToken(empresaId);
 
-        const accessToken = await getAccessToken(empresaId)
-
-        // 3) Obtener URL firmada de Graph (pide también mime_type)
+        // 3) Obtener URL firmada de Graph (con mime y tamaño)
         const meta = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
             params: { fields: 'url,mime_type,file_size' },
             headers: { Authorization: `Bearer ${accessToken}` },
             timeout: 15000,
-        })
-        const mediaUrl = meta?.data?.url
-        const mime = meta?.data?.mime_type as string | undefined
+        });
+        const mediaUrl = meta?.data?.url;
+        const mime = meta?.data?.mime_type as string | undefined;
 
-        if (!mediaUrl) return res.status(404).json({ ok: false, error: 'Media no encontrada' })
+        if (!mediaUrl) {
+            console.warn('[streamMediaById] 404 Meta url vacía', { mediaId, empresaId });
+            return res.status(404).json({ ok: false, error: 'Media no encontrada' });
+        }
 
-        // 4) Descargar y streamear
+        // 4) Descargar y streamear (pasando Range si viene)
+        const range = req.headers.range as string | undefined;
         const file = await axios.get(mediaUrl, {
             responseType: 'stream',
-            headers: { Authorization: `Bearer ${accessToken}` },
+            headers: { Authorization: `Bearer ${accessToken}`, ...(range ? { Range: range } : {}) },
             timeout: 30000,
-        })
+        });
 
-        res.setHeader('Content-Type', mime || file.headers['content-type'] || 'application/octet-stream')
-        res.setHeader('Content-Disposition', 'inline')
-        if (file.headers['content-length']) {
-            res.setHeader('Content-Length', file.headers['content-length'] as string)
+        // Copiamos cabeceras útiles (mejora video/seek)
+        const pass = [
+            'content-type',
+            'content-length',
+            'content-range',
+            'accept-ranges',
+            'etag',
+            'last-modified',
+            'cache-control',
+        ] as const;
+        for (const h of pass) {
+            const v = (file.headers as any)[h];
+            if (v !== undefined) res.setHeader(h, v);
         }
-        // Cache corto (5 min) — suficiente para evitar recargas agresivas del mismo media
-        res.setHeader('Cache-Control', 'private, max-age=300')
+        if (!file.headers['content-type'] && mime) res.setHeader('Content-Type', mime);
+        res.setHeader('Content-Disposition', 'inline');
+        if (!file.headers['cache-control']) res.setHeader('Cache-Control', 'private, max-age=300');
 
-        file.data.pipe(res)
+        res.status(file.status === 206 ? 206 : 200);
+        file.data.pipe(res);
     } catch (err: any) {
-        const status = err?.response?.status
-        const data = err?.response?.data
-        if (status === 404) return res.status(404).json({ ok: false, error: 'Media no encontrada' })
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        if (status === 404) return res.status(404).json({ ok: false, error: 'Media no encontrada' });
         if (status === 401 || status === 403) {
-            console.warn('[streamMediaById] 401/403 desde Graph:', data)
-            return res.status(401).json({ ok: false, error: 'No autorizado para este media' })
+            console.warn('[streamMediaById] 401/403 desde Graph:', data);
+            return res.status(401).json({ ok: false, error: 'No autorizado para este media' });
         }
-        console.error('[streamMediaById] error:', data || err.message || err)
-        return res.status(500).json({ ok: false, error: 'No se pudo obtener la media' })
+        console.error('[streamMediaById] error:', data || err.message || err);
+        return res.status(500).json({ ok: false, error: 'No se pudo obtener la media' });
     }
-}
+};
 
 /* =============================================================================
  * Utilidades
