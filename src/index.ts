@@ -12,6 +12,7 @@ import authRoutes from './routes/auth.route'
 import whatsappRoutes from './routes/whatsapp.routes'
 import empresaRoutes from './routes/empresa.routes'
 import messageTemplateRoutes from './routes/template.routes'
+import productRoutes from './routes/product.routes'
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -85,6 +86,7 @@ app.use('/api/webhook', webhookRoutes)
 app.use('/api/whatsapp', whatsappRoutes) // conexión de cuenta WhatsApp por empresa
 
 // 🔐 Rutas protegidas (JWT middleware dentro de cada archivo)
+app.use('/api/products', productRoutes)
 app.use('/api/config', configRoutes) // configuración del negocio
 app.use('/api', chatRoutes) // historial, estados, IA
 

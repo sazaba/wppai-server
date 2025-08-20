@@ -46,6 +46,11 @@ enum MediaType {
   document
 }
 
+enum BusinessType {
+  servicios
+  infoproductos
+}
+
 model Usuario {
   id        Int      @id @default(autoincrement())
   email     String   @unique
@@ -65,13 +70,13 @@ model Empresa {
   plan   Plan   @default(gratis)
   estado Estado @default(inactivo)
 
-  // ✅ Control de prueba gratuita
   trialStart        DateTime?
   trialEnd          DateTime?
   conversationsUsed Int       @default(0)
 
-  usuarios         Usuario[]
-  configuraciones  BusinessConfig[]
+  usuarios Usuario[]
+
+  configuracion    BusinessConfig?
   conversaciones   Conversation[]
   cuentaWhatsapp   WhatsappAccount?
   messageTemplates MessageTemplate[]
@@ -79,6 +84,7 @@ model Empresa {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   Message   Message[]
+  Product   Product[]
 
   @@map("empresa")
 }
@@ -131,22 +137,19 @@ model Conversation {
 }
 
 model BusinessConfig {
-  id                   Int      @id @default(autoincrement())
-  nombre               String   @db.VarChar(100)
-  descripcion          String   @db.Text
-  servicios            String   @db.Text
-  faq                  String   @db.Text
-  horarios             String   @db.Text
-  escalarSiNoConfia    Boolean
-  escalarPalabrasClave String   @db.Text
-  escalarPorReintentos Int
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  id           Int          @id @default(autoincrement())
+  empresaId    Int          @unique
+  nombre       String
+  descripcion  String
+  servicios    String       @default("")
+  faq          String       @default("")
+  horarios     String       @default("")
+  businessType BusinessType @default(servicios)
+  disclaimers  String       @default("")
+  updatedAt    DateTime     @updatedAt
+  createdAt    DateTime     @default(now())
 
-  empresaId Int
-  empresa   Empresa @relation(fields: [empresaId], references: [id])
-
-  @@map("businessconfig")
+  empresa Empresa @relation(fields: [empresaId], references: [id])
 }
 
 model WhatsappAccount {
@@ -181,4 +184,32 @@ model MessageTemplate {
 
   @@unique([empresaId, nombre, idioma]) // ← necesario para upsert (sync con Meta)
   @@map("messagetemplate")
+}
+
+model Product {
+  id              Int      @id @default(autoincrement())
+  empresaId       Int
+  slug            String   @unique
+  nombre          String
+  descripcion     String   @default("")
+  beneficios      String   @default("") // bullets \n separados
+  caracteristicas String   @default("") // bullets \n
+  precioDesde     Decimal? // opcional (si no quieres que la IA diga precios, déjalo null)
+  disponible      Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+  createdAt       DateTime @default(now())
+
+  imagenes ProductImage[]
+  empresa  Empresa        @relation(fields: [empresaId], references: [id])
+
+  @@index([empresaId, nombre])
+}
+
+model ProductImage {
+  id        Int    @id @default(autoincrement())
+  productId Int
+  url       String // Cloudinary o URL pública
+  alt       String @default("")
+
+  product Product @relation(fields: [productId], references: [id])
 }

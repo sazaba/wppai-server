@@ -4,6 +4,7 @@ import prisma from '../lib/prisma'
 import { shouldEscalateChat } from './shouldEscalate'
 import { openai } from '../lib/openai'
 import { ConversationEstado } from '@prisma/client'
+import { retrieveRelevantProducts } from './products.helper'
 
 type IAReplyResult = {
     estado: ConversationEstado
@@ -25,9 +26,8 @@ const OPENROUTER_API_KEY =
 
 /** Normaliza IDs comunes (alias → ID válido de OpenRouter) */
 function normalizeModelId(model: string): string {
-    const m = model.trim()
+    const m = (model || '').trim()
     if (m === 'google/gemini-2.0-flash-lite') return 'google/gemini-2.0-flash-lite-001' // fix
-    // puedes añadir más alias aquí si hace falta
     return m
 }
 
@@ -38,9 +38,7 @@ function isOpenRouterModel(model: string): boolean {
 
 /** Fallback económico si el ID no existe o viene vacío */
 function fallbackModel(): string {
-    // Económicos y muy disponibles en OR; ajusta a tu preferencia:
-    // - Gemini 2.0 Flash Lite (001) (Google)
-    // - openai/gpt-4o-mini (OpenAI vía OR)
+    // Ejemplos económicos en OR
     return 'google/gemini-2.0-flash-lite-001'
 }
 
@@ -132,21 +130,52 @@ function esRespuestaInvalida(respuesta: string): boolean {
     return tieneEmail || tieneLink || tieneTel || contiene
 }
 
-function buildSystemPrompt(config: any, mensajeEscalamiento: string): string {
-    return `Actúas como un asesor humano de la empresa ${config.nombre}.
+/** Prompt robusto para 2 categorías + catálogo opcional y reglas anti‑alucinaciones */
+function buildSystemPrompt(
+    config: any,
+    productos: Array<{
+        nombre: string
+        descripcion?: string | null
+        beneficios?: string | null
+        caracteristicas?: string | null
+        precioDesde?: any | null
+    }>,
+    mensajeEscalamiento: string
+): string {
+    const esInfo = config?.businessType === 'infoproductos'
+    const catHeader =
+        esInfo && Array.isArray(productos) && productos.length > 0
+            ? `\n[CATÁLOGO AUTORIZADO]\n${productos.map((p) => `- ${p.nombre}
+  Descripción: ${p.descripcion ?? ''}
+  Beneficios: ${p.beneficios ?? ''}
+  Características: ${p.caracteristicas ?? ''}
+  ${p?.precioDesde != null ? `Precio desde: ${p.precioDesde}` : ''}`).join('\n\n')}\n`
+            : ''
 
-Responde SOLO con base en:
-- Descripción: ${config.descripcion}
-- Servicios/Productos: ${config.servicios}
-- Preguntas frecuentes: ${config.faq}
-- Horario de atención: ${config.horarios}
+    const reglas = `
+[REGLAS DE ORO – NO INVENTAR]
+1) Responde SOLO con la información listada más abajo (configuración + catálogo).
+   Si falta un dato o no estás seguro, responde EXACTAMENTE:
+   "${mensajeEscalamiento}"
+2) Prohibido inventar productos, precios, stock, políticas, teléfonos, emails o links.
+3) No digas que eres IA. Tono humano, natural y directo. Respuestas breves para WhatsApp.
+4) Si el usuario pide algo fuera del alcance, usa el mensaje de escalamiento.
+${config?.disclaimers ? `5) Disclaimers del negocio:\n${config.disclaimers}` : ''}`
 
-Tono: profesional, natural y directo, mensajes cortos para WhatsApp.
-No digas que eres IA, ni menciones "según la información", "de acuerdo a los datos", etc.
-No inventes; si no sabes, responde EXACTAMENTE:
-"${mensajeEscalamiento}"
+    return `Actúas como un asesor humano de la empresa "${config?.nombre ?? 'Negocio'}".
 
-Formato: una respuesta breve y clara (sin listas salvo que el usuario lo pida).`
+[INFORMACIÓN AUTORIZADA]
+- Descripción: ${config?.descripcion ?? ''}
+- Servicios/Productos (texto): ${config?.servicios ?? ''}
+- FAQs: ${config?.faq ?? ''}
+- Horarios: ${config?.horarios ?? ''}
+${catHeader}
+${reglas}
+
+[FORMATO]
+- 2–4 líneas máximo.
+- Si usas viñetas, máx 4.
+- No incluyas links ni teléfonos a menos que estén explícitos en la información autorizada.`
 }
 
 /* ========================= Core ========================= */
@@ -204,7 +233,18 @@ export const handleIAReply = async (
         .filter(m => (m.contenido || '').trim().length > 0)
         .map(m => ({ role: m.from === 'client' ? 'user' : 'assistant', content: m.contenido } as const))
 
-    const systemPrompt = buildSystemPrompt(config, mensajeEscalamiento)
+    // 3.1) Catálogo relevante SOLO para infoproductos
+    let productosRelevantes: any[] = []
+    if (config.businessType === 'infoproductos') {
+        try {
+            productosRelevantes = await retrieveRelevantProducts(conversacion.empresaId, mensaje, 5)
+        } catch (err) {
+            console.warn('[handleIAReply] retrieveRelevantProducts error:', (err as any)?.message || err)
+            productosRelevantes = []
+        }
+    }
+
+    const systemPrompt = buildSystemPrompt(config, productosRelevantes, mensajeEscalamiento)
 
     // 4) Llamada al modelo (OpenRouter/OpenAI según ID)
     let respuestaIA = ''
@@ -214,7 +254,7 @@ export const handleIAReply = async (
             messages: [
                 { role: 'system', content: systemPrompt },
                 ...historial,
-                { role: 'user', content: mensaje },
+                { role: 'user', content: (mensaje || '').trim() },
             ],
             temperature: TEMPERATURE,
             maxTokens: MAX_COMPLETION_TOKENS,
@@ -228,7 +268,7 @@ export const handleIAReply = async (
                 messages: [
                     { role: 'system', content: systemPrompt },
                     ...historial,
-                    { role: 'user', content: mensaje },
+                    { role: 'user', content: (mensaje || '').trim() },
                 ],
                 temperature: TEMPERATURE,
                 maxTokens: MAX_COMPLETION_TOKENS,
@@ -243,10 +283,14 @@ export const handleIAReply = async (
         }
     }
 
+    // Sanitiza respuesta (evita espacios/ruido)
+    respuestaIA = (respuestaIA || '').replace(/\s+$/g, '').trim()
+
     console.log('🧠 Respuesta generada por IA:', respuestaIA)
 
     // 5) Validaciones de contenido → escalado
     const debeEscalar =
+        !respuestaIA ||
         respuestaIA === mensajeEscalamiento ||
         normalizarTexto(respuestaIA) === normalizarTexto(mensajeEscalamiento) ||
         esRespuestaInvalida(respuestaIA)
