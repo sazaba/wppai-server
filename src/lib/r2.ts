@@ -1,10 +1,11 @@
 // src/lib/r2.ts
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
-import https from "https";
-import { randomUUID } from "crypto";
-import http from "http";
-import { URL } from "url";
+import https from "node:https";
+import dns from "node:dns";
+import type { LookupFunction } from "node:net";
+import { randomUUID } from "node:crypto";
+import { URL } from "node:url";
 
 const {
     R2_ACCOUNT_ID,
@@ -22,14 +23,27 @@ if (!R2_ENDPOINT && !R2_ACCOUNT_ID) {
     throw new Error("[R2] Faltan variables: R2_ENDPOINT o R2_ACCOUNT_ID.");
 }
 
-const ENDPOINT = (R2_ENDPOINT && R2_ENDPOINT.trim())
-    ? R2_ENDPOINT.trim().replace(/\/+$/, '')
+// Normaliza endpoint (sin barras finales) y asegura https
+const RAW_ENDPOINT = (R2_ENDPOINT && R2_ENDPOINT.trim())
+    ? R2_ENDPOINT.trim().replace(/\/+$/, "")
     : `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+const ENDPOINT = RAW_ENDPOINT.startsWith("http") ? RAW_ENDPOINT : `https://${RAW_ENDPOINT}`;
+
+// 👇 lookup forzado a IPv4 (evita rutas IPv6 problemáticas en algunos PaaS)
+const lookupIPv4: LookupFunction = (hostname: string, options: any, callback?: any) => {
+    if (typeof options === "function") {
+        // lookup(hostname, callback)
+        return dns.lookup(hostname, { family: 4, all: false }, options);
+    }
+    // lookup(hostname, options, callback)
+    return dns.lookup(hostname, { family: 4, all: false }, callback);
+};
 
 const httpsAgent = new https.Agent({
     keepAlive: true,
     maxSockets: 50,
     minVersion: "TLSv1.2",
+    lookup: lookupIPv4,
 });
 
 export const r2 = new S3Client({
@@ -46,34 +60,42 @@ export const r2 = new S3Client({
 // URLs para devolver al cliente
 export const R2_BUCKET_NAME = R2_BUCKET!;
 export const R2_PUBLIC_BASE = (R2_PUBLIC_BASE_URL && R2_PUBLIC_BASE_URL.trim())
-    ? R2_PUBLIC_BASE_URL.trim().replace(/\/+$/, '')
+    ? R2_PUBLIC_BASE_URL.trim().replace(/\/+$/, "")
     : `${ENDPOINT}/${R2_BUCKET_NAME}`;
 
+// Genera key para imágenes de producto
 export function makeObjectKeyForProduct(productId: number, originalName: string) {
-    const ext = (originalName?.split(".").pop() || "bin").toLowerCase();
-    return `products/${productId}/${randomUUID()}.${ext}`;
+    const ext = (originalName?.split(".").pop() || "bin").toLowerCase().replace(/[^\w]+/g, "");
+    return `products/${productId}/${randomUUID()}.${ext || "bin"}`;
 }
 
-// ——— PRECHECK TLS: HEAD a la raíz del endpoint ———
+// ——— PRECHECK TLS: HEAD al host (fuerza IPv4 y SNI explícito) ———
 async function precheckTLS(endpoint: string) {
-    try {
-        const u = new URL(endpoint);
-        await new Promise<void>((resolve, reject) => {
-            const req = https.request(
-                { method: "HEAD", hostname: u.hostname, path: "/", agent: httpsAgent },
-                res => { res.resume(); resolve(); }
-            );
-            req.on("error", reject);
-            req.end();
+    const u = new URL(endpoint);
+    await new Promise<void>((resolve, reject) => {
+        const req = https.request(
+            {
+                method: "HEAD",
+                hostname: u.hostname,
+                path: "/",
+                agent: httpsAgent,
+                servername: u.hostname, // SNI explícito
+            },
+            (res) => {
+                res.resume();
+                resolve();
+            }
+        );
+        req.on("error", (err) => {
+            console.error("[R2 TLS precheck] fallo handshake:", err?.message || err);
+            reject(new Error("[R2] Handshake TLS falló contra endpoint. Revisa endpoint, keys y Node."));
         });
-    } catch (e: any) {
-        console.error("[R2 TLS precheck] fallo handshake:", e?.message || e);
-        throw new Error("[R2] Handshake TLS falló contra endpoint. Revisa endpoint, keys y Node.");
-    }
+        req.end();
+    });
 }
 
 export async function r2PutObject(objectKey: string, body: Buffer, contentType?: string) {
-    await precheckTLS(ENDPOINT); // ayuda a exponer el error real (handshake)
+    await precheckTLS(ENDPOINT);
     const cmd = new PutObjectCommand({
         Bucket: R2_BUCKET_NAME,
         Key: objectKey,
