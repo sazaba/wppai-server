@@ -1,6 +1,10 @@
 // src/controllers/product.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
+import sharp from 'sharp'
+import { r2DeleteObject, r2PutObject, makeObjectKeyForProduct } from '../lib/r2'
+import { StorageProvider } from '@prisma/client'
+
 
 // helper para parsear ids
 const toInt = (v: unknown): number => {
@@ -139,33 +143,148 @@ export async function deleteProduct(req: Request, res: Response) {
  */
 export async function deleteImage(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
-    // Tipamos params para evitar el error de TS: Property 'imageId' does not exist on type 'ParamsDictionary'
     const { id, imageId } = req.params as unknown as { id: string; imageId: string }
 
     const productId = toInt(id)
     const imgId = toInt(imageId)
 
-    // Validamos primero que el producto es de la empresa
-    const product = await prisma.product.findFirst({
-        where: { id: productId, empresaId },
-        select: { id: true },
+    // Trae la imagen verificando pertenencia a empresa vía relación
+    const img = await prisma.productImage.findFirst({
+        where: { id: imgId, productId, product: { empresaId } },
     })
+
+    if (!img) {
+        return res.status(404).json({ error: 'Imagen no encontrada para este producto' })
+    }
+
+    // Borra en R2 si corresponde (no falla la operación si no se puede borrar remoto)
+    if (img.provider === StorageProvider.r2 && img.objectKey) {
+        try {
+            await r2DeleteObject(img.objectKey)
+        } catch (e) {
+            console.warn('[deleteImage] No se pudo borrar en R2, se continuará con DB:', e)
+        }
+    }
+
+    await prisma.productImage.delete({ where: { id: img.id } })
+    res.status(204).end()
+}
+
+// ========================
+// SUBIR IMAGEN A R2  (POST /api/products/:id/images)
+// Body: multipart/form-data -> field 'file'; opcional: alt, isPrimary="true|false"
+// ========================
+export async function uploadProductImageR2(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+    const productId = toInt(req.params.id)
+
+    if (!req.file) {
+        return res.status(400).json({ error: "No file received. Use field 'file'." })
+    }
+
+    // Validar producto pertenece a la empresa
+    const product = await prisma.product.findFirst({ where: { id: productId, empresaId } })
     if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
 
-    // Borrado robusto: exige coincidir id + productId (y por seguridad validamos empresa vía relación)
-    const result = await prisma.productImage.deleteMany({
-        where: {
-            id: imgId,
-            productId: productId,
-            product: { empresaId }, // filtro relacional extra por seguridad multiempresa
-        },
+    const alt = (req.body?.alt as string) || ''
+    const isPrimary = String(req.body?.isPrimary || '').toLowerCase() === 'true'
+
+    // Meta de imagen (no bloqueante si falla)
+    let width: number | undefined
+    let height: number | undefined
+    try {
+        const meta = await sharp(req.file.buffer).metadata()
+        width = meta.width
+        height = meta.height
+    } catch { /* ignore */ }
+
+    const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
+    const mimeType = req.file.mimetype
+    const sizeBytes = req.file.size
+
+    // Sube a R2
+    let publicUrl: string
+    try {
+        publicUrl = await r2PutObject(objectKey, req.file.buffer, mimeType)
+    } catch (e) {
+        console.error('[uploadProductImageR2] r2PutObject error:', e)
+        return res.status(500).json({ error: 'Error subiendo a R2' })
+    }
+
+    // Guarda en DB (si isPrimary=true desmarca otras dentro de la misma tx)
+    const img = await prisma.$transaction(async (tx) => {
+        if (isPrimary) {
+            await tx.productImage.updateMany({
+                where: { productId, isPrimary: true },
+                data: { isPrimary: false },
+            })
+        }
+        return tx.productImage.create({
+            data: {
+                productId,
+                url: publicUrl,
+                alt,
+                provider: 'r2',
+                objectKey,
+                mimeType,
+                sizeBytes,
+                width,
+                height,
+                isPrimary,
+            },
+        })
     })
 
-    if (result.count === 0) {
-        return res
-            .status(404)
-            .json({ error: 'Imagen no encontrada para este producto' })
-    }
+    return res.status(201).json({
+        id: img.id,
+        url: img.url,
+        objectKey: img.objectKey,
+        isPrimary: img.isPrimary,
+        mimeType: img.mimeType,
+        sizeBytes: img.sizeBytes,
+        width: img.width,
+        height: img.height,
+        provider: img.provider,
+    })
+}
+
+// ========================
+// LISTAR IMÁGENES (GET /api/products/:id/images)
+// ========================
+export async function listProductImages(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+    const productId = toInt(req.params.id)
+
+    const product = await prisma.product.findFirst({ where: { id: productId, empresaId }, select: { id: true } })
+    if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
+
+    const images = await prisma.productImage.findMany({
+        where: { productId },
+        orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }, { id: 'asc' }],
+    })
+    res.json(images)
+}
+
+// ========================
+// SET PRIMARY (PUT /api/products/:id/images/:imageId/primary)
+// ========================
+export async function setPrimaryImage(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+    const productId = toInt(req.params.id)
+    const imageId = toInt(req.params.imageId)
+
+    const product = await prisma.product.findFirst({ where: { id: productId, empresaId } })
+    if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
+
+    const img = await prisma.productImage.findFirst({
+        where: { id: imageId, productId, product: { empresaId } },
+    })
+    if (!img) return res.status(404).json({ error: 'Imagen no encontrada para este producto' })
+
+    await prisma.$transaction([
+        prisma.productImage.updateMany({ where: { productId, isPrimary: true }, data: { isPrimary: false } }),
+        prisma.productImage.update({ where: { id: imageId }, data: { isPrimary: true } }),
+    ])
 
     res.status(204).end()
 }

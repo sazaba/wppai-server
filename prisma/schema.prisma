@@ -51,6 +51,14 @@ enum BusinessType {
   productos
 }
 
+// ✅ NUEVO: proveedor de almacenamiento
+enum StorageProvider {
+  local // /uploads/...
+  s3 // S3 / Wasabi / Spaces
+  r2 // Cloudflare R2
+  external // cualquier URL externa
+}
+
 model Usuario {
   id        Int      @id @default(autoincrement())
   email     String   @unique
@@ -98,17 +106,17 @@ model Message {
   updatedAt      DateTime    @updatedAt
 
   // Cloud API
-  externalId String?    @unique // wamid de Meta (MySQL permite varios NULL)
+  externalId String?    @unique
   mediaType  MediaType?
-  mediaId    String?    @db.VarChar(128) // id devuelto por /media
-  mediaUrl   String?    @db.Text // si lo envías por link o cacheas el presigned
+  mediaId    String?    @db.VarChar(128)
+  mediaUrl   String?    @db.Text
   mimeType   String?    @db.VarChar(64)
   caption    String?    @db.Text
 
   // 🔊 Notas de voz
-  isVoiceNote   Boolean? @default(false) // true si msg.audio.voice === true
-  durationSec   Int? // opcional, si lo calculas después
-  transcription String?  @db.Text // texto transcrito (Whisper / 4o-mini-transcribe)
+  isVoiceNote   Boolean? @default(false)
+  durationSec   Int?
+  transcription String?  @db.Text
 
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
@@ -141,7 +149,7 @@ model BusinessConfig {
   empresaId    Int          @unique
   nombre       String       @default("")
   descripcion  String       @default("")
-  servicios    String       @default("") // también sirve para listar productos
+  servicios    String       @default("")
   faq          String       @default("")
   horarios     String       @default("")
   businessType BusinessType @default(servicios)
@@ -185,7 +193,7 @@ model MessageTemplate {
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
-  @@unique([empresaId, nombre, idioma]) // ← necesario para upsert (sync con Meta)
+  @@unique([empresaId, nombre, idioma])
   @@map("messagetemplate")
 }
 
@@ -195,9 +203,9 @@ model Product {
   slug            String   @unique
   nombre          String
   descripcion     String   @default("")
-  beneficios      String   @default("") // bullets \n separados
+  beneficios      String   @default("") // bullets \n
   caracteristicas String   @default("") // bullets \n
-  precioDesde     Decimal? // opcional (si no quieres que la IA diga precios, déjalo null)
+  precioDesde     Decimal?
   disponible      Boolean  @default(true)
   updatedAt       DateTime @updatedAt
   createdAt       DateTime @default(now())
@@ -209,13 +217,34 @@ model Product {
   @@map("product")
 }
 
+// ✅ Recomendado: URL como VARCHAR grande con default ""
 model ProductImage {
-  id        Int    @id @default(autoincrement())
+  id        Int @id @default(autoincrement())
   productId Int
-  url       String // Cloudinary o URL pública
-  alt       String @default("")
+
+  url String @default("") @db.VarChar(2048) // <- antes era Text con default; ahora VARCHAR
+  alt String @default("")
+
+  provider  StorageProvider @default(r2)
+  objectKey String?         @db.VarChar(255)
+  mimeType  String?         @db.VarChar(64)
+  sizeBytes Int?
+  width     Int?
+  height    Int?
+
+  whatsappMediaId String?   @db.VarChar(128)
+  mediaCachedAt   DateTime?
+
+  isPrimary Boolean @default(false)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 
+  @@index([productId])
+  @@index([provider, objectKey])
+  @@index([whatsappMediaId])
   @@map("productimage")
 }
