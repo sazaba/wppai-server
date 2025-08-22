@@ -158,11 +158,13 @@ export async function deleteImage(req: Request, res: Response) {
     }
 
 
+    // dentro de deleteImage, después de encontrar la imagen:
     if (img.provider === 'r2' && img.objectKey) {
         try { await r2DeleteObject(img.objectKey) } catch (e) {
-            console.warn('[deleteImage] No se pudo borrar en R2, seguimos:', e)
+            console.warn('[deleteImage] R2 delete falló, continuamos:', e)
         }
     }
+
 
 
     await prisma.productImage.delete({ where: { id: img.id } })
