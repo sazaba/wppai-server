@@ -157,14 +157,13 @@ export async function deleteImage(req: Request, res: Response) {
         return res.status(404).json({ error: 'Imagen no encontrada para este producto' })
     }
 
-    // Borra en R2 si corresponde (no falla la operación si no se puede borrar remoto)
-    if (img.provider === StorageProvider.r2 && img.objectKey) {
-        try {
-            await r2DeleteObject(img.objectKey)
-        } catch (e) {
-            console.warn('[deleteImage] No se pudo borrar en R2, se continuará con DB:', e)
+
+    if (img.provider === 'r2' && img.objectKey) {
+        try { await r2DeleteObject(img.objectKey) } catch (e) {
+            console.warn('[deleteImage] No se pudo borrar en R2, seguimos:', e)
         }
     }
+
 
     await prisma.productImage.delete({ where: { id: img.id } })
     res.status(204).end()
