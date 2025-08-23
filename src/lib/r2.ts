@@ -31,22 +31,27 @@ const RAW_ENDPOINT = (R2_ENDPOINT && R2_ENDPOINT.trim())
     : `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
 const ENDPOINT = RAW_ENDPOINT.startsWith("http") ? RAW_ENDPOINT : `https://${RAW_ENDPOINT}`;
 
-// lookup forzado a IPv4
+// Resolver IPv4 para usar SOLO en el precheck TLS (no en el Agent del SDK)
 const lookupIPv4: LookupFunction = (hostname: string, options: any, callback?: any) => {
+    // guardas para evitar "Invalid IP address: undefined"
+    if (!hostname || typeof hostname !== "string") {
+        if (typeof options === "function") return options(new Error("lookupIPv4: hostname inválido"));
+        return callback?.(new Error("lookupIPv4: hostname inválido"));
+    }
     if (typeof options === "function") {
         return dns.lookup(hostname, { family: 4, all: false }, options);
     }
     return dns.lookup(hostname, { family: 4, all: false }, callback);
 };
 
-// Agent HTTPS: IPv4 + TLS1.2-only
+// Agent HTTPS del SDK (sin lookup custom)
 const httpsAgent = new https.Agent({
     keepAlive: true,
     maxSockets: 50,
     minVersion: "TLSv1.2",
     maxVersion: "TLSv1.2",
     honorCipherOrder: true,
-    lookup: lookupIPv4,
+    // 👈 importante: NO poner lookup aquí
 });
 
 export const r2 = new S3Client({
@@ -80,17 +85,15 @@ async function precheckTLS(endpoint: string) {
     await new Promise<void>((resolve, reject) => {
         const socket = tls.connect(
             {
-                host: u.hostname,          // usamos hostname (no IP directa)
+                host: u.hostname,          // hostname (no IP directa)
                 port,
                 servername: u.hostname,    // SNI correcto
                 minVersion: "TLSv1.2",
-                maxVersion: "TLSv1.2",     // fuerza TLS1.2
+                maxVersion: "TLSv1.2",
                 rejectUnauthorized: true,
-                lookup: lookupIPv4,        // fuerza IPv4
+                lookup: lookupIPv4,        // 👈 aquí sí forzamos IPv4
             },
             () => {
-                // const proto = socket.alpnProtocol || "unknown";
-                // console.log(`[R2 TLS precheck] OK, ALPN: ${proto}`);
                 socket.end();
                 resolve();
             }
