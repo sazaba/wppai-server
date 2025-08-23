@@ -174,33 +174,44 @@ import productRoutes from './routes/product.routes'
 // 📦 Cargar variables de entorno
 dotenv.config()
 
-// 🌐 Orígenes permitidos (ENV: ALLOWED_ORIGINS=foo.com,bar.com)
+// Normaliza y valida un path (evita valores estilo URL completas)
+function sanitizePath(input?: string, fallback: string = '/socket.io') {
+    if (!input) return fallback
+    try {
+        // Si viene una URL completa (https://...), la rechazamos
+        // y usamos el fallback para evitar que algún lib intente registrarla como ruta.
+        const u = new URL(input)
+        // si no lanza, entonces era URL
+        return fallback
+    } catch {
+        // no era URL; nos aseguramos que empiece por "/"
+        return input.startsWith('/') ? input : `/${input}`
+    }
+}
+
+// 🌐 Orígenes permitidos
 const ENV_ALLOWED = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean)
 
 const allowedOrigins = new Set<string>([
-    // Defaults tuyos
     'https://wppai-client.vercel.app',
     'https://www.wasaaa.com',
     'https://wasaaa.com',
     'http://localhost:3000',
-    // Agrega por ENV
     ...ENV_ALLOWED,
 ])
 
-// helper: permite subdominios *.vercel.app si lo necesitas
 const dynamicAllowed = (origin?: string | null) => {
-    if (!origin) return true // permite herramientas como curl/Postman
+    if (!origin) return true
     try {
         const u = new URL(origin)
         if (allowedOrigins.has(origin)) return true
-        // whitelists convenientes
         if (u.hostname === 'localhost') return true
         if (u.hostname.endsWith('.vercel.app')) return true
         if (u.hostname.endsWith('.wasaaa.com')) return true
-    } catch { /* ignore parse */ }
+    } catch { /* noop */ }
     return false
 }
 
@@ -209,8 +220,10 @@ const app = express()
 
 // 🧠 Servidor HTTP + WebSocket
 const server = http.createServer(app)
+const socketPath = sanitizePath(process.env.SOCKET_IO_PATH, '/socket.io')
+
 const io = new Server(server, {
-    path: process.env.SOCKET_IO_PATH || '/socket.io',
+    path: socketPath,
     cors: {
         origin: (origin, cb) => {
             if (dynamicAllowed(origin)) return cb(null, true)
@@ -219,13 +232,12 @@ const io = new Server(server, {
         },
         credentials: true,
     },
-    // más resiliencia tras proxy (Render/Cloudflare)
     pingInterval: 25000,
     pingTimeout: 60000,
 })
 app.set('io', io)
 
-// ✅ Confiar en proxy (Render/Cloudflare) para X-Forwarded-*
+// ✅ Confiar en proxy (Render/Cloudflare)
 app.set('trust proxy', 1)
 
 // 🔌 WebSocket conectado
@@ -252,21 +264,11 @@ app.use(
         exposedHeaders: ['Content-Length'],
     }),
 )
-// Preflight explícito (algunos proxies lo agradecen)
-app.options('*', cors())
-
-// Bypass específico (mantén tu excepción de media WhatsApp)
-app.use((req, _res, next) => {
-    if (req.method === 'GET' && /^\/api\/whatsapp\/media\//.test(req.path)) {
-        return next()
-    }
-    return next()
-})
 
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json({ type: 'application/json', limit: '5mb' }))
 
-// 🏥 Healthchecks (Render)
+// 🏥 Healthchecks
 app.get('/healthz', (_req, res) => res.status(200).send('ok'))
 app.get('/readyz', (_req, res) => res.status(200).send('ready'))
 
@@ -276,25 +278,25 @@ app.get('/', (_req, res) => {
 })
 
 // 📌 Rutas públicas
-app.use('/api/auth', authRoutes) // login, registro, OAuth
+app.use('/api/auth', authRoutes)
 app.use('/api/webhook', webhookRoutes)
-app.use('/api/whatsapp', whatsappRoutes) // conexión de cuenta WhatsApp por empresa
+app.use('/api/whatsapp', whatsappRoutes)
 
-// 🔐 Rutas protegidas (JWT middleware dentro de cada archivo)
+// 🔐 Rutas protegidas
 app.use('/api/products', productRoutes)
-app.use('/api/config', configRoutes) // configuración del negocio
-app.use('/api', chatRoutes) // historial, estados, IA
+app.use('/api/config', configRoutes)
+app.use('/api', chatRoutes)
 app.use('/api', empresaRoutes)
 app.use('/api/templates', messageTemplateRoutes)
 
-// 404 JSON (después de las rutas)
-app.use((req, res, _next) => {
+// 404 JSON final
+app.use((req, res) => {
     const url = req.originalUrl.split('?')[0]
     console.log('[404]', req.method, url)
     res.status(404).json({ error: 'Not Found' })
 })
 
-// Handler de errores (CORS, JSON parser, etc.)
+// Error handler
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const code = err?.status || 500
     const msg = err?.message || 'Internal Server Error'
@@ -302,41 +304,9 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
     res.status(code).json({ error: msg })
 })
 
-// ✅ Printer de rutas (solo log; no crítico en prod)
-function printRoutesSafe(app: any) {
-    try {
-        const root = app && app._router
-        if (!root || !root.stack) {
-            console.log('🧭 (no hay _router.stack disponible; omito listado)')
-            return
-        }
-        const walk = (layer: any, prefix = '') => {
-            if (layer.route && layer.route.path) {
-                const methods = Object.keys(layer.route.methods || {})
-                    .map((m) => m.toUpperCase())
-                    .join(',')
-                console.log(`➡️  ${methods.padEnd(6)} ${prefix}${layer.route.path}`)
-            } else if (layer.name === 'router' && layer.handle && layer.handle.stack) {
-                let mount = ''
-                if (layer.regexp && layer.regexp.source) {
-                    const match = layer.regexp.source
-                        .replace(/\\\//g, '/')
-                        .match(/^\^\\?\/(.*)\\\/\?\(\?=\\\/\|\$\)\$/)
-                    mount = match && match[1] ? '/' + match[1] : ''
-                }
-                for (const l of layer.handle.stack) walk(l, `${prefix}${mount}`)
-            }
-        }
-        for (const layer of root.stack) walk(layer, '')
-    } catch (e: any) {
-        console.log('🧭 (error imprimiendo rutas, omito):', e?.message || e)
-    }
-}
-
 // 🟢 Iniciar servidor
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000
 server.listen(PORT, () => {
     console.log(`✅ API escuchando en http://localhost:${PORT}`)
-    console.log('🧭 Rutas registradas:')
-    printRoutesSafe(app)
+    console.log(`🛰️  Socket.IO path: ${socketPath}`)
 })
