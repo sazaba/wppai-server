@@ -5,11 +5,35 @@ import sharp from 'sharp'
 import { r2DeleteObject, r2PutObject, makeObjectKeyForProduct } from '../lib/r2'
 import { StorageProvider } from '@prisma/client'
 
-
 // helper para parsear ids
 const toInt = (v: unknown): number => {
     const n = Number.parseInt(String(v), 10)
     return Number.isNaN(n) ? 0 : n
+}
+
+/** Normaliza el nombre a slug seguro */
+function slugify(name: string) {
+    return (name || '')
+        .toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // quita acentos
+        .replace(/[^\w\s-]/g, '')                           // solo letras/números/_/espacios/-
+        .trim()
+        .replace(/\s+/g, '-')                               // espacios -> guiones
+        .replace(/-+/g, '-')                                // colapsa guiones
+}
+
+/** Busca un slug disponible (global, porque tu índice único es global) */
+async function ensureUniqueSlug(base: string) {
+    let candidate = base || 'producto'
+    let i = 2
+    while (true) {
+        const exists = await prisma.product.findFirst({
+            where: { slug: candidate },
+            select: { id: true },
+        })
+        if (!exists) return candidate
+        candidate = `${base}-${i++}`
+    }
 }
 
 export async function createProduct(req: Request, res: Response) {
@@ -22,24 +46,46 @@ export async function createProduct(req: Request, res: Response) {
         precioDesde,
     } = req.body
 
-    const slug = nombre
-        .toLowerCase()
-        .replace(/\s+/g, '-')
-        .replace(/[^\w-]/g, '')
+    if (!nombre || !String(nombre).trim()) {
+        return res.status(400).json({ error: 'El producto necesita un nombre.' })
+    }
 
-    const p = await prisma.product.create({
-        data: {
-            empresaId,
-            nombre,
-            slug,
-            descripcion: descripcion ?? '',
-            beneficios: beneficios ?? '',
-            caracteristicas: caracteristicas ?? '',
-            precioDesde: precioDesde ?? null,
-        },
-    })
+    const baseSlug = slugify(nombre)
+    let slug = await ensureUniqueSlug(baseSlug)
 
-    res.status(201).json(p)
+    try {
+        const p = await prisma.product.create({
+            data: {
+                empresaId,
+                nombre,
+                slug,
+                descripcion,
+                beneficios,
+                caracteristicas,
+                precioDesde: precioDesde ?? null,
+            },
+        })
+        return res.status(201).json(p)
+    } catch (err: any) {
+        // por si hay carrera y alguien tomó el mismo slug justo antes
+        if (err?.code === 'P2002') {
+            slug = await ensureUniqueSlug(baseSlug)
+            const p = await prisma.product.create({
+                data: {
+                    empresaId,
+                    nombre,
+                    slug,
+                    descripcion,
+                    beneficios,
+                    caracteristicas,
+                    precioDesde: precioDesde ?? null,
+                },
+            })
+            return res.status(201).json(p)
+        }
+        console.error('[createProduct] error:', err)
+        return res.status(500).json({ error: 'No se pudo crear el producto.' })
+    }
 }
 
 export async function addImage(req: Request, res: Response) {
@@ -157,15 +203,12 @@ export async function deleteImage(req: Request, res: Response) {
         return res.status(404).json({ error: 'Imagen no encontrada para este producto' })
     }
 
-
-    // dentro de deleteImage, después de encontrar la imagen:
+    // si fue subida a R2, intentamos borrarla también en el storage
     if (img.provider === 'r2' && img.objectKey) {
         try { await r2DeleteObject(img.objectKey) } catch (e) {
             console.warn('[deleteImage] R2 delete falló, continuamos:', e)
         }
     }
-
-
 
     await prisma.productImage.delete({ where: { id: img.id } })
     res.status(204).end()
