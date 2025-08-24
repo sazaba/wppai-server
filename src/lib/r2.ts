@@ -1,4 +1,4 @@
-
+// src/lib/r2.ts
 import {
     S3Client,
     PutObjectCommand,
@@ -57,10 +57,23 @@ const httpsAgent = new https.Agent({
     honorCipherOrder: true,
 });
 
+// Cliente path-style para PUT/DELETE (se mantiene)
 export const r2 = new S3Client({
     region: "auto",
     endpoint: ENDPOINT,
     forcePathStyle: true,
+    requestHandler: new NodeHttpHandler({ httpsAgent }),
+    credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID!,
+        secretAccessKey: R2_SECRET_ACCESS_KEY!,
+    },
+});
+
+// Cliente vhost-style SOLO para presign GET (soluciona 401/403 en R2)
+const r2Vhost = new S3Client({
+    region: "auto",
+    endpoint: ENDPOINT,
+    forcePathStyle: false, // clave: virtual-hosted-style
     requestHandler: new NodeHttpHandler({ httpsAgent }),
     credentials: {
         accessKeyId: R2_ACCESS_KEY_ID!,
@@ -156,32 +169,31 @@ export async function r2DeleteObject(objectKey: string) {
     await r2.send(cmd);
 }
 
-// 
-// Nota: desactivamos checksum para que no agregue x-amz-checksum-mode
+// --- URL firmada (presigned GET) para buckets privados ---
+// Usamos r2Vhost para firmar en virtual-hosted-style y limpiamos checksum si aparece.
 export async function getSignedGetUrl(key: string, expiresSec = 3600) {
-    // Algunos entornos R2 fallan si se presigna con checksum ENABLED
-    // Por eso lo forzamos a DISABLED explícitamente.
     const cmd = new GetObjectCommand({
         Bucket: R2_BUCKET_NAME,
         Key: key,
-        // @ts-expect-error: ChecksumMode no está tipado en todos los SDKs, pero R2 lo ignora si no aplica
-        ChecksumMode: 'DISABLED',
+        // no seteamos ChecksumMode para evitar x-amz-checksum-mode en la URL
     });
 
-    // Log útil para diagnosticar skew de reloj
-    if (process.env.NODE_ENV !== 'production') {
-        const now = new Date();
-        console.log('[R2 presign] local time ISO:', now.toISOString());
+    if (process.env.NODE_ENV !== "production") {
+        console.log("[R2 presign] local time ISO:", new Date().toISOString());
     }
 
-    return getSignedUrl(r2, cmd, { expiresIn: expiresSec });
+    let url = await getSignedUrl(r2Vhost, cmd, { expiresIn: expiresSec });
+
+    // Hardening: eliminar x-amz-checksum-mode si algún middleware lo añadió
+    url = url.replace(/([?&])x-amz-checksum-mode=[^&]+&?/i, "$1").replace(/[?&]$/, "");
+
+    return url;
 }
 
-// --- EXISTENTE: helper para elegir pública vs firmada según env ---
+// --- helper que respeta R2_SIGNED_GET ---
 export async function resolveR2Url(key: string, opts?: { expiresSec?: number }) {
-    if (process.env.R2_SIGNED_GET === "1") {
+    if (R2_SIGNED_GET === "1") {
         return getSignedGetUrl(key, opts?.expiresSec ?? 3600);
     }
     return publicR2Url(key);
 }
-
