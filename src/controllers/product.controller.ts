@@ -403,23 +403,16 @@ export async function setPrimaryImage(req: Request, res: Response) {
 // NUEVO: STREAM (PROXY) DE IMAGEN DESDE R2
 // GET /api/products/:id/images/:file
 // ======================================================================
-export async function streamProductImage(req: Request, res: Response) {
-    const empresaId = (req as any).user?.empresaId as number
-    const productId = toInt(req.params.id)
+export async function streamProductImagePublic(req: Request, res: Response) {
+    const productId = Number.parseInt(String(req.params.id || ''), 10) || 0
     const file = String(req.params.file || '')
 
-    // Validar que exista producto en la empresa
-    const product = await prisma.product.findFirst({
-        where: { id: productId, empresaId },
-        select: { id: true },
-    })
-    if (!product) return res.status(404).end()
+    if (!productId || !file) return res.status(404).end()
 
-    // Buscar la imagen por objectKey (termina con /<file>)
+    // Buscamos por objectKey (termina en /<file>) y productId
     const img = await prisma.productImage.findFirst({
         where: {
             productId,
-            product: { empresaId },
             objectKey: { endsWith: `/${file}` },
         },
     })
@@ -432,16 +425,14 @@ export async function streamProductImage(req: Request, res: Response) {
         })
         const obj = await r2.send(cmd)
 
-        const contentType = (obj.ContentType as string) || img.mimeType || 'application/octet-stream'
-        res.setHeader('Content-Type', contentType)
-
-        // Cachea en CDN/navegador si quieres (ajusta a tu estrategia)
+        res.setHeader('Content-Type', (obj.ContentType as string) || img.mimeType || 'application/octet-stream')
+        // cachea 1h + SWR (ajústalo a tu gusto)
         res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
 
-        // @ts-ignore Body es un Readable
+        // @ts-ignore Body es Readable
         obj.Body.pipe(res)
     } catch (e) {
-        console.error('[streamProductImage] error:', e)
+        console.error('[streamProductImagePublic] error:', e)
         res.status(500).end()
     }
 }
