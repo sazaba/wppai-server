@@ -2,7 +2,7 @@
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import sharp from 'sharp'
-import { r2DeleteObject, r2PutObject, makeObjectKeyForProduct } from '../lib/r2'
+import { r2DeleteObject, r2PutObject, makeObjectKeyForProduct, publicR2Url } from '../lib/r2'
 import { StorageProvider } from '@prisma/client'
 
 // helper para parsear ids
@@ -256,7 +256,6 @@ export async function uploadProductImageR2(req: Request, res: Response) {
 
     try {
         if (process.env.USE_R2_WORKER === '1') {
-            // ---- vía Worker (evita el TLS Render<->R2) ----
             const { uploadToR2ViaWorker } = await import('../lib/r2-worker')
             const result = await uploadToR2ViaWorker({
                 productId,
@@ -266,19 +265,19 @@ export async function uploadProductImageR2(req: Request, res: Response) {
                 alt,
                 isPrimary,
             })
-            publicUrl = result.publicUrl
+            // AUNQUE el worker devuelva una publicUrl, la forzamos con nuestra base:
             objectKeyStored = result.objectKey
+            publicUrl = publicR2Url(objectKeyStored)
         } else {
-            // ---- directo (cuando tu PaaS ya soporte el handshake TLS con R2) ----
             const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
-            publicUrl = await r2PutObject(objectKey, req.file.buffer, mimeType)
+            await r2PutObject(objectKey, req.file.buffer, mimeType)
             objectKeyStored = objectKey
+            publicUrl = publicR2Url(objectKeyStored)
         }
     } catch (e) {
         console.error('[uploadProductImageR2] upload error:', e)
         return res.status(500).json({ error: 'Error subiendo imagen' })
     }
-
     // Guarda en DB (si isPrimary=true desmarca otras dentro de la misma tx)
     const img = await prisma.$transaction(async (tx) => {
         if (isPrimary) {
