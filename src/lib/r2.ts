@@ -156,22 +156,32 @@ export async function r2DeleteObject(objectKey: string) {
     await r2.send(cmd);
 }
 
-// --- NUEVO: URL firmada (presigned GET) para buckets privados ---
+// 
+// Nota: desactivamos checksum para que no agregue x-amz-checksum-mode
 export async function getSignedGetUrl(key: string, expiresSec = 3600) {
+    // Algunos entornos R2 fallan si se presigna con checksum ENABLED
+    // Por eso lo forzamos a DISABLED explícitamente.
     const cmd = new GetObjectCommand({
         Bucket: R2_BUCKET_NAME,
         Key: key,
+        // @ts-expect-error: ChecksumMode no está tipado en todos los SDKs, pero R2 lo ignora si no aplica
+        ChecksumMode: 'DISABLED',
     });
-    // presign NO requiere precheck TLS (solo firma local)
+
+    // Log útil para diagnosticar skew de reloj
+    if (process.env.NODE_ENV !== 'production') {
+        const now = new Date();
+        console.log('[R2 presign] local time ISO:', now.toISOString());
+    }
+
     return getSignedUrl(r2, cmd, { expiresIn: expiresSec });
 }
 
-// --- NUEVO: helper para elegir pública vs firmada según env ---
+// --- EXISTENTE: helper para elegir pública vs firmada según env ---
 export async function resolveR2Url(key: string, opts?: { expiresSec?: number }) {
-    if (R2_SIGNED_GET === "1") {
+    if (process.env.R2_SIGNED_GET === "1") {
         return getSignedGetUrl(key, opts?.expiresSec ?? 3600);
     }
     return publicR2Url(key);
 }
-
 
