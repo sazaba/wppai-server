@@ -191,21 +191,25 @@ export async function deleteImage(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const { id, imageId } = req.params as unknown as { id: string; imageId: string }
 
-    const productId = toInt(id)
-    const imgId = toInt(imageId)
+    const productId = Number.parseInt(id, 10) || 0
+    const imgId = Number.parseInt(imageId, 10) || 0
 
     // Trae la imagen verificando pertenencia a empresa vía relación
     const img = await prisma.productImage.findFirst({
         where: { id: imgId, productId, product: { empresaId } },
     })
-
-    if (!img) {
-        return res.status(404).json({ error: 'Imagen no encontrada para este producto' })
-    }
+    if (!img) return res.status(404).json({ error: 'Imagen no encontrada para este producto' })
 
     // si fue subida a R2, intentamos borrarla también en el storage
     if (img.provider === 'r2' && img.objectKey) {
-        try { await r2DeleteObject(img.objectKey) } catch (e) {
+        try {
+            if (process.env.USE_R2_WORKER === '1') {
+                const { deleteFromR2ViaWorker } = await import('../lib/r2-worker')
+                await deleteFromR2ViaWorker(img.objectKey)
+            } else {
+                await r2DeleteObject(img.objectKey)
+            }
+        } catch (e) {
             console.warn('[deleteImage] R2 delete falló, continuamos:', e)
         }
     }
@@ -213,6 +217,7 @@ export async function deleteImage(req: Request, res: Response) {
     await prisma.productImage.delete({ where: { id: img.id } })
     res.status(204).end()
 }
+
 
 // ========================
 // SUBIR IMAGEN A R2  (POST /api/products/:id/images)
