@@ -2,19 +2,16 @@
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import sharp from 'sharp'
-import { r2DeleteObject, r2PutObject, makeObjectKeyForProduct, resolveR2Url } from '../lib/r2'
+import {
+    r2DeleteObject,
+    r2PutObject,
+    makeObjectKeyForProduct,
+    resolveR2Url,
+    r2,
+    GetObjectCommand,
+    R2_BUCKET_NAME,
+} from '../lib/r2'
 import { StorageProvider } from '@prisma/client'
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
-
-// ---- R2 SDK (para el proxy de lectura) ----
-const r2 = new S3Client({
-    region: 'auto',
-    endpoint: process.env.R2_ENDPOINT, // p.ej. https://<accountid>.r2.cloudflarestorage.com
-    credentials: {
-        accessKeyId: process.env.R2_ACCESS_KEY_ID!,
-        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
-    },
-})
 
 // helper para parsear ids
 const toInt = (v: unknown): number => {
@@ -60,6 +57,9 @@ async function decorateImagesWithSignedUrl<
     )
 }
 
+// ========================
+// CRUD PRODUCTOS
+// ========================
 export async function createProduct(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const {
@@ -91,7 +91,6 @@ export async function createProduct(req: Request, res: Response) {
         })
         return res.status(201).json(p)
     } catch (err: any) {
-        // por si hay carrera y alguien tomó el mismo slug justo antes
         if (err?.code === 'P2002') {
             slug = await ensureUniqueSlug(baseSlug)
             const p = await prisma.product.create({
@@ -148,7 +147,6 @@ export async function listProducts(req: Request, res: Response) {
         orderBy: { updatedAt: 'desc' },
     })
 
-    // firmar URLs en cada producto (si hay objectKey)
     const withSigned = await Promise.all(
         items.map(async (p) => ({
             ...p,
@@ -207,20 +205,15 @@ export async function deleteProduct(req: Request, res: Response) {
     })
     if (!exists) return res.status(404).json({ error: 'Producto no encontrado' })
 
-    // si tu FK no tiene CASCADE, mantenemos esta limpieza explícita
     await prisma.productImage.deleteMany({ where: { productId: Number(id) } })
     await prisma.product.delete({ where: { id: Number(id) } })
 
     res.status(204).end()
 }
 
-/**
- * DELETE /api/products/:id/images/:imageId
- * Borra una imagen validando:
- *  - que la imagen existe
- *  - que pertenece al producto indicado
- *  - que el producto pertenece a la empresa del usuario
- */
+// ========================
+// IMÁGENES
+// ========================
 export async function deleteImage(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const { id, imageId } = req.params as unknown as { id: string; imageId: string }
@@ -228,13 +221,11 @@ export async function deleteImage(req: Request, res: Response) {
     const productId = Number.parseInt(id, 10) || 0
     const imgId = Number.parseInt(imageId, 10) || 0
 
-    // Trae la imagen verificando pertenencia a empresa vía relación
     const img = await prisma.productImage.findFirst({
         where: { id: imgId, productId, product: { empresaId } },
     })
     if (!img) return res.status(404).json({ error: 'Imagen no encontrada para este producto' })
 
-    // si fue subida a R2, intentamos borrarla también en el storage
     if (img.provider === 'r2' && img.objectKey) {
         try {
             if (process.env.USE_R2_WORKER === '1') {
@@ -252,9 +243,7 @@ export async function deleteImage(req: Request, res: Response) {
     res.status(204).end()
 }
 
-// ========================
-// SUBIR IMAGEN A R2  (POST /api/products/:id/images)
-// ========================
+// SUBIR IMAGEN A R2  (POST /api/products/:id/images/upload)
 export async function uploadProductImageR2(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)
@@ -263,14 +252,12 @@ export async function uploadProductImageR2(req: Request, res: Response) {
         return res.status(400).json({ error: "No file received. Use field 'file'." })
     }
 
-    // Validar producto pertenece a la empresa
     const product = await prisma.product.findFirst({ where: { id: productId, empresaId } })
     if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
 
     const alt = (req.body?.alt as string) || ''
     const isPrimary = String(req.body?.isPrimary || '').toLowerCase() === 'true'
 
-    // Meta de imagen (no bloqueante si falla)
     let width: number | undefined, height: number | undefined
     try {
         const meta = await sharp(req.file.buffer).metadata()
@@ -281,8 +268,7 @@ export async function uploadProductImageR2(req: Request, res: Response) {
     const mimeType = req.file.mimetype
     const sizeBytes = req.file.size
 
-    // Sube a R2 (vía Worker si está activo)
-    let urlParaVer: string   // <- puede ser firmada o pública (según env)
+    let urlParaVer: string
     let objectKeyStored: string
 
     try {
@@ -296,7 +282,6 @@ export async function uploadProductImageR2(req: Request, res: Response) {
                 alt,
                 isPrimary,
             })
-            // aunque el worker devuelva una URL, generamos la nuestra (respeta R2_SIGNED_GET)
             objectKeyStored = result.objectKey
             urlParaVer = await resolveR2Url(objectKeyStored)
         } else {
@@ -310,13 +295,11 @@ export async function uploadProductImageR2(req: Request, res: Response) {
         return res.status(500).json({ error: 'Error subiendo imagen' })
     }
 
-    // log temporal para verificar firma
     console.log('[R2 upload OK]', {
         objectKeyStored,
         urlSample: urlParaVer.slice(0, 160),
     })
 
-    // Guarda en DB (si isPrimary=true desmarca otras dentro de la misma tx)
     const img = await prisma.$transaction(async (tx) => {
         if (isPrimary) {
             await tx.productImage.updateMany({
@@ -327,10 +310,10 @@ export async function uploadProductImageR2(req: Request, res: Response) {
         return tx.productImage.create({
             data: {
                 productId,
-                url: urlParaVer,                  // <- vista (firmada si R2_SIGNED_GET=1)
+                url: urlParaVer,
                 alt,
                 provider: 'r2' as StorageProvider,
-                objectKey: objectKeyStored,       // <- clave real en el bucket
+                objectKey: objectKeyStored,
                 mimeType,
                 sizeBytes,
                 width,
@@ -353,9 +336,7 @@ export async function uploadProductImageR2(req: Request, res: Response) {
     })
 }
 
-// ========================
 // LISTAR IMÁGENES (GET /api/products/:id/images)
-// ========================
 export async function listProductImages(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)
@@ -375,9 +356,7 @@ export async function listProductImages(req: Request, res: Response) {
     res.json(withViewUrl)
 }
 
-// ========================
 // SET PRIMARY (PUT /api/products/:id/images/:imageId/primary)
-// ========================
 export async function setPrimaryImage(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)
@@ -399,40 +378,37 @@ export async function setPrimaryImage(req: Request, res: Response) {
     res.status(204).end()
 }
 
-// ======================================================================
-// NUEVO: STREAM (PROXY) DE IMAGEN DESDE R2
-// GET /api/products/:id/images/:file
-// ======================================================================
+// ========================
+// STREAM PÚBLICO DE IMAGEN (sin JWT)  GET /api/products/:id/images/:file
+// ========================
 export async function streamProductImagePublic(req: Request, res: Response) {
     const productId = Number.parseInt(String(req.params.id || ''), 10) || 0
     const file = String(req.params.file || '')
 
     if (!productId || !file) return res.status(404).end()
 
-    // Buscamos por objectKey (termina en /<file>) y productId
     const img = await prisma.productImage.findFirst({
         where: {
             productId,
             objectKey: { endsWith: `/${file}` },
         },
     })
-    if (!img || !img.objectKey) return res.status(404).end()
+    if (!img?.objectKey) return res.status(404).end()
 
     try {
-        const cmd = new GetObjectCommand({
-            Bucket: process.env.R2_BUCKET!,
+        const obj = await r2.send(new GetObjectCommand({
+            Bucket: R2_BUCKET_NAME,
             Key: img.objectKey,
-        })
-        const obj = await r2.send(cmd)
+        }))
 
         res.setHeader('Content-Type', (obj.ContentType as string) || img.mimeType || 'application/octet-stream')
-        // cachea 1h + SWR (ajústalo a tu gusto)
         res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
 
-        // @ts-ignore Body es Readable
+        // @ts-ignore Node stream
         obj.Body.pipe(res)
-    } catch (e) {
+    } catch (e: any) {
+        if (e?.$metadata?.httpStatusCode === 404) return res.status(404).end()
         console.error('[streamProductImagePublic] error:', e)
-        res.status(500).end()
+        return res.status(500).end()
     }
 }

@@ -6,10 +6,10 @@ import { uploadImageMem } from '../middleware/upload'
 
 const r = Router()
 
-// 🔓 PUBLICA: stream de imagen (para <img> sin Authorization)
+// 🔓 Público: necesario para <img> sin headers Authorization
 r.get('/:id/images/:file', ctrl.streamProductImagePublic)
 
-// 🔐 A partir de aquí, todo pide JWT
+// 🔐 A partir de aquí, todo requiere JWT
 r.use(verificarJWT)
 
 // CRUD productos
@@ -19,7 +19,7 @@ r.get('/:id', ctrl.getProduct)
 r.put('/:id', ctrl.updateProduct)
 r.delete('/:id', ctrl.deleteProduct)
 
-// IMÁGENES
+// IMÁGENES (protegidas para gestionar)
 r.post('/:id/images', ctrl.addImage)
 r.post('/:id/images/upload', uploadImageMem.single('file'), ctrl.uploadProductImageR2)
 r.get('/:id/images', ctrl.listProductImages)
