@@ -21,7 +21,7 @@ r.delete('/:id', ctrl.deleteProduct)
 
 // IMÁGENES (protegidas para gestionar)
 r.post('/:id/images', ctrl.addImage)
-r.post('/:id/images/upload', uploadImageMem.single('file'), ctrl.uploadProductImageR2)
+// r.post('/:id/images/upload', uploadImageMem.single('file'), ctrl.uploadProductImageR2)
 r.get('/:id/images', ctrl.listProductImages)
 r.put('/:id/images/:imageId/primary', ctrl.setPrimaryImage)
 r.delete('/:id/images/:imageId', ctrl.deleteImage)

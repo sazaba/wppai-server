@@ -237,81 +237,11 @@ export async function deleteImage(req: Request, res: Response) {
 }
 
 // SUBIR IMAGEN A R2  (POST /api/products/:id/images/upload)
+// server/src/controllers/product.controller.ts
 export async function uploadProductImageR2(req: Request, res: Response) {
-    const empresaId = (req as any).user?.empresaId as number
-    const productId = toInt(req.params.id)
-
-    if (!req.file) {
-        return res.status(400).json({ error: "No file received. Use field 'file'." })
-    }
-
-    const product = await prisma.product.findFirst({ where: { id: productId, empresaId } })
-    if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
-
-    const alt = (req.body?.alt as string) || ''
-    const isPrimary = String(req.body?.isPrimary || '').toLowerCase() === 'true'
-
-    let width: number | undefined, height: number | undefined
-    try {
-        const meta = await sharp(req.file.buffer).metadata()
-        width = meta.width
-        height = meta.height
-    } catch { /* ignore */ }
-
-    const mimeType = req.file.mimetype
-    const sizeBytes = req.file.size
-
-    let urlParaVer: string
-    let objectKeyStored: string
-
-    try {
-        const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
-        await r2PutObject(objectKey, req.file.buffer, mimeType)
-        objectKeyStored = objectKey
-        urlParaVer = await resolveR2Url(objectKeyStored)
-    } catch (e) {
-        console.error('[uploadProductImageR2] upload error:', e)
-        return res.status(500).json({ error: 'Error subiendo imagen' })
-    }
-
-    console.log('[R2 upload OK]', {
-        objectKeyStored,
-        urlSample: urlParaVer.slice(0, 160),
-    })
-
-    const img = await prisma.$transaction(async (tx) => {
-        if (isPrimary) {
-            await tx.productImage.updateMany({
-                where: { productId, isPrimary: true },
-                data: { isPrimary: false },
-            })
-        }
-        return tx.productImage.create({
-            data: {
-                productId,
-                url: urlParaVer,
-                alt,
-                provider: 'r2' as StorageProvider,
-                objectKey: objectKeyStored,
-                mimeType,
-                sizeBytes,
-                width,
-                height,
-                isPrimary,
-            },
-        })
-    })
-
-    return res.status(201).json({
-        id: img.id,
-        url: img.url,
-        objectKey: img.objectKey,
-        isPrimary: img.isPrimary,
-        mimeType: img.mimeType,
-        sizeBytes: img.sizeBytes,
-        width: img.width,
-        height: img.height,
-        provider: img.provider,
+    console.warn('[LEGACY] uploadProductImageR2 fue invocado. Usa presign → PUT → confirm.')
+    return res.status(410).json({
+        error: 'Este endpoint fue retirado. Usa /:id/images/presign y /:id/images/confirm.'
     })
 }
 
