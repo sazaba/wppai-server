@@ -1,4 +1,4 @@
-// server/src/routes/product.routes.ts
+// src/routes/product.routes.ts
 import { Router } from 'express'
 import { verificarJWT } from '../middleware/auth.middleware'
 import * as ctrl from '../controllers/product.controller'
@@ -6,7 +6,7 @@ import { uploadImageMem } from '../middleware/upload'
 
 const r = Router()
 
-// 🔓 Público: necesario para <img> sin Authorization
+// 🔓 Público: necesario para <img> sin headers Authorization
 r.get('/:id/images/:file', ctrl.streamProductImagePublic)
 
 // 🔐 A partir de aquí, todo requiere JWT
@@ -21,14 +21,9 @@ r.delete('/:id', ctrl.deleteProduct)
 
 // IMÁGENES (protegidas para gestionar)
 r.post('/:id/images', ctrl.addImage)
-// r.post('/:id/images/upload', uploadImageMem.single('file'), ctrl.uploadProductImageR2)
+r.post('/:id/images/upload', uploadImageMem.single('file'), ctrl.uploadProductImageR2)
 r.get('/:id/images', ctrl.listProductImages)
 r.put('/:id/images/:imageId/primary', ctrl.setPrimaryImage)
 r.delete('/:id/images/:imageId', ctrl.deleteImage)
-
-// 👉 añade estas 2 rutas debajo de las protegidas (requieren JWT)
-r.post('/:id/images/presign', ctrl.presignProductImageUpload)
-r.post('/:id/images/confirm', ctrl.confirmProductImage)
-
 
 export default r
