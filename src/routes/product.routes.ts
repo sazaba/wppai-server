@@ -22,6 +22,9 @@ r.post('/:id/images', ctrl.addImage)
 // Subida real a R2 (nuevo, campo 'file')
 r.post('/:id/images/upload', uploadImageMem.single('file'), ctrl.uploadProductImageR2)
 
+// 🔴 NUEVO: stream de imagen (proxy R2) — tiene que existir para GET
+r.get('/:id/images/:file', ctrl.streamProductImage)
+
 // Listar imágenes de un producto
 r.get('/:id/images', ctrl.listProductImages)
 
