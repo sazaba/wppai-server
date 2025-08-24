@@ -2,7 +2,7 @@
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import sharp from 'sharp'
-import { r2DeleteObject, r2PutObject, makeObjectKeyForProduct, publicR2Url } from '../lib/r2'
+import { r2DeleteObject, r2PutObject, makeObjectKeyForProduct, resolveR2Url } from '../lib/r2'
 import { StorageProvider } from '@prisma/client'
 
 // helper para parsear ids
@@ -223,6 +223,99 @@ export async function deleteImage(req: Request, res: Response) {
 // SUBIR IMAGEN A R2  (POST /api/products/:id/images)
 // Body: multipart/form-data -> field 'file'; opcional: alt, isPrimary="true|false"
 // ========================
+// export async function uploadProductImageR2(req: Request, res: Response) {
+//     const empresaId = (req as any).user?.empresaId as number
+//     const productId = toInt(req.params.id)
+
+//     if (!req.file) {
+//         return res.status(400).json({ error: "No file received. Use field 'file'." })
+//     }
+
+//     // Validar producto pertenece a la empresa
+//     const product = await prisma.product.findFirst({ where: { id: productId, empresaId } })
+//     if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
+
+//     const alt = (req.body?.alt as string) || ''
+//     const isPrimary = String(req.body?.isPrimary || '').toLowerCase() === 'true'
+
+//     // Meta de imagen (no bloqueante si falla)
+//     let width: number | undefined
+//     let height: number | undefined
+//     try {
+//         const meta = await sharp(req.file.buffer).metadata()
+//         width = meta.width
+//         height = meta.height
+//     } catch { /* ignore */ }
+
+//     const mimeType = req.file.mimetype
+//     const sizeBytes = req.file.size
+
+//     // Sube a R2 (vía Worker si está activo)
+//     let publicUrl: string
+//     let objectKeyStored: string
+
+//     try {
+//         if (process.env.USE_R2_WORKER === '1') {
+//             const { uploadToR2ViaWorker } = await import('../lib/r2-worker')
+//             const result = await uploadToR2ViaWorker({
+//                 productId,
+//                 buffer: req.file.buffer,
+//                 filename: req.file.originalname,
+//                 contentType: mimeType,
+//                 alt,
+//                 isPrimary,
+//             })
+//             // AUNQUE el worker devuelva una publicUrl, la forzamos con nuestra base:
+//             objectKeyStored = result.objectKey
+//             publicUrl = publicR2Url(objectKeyStored)
+//         } else {
+//             const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
+//             await r2PutObject(objectKey, req.file.buffer, mimeType)
+//             objectKeyStored = objectKey
+//             publicUrl = publicR2Url(objectKeyStored)
+//         }
+//     } catch (e) {
+//         console.error('[uploadProductImageR2] upload error:', e)
+//         return res.status(500).json({ error: 'Error subiendo imagen' })
+//     }
+//     // Guarda en DB (si isPrimary=true desmarca otras dentro de la misma tx)
+//     const img = await prisma.$transaction(async (tx) => {
+//         if (isPrimary) {
+//             await tx.productImage.updateMany({
+//                 where: { productId, isPrimary: true },
+//                 data: { isPrimary: false },
+//             })
+//         }
+//         return tx.productImage.create({
+//             data: {
+//                 productId,
+//                 url: publicUrl,
+//                 alt,
+//                 provider: 'r2' as StorageProvider,
+//                 objectKey: objectKeyStored,
+//                 mimeType,
+//                 sizeBytes,
+//                 width,
+//                 height,
+//                 isPrimary,
+//             },
+//         })
+//     })
+
+//     return res.status(201).json({
+//         id: img.id,
+//         url: img.url,
+//         objectKey: img.objectKey,
+//         isPrimary: img.isPrimary,
+//         mimeType: img.mimeType,
+//         sizeBytes: img.sizeBytes,
+//         width: img.width,
+//         height: img.height,
+//         provider: img.provider,
+//     })
+// }
+
+
 export async function uploadProductImageR2(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)
@@ -233,10 +326,10 @@ export async function uploadProductImageR2(req: Request, res: Response) {
 
     // Validar producto pertenece a la empresa
     const product = await prisma.product.findFirst({ where: { id: productId, empresaId } })
-    if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
+    if (!product) return res.status(404).json({ error: "Producto no encontrado" })
 
-    const alt = (req.body?.alt as string) || ''
-    const isPrimary = String(req.body?.isPrimary || '').toLowerCase() === 'true'
+    const alt = (req.body?.alt as string) || ""
+    const isPrimary = String(req.body?.isPrimary || "").toLowerCase() === "true"
 
     // Meta de imagen (no bloqueante si falla)
     let width: number | undefined
@@ -250,13 +343,12 @@ export async function uploadProductImageR2(req: Request, res: Response) {
     const mimeType = req.file.mimetype
     const sizeBytes = req.file.size
 
-    // Sube a R2 (vía Worker si está activo)
     let publicUrl: string
     let objectKeyStored: string
 
     try {
-        if (process.env.USE_R2_WORKER === '1') {
-            const { uploadToR2ViaWorker } = await import('../lib/r2-worker')
+        if (process.env.USE_R2_WORKER === "1") {
+            const { uploadToR2ViaWorker } = await import("../lib/r2-worker")
             const result = await uploadToR2ViaWorker({
                 productId,
                 buffer: req.file.buffer,
@@ -265,20 +357,19 @@ export async function uploadProductImageR2(req: Request, res: Response) {
                 alt,
                 isPrimary,
             })
-            // AUNQUE el worker devuelva una publicUrl, la forzamos con nuestra base:
             objectKeyStored = result.objectKey
-            publicUrl = publicR2Url(objectKeyStored)
+            publicUrl = await resolveR2Url(objectKeyStored)
         } else {
             const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
             await r2PutObject(objectKey, req.file.buffer, mimeType)
             objectKeyStored = objectKey
-            publicUrl = publicR2Url(objectKeyStored)
+            publicUrl = await resolveR2Url(objectKeyStored)
         }
     } catch (e) {
-        console.error('[uploadProductImageR2] upload error:', e)
-        return res.status(500).json({ error: 'Error subiendo imagen' })
+        console.error("[uploadProductImageR2] upload error:", e)
+        return res.status(500).json({ error: "Error subiendo imagen" })
     }
-    // Guarda en DB (si isPrimary=true desmarca otras dentro de la misma tx)
+
     const img = await prisma.$transaction(async (tx) => {
         if (isPrimary) {
             await tx.productImage.updateMany({
@@ -291,7 +382,7 @@ export async function uploadProductImageR2(req: Request, res: Response) {
                 productId,
                 url: publicUrl,
                 alt,
-                provider: 'r2' as StorageProvider,
+                provider: "r2" as StorageProvider,
                 objectKey: objectKeyStored,
                 mimeType,
                 sizeBytes,
