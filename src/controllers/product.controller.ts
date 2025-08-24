@@ -1,4 +1,4 @@
-// src/controllers/product.controller.ts
+// server/src/controllers/product.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import sharp from 'sharp'
@@ -7,9 +7,6 @@ import {
     r2PutObject,
     makeObjectKeyForProduct,
     resolveR2Url,
-    r2,
-    GetObjectCommand,
-    R2_BUCKET_NAME,
 } from '../lib/r2'
 import { StorageProvider } from '@prisma/client'
 
@@ -23,14 +20,14 @@ const toInt = (v: unknown): number => {
 function slugify(name: string) {
     return (name || '')
         .toLowerCase()
-        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // quita acentos
-        .replace(/[^\w\s-]/g, '')                           // solo letras/números/_/espacios/-
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^\w\s-]/g, '')
         .trim()
-        .replace(/\s+/g, '-')                               // espacios -> guiones
-        .replace(/-+/g, '-')                                // colapsa guiones
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-')
 }
 
-/** Busca un slug disponible (global, porque tu índice único es global) */
+/** Busca un slug disponible (global) */
 async function ensureUniqueSlug(base: string) {
     let candidate = base || 'producto'
     let i = 2
@@ -51,7 +48,7 @@ async function decorateImagesWithSignedUrl<
     return Promise.all(
         imgs.map(async (img) => {
             const key = img.objectKey
-            const viewUrl = key ? await resolveR2Url(key) : img.url // fallback si falta key
+            const viewUrl = key ? await resolveR2Url(key) : img.url
             return { ...img, url: viewUrl }
         })
     )
@@ -228,12 +225,7 @@ export async function deleteImage(req: Request, res: Response) {
 
     if (img.provider === 'r2' && img.objectKey) {
         try {
-            if (process.env.USE_R2_WORKER === '1') {
-                const { deleteFromR2ViaWorker } = await import('../lib/r2-worker')
-                await deleteFromR2ViaWorker(img.objectKey)
-            } else {
-                await r2DeleteObject(img.objectKey)
-            }
+            await r2DeleteObject(img.objectKey)
         } catch (e) {
             console.warn('[deleteImage] R2 delete falló, continuamos:', e)
         }
@@ -272,24 +264,10 @@ export async function uploadProductImageR2(req: Request, res: Response) {
     let objectKeyStored: string
 
     try {
-        if (process.env.USE_R2_WORKER === '1') {
-            const { uploadToR2ViaWorker } = await import('../lib/r2-worker')
-            const result = await uploadToR2ViaWorker({
-                productId,
-                buffer: req.file.buffer,
-                filename: req.file.originalname,
-                contentType: mimeType,
-                alt,
-                isPrimary,
-            })
-            objectKeyStored = result.objectKey
-            urlParaVer = await resolveR2Url(objectKeyStored)
-        } else {
-            const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
-            await r2PutObject(objectKey, req.file.buffer, mimeType)
-            objectKeyStored = objectKey
-            urlParaVer = await resolveR2Url(objectKeyStored)
-        }
+        const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
+        await r2PutObject(objectKey, req.file.buffer, mimeType)
+        objectKeyStored = objectKey
+        urlParaVer = await resolveR2Url(objectKeyStored)
     } catch (e) {
         console.error('[uploadProductImageR2] upload error:', e)
         return res.status(500).json({ error: 'Error subiendo imagen' })
@@ -379,7 +357,8 @@ export async function setPrimaryImage(req: Request, res: Response) {
 }
 
 // ========================
-// STREAM PÚBLICO DE IMAGEN (sin JWT)  GET /api/products/:id/images/:file
+// STREAM PÚBLICO → REDIRECT 302 A URL (firmada)
+// GET /api/products/:id/images/:file
 // ========================
 export async function streamProductImagePublic(req: Request, res: Response) {
     const productId = Number.parseInt(String(req.params.id || ''), 10) || 0
@@ -388,27 +367,17 @@ export async function streamProductImagePublic(req: Request, res: Response) {
     if (!productId || !file) return res.status(404).end()
 
     const img = await prisma.productImage.findFirst({
-        where: {
-            productId,
-            objectKey: { endsWith: `/${file}` },
-        },
+        where: { productId, objectKey: { endsWith: `/${file}` } },
+        select: { objectKey: true },
     })
     if (!img?.objectKey) return res.status(404).end()
 
     try {
-        const obj = await r2.send(new GetObjectCommand({
-            Bucket: R2_BUCKET_NAME,
-            Key: img.objectKey,
-        }))
-
-        res.setHeader('Content-Type', (obj.ContentType as string) || img.mimeType || 'application/octet-stream')
-        res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
-
-        // @ts-ignore Node stream
-        obj.Body.pipe(res)
-    } catch (e: any) {
-        if (e?.$metadata?.httpStatusCode === 404) return res.status(404).end()
-        console.error('[streamProductImagePublic] error:', e)
+        const signed = await resolveR2Url(img.objectKey, { expiresSec: 60 })
+        res.setHeader('Cache-Control', 'public, max-age=30, s-maxage=60')
+        return res.redirect(302, signed)
+    } catch (e) {
+        console.error('[streamProductImagePublic] error firmando URL:', e)
         return res.status(500).end()
     }
 }

@@ -1,4 +1,4 @@
-// src/lib/r2.ts
+// server/src/lib/r2.ts
 import {
     S3Client,
     PutObjectCommand,
@@ -92,7 +92,6 @@ function normalizePublicBase(raw: string, bucket: string) {
     if (!raw) return "";
     try {
         const u = new URL(raw);
-        // si ya incluye el bucket en el path, no dupliques
         if (u.pathname && new RegExp(`/(^|)${bucket}(/|$)`).test(u.pathname)) {
             return raw.replace(/\/+$/, "");
         }
@@ -174,7 +173,6 @@ export async function getSignedGetUrl(key: string, expiresSec = 3600) {
     const cmd = new GetObjectCommand({
         Bucket: R2_BUCKET_NAME,
         Key: key,
-        // No seteamos ChecksumMode para evitar x-amz-checksum-mode en la URL
     });
 
     if (process.env.NODE_ENV !== "production") {

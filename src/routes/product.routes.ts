@@ -1,4 +1,4 @@
-// src/routes/product.routes.ts
+// server/src/routes/product.routes.ts
 import { Router } from 'express'
 import { verificarJWT } from '../middleware/auth.middleware'
 import * as ctrl from '../controllers/product.controller'
@@ -6,7 +6,7 @@ import { uploadImageMem } from '../middleware/upload'
 
 const r = Router()
 
-// 🔓 Público: necesario para <img> sin headers Authorization
+// 🔓 Público: necesario para <img> sin Authorization
 r.get('/:id/images/:file', ctrl.streamProductImagePublic)
 
 // 🔐 A partir de aquí, todo requiere JWT
