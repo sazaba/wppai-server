@@ -13,21 +13,24 @@ const {
     R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY,
     R2_BUCKET,
-    R2_PUBLIC_BASE_URL,   // opcional: solo para URL públicas de lectura
+    R2_PUBLIC_BASE_URL, // opcional: solo para URL públicas de lectura
 } = process.env;
 
 if (!R2_BUCKET || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_ACCOUNT_ID) {
-    throw new Error("[R2] Faltan variables: R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID.");
+    throw new Error(
+        "[R2] Faltan variables: R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID."
+    );
 }
 
 /**
- * MUY IMPORTANTE:
- * - Endpoint SIEMPRE de cuenta: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
- *   (NO usar aquí el host público del bucket)
+ * Endpoint de cuenta SIEMPRE (no uses aquí el host público del bucket)
+ * https://<ACCOUNT_ID>.r2.cloudflarestorage.com
  */
 const ENDPOINT = `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
 
-// Cliente S3 simple (sin agentes ni prechecks)
+export const R2_BUCKET_NAME = R2_BUCKET!;
+
+// Cliente S3 para operaciones del servidor (path-style)
 export const r2 = new S3Client({
     region: "auto",
     endpoint: ENDPOINT,
@@ -35,10 +38,19 @@ export const r2 = new S3Client({
         accessKeyId: R2_ACCESS_KEY_ID!,
         secretAccessKey: R2_SECRET_ACCESS_KEY!,
     },
-    forcePathStyle: true, // recomendado en R2
+    forcePathStyle: true,
 });
 
-export const R2_BUCKET_NAME = R2_BUCKET!;
+// Cliente SOLO para firmar URLs (virtual-hosted-style)
+const r2Vhost = new S3Client({
+    region: "auto",
+    endpoint: ENDPOINT,
+    credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID!,
+        secretAccessKey: R2_SECRET_ACCESS_KEY!,
+    },
+    forcePathStyle: false,
+});
 
 // ------- helpers públicos (solo lectura) -------
 export const R2_PUBLIC_BASE = (R2_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
@@ -56,7 +68,7 @@ export function makeObjectKeyForProduct(productId: number, originalName: string)
     return `products/${productId}/${randomUUID()}.${ext || "bin"}`;
 }
 
-// --- SUBIR ---
+// --- SUBIR (desde el servidor, si alguna vez lo usas) ---
 export async function r2PutObject(objectKey: string, body: Buffer, contentType?: string) {
     const cmd = new PutObjectCommand({
         Bucket: R2_BUCKET_NAME,
@@ -74,10 +86,10 @@ export async function r2DeleteObject(objectKey: string) {
     await r2.send(cmd);
 }
 
-// --- URL firmada (GET) ---
+// --- URL firmada (GET) usando cliente vhost ---
 export async function getSignedGetUrl(key: string, expiresSec = 3600) {
     const cmd = new GetObjectCommand({ Bucket: R2_BUCKET_NAME, Key: key });
-    return getSignedUrl(r2, cmd, { expiresIn: expiresSec });
+    return getSignedUrl(r2Vhost, cmd, { expiresIn: expiresSec });
 }
 
 // Elegir pública vs firmada según prefieras (si tu bucket es público, usa pública)
@@ -88,14 +100,19 @@ export async function resolveR2Url(key: string, opts?: { expiresSec?: number }) 
     return publicR2Url(key);
 }
 
-// re-export útil
-export { GetObjectCommand };
-
-export async function getSignedPutUrl(key: string, contentType = "application/octet-stream", expiresSec = 300) {
+// URL firmada (PUT) para subida directa desde el navegador (cliente vhost)
+export async function getSignedPutUrl(
+    key: string,
+    contentType = "application/octet-stream",
+    expiresSec = 300
+) {
     const cmd = new PutObjectCommand({
         Bucket: R2_BUCKET_NAME,
         Key: key,
-        ContentType: contentType,
-    })
-    return getSignedUrl(r2, cmd, { expiresIn: expiresSec })
+        ContentType: contentType, // debe coincidir con el header del PUT del browser
+    });
+    return getSignedUrl(r2Vhost, cmd, { expiresIn: expiresSec });
 }
+
+// re-export útil
+export { GetObjectCommand };
