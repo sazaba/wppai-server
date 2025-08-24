@@ -316,6 +316,7 @@ export async function deleteImage(req: Request, res: Response) {
 // }
 
 
+// controllers/product.controller.ts  (solo esta función)
 export async function uploadProductImageR2(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)
@@ -324,16 +325,13 @@ export async function uploadProductImageR2(req: Request, res: Response) {
         return res.status(400).json({ error: "No file received. Use field 'file'." })
     }
 
-    // Validar producto pertenece a la empresa
     const product = await prisma.product.findFirst({ where: { id: productId, empresaId } })
-    if (!product) return res.status(404).json({ error: "Producto no encontrado" })
+    if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
 
-    const alt = (req.body?.alt as string) || ""
-    const isPrimary = String(req.body?.isPrimary || "").toLowerCase() === "true"
+    const alt = (req.body?.alt as string) || ''
+    const isPrimary = String(req.body?.isPrimary || '').toLowerCase() === 'true'
 
-    // Meta de imagen (no bloqueante si falla)
-    let width: number | undefined
-    let height: number | undefined
+    let width: number | undefined, height: number | undefined
     try {
         const meta = await sharp(req.file.buffer).metadata()
         width = meta.width
@@ -343,12 +341,12 @@ export async function uploadProductImageR2(req: Request, res: Response) {
     const mimeType = req.file.mimetype
     const sizeBytes = req.file.size
 
-    let publicUrl: string
+    let urlParaVer: string   // <- puede ser firmada o pública
     let objectKeyStored: string
 
     try {
-        if (process.env.USE_R2_WORKER === "1") {
-            const { uploadToR2ViaWorker } = await import("../lib/r2-worker")
+        if (process.env.USE_R2_WORKER === '1') {
+            const { uploadToR2ViaWorker } = await import('../lib/r2-worker')
             const result = await uploadToR2ViaWorker({
                 productId,
                 buffer: req.file.buffer,
@@ -358,17 +356,23 @@ export async function uploadProductImageR2(req: Request, res: Response) {
                 isPrimary,
             })
             objectKeyStored = result.objectKey
-            publicUrl = await resolveR2Url(objectKeyStored)
+            urlParaVer = await resolveR2Url(objectKeyStored) // <- AQUÍ
         } else {
             const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
             await r2PutObject(objectKey, req.file.buffer, mimeType)
             objectKeyStored = objectKey
-            publicUrl = await resolveR2Url(objectKeyStored)
+            urlParaVer = await resolveR2Url(objectKeyStored) // <- AQUÍ
         }
     } catch (e) {
-        console.error("[uploadProductImageR2] upload error:", e)
-        return res.status(500).json({ error: "Error subiendo imagen" })
+        console.error('[uploadProductImageR2] upload error:', e)
+        return res.status(500).json({ error: 'Error subiendo imagen' })
     }
+
+    // 👇 log temporal para verificar que sea FIRMADA
+    console.log('[R2 upload OK]', {
+        objectKeyStored,
+        urlSample: urlParaVer.slice(0, 140), // no loguear todo
+    })
 
     const img = await prisma.$transaction(async (tx) => {
         if (isPrimary) {
@@ -380,10 +384,10 @@ export async function uploadProductImageR2(req: Request, res: Response) {
         return tx.productImage.create({
             data: {
                 productId,
-                url: publicUrl,
+                url: urlParaVer,                  // <- se guarda la vista (firmada si R2_SIGNED_GET=1)
                 alt,
-                provider: "r2" as StorageProvider,
-                objectKey: objectKeyStored,
+                provider: 'r2' as StorageProvider,
+                objectKey: objectKeyStored,       // <- importante: guardamos la key real
                 mimeType,
                 sizeBytes,
                 width,
