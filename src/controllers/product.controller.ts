@@ -242,17 +242,36 @@ export async function uploadProductImageR2(req: Request, res: Response) {
         height = meta.height
     } catch { /* ignore */ }
 
-    const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
     const mimeType = req.file.mimetype
     const sizeBytes = req.file.size
 
-    // Sube a R2
+    // Sube a R2 (vía Worker si está activo)
     let publicUrl: string
+    let objectKeyStored: string
+
     try {
-        publicUrl = await r2PutObject(objectKey, req.file.buffer, mimeType)
+        if (process.env.USE_R2_WORKER === '1') {
+            // ---- vía Worker (evita el TLS Render<->R2) ----
+            const { uploadToR2ViaWorker } = await import('../lib/r2-worker')
+            const result = await uploadToR2ViaWorker({
+                productId,
+                buffer: req.file.buffer,
+                filename: req.file.originalname,
+                contentType: mimeType,
+                alt,
+                isPrimary,
+            })
+            publicUrl = result.publicUrl
+            objectKeyStored = result.objectKey
+        } else {
+            // ---- directo (cuando tu PaaS ya soporte el handshake TLS con R2) ----
+            const objectKey = makeObjectKeyForProduct(productId, req.file.originalname)
+            publicUrl = await r2PutObject(objectKey, req.file.buffer, mimeType)
+            objectKeyStored = objectKey
+        }
     } catch (e) {
-        console.error('[uploadProductImageR2] r2PutObject error:', e)
-        return res.status(500).json({ error: 'Error subiendo a R2' })
+        console.error('[uploadProductImageR2] upload error:', e)
+        return res.status(500).json({ error: 'Error subiendo imagen' })
     }
 
     // Guarda en DB (si isPrimary=true desmarca otras dentro de la misma tx)
@@ -268,8 +287,8 @@ export async function uploadProductImageR2(req: Request, res: Response) {
                 productId,
                 url: publicUrl,
                 alt,
-                provider: 'r2',
-                objectKey,
+                provider: 'r2' as StorageProvider,
+                objectKey: objectKeyStored,
                 mimeType,
                 sizeBytes,
                 width,
