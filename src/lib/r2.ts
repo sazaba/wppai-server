@@ -90,3 +90,12 @@ export async function resolveR2Url(key: string, opts?: { expiresSec?: number }) 
 
 // re-export útil
 export { GetObjectCommand };
+
+export async function getSignedPutUrl(key: string, contentType = "application/octet-stream", expiresSec = 300) {
+    const cmd = new PutObjectCommand({
+        Bucket: R2_BUCKET_NAME,
+        Key: key,
+        ContentType: contentType,
+    })
+    return getSignedUrl(r2, cmd, { expiresIn: expiresSec })
+}

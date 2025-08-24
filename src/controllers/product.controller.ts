@@ -9,6 +9,7 @@ import {
     resolveR2Url,
 } from '../lib/r2'
 import { StorageProvider } from '@prisma/client'
+import { getSignedPutUrl } from '../lib/r2'
 
 // helper para parsear ids
 const toInt = (v: unknown): number => {
@@ -379,5 +380,93 @@ export async function streamProductImagePublic(req: Request, res: Response) {
     } catch (e) {
         console.error('[streamProductImagePublic] error firmando URL:', e)
         return res.status(500).end()
+    }
+}
+
+// POST /api/products/:id/images/presign
+export async function presignProductImageUpload(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+    const productId = toInt(req.params.id)
+    const { filename, mimeType } = req.body || {}
+
+    if (!productId || !filename) {
+        return res.status(400).json({ error: "filename requerido" })
+    }
+
+    // verifica pertenencia del producto
+    const product = await prisma.product.findFirst({ where: { id: productId, empresaId }, select: { id: true } })
+    if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
+
+    const objectKey = makeObjectKeyForProduct(productId, filename)
+    try {
+        const url = await getSignedPutUrl(objectKey, mimeType || 'application/octet-stream', 300)
+        return res.json({ objectKey, url, expiresIn: 300 })
+    } catch (e) {
+        console.error('[presignProductImageUpload] error:', e)
+        return res.status(500).json({ error: 'No se pudo firmar URL de subida' })
+    }
+}
+
+// 👉 NUEVO: confirma subida (guarda en DB) luego de que el browser hizo el PUT a R2
+// POST /api/products/:id/images/confirm
+export async function confirmProductImage(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+    const productId = toInt(req.params.id)
+
+    const {
+        objectKey,
+        alt = '',
+        isPrimary = false,
+        mimeType,
+        sizeBytes,
+        width,
+        height,
+    } = req.body || {}
+
+    if (!objectKey) return res.status(400).json({ error: 'objectKey requerido' })
+
+    const product = await prisma.product.findFirst({ where: { id: productId, empresaId }, select: { id: true } })
+    if (!product) return res.status(404).json({ error: 'Producto no encontrado' })
+
+    try {
+        const viewUrl = await resolveR2Url(objectKey) // pública o firmada según tu env
+
+        const img = await prisma.$transaction(async (tx) => {
+            if (isPrimary) {
+                await tx.productImage.updateMany({
+                    where: { productId, isPrimary: true },
+                    data: { isPrimary: false },
+                })
+            }
+            return tx.productImage.create({
+                data: {
+                    productId,
+                    url: viewUrl,
+                    alt,
+                    provider: 'r2',
+                    objectKey,
+                    mimeType: mimeType || null,
+                    sizeBytes: typeof sizeBytes === 'number' ? sizeBytes : null,
+                    width: typeof width === 'number' ? width : null,
+                    height: typeof height === 'number' ? height : null,
+                    isPrimary: !!isPrimary,
+                },
+            })
+        })
+
+        return res.status(201).json({
+            id: img.id,
+            url: img.url,
+            objectKey: img.objectKey,
+            isPrimary: img.isPrimary,
+            mimeType: img.mimeType,
+            sizeBytes: img.sizeBytes,
+            width: img.width,
+            height: img.height,
+            provider: img.provider,
+        })
+    } catch (e) {
+        console.error('[confirmProductImage] error:', e)
+        return res.status(500).json({ error: 'No se pudo confirmar la imagen' })
     }
 }

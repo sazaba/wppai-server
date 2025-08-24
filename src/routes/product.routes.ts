@@ -26,4 +26,9 @@ r.get('/:id/images', ctrl.listProductImages)
 r.put('/:id/images/:imageId/primary', ctrl.setPrimaryImage)
 r.delete('/:id/images/:imageId', ctrl.deleteImage)
 
+// 👉 añade estas 2 rutas debajo de las protegidas (requieren JWT)
+r.post('/:id/images/presign', ctrl.presignProductImageUpload)
+r.post('/:id/images/confirm', ctrl.confirmProductImage)
+
+
 export default r
