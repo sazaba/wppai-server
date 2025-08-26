@@ -2,7 +2,7 @@
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { cfImagesUpload, cfImagesDelete, cfImageUrl } from '../lib/cloudflareImages'
-import { StorageProvider } from '@prisma/client' // <-- IMPORTANTE
+import { StorageProvider } from '@prisma/client'
 
 // Helper para parsear IDs
 const toInt = (v: unknown): number => {
@@ -37,6 +37,8 @@ async function ensureUniqueSlug(base: string) {
 // ========================
 // CRUD PRODUCTOS
 // ========================
+
+// Crear producto (POST /api/products)
 export async function createProduct(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const {
@@ -88,6 +90,63 @@ export async function createProduct(req: Request, res: Response) {
     }
 }
 
+// Listar productos (GET /api/products)
+export async function listProducts(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId
+    const productos = await prisma.product.findMany({
+        where: { empresaId },
+        include: { imagenes: true },
+        orderBy: { createdAt: 'desc' },
+    })
+    res.json(productos)
+}
+
+// Obtener 1 producto (GET /api/products/:id)
+export async function getProduct(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId
+    const id = toInt(req.params.id)
+    const producto = await prisma.product.findFirst({
+        where: { id, empresaId },
+        include: { imagenes: true },
+    })
+    if (!producto) return res.status(404).json({ error: 'Producto no encontrado' })
+    res.json(producto)
+}
+
+// Actualizar producto (PUT /api/products/:id)
+export async function updateProduct(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId
+    const id = toInt(req.params.id)
+    const data = req.body
+    const exists = await prisma.product.findFirst({ where: { id, empresaId } })
+    if (!exists) return res.status(404).json({ error: 'Producto no encontrado' })
+    const updated = await prisma.product.update({
+        where: { id },
+        data: {
+            nombre: data?.nombre ?? exists.nombre,
+            descripcion: data?.descripcion ?? exists.descripcion,
+            beneficios: data?.beneficios ?? exists.beneficios,
+            caracteristicas: data?.caracteristicas ?? exists.caracteristicas,
+            precioDesde:
+                typeof data?.precioDesde === 'number' || data?.precioDesde === null
+                    ? data.precioDesde
+                    : exists.precioDesde,
+        },
+    })
+    res.json(updated)
+}
+
+// Eliminar producto (DELETE /api/products/:id)
+export async function deleteProduct(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId
+    const id = toInt(req.params.id)
+    const exists = await prisma.product.findFirst({ where: { id, empresaId } })
+    if (!exists) return res.status(404).json({ error: 'Producto no encontrado' })
+    await prisma.productImage.deleteMany({ where: { productId: id } })
+    await prisma.product.delete({ where: { id } })
+    res.status(204).end()
+}
+
 // ========================
 // IMÁGENES CLOUDLFARE IMAGES
 // ========================
@@ -131,7 +190,7 @@ export async function uploadProductImage(req: Request, res: Response) {
                 productId,
                 url: urlParaVer,
                 alt,
-                provider: StorageProvider.cloudflare_image, // <-- Enum aquí
+                provider: StorageProvider.cloudflare_image,
                 imageId,
                 isPrimary,
             },
