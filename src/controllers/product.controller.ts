@@ -94,12 +94,39 @@ export async function createProduct(req: Request, res: Response) {
 
 export async function listProducts(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
+
     const productos = await prisma.product.findMany({
         where: { empresaId },
-        include: { imagenes: true },
+        include: {
+            imagenes: {
+                orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }, { id: 'asc' }],
+                select: {
+                    id: true,
+                    url: true,
+                    alt: true,
+                    imageId: true,
+                    isPrimary: true,
+                    provider: true,
+                    createdAt: true,
+                    updatedAt: true,
+                    sortOrder: true,
+                    productId: true,
+                },
+            },
+        },
         orderBy: { createdAt: 'desc' },
     })
-    res.json(productos)
+
+    // reescribimos la URL con el variant
+    const out = productos.map((p) => ({
+        ...p,
+        imagenes: (p.imagenes || []).map((img) => ({
+            ...img,
+            url: cfImageUrl(img.imageId, CF_VARIANT),
+        })),
+    }))
+
+    res.json(out)
 }
 
 export async function getProduct(req: Request, res: Response) {
@@ -173,7 +200,6 @@ export async function uploadProductImage(req: Request, res: Response) {
         return res.status(500).json({ error: 'Error subiendo imagen' })
     }
 
-    // URL de entrega con VARIANT nombrado
     const urlParaVer = cfImageUrl(imageId, CF_VARIANT)
 
     const img = await prisma.$transaction(async (tx) => {
@@ -198,9 +224,11 @@ export async function uploadProductImage(req: Request, res: Response) {
     return res.status(201).json({
         id: img.id,
         url: img.url,
+        alt: img.alt,
         imageId: img.imageId,
         isPrimary: img.isPrimary,
         provider: img.provider,
+        updatedAt: img.updatedAt, // <- para cache-buster
     })
 }
 
@@ -219,11 +247,19 @@ export async function listProductImages(req: Request, res: Response) {
         orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }, { id: 'asc' }],
     })
 
-    // Reescribir URL a la variante nombrada por si se cambia el variant en el futuro
     const withViewUrl = images.map(img => ({
-        ...img,
+        id: img.id,
         url: cfImageUrl(img.imageId, CF_VARIANT),
+        alt: img.alt,
+        imageId: img.imageId,
+        isPrimary: img.isPrimary,
+        provider: img.provider,
+        sortOrder: img.sortOrder,
+        createdAt: img.createdAt,
+        updatedAt: img.updatedAt, // <- importante
+        productId: img.productId,
     }))
+
     res.json(withViewUrl)
 }
 
