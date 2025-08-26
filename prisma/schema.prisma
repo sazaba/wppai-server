@@ -57,6 +57,7 @@ enum StorageProvider {
   s3 // S3 / Wasabi / Spaces
   r2 // Cloudflare R2
   external // cualquier URL externa
+  cloudflare_image
 }
 
 model Usuario {
@@ -222,21 +223,22 @@ model ProductImage {
   id        Int @id @default(autoincrement())
   productId Int
 
-  url String @default("") @db.VarChar(2048) // <- antes era Text con default; ahora VARCHAR
-  alt String @default("")
+  // Cloudflare Images
+  imageId   String          @db.VarChar(128) // <- NUEVO: ID de Images (requerido)
+  url       String          @default("") @db.VarChar(2048)
+  alt       String          @default("")
+  provider  StorageProvider @default(external) // cambia a 'external' o crea 'cloudflare_images' si prefieres
+  isPrimary Boolean         @default(false)
+  sortOrder Int             @default(0)
 
-  provider  StorageProvider @default(r2)
-  objectKey String?         @db.VarChar(255)
-  mimeType  String?         @db.VarChar(64)
-  sizeBytes Int?
-  width     Int?
-  height    Int?
-
+  // Puedes dejar estos como opcionales (no romperán nada, simplemente no se llenarán)
+  objectKey       String?   @db.VarChar(255)
+  mimeType        String?   @db.VarChar(64)
+  sizeBytes       Int?
+  width           Int?
+  height          Int?
   whatsappMediaId String?   @db.VarChar(128)
   mediaCachedAt   DateTime?
-
-  isPrimary Boolean @default(false)
-  sortOrder Int     @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
