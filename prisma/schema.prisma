@@ -156,6 +156,11 @@ model BusinessConfig {
   businessType BusinessType @default(servicios)
   disclaimers  String       @default("")
 
+  // 🔽 NUEVO: reglas de escalamiento
+  escalarSiNoConfia    Boolean @default(true)
+  escalarPalabrasClave String  @default("") // coma-separado
+  escalarPorReintentos Int     @default(0) // 0 = desactivado
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
