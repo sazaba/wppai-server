@@ -4,6 +4,9 @@ import prisma from '../lib/prisma'
 import { cfImagesUpload, cfImagesDelete, cfImageUrl } from '../lib/cloudflareImages'
 import { StorageProvider } from '@prisma/client'
 
+// 🔧 Ajusta aquí el nombre del variant que tengas creado en Cloudflare Images
+const CF_VARIANT = process.env.CF_IMAGES_VARIANT || 'public'
+
 // Helper para parsear IDs
 const toInt = (v: unknown): number => {
     const n = Number.parseInt(String(v), 10)
@@ -38,7 +41,6 @@ async function ensureUniqueSlug(base: string) {
 // CRUD PRODUCTOS
 // ========================
 
-// Crear producto (POST /api/products)
 export async function createProduct(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const {
@@ -90,7 +92,6 @@ export async function createProduct(req: Request, res: Response) {
     }
 }
 
-// Listar productos (GET /api/products)
 export async function listProducts(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const productos = await prisma.product.findMany({
@@ -101,7 +102,6 @@ export async function listProducts(req: Request, res: Response) {
     res.json(productos)
 }
 
-// Obtener 1 producto (GET /api/products/:id)
 export async function getProduct(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const id = toInt(req.params.id)
@@ -113,7 +113,6 @@ export async function getProduct(req: Request, res: Response) {
     res.json(producto)
 }
 
-// Actualizar producto (PUT /api/products/:id)
 export async function updateProduct(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const id = toInt(req.params.id)
@@ -136,7 +135,6 @@ export async function updateProduct(req: Request, res: Response) {
     res.json(updated)
 }
 
-// Eliminar producto (DELETE /api/products/:id)
 export async function deleteProduct(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const id = toInt(req.params.id)
@@ -148,10 +146,9 @@ export async function deleteProduct(req: Request, res: Response) {
 }
 
 // ========================
-// IMÁGENES CLOUDLFARE IMAGES
+// IMÁGENES (Cloudflare Images)
 // ========================
 
-// SUBIR IMAGEN (POST /api/products/:id/images/upload)
 export async function uploadProductImage(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)
@@ -166,7 +163,7 @@ export async function uploadProductImage(req: Request, res: Response) {
     const alt = (req.body?.alt as string) || ''
     const isPrimary = String(req.body?.isPrimary || '').toLowerCase() === 'true'
 
-    // Sube imagen a Cloudflare Images
+    // Subida a Cloudflare Images
     let imageId: string
     try {
         const result = await cfImagesUpload(req.file.buffer, req.file.originalname)
@@ -176,7 +173,8 @@ export async function uploadProductImage(req: Request, res: Response) {
         return res.status(500).json({ error: 'Error subiendo imagen' })
     }
 
-    const urlParaVer = cfImageUrl(imageId, 'w=320,h=320,fit=cover')
+    // URL de entrega con VARIANT nombrado
+    const urlParaVer = cfImageUrl(imageId, CF_VARIANT)
 
     const img = await prisma.$transaction(async (tx) => {
         if (isPrimary) {
@@ -206,7 +204,6 @@ export async function uploadProductImage(req: Request, res: Response) {
     })
 }
 
-// LISTAR IMÁGENES (GET /api/products/:id/images)
 export async function listProductImages(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)
@@ -222,15 +219,14 @@ export async function listProductImages(req: Request, res: Response) {
         orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }, { id: 'asc' }],
     })
 
-    // Construye la URL pública de Images
+    // Reescribir URL a la variante nombrada por si se cambia el variant en el futuro
     const withViewUrl = images.map(img => ({
         ...img,
-        url: cfImageUrl(img.imageId, 'w=320,h=320,fit=cover'),
+        url: cfImageUrl(img.imageId, CF_VARIANT),
     }))
     res.json(withViewUrl)
 }
 
-// BORRAR IMAGEN (DELETE /api/products/:id/images/:imageId)
 export async function deleteImage(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId
     const { id, imageId } = req.params as unknown as { id: string; imageId: string }
@@ -255,7 +251,6 @@ export async function deleteImage(req: Request, res: Response) {
     res.status(204).end()
 }
 
-// SET PRIMARY (PUT /api/products/:id/images/:imageId/primary)
 export async function setPrimaryImage(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const productId = toInt(req.params.id)

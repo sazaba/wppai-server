@@ -6,17 +6,17 @@ import { uploadImageMem } from '../middleware/upload'
 
 const r = Router()
 
-// 🔐 Todo requiere JWT ahora
+// 🔐 Todo requiere JWT
 r.use(verificarJWT)
 
-// CRUD productos
+// CRUD
 r.post('/', ctrl.createProduct)
 r.get('/', ctrl.listProducts)
 r.get('/:id', ctrl.getProduct)
 r.put('/:id', ctrl.updateProduct)
 r.delete('/:id', ctrl.deleteProduct)
 
-// IMÁGENES (solo endpoints válidos para Cloudflare Images)
+// Imágenes (Cloudflare Images)
 r.post('/:id/images/upload', uploadImageMem.single('file'), ctrl.uploadProductImage)
 r.get('/:id/images', ctrl.listProductImages)
 r.put('/:id/images/:imageId/primary', ctrl.setPrimaryImage)
