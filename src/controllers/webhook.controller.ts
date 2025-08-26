@@ -1,22 +1,14 @@
-// src/controllers/webhook.controller.ts
+// server/src/controllers/webhook.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { handleIAReply } from '../utils/handleIAReply'
 import { MessageFrom, ConversationEstado, MediaType } from '@prisma/client'
 import {
-    sendText as sendTextSvc,
     getMediaUrl,
     downloadMediaToBuffer,
 } from '../services/whatsapp.services'
 import { transcribeAudioBuffer } from '../services/transcription.service'
-// 🆕: firmador de token corto para URLs de media
-import { signMediaToken } from './whatsapp.controller'
-
-// 🆕 helper: construye URL firmada para que <img>/<video> puedan cargar sin Authorization
-function buildSignedMediaUrl(empresaId: number, mediaId: string) {
-    const t = signMediaToken(empresaId, mediaId)
-    return `/api/whatsapp/media/${mediaId}?t=${encodeURIComponent(t)}`
-}
+import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy firmado
 
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
@@ -135,7 +127,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             }
 
             contenido = transcription || '[nota de voz]'
-            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
         }
         // 🖼️ IMAGEN
         else if (msg.type === 'image' && msg.image?.id) {
@@ -145,7 +137,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             captionForDb = (msg.image?.caption as string | undefined) || undefined
 
             contenido = captionForDb || '[imagen]'
-            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
         }
         // 🎞️ VIDEO
         else if (msg.type === 'video' && msg.video?.id) {
@@ -155,7 +147,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             captionForDb = (msg.video?.caption as string | undefined) || undefined
 
             contenido = captionForDb || '[video]'
-            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
         }
         // 📎 DOCUMENTO
         else if (msg.type === 'document' && msg.document?.id) {
@@ -166,7 +158,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             captionForDb = filename
 
             contenido = filename ? `[documento] ${filename}` : '[documento]'
-            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaUrl(empresaId, inboundMediaId)
+            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
         }
 
         // Guardar ENTRANTE
@@ -202,7 +194,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 transcription,
                 isVoiceNote,
                 caption: captionForDb,
-                mediaId: inboundMediaId,   // 🆕 añadido para el front
+                mediaId: inboundMediaId,
             },
             phone: conversation.phone,
             nombre: conversation.nombre ?? conversation.phone,
@@ -212,10 +204,13 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         // ----- Evitar falso escalado con audio sin transcripción
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
-        // 3) IA → RESPUESTA
+        // 3) IA → RESPUESTA (auto envía y persiste)
         let result: Awaited<ReturnType<typeof handleIAReply>>
         try {
-            result = await handleIAReply(conversation.id, contenido)
+            result = await handleIAReply(conversation.id, contenido, {
+                autoSend: true,
+                toPhone: conversation.phone,
+            })
 
             if (
                 skipEscalateForAudioNoTranscript &&
@@ -224,79 +219,76 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             ) {
                 result = {
                     estado: ConversationEstado.en_proceso,
-                    mensaje: 'No pude escuchar bien tu nota de voz. ¿Puedes repetir o escribir lo que necesitas?'
-                }
+                    mensaje: 'No pude escuchar bien tu nota de voz. ¿Puedes repetir o escribir lo que necesitas?',
+                    messageId: undefined,
+                } as any
             }
         } catch {
             result = {
                 estado: ConversationEstado.en_proceso,
-                mensaje: 'Gracias por tu mensaje. ¿Podrías darme un poco más de contexto?'
-            }
+                mensaje: 'Gracias por tu mensaje. ¿Podrías darme un poco más de contexto?',
+                messageId: undefined,
+            } as any
         }
 
-        if (result?.mensaje) {
-            const yaExiste = await prisma.message.findFirst({
-                where: {
-                    conversationId: conversation.id,
-                    from: MessageFrom.bot,
-                    contenido: result.mensaje,
-                    timestamp: { gte: ts },
-                },
-            })
-            if (yaExiste) {
-                console.warn('[BOT] Evitado duplicado para este inbound.')
-                return res.status(200).json({ success: true, deduped: true })
-            }
+        // 4) Emitir la respuesta del bot (ya está guardada por handleIAReply)
+        if (result?.mensaje && result?.messageId) {
+            const creado = await prisma.message.findUnique({ where: { id: result.messageId } })
 
-            try {
-                console.log('[WA TX] Enviando texto →', {
-                    to: conversation.phone,
-                    preview: result.mensaje.slice(0, 80),
-                })
-
-                const respText = await sendTextSvc({
-                    empresaId,
-                    to: conversation.phone,
-                    body: result.mensaje,
-                })
-                const outboundId: string | null = respText?.outboundId ?? null
-                console.log('[WA TX] OK, outboundId:', outboundId)
-
-                const creado = await prisma.message.create({
-                    data: {
-                        conversationId: conversation.id,
-                        empresaId,
-                        from: MessageFrom.bot,
-                        contenido: result.mensaje,
-                        timestamp: new Date(),
-                    },
-                })
-
+            if (creado) {
                 io?.emit?.('nuevo_mensaje', {
                     conversationId: conversation.id,
                     message: {
                         id: creado.id,
-                        externalId: outboundId,
+                        externalId: creado.externalId ?? null,
                         from: 'bot',
-                        contenido: result.mensaje,
+                        contenido: creado.contenido,
                         timestamp: creado.timestamp.toISOString(),
                     },
                     estado: result.estado,
                 })
+            }
+        }
 
-                await prisma.conversation.update({
-                    where: { id: conversation.id },
-                    data: { estado: ConversationEstado.respondido },
+        // 5) Si el handler envió imágenes de productos, emítelas también
+        if (result?.media?.length) {
+            const wamids = result.media
+                .map(m => m.wamid)
+                .filter(Boolean) as string[]
+
+            if (wamids.length) {
+                const medias = await prisma.message.findMany({
+                    where: {
+                        conversationId: conversation.id,
+                        from: MessageFrom.bot,
+                        externalId: { in: wamids },
+                    },
+                    orderBy: { id: 'asc' },
+                    select: {
+                        id: true,
+                        externalId: true,
+                        mediaType: true,
+                        mediaUrl: true,
+                        caption: true,
+                        timestamp: true,
+                    }
                 })
-            } catch (e: any) {
-                const meta = e?.response?.data
-                const code = meta?.error?.code
-                console.error('[WA TX] ERROR al enviar texto:', code, meta || e?.message)
-                io?.emit?.('wa_policy_error', {
-                    conversationId: conversation.id,
-                    code,
-                    message: 'Ventana de 24h cerrada. Se requiere plantilla para iniciar la conversación.',
-                })
+
+                for (const m of medias) {
+                    io?.emit?.('nuevo_mensaje', {
+                        conversationId: conversation.id,
+                        message: {
+                            id: m.id,
+                            externalId: m.externalId ?? null,
+                            from: 'bot',
+                            contenido: '', // ya va en caption
+                            mediaType: m.mediaType,
+                            mediaUrl: m.mediaUrl,
+                            caption: m.caption,
+                            timestamp: m.timestamp.toISOString(),
+                        },
+                    })
+                }
             }
         }
 
