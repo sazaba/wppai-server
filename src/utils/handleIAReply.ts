@@ -469,6 +469,7 @@ export const handleIAReply = async (
 }
 
 /* ===================== Persistencia común ===================== */
+/* ===================== Persistencia común ===================== */
 function normalizeToE164(n: string) {
     return String(n || '').replace(/[^\d]/g, '')
 }
@@ -478,7 +479,7 @@ async function persistBotReply({
     empresaId,
     texto,
     nuevoEstado,
-    meta,
+    meta, // 👈 lo aceptamos pero NO lo guardamos (tu modelo no tiene este campo)
     sendTo,
     phoneNumberId,
 }: {
@@ -486,10 +487,11 @@ async function persistBotReply({
     empresaId: number
     texto: string
     nuevoEstado: ConversationEstado
-    meta?: Record<string, any>
+    meta?: Record<string, any>          // <- ignorado al persistir
     sendTo?: string
     phoneNumberId?: string
 }) {
+    // ⚠️ IMPORTANTE: no incluir "meta" en el create, porque tu modelo Message no lo soporta.
     const msg = await prisma.message.create({
         data: {
             conversationId,
@@ -502,14 +504,13 @@ async function persistBotReply({
             caption: null,
             isVoiceNote: false,
             transcription: null,
-            // @ts-ignore
-            meta
-        } as any
+            // meta,  <-- NO GUARDAR
+        } as any,
     })
 
     await prisma.conversation.update({
         where: { id: conversationId },
-        data: { estado: nuevoEstado }
+        data: { estado: nuevoEstado },
     })
 
     const willSend = Boolean(sendTo && String(sendTo).trim().length > 0)
@@ -525,26 +526,34 @@ async function persistBotReply({
     if (willSend) {
         const toNorm = normalizeToE164(sendTo!)
         try {
-            console.log('[persistBotReply] enviando a WhatsApp...', { empresaId, to: toNorm, phoneNumberId })
+            console.log('[persistBotReply] enviando a WhatsApp...', {
+                empresaId,
+                to: toNorm,
+                phoneNumberId,
+            })
             const resp = await sendWhatsappMessage({
                 empresaId,
                 to: toNorm,
-                body: texto,                 // 👈 OJO: el service espera "body"
+                body: texto,                // 👈 sendText usa "body"
                 phoneNumberIdHint: phoneNumberId,
             })
-            // OutboundResult -> id puede venir en data.messages[0].id o en outboundId
-            const wamidFromData = (resp as any)?.data?.messages?.[0]?.id
-            const wamidFromOutbound = (resp as any)?.outboundId
-            wamid = wamidFromData || wamidFromOutbound
+            // soporta ambas formas según axios
+            const idFromAxios = (resp as any)?.data?.messages?.[0]?.id
+            const idDirect = (resp as any)?.messages?.[0]?.id
+            wamid = idFromAxios || idDirect
             console.log('[persistBotReply] enviado OK', { wamid })
 
             if (wamid) {
-                await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
+                await prisma.message.update({
+                    where: { id: msg.id },
+                    data: { externalId: wamid },
+                })
             }
         } catch (err: any) {
-            const status = err?.response?.status
-            const data = err?.response?.data
-            console.error('[persistBotReply] ERROR enviando a WhatsApp:', { status, data, to: toNorm, empresaId, phoneNumberId })
+            console.error(
+                '[persistBotReply] ERROR enviando a WhatsApp:',
+                err?.response?.data || err?.message || err
+            )
         }
     } else {
         console.warn('[persistBotReply] no se envía a WhatsApp: sendTo vacío o inválido')
@@ -552,6 +561,7 @@ async function persistBotReply({
 
     return { messageId: msg.id, texto, wamid }
 }
+
 
 /* ===================== Helpers de producto ===================== */
 function buildProductCaption(p: {
