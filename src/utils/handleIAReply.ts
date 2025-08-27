@@ -57,13 +57,11 @@ function normalizarTexto(texto: string): string {
 }
 
 /* ===================== Guardas de salida ===================== */
-// ✅ Lista conservadora: bloquea “romper personaje” y datos de contacto.
 const FRASES_PROHIBIDAS = [
     'soy una ia', 'soy un asistente', 'modelo de lenguaje', 'inteligencia artificial',
     'segun la informacion', 'de acuerdo a la informacion', 'de acuerdo a los datos', 'segun el sistema'
 ].map(normalizarTexto)
 
-/** Inválida si entrega contacto o rompe personaje. */
 function esRespuestaInvalida(respuesta: string): boolean {
     const r = normalizarTexto(respuesta)
     const tieneEmail = /\b[\w.+-]+@[\w-]+\.[\w.-]+\b/.test(respuesta)
@@ -85,13 +83,18 @@ function isProductIntent(text: string): boolean {
     return keys.some(k => t.includes(k))
 }
 
+function isPriceIntent(text: string): boolean {
+    const t = normalizarTexto(text)
+    const keys = ['precio', 'cuanto vale', 'cuánto vale', 'cuanto cuesta', 'cuánto cuesta', 'vale', 'costo', 'coste', 'sale']
+    return keys.some(k => t.includes(k))
+}
+
 function isGreetingOrGenericIntent(text: string): boolean {
     const t = normalizarTexto(text)
     const keys = ['hola', 'buenos dias', 'buenas', 'necesito informacion', 'info', 'informacion', 'ayuda', 'asesoria']
     return keys.some(k => t.includes(k))
 }
 
-/** Topic shift más tolerante: no desvía si es saludo o intención de productos. */
 function isHardTopicShift(text: string, negocioKeywords: string[]): boolean {
     const t = (text || '').toLowerCase().trim()
     if (!t) return false
@@ -292,6 +295,55 @@ export const handleIAReply = async (
     ].filter(Boolean)
     const topicShift = isHardTopicShift(mensaje || ultimoCliente?.caption || '', negocioKeywords)
 
+    /* ========= 5.1 REGLA DETERMINÍSTICA DE PRECIOS (sin LLM) ========= */
+    const wantsPrice = isPriceIntent(mensaje || ultimoCliente?.caption || '')
+    if (wantsPrice) {
+        // Si no encontramos relevantes, traemos algunos productos como fallback
+        let prods = productosRelevantes
+        if (!prods.length) {
+            prods = await prisma.product.findMany({
+                where: { empresaId: conversacion.empresaId, disponible: true },
+                orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
+                take: 4,
+                select: { id: true, nombre: true, precioDesde: true, beneficios: true, caracteristicas: true, descripcion: true }
+            }) as any[]
+        }
+
+        // Filtrar los que tengan precioDesde
+        const withPrice = (prods || []).filter(p => p?.precioDesde != null)
+
+        let texto: string
+        if (withPrice.length === 0) {
+            // No hay precios cargados → guía breve
+            texto = 'Por ahora no tengo precios cargados. ¿Quieres que te cuente beneficios o disponibilidad?'
+        } else if (withPrice.length === 1) {
+            const p = withPrice[0]
+            texto = `${p.nombre}: Desde ${formatMoney(p.precioDesde)}. ¿Te confirmo disponibilidad o prefieres conocer beneficios?`
+        } else {
+            const lines = withPrice.slice(0, 4).map((p: any) => `• ${p.nombre}: desde ${formatMoney(p.precioDesde)}`)
+            texto = `${lines.join('\n')}\n¿Te interesa alguno para darte más detalles?`
+        }
+
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId: conversacion.empresaId,
+            texto,
+            nuevoEstado: ConversationEstado.respondido,
+            meta: { reason: 'precio_regla' },
+            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            phoneNumberId: opts?.phoneNumberId,
+        })
+
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: []
+        }
+    }
+    /* ========= FIN regla de precios ========= */
+
     // 6) Mensajes LLM
     const baseMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }> = [
         { role: 'system', content: systemPrompt },
@@ -374,7 +426,7 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.requiere_agente, mensaje: saved.texto, motivo: 'confianza_baja', messageId: saved.messageId, wamid: saved.wamid }
     }
 
-    // 9) shouldEscalate final (usa tu configuracion)
+    // 9) shouldEscalate final
     const iaConfianzaBaja =
         respuestaIA.length < 15 ||
         /no estoy seguro|no tengo certeza|no cuento con esa info/i.test(respuestaIA)
@@ -443,7 +495,7 @@ export const handleIAReply = async (
                         url: img.url,
                         type: 'image',
                         caption,
-                        phoneNumberIdHint: opts?.phoneNumberId, // 👈 importante
+                        phoneNumberIdHint: opts?.phoneNumberId,
                     } as any)
 
                     const wamid =
@@ -491,7 +543,7 @@ async function persistBotReply({
     empresaId,
     texto,
     nuevoEstado,
-    meta, // 👈 aceptado pero NO guardado (tu modelo no tiene este campo)
+    meta,
     sendTo,
     phoneNumberId,
 }: {
@@ -499,7 +551,7 @@ async function persistBotReply({
     empresaId: number
     texto: string
     nuevoEstado: ConversationEstado
-    meta?: Record<string, any>          // <- ignorado al persistir
+    meta?: Record<string, any>          // ignorado al persistir
     sendTo?: string
     phoneNumberId?: string
 }) {
