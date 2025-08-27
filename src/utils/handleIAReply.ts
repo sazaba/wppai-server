@@ -455,7 +455,6 @@ export const handleIAReply = async (
 /* ===================== Persistencia común ===================== */
 /* ===================== Persistencia común ===================== */
 function normalizeToE164(n: string) {
-    // Para WA Cloud API basta con CC+NSN sin símbolos
     return String(n || '').replace(/[^\d]/g, '')
 }
 
@@ -496,7 +495,6 @@ async function persistBotReply({
         data: { estado: nuevoEstado }
     })
 
-    // 🔎 LOGS para depurar el envío
     const willSend = Boolean(sendTo && String(sendTo).trim().length > 0)
     console.log('[persistBotReply] creado', {
         messageId: msg.id,
@@ -526,8 +524,6 @@ async function persistBotReply({
 
     return { messageId: msg.id, texto, wamid }
 }
-
-
 
 
 /* ===================== Helpers de producto ===================== */

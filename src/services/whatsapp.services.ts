@@ -62,9 +62,14 @@ const http = axios.create({
 /* ===================== Helpers ===================== */
 
 export async function getWhatsappCreds(empresaId: number) {
-    const acc = await prisma.whatsappAccount.findUnique({ where: { empresaId } })
+    // Toma la cuenta más reciente de la empresa (o la única), con token válido
+    const acc = await prisma.whatsappAccount.findFirst({
+        where: { empresaId, accessToken: { not: '' } },
+        orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+        select: { accessToken: true, phoneNumberId: true },
+    })
     if (!acc?.accessToken || !acc?.phoneNumberId) {
-        throw new Error('Cuenta de WhatsApp no conectada para esta empresa.')
+        throw new Error(`[WA] Cuenta de WhatsApp no conectada para esta empresaId=${empresaId}.`)
     }
     return { accessToken: acc.accessToken, phoneNumberId: acc.phoneNumberId }
 }
