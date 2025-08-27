@@ -1,6 +1,6 @@
 // server/src/utils/sendWhatsappMessage.ts
 import axios from 'axios'
-import { getWhatsappCreds } from '../services/whatsapp.services'
+import { getWhatsappCreds } from '../services/whatsapp.service'
 
 const FB_VERSION = process.env.META_GRAPH_VERSION || 'v20.0'
 

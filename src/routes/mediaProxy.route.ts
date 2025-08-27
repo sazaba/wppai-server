@@ -1,7 +1,7 @@
 import express from 'express'
 import axios from 'axios'
 import crypto from 'node:crypto'
-import { getWhatsappCreds } from '../services/whatsapp.services'
+import { getWhatsappCreds } from '../services/whatsapp.service'
 
 const router = express.Router()
 

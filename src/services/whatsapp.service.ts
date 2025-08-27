@@ -1,4 +1,4 @@
-// src/services/whatsapp.services.ts
+// server/src/services/whatsapp.services.ts
 import axios from 'axios'
 import prisma from '../lib/prisma'
 import { MessageFrom, MediaType as PrismaMediaType } from '@prisma/client'
@@ -14,6 +14,8 @@ type SendTextArgs = {
     to: string
     body: string
     conversationId?: number
+    /** Usar un número saliente específico (phone_number_id) */
+    phoneNumberIdHint?: string
 }
 
 type SendTemplateArgs = {
@@ -22,6 +24,7 @@ type SendTemplateArgs = {
     templateName: string
     templateLang: string
     variables?: string[]
+    phoneNumberIdHint?: string
 }
 
 export type MediaType = 'image' | 'video' | 'audio' | 'document'
@@ -34,6 +37,7 @@ type SendMediaByLinkArgs = {
     caption?: string
     conversationId?: number
     mimeType?: string
+    phoneNumberIdHint?: string
 }
 
 type SendMediaByIdArgs = {
@@ -44,6 +48,7 @@ type SendMediaByIdArgs = {
     caption?: string
     conversationId?: number
     mimeType?: string
+    phoneNumberIdHint?: string
 }
 
 export type OutboundResult = {
@@ -81,8 +86,6 @@ export async function getWhatsappCreds(empresaId: number, phoneNumberIdHint?: st
     }
     return { accessToken: acc.accessToken, phoneNumberId: acc.phoneNumberId }
 }
-
-
 
 function sanitizePhone(to: string | number) {
     return String(to).replace(/\D+/g, '')
@@ -152,8 +155,9 @@ export async function sendText({
     to,
     body,
     conversationId,
+    phoneNumberIdHint,
 }: SendTextArgs): Promise<OutboundResult> {
-    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId, phoneNumberIdHint)
     const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
     const toSanitized = sanitizePhone(to)
     const payload = { messaging_product: 'whatsapp', to: toSanitized, type: 'text', text: { body } }
@@ -197,11 +201,12 @@ export async function sendWhatsappMedia({
     caption,
     conversationId,
     mimeType,
+    phoneNumberIdHint,
 }: SendMediaByLinkArgs): Promise<OutboundResult> {
     if (!to) throw new Error('Destino (to) requerido')
     if (!url) throw new Error('URL de media requerida')
 
-    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId, phoneNumberIdHint)
     const endpoint = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
     const toSanitized = sanitizePhone(to)
     const safeCaption = clampCaption(caption)
@@ -250,11 +255,12 @@ export async function sendWhatsappMediaById({
     caption,
     conversationId,
     mimeType,
+    phoneNumberIdHint,
 }: SendMediaByIdArgs): Promise<OutboundResult> {
     if (!to) throw new Error('Destino (to) requerido')
     if (!mediaId) throw new Error('mediaId requerido')
 
-    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId, phoneNumberIdHint)
     const endpoint = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
     const toSanitized = sanitizePhone(to)
     const safeCaption = clampCaption(caption)
@@ -382,8 +388,9 @@ export async function sendTemplate({
     templateName,
     templateLang,
     variables = [],
+    phoneNumberIdHint,
 }: SendTemplateArgs): Promise<OutboundResult> {
-    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId, phoneNumberIdHint)
     const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/messages`
     const toSanitized = sanitizePhone(to)
 
@@ -415,25 +422,26 @@ export async function sendTemplate({
     }
 }
 
-/* ===================== Facade (texto simple) ===================== */
+/* ===================== Facade y alias ===================== */
 
 export async function sendOutboundMessage(args: {
     conversationId?: number
     empresaId: number
     to: string
     body: string
+    phoneNumberIdHint?: string
 }): Promise<OutboundResult> {
-    const { empresaId, to, body, conversationId } = args
-
+    const { empresaId, to, body, conversationId, phoneNumberIdHint } = args
     if (!body?.trim()) {
         const err: any = new Error('EMPTY_BODY')
         err.status = 400
         throw err
     }
-
-    return sendText({ empresaId, to, body, conversationId })
+    return sendText({ empresaId, to, body, conversationId, phoneNumberIdHint })
 }
 
+// Alias para compatibilidad con código que esperaba sendWhatsappMessage
+export const sendWhatsappMessage = sendText
 
 /* ===================== Atajos útiles ===================== */
 
@@ -443,6 +451,7 @@ export async function sendVoiceNoteByLink(opts: {
     url: string
     conversationId?: number
     mimeType?: string
+    phoneNumberIdHint?: string
 }) {
     return sendWhatsappMedia({ ...opts, type: 'audio' })
 }
@@ -454,6 +463,7 @@ export async function sendImageByLink(opts: {
     caption?: string
     conversationId?: number
     mimeType?: string
+    phoneNumberIdHint?: string
 }) {
     return sendWhatsappMedia({ ...opts, type: 'image' })
 }
@@ -465,6 +475,7 @@ export async function sendVideoByLink(opts: {
     caption?: string
     conversationId?: number
     mimeType?: string
+    phoneNumberIdHint?: string
 }) {
     return sendWhatsappMedia({ ...opts, type: 'video' })
 }

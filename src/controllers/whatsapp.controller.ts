@@ -10,7 +10,7 @@ import {
     sendText as sendTextSvc,
     uploadToWhatsappMedia,
     sendWhatsappMediaById,
-} from '../services/whatsapp.services'
+} from '../services/whatsapp.service'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
 // ✅ normaliza (evita espacios o comillas perdidas de la UI del host)

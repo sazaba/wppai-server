@@ -6,7 +6,7 @@ import { MessageFrom, ConversationEstado, MediaType } from '@prisma/client'
 import {
     getMediaUrl,
     downloadMediaToBuffer,
-} from '../services/whatsapp.services'
+} from '../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../services/transcription.service'
 import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy firmado
 

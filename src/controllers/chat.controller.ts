@@ -3,7 +3,7 @@ import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { ConversationEstado, MessageFrom } from '@prisma/client'
 import { handleIAReply } from '../utils/handleIAReply'
-import { sendOutboundMessage, sendTemplate } from '../services/whatsapp.services'
+import { sendOutboundMessage, sendTemplate } from '../services/whatsapp.service'
 // 🆕 importar el firmador de URLs cortas para media
 import { signMediaToken } from './whatsapp.controller'
 
