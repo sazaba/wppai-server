@@ -289,11 +289,18 @@ export const handleIAReply = async (
                 where: {
                     empresaId: conversacion.empresaId,
                     OR: [
-                        { nombre: { contains: tokens[0], mode: 'insensitive' } },
-                        { descripcion: { contains: tokens[0], mode: 'insensitive' } },
+                        { nombre: { contains: tokens[0] } },   // <- sin mode
+                        { descripcion: { contains: tokens[0] } },   // <- sin mode
                     ]
                 },
                 take: 5,
+                orderBy: { id: 'asc' }
+            })
+        }
+        if (!productosRelevantes.length) {
+            productosRelevantes = await prisma.product.findMany({
+                where: { empresaId: conversacion.empresaId, disponible: true },
+                take: 3,
                 orderBy: { id: 'asc' }
             })
         }
