@@ -20,6 +20,31 @@ import {
 
 const router = Router()
 
+// server/src/routes/whatsapp.routes.ts
+import { sendText } from '../services/whatsapp.service'
+
+router.get('/ping-send', async (req, res) => {
+    try {
+        const empresaId = Number(req.query.empresaId || 0)
+        const to = String(req.query.to || '')
+        const body = String(req.query.body || '✅ Ping desde Wasaaa (service)')
+
+        if (!empresaId || !to) {
+            return res.status(400).json({ ok: false, error: 'Falta empresaId o to' })
+        }
+
+        const r = await sendText({ empresaId, to, body })
+        return res.json({ ok: true, meta: r })
+    } catch (err: any) {
+        return res.status(err?.response?.status || 500).json({
+            ok: false,
+            status: err?.response?.status,
+            error: err?.response?.data || err?.message || err,
+        })
+    }
+})
+
+
 // --- Helper: permite token corto en ?t= SOLO para /media,
 //     o pasa a verificarJWT para el resto. No valida aquí el JWT;
 //     lo valida el controlador (y también lo soporta verificarJWT).

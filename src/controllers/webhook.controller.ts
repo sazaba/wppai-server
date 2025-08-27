@@ -80,12 +80,14 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversation = await prisma.conversation.create({
                 data: { phone: fromWa, estado: ConversationEstado.pendiente, empresaId },
             })
+            console.log('[CONV] creada', { id: conversation.id, phone: fromWa })
         } else if (conversation.estado === ConversationEstado.cerrado) {
             await prisma.conversation.update({
                 where: { id: conversation.id },
                 data: { estado: ConversationEstado.pendiente },
             })
             conversation.estado = ConversationEstado.pendiente
+            console.log('[CONV] reabierta', { id: conversation.id })
         }
 
         // ----- Contenido base (texto/botones)
@@ -177,6 +179,12 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         if (process.env.FEATURE_ISVOICENOTE === '1') inboundData.isVoiceNote = Boolean(isVoiceNote)
 
         const inbound = await prisma.message.create({ data: inboundData })
+        console.log('[INBOUND] guardado', {
+            id: inbound.id,
+            conv: conversation.id,
+            type: inboundMediaType || 'text',
+            mediaId: inboundMediaId,
+        })
 
         // Emitir ENTRANTE al frontend
         const io = req.app.get('io') as any
@@ -205,6 +213,14 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
         // 3) IA → RESPUESTA (auto envía y persiste)
+        console.log('[IA] Llamando handleIAReply con:', {
+            conversationId: conversation.id,
+            empresaId,
+            toPhone: conversation.phone,
+            phoneNumberId,
+            contenido,
+        })
+
         let result: Awaited<ReturnType<typeof handleIAReply>>
         try {
             result = await handleIAReply(conversation.id, contenido, {
@@ -224,13 +240,22 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     messageId: undefined,
                 } as any
             }
-        } catch {
+        } catch (e: any) {
+            console.error('[IA] handleIAReply lanzó error:', e?.response?.data || e?.message || e)
             result = {
                 estado: ConversationEstado.en_proceso,
                 mensaje: 'Gracias por tu mensaje. ¿Podrías darme un poco más de contexto?',
                 messageId: undefined,
             } as any
         }
+
+        console.log('[IA] Resultado handleIAReply:', {
+            estado: result?.estado,
+            messageId: result?.messageId,
+            wamid: result?.wamid,
+            mediaCount: result?.media?.length || 0,
+            mensaje: result?.mensaje,
+        })
 
         // 4) Persistir/emitir SIEMPRE la respuesta del bot (con fallback)
         let botMessageId = result?.messageId ?? undefined
@@ -248,6 +273,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 },
             })
             botMessageId = creadoFallback.id
+            console.log('[BOT] persistido fallback', { id: botMessageId })
         }
 
         // Emitimos el mensaje del bot si hay contenido y un id (del handler o del fallback)
@@ -261,6 +287,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     data: { estado: result.estado },
                 })
                 conversation.estado = result.estado
+                console.log('[CONV] estado actualizado por IA', { id: conversation.id, estado: conversation.estado })
             }
 
             if (creado) {
