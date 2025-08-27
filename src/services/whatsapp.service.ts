@@ -1,11 +1,11 @@
-// server/src/services/whatsapp.services.ts
+// server/src/services/whatsapp.service.ts
 import axios from 'axios'
 import prisma from '../lib/prisma'
 import { MessageFrom, MediaType as PrismaMediaType } from '@prisma/client'
 import fs from 'fs'
 import FormData from 'form-data'
 
-const FB_VERSION = process.env.FB_VERSION || 'v20.0'
+const FB_VERSION = process.env.FB_VERSION || 'v21.0'
 
 /* ===================== Types ===================== */
 
@@ -14,7 +14,6 @@ type SendTextArgs = {
     to: string
     body: string
     conversationId?: number
-    /** Usar un número saliente específico (phone_number_id) */
     phoneNumberIdHint?: string
 }
 
@@ -60,7 +59,7 @@ export type OutboundResult = {
 /* ===================== HTTP ===================== */
 
 const http = axios.create({
-    timeout: 12000,
+    timeout: 15000,
     headers: { 'Content-Type': 'application/json' },
 })
 
@@ -167,6 +166,7 @@ export async function sendText({
             headers: { Authorization: `Bearer ${accessToken}` },
         })
         const outboundId = data?.messages?.[0]?.id ?? null
+        console.log('[WA SEND text][OK]', { to: toSanitized, outboundId })
 
         if (conversationId) {
             try {
@@ -186,7 +186,7 @@ export async function sendText({
 
         return { type: 'text', data, outboundId }
     } catch (e: any) {
-        console.error('[WA sendText] Error:', e?.response?.data || e.message)
+        console.error('[WA sendText][ERROR]', e?.response?.data || e.message)
         throw e
     }
 }
@@ -226,6 +226,7 @@ export async function sendWhatsappMedia({
             headers: { Authorization: `Bearer ${accessToken}` },
         })
         const outboundId = data?.messages?.[0]?.id ?? null
+        console.log('[WA SEND media][OK]', { to: toSanitized, type, outboundId })
 
         await persistMediaMessage({
             conversationId,
@@ -240,7 +241,7 @@ export async function sendWhatsappMedia({
 
         return { type: 'media', data, outboundId }
     } catch (e: any) {
-        console.error('[WA sendWhatsappMedia] Error:', e?.response?.data || e.message)
+        console.error('[WA sendWhatsappMedia][ERROR]', e?.response?.data || e.message)
         throw e
     }
 }
@@ -280,6 +281,7 @@ export async function sendWhatsappMediaById({
             headers: { Authorization: `Bearer ${accessToken}` },
         })
         const outboundId = data?.messages?.[0]?.id ?? null
+        console.log('[WA SEND mediaById][OK]', { to: toSanitized, type, outboundId })
 
         await persistMediaMessage({
             conversationId,
@@ -294,7 +296,7 @@ export async function sendWhatsappMediaById({
 
         return { type: 'media', data, outboundId }
     } catch (e: any) {
-        console.error('[WA sendWhatsappMediaById] Error:', e?.response?.data || e.message)
+        console.error('[WA sendWhatsappMediaById][ERROR]', e?.response?.data || e.message)
         throw e
     }
 }
@@ -319,7 +321,7 @@ export async function uploadToWhatsappMedia(empresaId: number, filePath: string,
         )
         return data?.id as string
     } catch (e: any) {
-        console.error('[WA uploadToWhatsappMedia] Error:', e?.response?.data || e.message)
+        console.error('[WA uploadToWhatsappMedia][ERROR]', e?.response?.data || e.message)
         throw e
     }
 }
@@ -334,7 +336,6 @@ type MediaMeta = {
     file_size?: number
 }
 
-/** Devuelve metadatos del media-id (incluye url firmada y mime_type) */
 export async function getMediaMeta(empresaId: number, mediaId: string): Promise<MediaMeta> {
     const { accessToken } = await getWhatsappCreds(empresaId)
     const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
@@ -360,7 +361,6 @@ export async function downloadMediaToBuffer(empresaId: number, mediaUrl: string)
     return Buffer.from(data)
 }
 
-/** Descarga directo a partir de un mediaId (retorna buffer y mime) */
 export async function downloadMediaByIdToBuffer(
     empresaId: number,
     mediaId: string
@@ -415,9 +415,10 @@ export async function sendTemplate({
             headers: { Authorization: `Bearer ${accessToken}` },
         })
         const outboundId = data?.messages?.[0]?.id ?? null
+        console.log('[WA SEND template][OK]', { to: toSanitized, outboundId })
         return { type: 'template', data, outboundId }
     } catch (e: any) {
-        console.error('[WA sendTemplate] Error:', e?.response?.data || e.message)
+        console.error('[WA sendTemplate][ERROR]', e?.response?.data || e.message)
         throw e
     }
 }
@@ -440,7 +441,7 @@ export async function sendOutboundMessage(args: {
     return sendText({ empresaId, to, body, conversationId, phoneNumberIdHint })
 }
 
-// Alias para compatibilidad con código que esperaba sendWhatsappMessage
+// Alias
 export const sendWhatsappMessage = sendText
 
 /* ===================== Atajos útiles ===================== */
