@@ -453,6 +453,12 @@ export const handleIAReply = async (
 }
 
 /* ===================== Persistencia común ===================== */
+/* ===================== Persistencia común ===================== */
+function normalizeToE164(n: string) {
+    // Para WA Cloud API basta con CC+NSN sin símbolos
+    return String(n || '').replace(/[^\d]/g, '')
+}
+
 async function persistBotReply({
     conversationId,
     empresaId,
@@ -490,21 +496,39 @@ async function persistBotReply({
         data: { estado: nuevoEstado }
     })
 
+    // 🔎 LOGS para depurar el envío
+    const willSend = Boolean(sendTo && String(sendTo).trim().length > 0)
+    console.log('[persistBotReply] creado', {
+        messageId: msg.id,
+        nuevoEstado,
+        willSend,
+        to: sendTo
+    })
+
     let wamid: string | undefined
-    if (sendTo) {
+    if (willSend) {
+        const toNorm = normalizeToE164(sendTo!)
         try {
-            const resp = await sendWhatsappMessage({ empresaId, to: sendTo, message: texto })
+            console.log('[persistBotReply] enviando a WhatsApp...', { empresaId, to: toNorm })
+            const resp = await sendWhatsappMessage({ empresaId, to: toNorm, message: texto })
             wamid = resp?.messages?.[0]?.id
+            console.log('[persistBotReply] enviado OK', { wamid })
+
             if (wamid) {
                 await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
             }
         } catch (err: any) {
-            console.error('[sendWhatsappMessage] error:', err?.response?.data || err?.message || err)
+            console.error('[persistBotReply] ERROR enviando a WhatsApp:', err?.response?.data || err?.message || err)
         }
+    } else {
+        console.warn('[persistBotReply] no se envía a WhatsApp: sendTo vacío o inválido')
     }
 
     return { messageId: msg.id, texto, wamid }
 }
+
+
+
 
 /* ===================== Helpers de producto ===================== */
 function buildProductCaption(p: {
