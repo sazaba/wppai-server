@@ -6,10 +6,10 @@ import { openai } from '../lib/openai'
 import { ConversationEstado, MediaType, MessageFrom } from '@prisma/client'
 import { retrieveRelevantProducts } from './products.helper'
 
-// ✅ usa el service (NO el utils)
+// ✅ usa el service unificado (NO el utils)
 import {
-    sendWhatsappMessage,     // alias -> sendText
-    sendWhatsappMedia,
+    sendWhatsappMessage,     // alias -> sendText (retorna OutboundResult { data, outboundId })
+    sendWhatsappMedia,       // retorna OutboundResult
 } from '../services/whatsapp.service'
 
 type IAReplyResult = {
@@ -433,7 +433,11 @@ export const handleIAReply = async (
                         phoneNumberIdHint: opts?.phoneNumberId, // 👈 importante
                     } as any)
 
-                    const wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
+                    const wamid =
+                        (resp as any)?.data?.messages?.[0]?.id ||
+                        (resp as any)?.messages?.[0]?.id ||
+                        (resp as any)?.outboundId || undefined
+
                     mediaSent.push({ productId: pid, imageUrl: img.url, wamid })
 
                     await prisma.message.create({
@@ -525,20 +529,22 @@ async function persistBotReply({
             const resp = await sendWhatsappMessage({
                 empresaId,
                 to: toNorm,
-                body: texto,
+                body: texto,                 // 👈 OJO: el service espera "body"
                 phoneNumberIdHint: phoneNumberId,
             })
-            // soporta ambas formas según axios
-            const idFromAxios = (resp as any)?.data?.messages?.[0]?.id
-            const idDirect = (resp as any)?.messages?.[0]?.id
-            wamid = idFromAxios || idDirect
+            // OutboundResult -> id puede venir en data.messages[0].id o en outboundId
+            const wamidFromData = (resp as any)?.data?.messages?.[0]?.id
+            const wamidFromOutbound = (resp as any)?.outboundId
+            wamid = wamidFromData || wamidFromOutbound
             console.log('[persistBotReply] enviado OK', { wamid })
 
             if (wamid) {
                 await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
             }
         } catch (err: any) {
-            console.error('[persistBotReply] ERROR enviando a WhatsApp:', err?.response?.data || err?.message || err)
+            const status = err?.response?.status
+            const data = err?.response?.data
+            console.error('[persistBotReply] ERROR enviando a WhatsApp:', { status, data, to: toNorm, empresaId, phoneNumberId })
         }
     } else {
         console.warn('[persistBotReply] no se envía a WhatsApp: sendTo vacío o inválido')
