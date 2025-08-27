@@ -231,9 +231,36 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             } as any
         }
 
-        // 4) Emitir la respuesta del bot (ya está guardada por handleIAReply)
-        if (result?.mensaje && result?.messageId) {
-            const creado = await prisma.message.findUnique({ where: { id: result.messageId } })
+        // 4) Persistir/emitir SIEMPRE la respuesta del bot (con fallback)
+        let botMessageId = result?.messageId ?? undefined
+        let botContenido = (result?.mensaje || '').trim()
+
+        // Si no hubo messageId, creamos el registro nosotros como fallback
+        if (botContenido && !botMessageId) {
+            const creadoFallback = await prisma.message.create({
+                data: {
+                    conversationId: conversation.id,
+                    empresaId,
+                    from: MessageFrom.bot,
+                    contenido: botContenido,
+                    timestamp: new Date(),
+                },
+            })
+            botMessageId = creadoFallback.id
+        }
+
+        // Emitimos el mensaje del bot si hay contenido y un id (del handler o del fallback)
+        if (botContenido && botMessageId) {
+            const creado = await prisma.message.findUnique({ where: { id: botMessageId } })
+
+            // Si el handler modificó el estado de la conversación, reflejarlo también
+            if (result?.estado && result.estado !== conversation.estado) {
+                await prisma.conversation.update({
+                    where: { id: conversation.id },
+                    data: { estado: result.estado },
+                })
+                conversation.estado = result.estado
+            }
 
             if (creado) {
                 io?.emit?.('nuevo_mensaje', {
@@ -241,11 +268,11 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     message: {
                         id: creado.id,
                         externalId: creado.externalId ?? null,
-                        from: 'bot',
+                        from: 'bot', // 👈 el frontend espera 'bot'
                         contenido: creado.contenido,
                         timestamp: creado.timestamp.toISOString(),
                     },
-                    estado: result.estado,
+                    estado: conversation.estado,
                 })
             }
         }
@@ -281,7 +308,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                             id: m.id,
                             externalId: m.externalId ?? null,
                             from: 'bot',
-                            contenido: '', // ya va en caption
+                            contenido: '', // el texto va en caption
                             mediaType: m.mediaType,
                             mediaUrl: m.mediaUrl,
                             caption: m.caption,
