@@ -8,6 +8,7 @@ type SendTextInput = {
     empresaId: number
     to: string
     message: string
+    phoneNumberIdHint?: string
 }
 
 type MediaType = 'image' | 'video' | 'audio' | 'document'
@@ -45,10 +46,9 @@ function headers(token: string) {
 }
 
 /** Enviar TEXTO por WhatsApp usando credenciales guardadas por empresa. */
-export const sendWhatsappMessage = async ({ empresaId, to, message }: SendTextInput) => {
+export const sendWhatsappMessage = async ({ empresaId, to, message, phoneNumberIdHint }: SendTextInput) => {
     if (!message?.trim()) throw new Error('[WA] EMPTY_BODY')
-
-    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId)
+    const { accessToken, phoneNumberId } = await getWhatsappCreds(empresaId, phoneNumberIdHint as any)
     assertCreds(accessToken, phoneNumberId)
 
     const toNorm = normalizeToE164(to)

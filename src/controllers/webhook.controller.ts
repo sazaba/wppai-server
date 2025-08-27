@@ -210,6 +210,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             result = await handleIAReply(conversation.id, contenido, {
                 autoSend: true,
                 toPhone: conversation.phone,
+                phoneNumberId,
             })
 
             if (

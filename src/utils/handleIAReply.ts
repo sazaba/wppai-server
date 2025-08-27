@@ -194,8 +194,9 @@ async function chatComplete({
 export const handleIAReply = async (
     chatId: number,
     mensajeArg: string,
-    opts?: { toPhone?: string; autoSend?: boolean }
+    opts?: { toPhone?: string; autoSend?: boolean; phoneNumberId?: string } // 👈 añadido
 ): Promise<IAReplyResult | null> => {
+
     // 0) Conversación
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
@@ -220,8 +221,10 @@ export const handleIAReply = async (
             texto: mensajeEscalamiento,
             nuevoEstado: ConversationEstado.requiere_agente,
             meta: { reason: 'no_business_config' },
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined
+            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            phoneNumberId: opts?.phoneNumberId, // 👈 añade esto
         })
+
         return { estado: ConversationEstado.requiere_agente, mensaje: mensajeEscalamiento, motivo: 'confianza_baja', messageId: escalado.messageId, wamid: escalado.wamid }
     }
 
@@ -464,7 +467,8 @@ async function persistBotReply({
     texto,
     nuevoEstado,
     meta,
-    sendTo
+    sendTo,
+    phoneNumberId, // 👈 añadido
 }: {
     conversationId: number
     empresaId: number
@@ -472,6 +476,7 @@ async function persistBotReply({
     nuevoEstado: ConversationEstado
     meta?: Record<string, any>
     sendTo?: string
+    phoneNumberId?: string // 👈 añadido
 }) {
     const msg = await prisma.message.create({
         data: {
@@ -500,15 +505,21 @@ async function persistBotReply({
         messageId: msg.id,
         nuevoEstado,
         willSend,
-        to: sendTo
+        to: sendTo,
+        phoneNumberId, // 👈 log para verificar qué número saliente usamos
     })
 
     let wamid: string | undefined
     if (willSend) {
         const toNorm = normalizeToE164(sendTo!)
         try {
-            console.log('[persistBotReply] enviando a WhatsApp...', { empresaId, to: toNorm })
-            const resp = await sendWhatsappMessage({ empresaId, to: toNorm, message: texto })
+            console.log('[persistBotReply] enviando a WhatsApp...', { empresaId, to: toNorm, phoneNumberId })
+            const resp = await sendWhatsappMessage({
+                empresaId,
+                to: toNorm,
+                message: texto,
+                phoneNumberIdHint: phoneNumberId, // 👈 pasamos el hint hacia el sender
+            } as any)
             wamid = resp?.messages?.[0]?.id
             console.log('[persistBotReply] enviado OK', { wamid })
 
@@ -524,7 +535,6 @@ async function persistBotReply({
 
     return { messageId: msg.id, texto, wamid }
 }
-
 
 /* ===================== Helpers de producto ===================== */
 function buildProductCaption(p: {
