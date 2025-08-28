@@ -1,3 +1,4 @@
+// server/src/controllers/config.controller.ts
 import { Request, Response } from "express"
 import prisma from "../lib/prisma"
 
@@ -16,18 +17,37 @@ export async function getConfig(req: Request, res: Response) {
 // PUT /api/config
 export async function upsertConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
+
     const {
+        // base
         nombre = "", descripcion = "", servicios = "", faq = "",
         horarios = "", businessType = "servicios", disclaimers = "",
+
+        // operación
+        enviosInfo = "", metodosPago = "", tiendaFisica = false, direccionTienda = "",
+        politicasDevolucion = "", politicasGarantia = "", promocionesInfo = "",
+        canalesAtencion = "", extras = "", palabrasClaveNegocio = "",
+
+        // escalamiento
+        escalarSiNoConfia = true,
+        escalarPalabrasClave = "",
+        escalarPorReintentos = 0,
     } = req.body || {}
 
-    if (!nombre || !descripcion || !faq || !horarios) {
-        return res.status(400).json({ error: "Faltan campos requeridos." })
-    }
+    if (!nombre) return res.status(400).json({ error: "El nombre del negocio es obligatorio." })
 
     try {
+        const data = {
+            nombre, descripcion, servicios, faq, horarios, businessType, disclaimers,
+            enviosInfo, metodosPago, tiendaFisica, direccionTienda,
+            politicasDevolucion, politicasGarantia, promocionesInfo,
+            canalesAtencion, extras, palabrasClaveNegocio,
+            escalarSiNoConfia: Boolean(escalarSiNoConfia),
+            escalarPalabrasClave: String(escalarPalabrasClave || ""),
+            escalarPorReintentos: Number(escalarPorReintentos || 0),
+        }
+
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
-        const data = { nombre, descripcion, servicios, faq, horarios, businessType, disclaimers }
 
         const cfg = existente
             ? await prisma.businessConfig.update({ where: { empresaId }, data })
@@ -39,7 +59,6 @@ export async function upsertConfig(req: Request, res: Response) {
         return res.status(500).json({ error: "No se pudo guardar la configuración" })
     }
 }
-
 
 // (opcional) GET /api/config/all
 export async function getAllConfigs(req: Request, res: Response) {
@@ -72,6 +91,7 @@ export async function deleteConfig(req: Request, res: Response) {
         return res.status(500).json({ error: "No se pudo eliminar la configuración" })
     }
 }
+
 // DELETE /api/config?withCatalog=1
 export async function resetConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
@@ -79,11 +99,8 @@ export async function resetConfig(req: Request, res: Response) {
 
     try {
         await prisma.$transaction(async (tx) => {
-            // borra config 1:1 (ignora si no existe)
             await tx.businessConfig.delete({ where: { empresaId } }).catch(() => { })
-
             if (withCatalog) {
-                // borra imágenes y productos del catálogo de la empresa
                 await tx.productImage.deleteMany({ where: { product: { empresaId } } })
                 await tx.product.deleteMany({ where: { empresaId } })
             }

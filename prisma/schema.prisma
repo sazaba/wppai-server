@@ -146,45 +146,32 @@ model Conversation {
 }
 
 model BusinessConfig {
-  id        Int @id @default(autoincrement())
-  empresaId Int @unique
-
-  // Identidad y contexto
+  id           Int          @id @default(autoincrement())
+  empresaId    Int          @unique
   nombre       String       @default("")
-  descripcion  String       @default("")
+  descripcion  String       @default("") @db.Text
+  servicios    String       @default("") @db.Text
+  faq          String       @default("") @db.Text
+  horarios     String       @default("") @db.Text
   businessType BusinessType @default(servicios)
+  disclaimers  String       @default("") @db.Text
 
-  // Texto libre para “servicios / qué vendemos”
-  servicios String @default("")
-
-  // Preguntas frecuentes (bloque grande de texto formateado P:/R:)
-  faq String @default("")
-
-  // Horario mostrable
-  horarios String @default("")
-
-  // ⚠️ Disclaimers legales y notas generales
-  disclaimers String @default("")
-
-  // ===== Campos nuevos (coinciden con tu formulario) =====
-  // Envíos
-  enviosInfo           String  @default("") // cobertura, tiempos, empresa de mensajería, costos
-  metodosPago          String  @default("") // tarjeta, débito, transferencia, contraentrega...
+  // ✅ NUEVOS (operación del negocio)
+  enviosInfo           String  @default("") @db.Text
+  metodosPago          String  @default("") @db.Text
   tiendaFisica         Boolean @default(false)
-  direccionTienda      String  @default("") // si tiendaFisica=true
-  politicasDevolucion  String  @default("") // cambios/devoluciones, plazos
-  politicasGarantia    String  @default("") // si aplica
-  promocionesInfo      String  @default("") // temporadas, condiciones
-  canalesAtencion      String  @default("") // “WhatsApp, correo, horario extendido…”
-  palabrasClaveNegocio String  @default("") // coma-separado para “topic locking” (ej: serum, protector, hidratante)
+  direccionTienda      String  @default("")
+  politicasDevolucion  String  @default("") @db.Text
+  politicasGarantia    String  @default("") @db.Text
+  promocionesInfo      String  @default("") @db.Text
+  canalesAtencion      String  @default("") @db.Text
+  extras               String  @default("") @db.Text
+  palabrasClaveNegocio String  @default("")
 
-  // 🔽 Reglas de escalamiento
+  // Escalamiento
   escalarSiNoConfia    Boolean @default(true)
   escalarPalabrasClave String  @default("") // coma-separado
-  escalarPorReintentos Int     @default(0) // 0 = desactivado
-
-  // Futuro/extra: JSON flexible para flags o configuraciones
-  extras Json?
+  escalarPorReintentos Int     @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
