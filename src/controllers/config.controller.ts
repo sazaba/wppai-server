@@ -20,13 +20,25 @@ export async function upsertConfig(req: Request, res: Response) {
 
     const {
         // base
-        nombre = "", descripcion = "", servicios = "", faq = "",
-        horarios = "", businessType = "servicios", disclaimers = "",
+        nombre = "",
+        descripcion = "",
+        servicios = "",
+        faq = "",
+        horarios = "",
+        businessType = "servicios",
+        disclaimers = "",
 
         // operación
-        enviosInfo = "", metodosPago = "", tiendaFisica = false, direccionTienda = "",
-        politicasDevolucion = "", politicasGarantia = "", promocionesInfo = "",
-        canalesAtencion = "", extras = "", palabrasClaveNegocio = "",
+        enviosInfo = "",
+        metodosPago = "",
+        tiendaFisica = false,
+        direccionTienda = "",
+        politicasDevolucion = "",
+        politicasGarantia = "",
+        promocionesInfo = "",
+        canalesAtencion = "",
+        extras = "",
+        palabrasClaveNegocio = "",
 
         // escalamiento
         escalarSiNoConfia = true,
@@ -34,21 +46,38 @@ export async function upsertConfig(req: Request, res: Response) {
         escalarPorReintentos = 0,
     } = req.body || {}
 
-    if (!nombre) return res.status(400).json({ error: "El nombre del negocio es obligatorio." })
+    // Reglas mínimas para no guardar vacío del todo
+    if (!nombre || !descripcion || !faq || !horarios) {
+        return res.status(400).json({ error: "Faltan campos requeridos." })
+    }
 
     try {
         const data = {
-            nombre, descripcion, servicios, faq, horarios, businessType, disclaimers,
-            enviosInfo, metodosPago, tiendaFisica, direccionTienda,
-            politicasDevolucion, politicasGarantia, promocionesInfo,
-            canalesAtencion, extras, palabrasClaveNegocio,
+            nombre,
+            descripcion,
+            servicios,
+            faq,
+            horarios,
+            businessType,
+            disclaimers,
+
+            enviosInfo,
+            metodosPago,
+            tiendaFisica: Boolean(tiendaFisica),
+            direccionTienda,
+            politicasDevolucion,
+            politicasGarantia,
+            promocionesInfo,
+            canalesAtencion,
+            extras,
+            palabrasClaveNegocio,
+
             escalarSiNoConfia: Boolean(escalarSiNoConfia),
-            escalarPalabrasClave: String(escalarPalabrasClave || ""),
+            escalarPalabrasClave,
             escalarPorReintentos: Number(escalarPorReintentos || 0),
         }
 
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
-
         const cfg = existente
             ? await prisma.businessConfig.update({ where: { empresaId }, data })
             : await prisma.businessConfig.create({ data: { empresaId, ...data } })
@@ -60,7 +89,7 @@ export async function upsertConfig(req: Request, res: Response) {
     }
 }
 
-// (opcional) GET /api/config/all
+// GET /api/config/all (opcional)
 export async function getAllConfigs(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
@@ -105,7 +134,6 @@ export async function resetConfig(req: Request, res: Response) {
                 await tx.product.deleteMany({ where: { empresaId } })
             }
         })
-
         return res.json({ ok: true, withCatalog })
     } catch (error) {
         console.error("[resetConfig] error:", error)
