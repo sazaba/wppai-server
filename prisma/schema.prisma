@@ -146,20 +146,45 @@ model Conversation {
 }
 
 model BusinessConfig {
-  id           Int          @id @default(autoincrement())
-  empresaId    Int          @unique
+  id        Int @id @default(autoincrement())
+  empresaId Int @unique
+
+  // Identidad y contexto
   nombre       String       @default("")
   descripcion  String       @default("")
-  servicios    String       @default("")
-  faq          String       @default("")
-  horarios     String       @default("")
   businessType BusinessType @default(servicios)
-  disclaimers  String       @default("")
 
-  // 🔽 NUEVO: reglas de escalamiento
+  // Texto libre para “servicios / qué vendemos”
+  servicios String @default("")
+
+  // Preguntas frecuentes (bloque grande de texto formateado P:/R:)
+  faq String @default("")
+
+  // Horario mostrable
+  horarios String @default("")
+
+  // ⚠️ Disclaimers legales y notas generales
+  disclaimers String @default("")
+
+  // ===== Campos nuevos (coinciden con tu formulario) =====
+  // Envíos
+  enviosInfo           String  @default("") // cobertura, tiempos, empresa de mensajería, costos
+  metodosPago          String  @default("") // tarjeta, débito, transferencia, contraentrega...
+  tiendaFisica         Boolean @default(false)
+  direccionTienda      String  @default("") // si tiendaFisica=true
+  politicasDevolucion  String  @default("") // cambios/devoluciones, plazos
+  politicasGarantia    String  @default("") // si aplica
+  promocionesInfo      String  @default("") // temporadas, condiciones
+  canalesAtencion      String  @default("") // “WhatsApp, correo, horario extendido…”
+  palabrasClaveNegocio String  @default("") // coma-separado para “topic locking” (ej: serum, protector, hidratante)
+
+  // 🔽 Reglas de escalamiento
   escalarSiNoConfia    Boolean @default(true)
   escalarPalabrasClave String  @default("") // coma-separado
   escalarPorReintentos Int     @default(0) // 0 = desactivado
+
+  // Futuro/extra: JSON flexible para flags o configuraciones
+  extras Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
