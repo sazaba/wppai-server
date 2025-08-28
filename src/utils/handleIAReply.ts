@@ -21,8 +21,15 @@ type IAReplyResult = {
     media?: Array<{ productId: number; imageUrl: string; wamid?: string }>
 }
 
-/* ===== Config IA ===== */
-const RAW_MODEL = process.env.IA_MODEL || 'google/gemini-2.0-flash-lite-001'
+/* ===== Config IA =====
+   Texto: Claude 3.5 Sonnet (OpenRouter)
+   Visión: GPT-4o-mini (cliente OpenAI)
+*/
+const RAW_MODEL =
+    process.env.IA_TEXT_MODEL ||            // nuevo (prioritario)
+    process.env.IA_MODEL ||                 // compatibilidad
+    'anthropic/claude-3.5-sonnet'
+
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.3)
 const MAX_COMPLETION_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 350)
 
@@ -45,6 +52,11 @@ function normalizeModelId(model: string): string {
 }
 function isOpenRouterModel(model: string): boolean { return model.includes('/') }
 function fallbackModel(): string { return 'google/gemini-2.0-flash-lite-001' }
+
+// Para el cliente OpenAI: si por error ponen "openai/gpt-4o-mini" lo normalizamos.
+function normalizeForOpenAI(model: string): string {
+    return model.replace(/^openai\//i, '').trim()
+}
 
 function normalizarTexto(texto: string): string {
     return (texto || '')
@@ -243,9 +255,10 @@ async function chatComplete({
         Array.isArray(m.content) && m.content.some((p: any) => p?.type === 'image_url')
     )
 
+    // 🔎 Si hay imagen -> siempre OpenAI visión (GPT-4o-mini)
     if (hasImage) {
         const resp = await openai.chat.completions.create({
-            model: VISION_MODEL,
+            model: normalizeForOpenAI(VISION_MODEL),
             messages,
             temperature,
             max_completion_tokens: maxTokens as any,
@@ -255,6 +268,7 @@ async function chatComplete({
         return resp?.choices?.[0]?.message?.content ?? ''
     }
 
+    // 🔎 Texto: si el modelo contiene "proveedor/modelo" -> OpenRouter (Claude, Gemini, etc.)
     if (isOpenRouterModel(normalized)) {
         if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY no configurada')
         const payload = { model: normalized, messages, temperature, max_tokens: maxTokens, max_output_tokens: maxTokens }
@@ -275,8 +289,9 @@ async function chatComplete({
                 : ''
     }
 
+    // 🔎 Texto con cliente OpenAI (por si pones un modelo OpenAI aquí)
     const resp = await openai.chat.completions.create({
-        model: normalized,
+        model: normalizeForOpenAI(normalized),
         messages,
         temperature,
         max_completion_tokens: maxTokens as any,
@@ -334,6 +349,7 @@ export const handleIAReply = async (
     })
 
     let mensaje = (mensajeArg || '').trim()
+    // 🔊 voz → usamos transcripción si ya existe (este archivo NO transcribe)
     if (!mensaje && ultimoCliente?.isVoiceNote && (ultimoCliente.transcription || '').trim()) {
         mensaje = String(ultimoCliente.transcription).trim()
     }
@@ -533,7 +549,7 @@ export const handleIAReply = async (
     respuestaIA = (respuestaIA || '').replace(/\s+$/g, '').trim()
     console.log('🧠 Respuesta generada por IA:', respuestaIA)
 
-    // 7) Validaciones y reconducción (menos agresivo)
+    // 7) Validaciones y reconducción
     let debeEscalar =
         !respuestaIA ||
         respuestaIA === mensajeEscalamiento ||
@@ -556,7 +572,7 @@ export const handleIAReply = async (
         mensaje: mensaje || ultimoCliente?.caption || '',
         config,
         iaConfianzaBaja,
-        intentosFallidos: Math.max(0, (config?.escalarPorReintentos ?? 0) - 1), // ⚖️ lo hacemos menos sensible
+        intentosFallidos: Math.max(0, (config?.escalarPorReintentos ?? 0) - 1),
     })
 
     if (debeEscalar || motivoFinal === 'palabra_clave') {
