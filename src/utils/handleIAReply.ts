@@ -22,12 +22,12 @@ type IAReplyResult = {
 }
 
 /* ===== Config IA =====
-   Texto: Claude 3.5 Sonnet (OpenRouter)
+   Texto: Claude 3.5 Sonnet (OpenRouter) por defecto
    Visión: GPT-4o-mini (cliente OpenAI)
 */
 const RAW_MODEL =
-    process.env.IA_TEXT_MODEL ||            // nuevo (prioritario)
-    process.env.IA_MODEL ||                 // compatibilidad
+    process.env.IA_TEXT_MODEL ||            // preferido
+    process.env.IA_MODEL ||                 // compatibilidad con tu .env anterior
     'anthropic/claude-3.5-sonnet'
 
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.3)
@@ -184,16 +184,7 @@ function buildBusinessAnswer(config: any, flags: ReturnType<typeof isBusinessInf
     return shortReply(parts.join('\n'))
 }
 
-/* ====== Intent: sobre la marca ====== */
-function isAboutBrand(t: string) {
-    const n = normalizarTexto(t)
-    return (
-        /que es|quienes son|quien es|a que se dedican|que hacen|que ofrecen|en que te especializas|en que se especializan/.test(n) ||
-        /qu[eé]\s+es\s+[\w\s]+/.test(n)
-    )
-}
-
-/* ====== Facts for LLM ====== */
+/* ====== Facts for LLM – VOZ MULTIEMPRESA & E-COMMERCE ====== */
 function buildSystemPrompt(config: any, productos: any[], mensajeEscalamiento: string): string {
     const catHeader =
         Array.isArray(productos) && productos.length > 0
@@ -227,55 +218,68 @@ ${config?.faq ?? ''}
 ${catHeader}
   `.trim()
 
-    const reglas = `
+    // 🧠 Voice Pack e-commerce multiempresa (humano + marketing)
+    const estilo = `
+[TONO & ESTILO]
+- Sonido humano, cálido y experto en ${config?.businessType === 'servicios' ? 'servicios' : 'e-commerce'}.
+- Escribe en 2–4 líneas máximas. Usa emojis contextuales (✨🌿💧🧴🛍️🚚💬) solo donde aporte claridad.
+- Varía las frases. Evita repetir el mismo cierre.
+- Prioriza beneficios, claridad y CTA cortos. No “vende agresivo”.
+
+[PITCH DE MARCA]
+- Si preguntan “qué es ${config?.nombre}” o “a qué se dedican”, responde con 1–2 líneas que mezclen: propuesta de valor + categoría + prueba social/beneficio.
+  Ej.: “${config?.nombre || 'Nuestra marca'} ofrece ${config?.descripcion || 'productos de alta calidad'} con envíos rápidos y soporte cercano. ¿Te muestro opciones según tu objetivo?”
+
+[VENTA SUAVE & PERSONALIZACIÓN]
+- Si el usuario menciona un objetivo (ej. “manchas”, “regalo”, “cabello seco”), recomienda 1 producto del CATÁLOGO con 2 beneficios y un CTA.
+- CTA sugeridos (elige 1 diferente cada vez): 
+  • “¿Te comparto precio exacto y disponibilidad?” 
+  • “¿Prefieres ver combos con descuento?” 
+  • “¿Quieres tips de uso según tu rutina?” 
+  • “¿Te envío fotos reales del producto?” 
+  • “¿Te reservo una unidad?”
+
+[OPERACIÓN]
+- Si la pregunta es de envíos, pagos, horarios, tienda, garantías o devoluciones: responde con un resumen claro basado solo en [OPERACIÓN] y cierra con una micro-ayuda (“Si te parece, te muestro opciones que aplican a tu ciudad”, etc.).
+
 [REGLAS DURAS – NO INVENTAR]
 1) Responde SOLO con la información de [NEGOCIO]/[OPERACIÓN]/[CATÁLOGO AUTORIZADO]/[FAQs].
-2) Si falta un dato o no estás seguro, reconduce y ofrece alternativas; usa el mensaje de escalamiento SOLO como último recurso:
+2) Si falta un dato, no inventes: reconduce y ofrece alternativas. Como último recurso usa:
    "${mensajeEscalamiento}"
 3) Prohibido inventar teléfonos, correos, links, precios o stock si no están arriba.
 4) Mantente en el tema del negocio; si el usuario se sale, reconduce con cortesía.
-5) Tono humano, breve (2–4 líneas), claro. No menciones que eres IA.
+5) Nunca digas que eres IA ni uses muletillas robóticas.
 ${config?.disclaimers ? `6) Disclaimers del negocio:\n${config.disclaimers}` : ''}
 ${config?.palabrasClaveNegocio ? `7) Palabras clave del negocio: ${config.palabrasClaveNegocio}` : ''}
-  `.trim()
-
-    const estiloVentas = `
-[ESTILO Y OBJETIVO]
-- Habla cálido, proactivo y persuasivo (experto en ventas y marketing).
-- Enfócate en convertir: resalta beneficios, resuelve objeciones y cierra con una mini-CTA amable.
-- Usa 1–3 emojis naturales (✨🌿💬) sin exagerar.
-- Respuestas de 2–4 líneas, concretas y accionables.
-- Si hay producto relevante, sugiere el más adecuado y ofrece siguiente paso (“¿Te confirmo disponibilidad?” / “¿Te comparto precio?”).
-`.trim()
-
-    return `Actúas como asesor humano de "${config?.nombre ?? 'Negocio'}".
-${infoNegocio}
-
-${reglas}
-
-${estiloVentas}
 
 [FORMATO]
-- Máx 2–4 líneas.
-- Usa viñetas cuando sea útil.
-- Evita mensajes genéricos; responde concreto según datos del negocio.`
+- Respuesta corta (2–4 líneas). 
+- Viñetas breves cuando sea útil.
+- Incluye 1 CTA natural distinto cuando la intención sea comercial.
+  `.trim()
+
+    return `Actúas como asesor de ventas y customer experience de "${config?.nombre ?? 'Negocio'}".
+${infoNegocio}
+
+${estilo}`
 }
 
 /* ==================== LLM call ==================== */
 async function chatComplete({
-    model, messages, temperature, maxTokens, useVision = false
+    model, messages, temperature, maxTokens
 }: {
     model: string
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }>
     temperature: number
     maxTokens: number
-    useVision?: boolean
 }): Promise<string> {
     const normalized = normalizeModelId(model) || fallbackModel()
+    const hasImage = messages.some(m =>
+        Array.isArray(m.content) && m.content.some((p: any) => p?.type === 'image_url')
+    )
 
-    // 🔎 Visión forzada (GPT-4o-mini via OpenAI)
-    if (useVision) {
-        console.log(`[IA][VISION][OpenAI] model= ${normalizeForOpenAI(VISION_MODEL)} temp= ${temperature} maxTok= ${maxTokens}`)
+    // 🔎 Si hay imagen -> siempre OpenAI visión (GPT-4o-mini)
+    if (hasImage) {
         const resp = await openai.chat.completions.create({
             model: normalizeForOpenAI(VISION_MODEL),
             messages,
@@ -287,10 +291,9 @@ async function chatComplete({
         return resp?.choices?.[0]?.message?.content ?? ''
     }
 
-    // 🔎 Texto: OpenRouter (Claude, Gemini, etc.)
+    // 🔎 Texto vía OpenRouter (Claude, Gemini, etc.)
     if (isOpenRouterModel(normalized)) {
         if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY no configurada')
-        console.log(`[IA][TEXT][OpenRouter] model= ${normalized} temp= ${temperature} maxTok= ${maxTokens}`)
         const payload = { model: normalized, messages, temperature, max_tokens: maxTokens, max_output_tokens: maxTokens }
         const { data } = await axios.post(OPENROUTER_URL, payload, {
             headers: {
@@ -309,8 +312,7 @@ async function chatComplete({
                 : ''
     }
 
-    // 🔎 Texto con cliente OpenAI (si decides usar un modelo OpenAI aquí)
-    console.log(`[IA][TEXT][OpenAI] model= ${normalizeForOpenAI(normalized)} temp= ${temperature} maxTok= ${maxTokens}`)
+    // 🔎 Texto con cliente OpenAI (si pones un modelo OpenAI en RAW_MODEL)
     const resp = await openai.chat.completions.create({
         model: normalizeForOpenAI(normalized),
         messages,
@@ -509,33 +511,13 @@ export const handleIAReply = async (
         }
     }
 
-    // 4.4 Sobre la marca (About)
-    if (isAboutBrand(mensaje || ultimoCliente?.caption || '')) {
-        const aboutParts: string[] = []
-        if ((config?.descripcion || '').trim()) aboutParts.push(config.descripcion.trim())
-        if ((config?.servicios || '').trim()) aboutParts.push(config.servicios.trim())
-        const texto = aboutParts.length
-            ? `✨ ${aboutParts.join(' ')} ¿Te cuento beneficios o prefieres ver precios/disponibilidad? 😊`
-            : 'Somos una marca enfocada en ayudarte con soluciones del catálogo. ¿Te comparto beneficios o precios? 🙂'
-        const saved = await persistBotReply({
-            conversationId: chatId,
-            empresaId: conversacion.empresaId,
-            texto,
-            nuevoEstado: ConversationEstado.respondido,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-            phoneNumberId: opts?.phoneNumberId,
-        })
-        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-    }
-
     /* ===== 5) Prompt y topic shift (LLM) ===== */
     const systemPrompt = buildSystemPrompt(config, productosRelevantes, mensajeEscalamiento)
     const empresa = await prisma.empresa.findUnique({ where: { id: conversacion.empresaId }, select: { nombre: true } })
     const negocioKeywords: string[] = [
         empresa?.nombre || '',
         ...(productosRelevantes?.map((p: any) => p?.nombre).filter(Boolean) ?? []),
-        ...(String(config?.servicios || '').split(/\W+/).slice(0, 10)),
-        ...(String(config?.palabrasClaveNegocio || '').split(',').map(s => s.trim()))
+        ...(String(config?.servicios || '').split(/\W+/).slice(0, 6))
     ].filter(Boolean)
     const topicShift = detectTopicShift(mensaje || ultimoCliente?.caption || '', negocioKeywords)
 
@@ -558,12 +540,12 @@ export const handleIAReply = async (
     // 6) LLM
     let respuestaIA = ''
     try {
+        console.log(`[IA][TEXT][OpenRouter] model= ${imageUrl ? VISION_MODEL : RAW_MODEL} temp= ${TEMPERATURE} maxTok= ${MAX_COMPLETION_TOKENS}`)
         respuestaIA = (await chatComplete({
             model: imageUrl ? VISION_MODEL : RAW_MODEL,
             messages: baseMessages,
             temperature: TEMPERATURE,
             maxTokens: MAX_COMPLETION_TOKENS,
-            useVision: Boolean(imageUrl),
         }))?.trim()
     } catch (e: any) {
         console.error('[IA] error:', e?.message || e)
@@ -573,7 +555,6 @@ export const handleIAReply = async (
                 messages: baseMessages,
                 temperature: TEMPERATURE,
                 maxTokens: MAX_COMPLETION_TOKENS,
-                useVision: Boolean(imageUrl),
             }))?.trim()
         } catch (e2: any) {
             console.error('[IA] fallback error:', e2?.message || e2)
@@ -592,7 +573,7 @@ export const handleIAReply = async (
     respuestaIA = (respuestaIA || '').replace(/\s+$/g, '').trim()
     console.log('🧠 Respuesta IA:', respuestaIA)
 
-    // 7) Validaciones y reconducción
+    // 7) Validaciones y reconducción (tono más humano)
     let debeEscalar =
         !respuestaIA ||
         respuestaIA === mensajeEscalamiento ||
@@ -600,8 +581,15 @@ export const handleIAReply = async (
         esRespuestaInvalida(respuestaIA)
 
     if (topicShift && !debeEscalar) {
-        // Solo reconducimos si el MENSAJE DEL USUARIO está fuera de tema.
-        respuestaIA = 'Puedo ayudarte con nuestros productos y políticas. ¿Qué te interesa: precio, beneficios o envíos? 🙂'
+        const opcionesReconduce = [
+            '¡Estoy para ayudarte con nuestros productos y políticas! ¿Qué te interesa hoy: precios, beneficios o envíos? 🙂',
+            'Puedo guiarte con el catálogo, promociones y envíos. ¿Prefieres ver precios, beneficios o disponibilidad? 🛍️',
+            'Si quieres, te muestro opciones y tiempos de envío. ¿Empezamos por precios, beneficios o combos con descuento? ✨'
+        ]
+        const pick = opcionesReconduce[(Date.now() / 1000 | 0) % opcionesReconduce.length]
+        if (detectTopicShift(respuestaIA, negocioKeywords)) {
+            respuestaIA = pick
+        }
     }
 
     // 8) Reglas finales de escalamiento (solo último recurso)
