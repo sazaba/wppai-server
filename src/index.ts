@@ -17,6 +17,8 @@ import empresaRoutes from './routes/empresa.routes'
 import messageTemplateRoutes from './routes/template.routes'
 import productRoutes from './routes/product.routes'
 import mediaProxyRouter from './routes/mediaProxy.route'
+import ordersRouter from "./routes/orders.routes"
+import paymentsRouter from "./routes/payments.routes"
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -141,6 +143,8 @@ app.use('/api', chatRoutes)
 app.use('/api', empresaRoutes)
 app.use('/api/templates', messageTemplateRoutes)
 app.use(mediaProxyRouter)
+app.use("/api/orders", ordersRouter)
+app.use("/api/payments", paymentsRouter)
 
 // 404 JSON final
 app.use((req, res) => {

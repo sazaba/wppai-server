@@ -7,12 +7,16 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Enums
+/**
+ * ========== Enums ==========
+ */
 enum ConversationEstado {
   pendiente
   respondido
   en_proceso
   requiere_agente
+  venta_en_proceso // NUEVO
+  venta_realizada // NUEVO
   cerrado
 }
 
@@ -51,15 +55,18 @@ enum BusinessType {
   productos
 }
 
-// ✅ NUEVO: proveedor de almacenamiento
+// proveedor de almacenamiento
 enum StorageProvider {
-  local // /uploads/...
-  s3 // S3 / Wasabi / Spaces
-  r2 // Cloudflare R2
-  external // cualquier URL externa
+  local
+  s3
+  r2
+  external
   cloudflare_image
 }
 
+/**
+ * ========== Modelos base ==========
+ */
 model Usuario {
   id        Int      @id @default(autoincrement())
   email     String   @unique
@@ -89,6 +96,8 @@ model Empresa {
   conversaciones   Conversation[]
   cuentaWhatsapp   WhatsappAccount?
   messageTemplates MessageTemplate[]
+
+  orders Order[] // NUEVO: pedidos asociados
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -124,6 +133,8 @@ model Message {
 
   Conversation Conversation @relation(fields: [conversationId], references: [id])
 
+  paymentReceipts PaymentReceipt[] // comprobantes que apuntan a este mensaje (opcional)
+
   @@index([conversationId, timestamp])
   @@index([empresaId, conversationId, timestamp])
   @@index([mediaId])
@@ -142,6 +153,8 @@ model Conversation {
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
+  orders Order[] // pedidos creados desde esta conversación
+
   @@map("conversation")
 }
 
@@ -149,24 +162,46 @@ model BusinessConfig {
   id           Int          @id @default(autoincrement())
   empresaId    Int          @unique
   nombre       String       @default("")
-  descripcion  String       @default("") @db.Text
-  servicios    String       @default("") @db.Text
-  faq          String       @default("") @db.Text
-  horarios     String       @default("") @db.Text
+  descripcion  String       @db.Text
+  servicios    String       @db.Text
+  faq          String       @db.Text
+  horarios     String       @db.Text
   businessType BusinessType @default(servicios)
-  disclaimers  String       @default("") @db.Text
+  disclaimers  String       @db.Text
 
-  // ✅ NUEVOS (operación del negocio)
-  enviosInfo           String  @default("") @db.Text
-  metodosPago          String  @default("") @db.Text
+  // ===== Operación del negocio
+  enviosInfo           String  @db.Text
+  metodosPago          String  @db.Text
   tiendaFisica         Boolean @default(false)
   direccionTienda      String  @default("")
-  politicasDevolucion  String  @default("") @db.Text
-  politicasGarantia    String  @default("") @db.Text
-  promocionesInfo      String  @default("") @db.Text
-  canalesAtencion      String  @default("") @db.Text
-  extras               String  @default("") @db.Text
+  politicasDevolucion  String  @db.Text
+  politicasGarantia    String  @db.Text
+  promocionesInfo      String  @db.Text
+  canalesAtencion      String  @db.Text
+  extras               String  @db.Text
   palabrasClaveNegocio String  @default("")
+
+  // ===== Pagos (link OPCIONAL + transferencia)
+  pagoLinkGenerico     String  @default("") // opcional
+  pagoLinkProductoBase String  @default("") // opcional (para SKU/qty)
+  pagoNotas            String? @db.Text // instrucciones/ref. (TEXT sin default)
+
+  bancoNombre        String @default("") // transferencia
+  bancoTitular       String @default("")
+  bancoTipoCuenta    String @default("") // Ahorros/Corriente
+  bancoNumeroCuenta  String @default("") // puedes enmascarar
+  bancoDocumento     String @default("") // NIT/CC
+  transferenciaQRUrl String @default("") // opcional
+
+  // ===== Envíos
+  envioTipo            String   @default("") // transportadora
+  envioEntregaEstimado String   @default("") // “2–5 días hábiles”
+  envioCostoFijo       Decimal? // tarifa plana opcional
+  envioGratisDesde     Decimal? // umbral envío gratis
+
+  // ===== Post-venta
+  facturaElectronicaInfo  String @default("") // cómo la solicitan
+  soporteDevolucionesInfo String @default("")
 
   // Escalamiento
   escalarSiNoConfia    Boolean @default(true)
@@ -228,27 +263,25 @@ model Product {
   updatedAt       DateTime @updatedAt
   createdAt       DateTime @default(now())
 
-  imagenes ProductImage[]
-  empresa  Empresa        @relation(fields: [empresaId], references: [id])
+  imagenes  ProductImage[]
+  empresa   Empresa        @relation(fields: [empresaId], references: [id])
+  OrderItem OrderItem[]
 
   @@index([empresaId, nombre])
   @@map("product")
 }
 
-// ✅ Recomendado: URL como VARCHAR grande con default ""
 model ProductImage {
   id        Int @id @default(autoincrement())
   productId Int
 
-  // Cloudflare Images
-  imageId   String          @db.VarChar(128) // <- NUEVO: ID de Images (requerido)
+  imageId   String          @db.VarChar(128)
   url       String          @default("") @db.VarChar(2048)
   alt       String          @default("")
-  provider  StorageProvider @default(external) // cambia a 'external' o crea 'cloudflare_images' si prefieres
+  provider  StorageProvider @default(external)
   isPrimary Boolean         @default(false)
   sortOrder Int             @default(0)
 
-  // Puedes dejar estos como opcionales (no romperán nada, simplemente no se llenarán)
   objectKey       String?   @db.VarChar(255)
   mimeType        String?   @db.VarChar(64)
   sizeBytes       Int?
@@ -266,4 +299,71 @@ model ProductImage {
   @@index([provider, objectKey])
   @@index([whatsappMediaId])
   @@map("productimage")
+}
+
+/**
+ * ========== NUEVO: Pedidos & Pagos ==========
+ */
+model Order {
+  id             Int     @id @default(autoincrement())
+  empresaId      Int
+  conversationId Int
+  customerPhone  String
+  customerName   String?
+  city           String?
+  address        String?
+  status         String  @default("pending") // pending|paid|shipped|delivered|canceled
+  subtotal       Decimal @default(0)
+  shippingCost   Decimal @default(0)
+  total          Decimal @default(0)
+  notes          String  @db.Text // TEXT sin default
+
+  items    OrderItem[]
+  payments PaymentReceipt[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa      Empresa      @relation(fields: [empresaId], references: [id])
+  Conversation Conversation @relation(fields: [conversationId], references: [id])
+
+  @@index([empresaId, conversationId, status])
+  @@map("order")
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int
+  productId Int
+  name      String
+  price     Decimal @default(0)
+  qty       Int     @default(1)
+  total     Decimal @default(0)
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+  @@map("orderitem")
+}
+
+model PaymentReceipt {
+  id         Int       @id @default(autoincrement())
+  orderId    Int
+  messageId  Int? // WhatsApp Message.id que trajo la imagen (opcional)
+  imageUrl   String    @default("")
+  amount     Decimal?
+  reference  String    @default("")
+  method     String    @default("") // link|transfer|qr
+  isVerified Boolean   @default(false)
+  verifiedAt DateTime?
+  rawOcrText String    @db.Text // TEXT sin default
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  message Message? @relation(fields: [messageId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId, isVerified])
+  @@map("paymentreceipt")
 }

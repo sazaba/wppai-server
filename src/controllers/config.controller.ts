@@ -2,6 +2,15 @@
 import { Request, Response } from "express"
 import prisma from "../lib/prisma"
 
+// Helpers de normalización
+const s = (v: any, def = "") => (v === undefined || v === null ? def : String(v).trim())
+const b = (v: any, def = false) => (v === undefined || v === null ? def : Boolean(v))
+const nOrNull = (v: any) => {
+    if (v === undefined || v === null || v === "") return null
+    const num = Number(v)
+    return Number.isFinite(num) ? num : null
+}
+
 // GET /api/config
 export async function getConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
@@ -18,41 +27,63 @@ export async function getConfig(req: Request, res: Response) {
 export async function upsertConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
 
-    const {
-        // base
-        nombre = "",
-        descripcion = "",
-        servicios = "",
-        faq = "",
-        horarios = "",
-        businessType = "servicios",
-        disclaimers = "",
+    // Base
+    const nombre = s(req.body?.nombre)
+    const descripcion = s(req.body?.descripcion)
+    const servicios = s(req.body?.servicios)
+    const faq = s(req.body?.faq)
+    const horarios = s(req.body?.horarios)
+    const businessType = s(req.body?.businessType || "servicios")
+    const disclaimers = s(req.body?.disclaimers)
 
-        // operación
-        enviosInfo = "",
-        metodosPago = "",
-        tiendaFisica = false,
-        direccionTienda = "",
-        politicasDevolucion = "",
-        politicasGarantia = "",
-        promocionesInfo = "",
-        canalesAtencion = "",
-        extras = "",
-        palabrasClaveNegocio = "",
+    // Operación
+    const enviosInfo = s(req.body?.enviosInfo)
+    const metodosPago = s(req.body?.metodosPago)
+    const tiendaFisica = b(req.body?.tiendaFisica, false)
+    const direccionTienda = s(req.body?.direccionTienda)
+    const politicasDevolucion = s(req.body?.politicasDevolucion)
+    const politicasGarantia = s(req.body?.politicasGarantia)
+    const promocionesInfo = s(req.body?.promocionesInfo)
+    const canalesAtencion = s(req.body?.canalesAtencion)
+    const extras = s(req.body?.extras)
+    const palabrasClaveNegocio = s(req.body?.palabrasClaveNegocio)
 
-        // escalamiento
-        escalarSiNoConfia = true,
-        escalarPalabrasClave = "",
-        escalarPorReintentos = 0,
-    } = req.body || {}
+    // 🔐 Escalamiento
+    const escalarSiNoConfia = b(req.body?.escalarSiNoConfia, true)
+    const escalarPalabrasClave = s(req.body?.escalarPalabrasClave)
+    const escalarPorReintentos = Number(req.body?.escalarPorReintentos ?? 0) || 0
 
-    // Reglas mínimas para no guardar vacío del todo
+    // 🛒 Ecommerce — pagos (link + transferencia)
+    const pagoLinkGenerico = s(req.body?.pagoLinkGenerico)
+    const pagoLinkProductoBase = s(req.body?.pagoLinkProductoBase)
+    const pagoNotasRaw = req.body?.pagoNotas // puede ser null
+    const pagoNotas = (pagoNotasRaw === null) ? null : s(pagoNotasRaw) || null
+
+    const bancoNombre = s(req.body?.bancoNombre)
+    const bancoTitular = s(req.body?.bancoTitular)
+    const bancoTipoCuenta = s(req.body?.bancoTipoCuenta)
+    const bancoNumeroCuenta = s(req.body?.bancoNumeroCuenta)
+    const bancoDocumento = s(req.body?.bancoDocumento)
+    const transferenciaQRUrl = s(req.body?.transferenciaQRUrl)
+
+    // 🚚 Envío
+    const envioTipo = s(req.body?.envioTipo)
+    const envioEntregaEstimado = s(req.body?.envioEntregaEstimado)
+    const envioCostoFijo = nOrNull(req.body?.envioCostoFijo)
+    const envioGratisDesde = nOrNull(req.body?.envioGratisDesde)
+
+    // 🧾 Post-venta
+    const facturaElectronicaInfo = s(req.body?.facturaElectronicaInfo)
+    const soporteDevolucionesInfo = s(req.body?.soporteDevolucionesInfo)
+
+    // Reglas mínimas para no guardar vacío del todo (igual que antes)
     if (!nombre || !descripcion || !faq || !horarios) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
 
     try {
-        const data = {
+        const data: any = {
+            // base
             nombre,
             descripcion,
             servicios,
@@ -61,9 +92,10 @@ export async function upsertConfig(req: Request, res: Response) {
             businessType,
             disclaimers,
 
+            // operación
             enviosInfo,
             metodosPago,
-            tiendaFisica: Boolean(tiendaFisica),
+            tiendaFisica,
             direccionTienda,
             politicasDevolucion,
             politicasGarantia,
@@ -72,10 +104,38 @@ export async function upsertConfig(req: Request, res: Response) {
             extras,
             palabrasClaveNegocio,
 
-            escalarSiNoConfia: Boolean(escalarSiNoConfia),
+            // escalamiento
+            escalarSiNoConfia,
             escalarPalabrasClave,
-            escalarPorReintentos: Number(escalarPorReintentos || 0),
+            escalarPorReintentos,
+
+            // ecommerce pagos
+            pagoLinkGenerico,
+            pagoLinkProductoBase,
+            pagoNotas, // TEXT nullable
+
+            bancoNombre,
+            bancoTitular,
+            bancoTipoCuenta,
+            bancoNumeroCuenta,
+            bancoDocumento,
+            transferenciaQRUrl,
+
+            // envíos
+            envioTipo,
+            envioEntregaEstimado,
+            envioCostoFijo,   // Decimal? -> Prisma acepta number | string
+            envioGratisDesde, // Decimal?
+
+            // post-venta
+            facturaElectronicaInfo,
+            soporteDevolucionesInfo,
         }
+
+        // Quitar claves Decimal que vengan null para no sobrescribir con null si tu
+        // formulario no envía el campo (opcional)
+        if (data.envioCostoFijo === null) delete data.envioCostoFijo
+        if (data.envioGratisDesde === null) delete data.envioGratisDesde
 
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
         const cfg = existente

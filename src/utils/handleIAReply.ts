@@ -71,7 +71,6 @@ const esRespuestaInvalida = (r: string) => {
 // ====== Lectura ROBUSTA de BusinessConfig (acepta alias)
 const cfg = (c: any, k: string) => {
     if (!c) return ''
-    // alias por si algún nombre tiene tilde u otra variante
     const map: Record<string, string[]> = {
         nombre: ['nombre'],
         descripcion: ['descripcion'],
@@ -90,6 +89,25 @@ const cfg = (c: any, k: string) => {
         palabrasClaveNegocio: ['palabrasClaveNegocio'],
         faq: ['faq'],
         disclaimers: ['disclaimers'],
+
+        // nuevos de ecommerce
+        pagoLinkGenerico: ['pagoLinkGenerico'],
+        pagoLinkProductoBase: ['pagoLinkProductoBase'],
+        pagoNotas: ['pagoNotas'],
+
+        bancoNombre: ['bancoNombre'],
+        bancoTitular: ['bancoTitular'],
+        bancoTipoCuenta: ['bancoTipoCuenta'],
+        bancoNumeroCuenta: ['bancoNumeroCuenta'],
+        bancoDocumento: ['bancoDocumento'],
+        transferenciaQRUrl: ['transferenciaQRUrl'],
+
+        envioTipo: ['envioTipo'],
+        envioEntregaEstimado: ['envioEntregaEstimado'],
+        envioCostoFijo: ['envioCostoFijo'],
+        envioGratisDesde: ['envioGratisDesde'],
+        facturaElectronicaInfo: ['facturaElectronicaInfo'],
+        soporteDevolucionesInfo: ['soporteDevolucionesInfo'],
     }
     const keys = map[k] || [k]
     for (const key of keys) {
@@ -109,7 +127,23 @@ const wantsImages = (t: string) =>
     ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto'].some(k => nrm(t).includes(nrm(k)))
 
 const isAffirmative = (t: string) =>
-    ['si', 'sí', 'dale', 'ok', 'listo', 'va', 'claro', 'perfecto', 'de una', 'me interesa', 'quiero'].some(k => nrm(t).includes(k))
+    ['si', 'sí', 'dale', 'ok', 'listo', 'va', 'claro', 'perfecto', 'de una', 'me interesa', 'quiero', 'comprar', 'lo quiero', 'lo compro'].some(k => nrm(t).includes(k))
+
+// Intents de cierre/compra/pago/dirección
+const wantsToBuy = (t: string) =>
+    ['comprar', 'lo compro', 'lo quiero', 'quiero comprar', 'me lo llevo', 'cerrar compra', 'finalizar compra', 'hacer pedido', 'ordenar', 'pedido'].some(k => nrm(t).includes(nrm(k)))
+
+const askPaymentLink = (t: string) =>
+    ['link de pago', 'enlace de pago', 'pagar con tarjeta', 'pse', 'nequi', 'daviplata', 'stripe', 'mercado pago', 'pagos online', 'pago online'].some(k => nrm(t).includes(nrm(k)))
+
+const askTransfer = (t: string) =>
+    ['transferencia', 'bancaria', 'datos bancarios', 'cuenta', 'consignacion', 'consignación', 'ban', 'bancolombia', 'qr', 'nequi', 'daviplata'].some(k => nrm(t).includes(nrm(k)))
+
+const providesAddress = (t: string) =>
+    ['direccion', 'dirección', 'dir', 'calle', 'cra', 'carrera', 'av', 'avenida', 'barrio', 'manzana', 'mz', 'casa', 'apto'].some(k => nrm(t).includes(nrm(k)))
+
+const providesCity = (t: string) =>
+    ['ciudad', 'municipio', 'poblacion', 'población', 'localidad', 'bogota', 'bogotá', 'medellin', 'cali', 'barranquilla', 'cartagena'].some(k => nrm(t).includes(nrm(k)))
 
 /* ====== Intents de negocio (desde BusinessConfig) ====== */
 const anyIn = (t: string, arr: string[]) => arr.some(k => nrm(t).includes(nrm(k)))
@@ -134,7 +168,6 @@ const bizFlags = (t: string) => ({
     canales: anyIn(t, Q.CANAL),
     any: false as boolean,
 })
-/* marcamos .any si alguno es true */
 const markAny = (f: ReturnType<typeof bizFlags>) => ({ ...f, any: Object.values(f).some(Boolean) })
 
 const short = (s: string) => s.trim().split('\n').slice(0, 4).join('\n')
@@ -297,7 +330,7 @@ export const handleIAReply = async (
     // 0) Conversación
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
-        select: { id: true, estado: true, empresaId: true, phone: true },
+        select: { id: true, estado: true, empresaId: true, phone: true, nombre: true },
     })
     if (!conversacion || conversacion.estado === 'cerrado') {
         console.warn(`[handleIAReply] 🔒 La conversación ${chatId} está cerrada.`)
@@ -333,7 +366,7 @@ export const handleIAReply = async (
     const ultimoCliente = await prisma.message.findFirst({
         where: { conversationId: chatId, from: 'client' },
         orderBy: { timestamp: 'desc' },
-        select: { mediaType: true, mediaUrl: true, caption: true, isVoiceNote: true, transcription: true, contenido: true }
+        select: { id: true, mediaType: true, mediaUrl: true, caption: true, isVoiceNote: true, transcription: true, contenido: true }
     })
 
     let mensaje = (mensajeArg || '').trim()
@@ -342,6 +375,46 @@ export const handleIAReply = async (
     }
     const isImage = ultimoCliente?.mediaType === MediaType.image && !!ultimoCliente.mediaUrl
     const imageUrl = isImage ? String(ultimoCliente?.mediaUrl) : null
+
+    // 2.1 Si vino imagen del cliente: la tratamos como posible comprobante de pago
+    if (isImage) {
+        const maybePayment = /comprobante|pago|recibo|transferencia|soporte|consignacion|consignación|voucher|dep[oó]sito|qr/i.test(
+            (ultimoCliente?.caption || '') + ' ' + (ultimoCliente?.contenido || '')
+        )
+        if (maybePayment) {
+            // Creamos o ubicamos un pedido "pending" de esta conversación
+            const order = await ensureDraftOrder(conversacion, config)
+            // Guardar PaymentReceipt asociado al mensaje/imagen
+            try {
+                await prisma.paymentReceipt.create({
+                    data: {
+                        orderId: order.id,
+                        messageId: ultimoCliente.id,
+                        imageUrl: imageUrl!,
+                        method: inferMethodFromConfig(config) || 'transfer|link',
+                        isVerified: false,
+                        rawOcrText: '', // (OCR futuro)
+                    }
+                })
+            } catch (e) {
+                console.warn('[handleIAReply] paymentReceipt create error:', (e as any)?.message || e)
+            }
+            const texto = [
+                '¡Gracias! Recibimos tu *comprobante* 🙌',
+                'Lo revisamos y te confirmamos por aquí.',
+                cfg(config, 'envioEntregaEstimado') ? `Entrega estimada: ${cfg(config, 'envioEntregaEstimado')}.` : '',
+            ].filter(Boolean).join('\n')
+            const savedR = await persistBotReply({
+                conversationId: chatId,
+                empresaId: conversacion.empresaId,
+                texto,
+                nuevoEstado: ConversationEstado.venta_en_proceso,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.venta_en_proceso, mensaje: savedR.texto, messageId: savedR.messageId, wamid: savedR.wamid, media: [] }
+        }
+    }
 
     // 3) Historial (para memoria)
     const mensajesPrevios = await prisma.message.findMany({
@@ -444,7 +517,70 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaRes }
     }
 
-    // 4.4 Seguimiento de CTA (memoria)
+    // 4.4 Flujo de compra (nuevo): intención de comprar / pago / dirección
+    if (wantsToBuy(mensaje) || askPaymentLink(mensaje) || askTransfer(mensaje) || providesAddress(mensaje) || providesCity(mensaje)) {
+        const draft = await ensureDraftOrder(conversacion, config)
+
+        // Si hay productos relevantes, agregamos primero (si no existe item)
+        if (productos.length) {
+            await upsertFirstItem(draft.id, productos[0])
+            await recalcOrderTotals(draft.id, config)
+        }
+
+        // Si pregunta por link de pago
+        if (askPaymentLink(mensaje)) {
+            const txt = composePaymentLinkMessage(config, productos[0])
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
+                nuevoEstado: ConversationEstado.venta_en_proceso,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+
+        // Si pide transferencia / datos bancarios
+        if (askTransfer(mensaje)) {
+            const txt = composeBankTransferMessage(config, productos[0])
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
+                nuevoEstado: ConversationEstado.venta_en_proceso,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+
+        // Recolección mínima de datos de envío
+        const needCity = !draft.city && providesCity(mensaje) === false
+        const needAddress = !draft.address && providesAddress(mensaje) === false
+        if (!draft.city || !draft.address) {
+            // Si mencionó algo de ciudad o dirección pero aún falta el otro campo
+            let ask = ''
+            if (!draft.city && draft.address) ask = '¿En qué *ciudad* recibes el pedido?'
+            else if (!draft.address && draft.city) ask = '¿Cuál es la *dirección* de entrega (calle, número, barrio)?'
+            else ask = 'Para coordinar el envío, ¿me compartes *ciudad* y *dirección* de entrega?'
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
+                nuevoEstado: ConversationEstado.venta_en_proceso,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+
+        // Si ya tenemos dirección y ciudad → ofrecer métodos de pago
+        const txt = composeCheckoutOptions(config, productos[0])
+        const saved = await persistBotReply({
+            conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
+            nuevoEstado: ConversationEstado.venta_en_proceso,
+            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            phoneNumberId: opts?.phoneNumberId,
+        })
+        return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+    }
+
+    // 4.5 Seguimiento de CTA (memoria)
     const lastCTA = lastBotCTA(mensajesPrevios)
     if ((isAffirmative(mensaje) || isProductIntent(mensaje) || isPrice(mensaje)) && productos.length) {
         const want: LastCTA =
@@ -623,4 +759,115 @@ function buildProductCaption(p: { nombre: string; beneficios?: string | null; ca
     else if (cars.length) lines.push(...cars.map((c, i) => `${pe(i)} ${c}`))
     if (p.precioDesde != null) lines.push(`💵 Desde: ${formatMoney(p.precioDesde)}`)
     return lines.slice(0, 5).join('\n')
+}
+
+/* ===================== Helpers de pedidos/pagos ===================== */
+
+function inferMethodFromConfig(c: any): string | null {
+    if (String(cfg(c, 'transferenciaQRUrl') || '').trim() || String(cfg(c, 'bancoNombre') || '').trim()) return 'transfer'
+    if (String(cfg(c, 'pagoLinkGenerico') || '').trim() || String(cfg(c, 'pagoLinkProductoBase') || '').trim()) return 'link'
+    return null
+}
+
+async function ensureDraftOrder(
+    conversacion: { id: number; empresaId: number; phone: string; nombre?: string | null },
+    c: any
+) {
+    // Busca pedido pendiente por conversación
+    let order = await prisma.order.findFirst({
+        where: { empresaId: conversacion.empresaId, conversationId: conversacion.id, status: { in: ['pending', 'pending_payment', 'created'] } },
+        orderBy: { id: 'desc' }
+    })
+    if (order) return order
+
+    // Crea nuevo
+    order = await prisma.order.create({
+        data: {
+            empresaId: conversacion.empresaId,
+            conversationId: conversacion.id,
+            customerPhone: conversacion.phone,
+            customerName: conversacion.nombre || null,
+            city: null,
+            address: null,
+            status: 'pending',
+            subtotal: 0,
+            shippingCost: Number(cfg(c, 'envioCostoFijo') || 0) || 0,
+            total: 0,
+            notes: '',
+        }
+    })
+    return order
+}
+
+async function upsertFirstItem(orderId: number, prod: any) {
+    const exists = await prisma.orderItem.findFirst({ where: { orderId, productId: prod.id } })
+    if (exists) return exists
+    const price = Number(prod?.precioDesde ?? 0) || 0
+    return prisma.orderItem.create({
+        data: { orderId, productId: prod.id, name: prod.nombre, price, qty: 1, total: price }
+    })
+}
+
+async function recalcOrderTotals(orderId: number, c: any) {
+    const items = await prisma.orderItem.findMany({ where: { orderId } })
+    const subtotal = items.reduce((acc, it) => acc + Number(it.total || 0), 0)
+    let shipping = Number(cfg(c, 'envioCostoFijo') || 0) || 0
+    const gratisDesde = Number(cfg(c, 'envioGratisDesde') || 0) || 0
+    if (gratisDesde && subtotal >= gratisDesde) shipping = 0
+    const total = subtotal + shipping
+    await prisma.order.update({ where: { id: orderId }, data: { subtotal, shippingCost: shipping, total } })
+}
+
+function composePaymentLinkMessage(c: any, prod?: any) {
+    const linkGen = String(cfg(c, 'pagoLinkGenerico') || '').trim()
+    const linkBase = String(cfg(c, 'pagoLinkProductoBase') || '').trim()
+    const notas = String(cfg(c, 'pagoNotas') || '').trim()
+    const parts: string[] = []
+    if (linkBase && prod?.slug) {
+        parts.push(`💳 Pago online: ${linkBase}?sku=${encodeURIComponent(prod.slug)}&qty=1`)
+    } else if (linkGen) {
+        parts.push(`💳 Pago online: ${linkGen}`)
+    } else {
+        parts.push('💳 Habilitamos pagos online. Si prefieres, también puedes pagar por transferencia.')
+    }
+    if (notas) parts.push(`ℹ️ Nota: ${notas}`)
+    parts.push('Cuando completes el pago, envíame el *comprobante* por aquí (foto).')
+    return short(parts.join('\n'))
+}
+
+function composeBankTransferMessage(c: any, prod?: any) {
+    const bank = {
+        banco: String(cfg(c, 'bancoNombre') || '').trim(),
+        titular: String(cfg(c, 'bancoTitular') || '').trim(),
+        tipo: String(cfg(c, 'bancoTipoCuenta') || '').trim(),
+        numero: String(cfg(c, 'bancoNumeroCuenta') || '').trim(),
+        doc: String(cfg(c, 'bancoDocumento') || '').trim(),
+        qr: String(cfg(c, 'transferenciaQRUrl') || '').trim(),
+        notas: String(cfg(c, 'pagoNotas') || '').trim()
+    }
+    const parts: string[] = []
+    parts.push('🏦 *Transferencia bancaria*')
+    if (bank.banco) parts.push(`• Banco: ${bank.banco}`)
+    if (bank.titular) parts.push(`• Titular: ${bank.titular}`)
+    if (bank.tipo) parts.push(`• Tipo de cuenta: ${bank.tipo}`)
+    if (bank.numero) parts.push(`• Nº de cuenta: ${bank.numero}`)
+    if (bank.doc) parts.push(`• Documento: ${bank.doc}`)
+    if (bank.qr) parts.push(`• QR: ${bank.qr}`)
+    if (bank.notas) parts.push(`ℹ️ ${bank.notas}`)
+    parts.push('Al hacer la transferencia, envíame el *comprobante* (foto) por aquí.')
+    return short(parts.join('\n'))
+}
+
+function composeCheckoutOptions(c: any, prod?: any) {
+    const hasLink = Boolean(String(cfg(c, 'pagoLinkGenerico') || cfg(c, 'pagoLinkProductoBase') || '').trim())
+    const hasBank = Boolean(String(cfg(c, 'bancoNombre') || cfg(c, 'transferenciaQRUrl') || '').trim())
+    const envioEta = String(cfg(c, 'envioEntregaEstimado') || '').trim()
+    const parts: string[] = []
+    parts.push('¡Perfecto! Para completar tu pedido puedes:')
+    if (hasLink) parts.push('• 💳 Pagar con *link* (tarjeta/PSE).')
+    if (hasBank) parts.push('• 🏦 Pagar por *transferencia bancaria*.')
+    if (!hasLink && !hasBank) parts.push('• Confirmar por aquí y coordinamos el pago.')
+    if (envioEta) parts.push(`⏰ Entrega estimada: ${envioEta}.`)
+    parts.push('¿Qué método prefieres?')
+    return short(parts.join('\n'))
 }
