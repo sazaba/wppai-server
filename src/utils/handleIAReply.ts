@@ -26,12 +26,12 @@ type IAReplyResult = {
    Visión: GPT-4o-mini (cliente OpenAI)
 */
 const RAW_MODEL =
-    process.env.IA_TEXT_MODEL ||            // nuevo (prioritario)
-    process.env.IA_MODEL ||                 // compatibilidad
+    process.env.IA_TEXT_MODEL ||
+    process.env.IA_MODEL ||
     'anthropic/claude-3.5-sonnet'
 
-const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.3)
-const MAX_COMPLETION_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 350)
+const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.5) // 🔓 un poco más creativo
+const MAX_COMPLETION_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 380)
 
 // OpenRouter
 const OPENROUTER_BASE = process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1'
@@ -52,11 +52,7 @@ function normalizeModelId(model: string): string {
 }
 function isOpenRouterModel(model: string): boolean { return model.includes('/') }
 function fallbackModel(): string { return 'google/gemini-2.0-flash-lite-001' }
-
-// Para el cliente OpenAI: si por error ponen "openai/gpt-4o-mini" lo normalizamos.
-function normalizeForOpenAI(model: string): string {
-    return model.replace(/^openai\//i, '').trim()
-}
+function normalizeForOpenAI(model: string): string { return model.replace(/^openai\//i, '').trim() }
 
 function normalizarTexto(texto: string): string {
     return (texto || '')
@@ -81,9 +77,7 @@ const CTAS = [
 ]
 
 // 🚫 Mucho más corta: solo lo crítico
-const FRASES_PROHIBIDAS = [
-    'soy una ia', 'modelo de lenguaje', 'inteligencia artificial'
-].map(normalizarTexto)
+const FRASES_PROHIBIDAS = ['soy una ia', 'modelo de lenguaje', 'inteligencia artificial'].map(normalizarTexto)
 
 function esRespuestaInvalida(respuesta: string): boolean {
     const r = normalizarTexto(respuesta || '')
@@ -105,7 +99,7 @@ function detectTopicShift(userText: string, negocioKeywords: string[]): boolean 
 /* ============ Intents ============ */
 function isProductIntent(text: string): boolean {
     const t = normalizarTexto(text)
-    const keys = ['producto', 'productos', 'catalogo', 'catalogo', 'precio', 'precios', 'foto', 'fotos', 'imagen', 'imagenes', 'mostrar', 'ver', 'presentacion', 'beneficio', 'beneficios', 'caracteristica', 'caracteristicas', 'promocion', 'promoción', 'oferta', 'disponibilidad']
+    const keys = ['producto', 'productos', 'catalogo', 'catálogo', 'precio', 'precios', 'foto', 'fotos', 'imagen', 'imagenes', 'mostrar', 'ver', 'presentacion', 'beneficio', 'beneficios', 'caracteristica', 'caracteristicas', 'promocion', 'promoción', 'oferta', 'disponibilidad', 'stock']
     return keys.some(k => t.includes(k))
 }
 function isPriceQuestion(text: string): boolean {
@@ -116,6 +110,13 @@ function isPriceQuestion(text: string): boolean {
 function isImageAsk(text: string): boolean {
     const t = normalizarTexto(text)
     const keys = ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto']
+    return keys.some(k => t.includes(k))
+}
+
+// ✅ Afirmativos/cierre de CTA (“sí, dale, muéstrame…”)
+function isAffirmative(text: string): boolean {
+    const t = normalizarTexto(text)
+    const keys = ['si', 'sí', 'dale', 'ok', 'listo', 'va', 'claro', 'perfecto', 'de una', 'hágale', 'hagale', 'quiero', 'me sirve', 'me interesa']
     return keys.some(k => t.includes(k))
 }
 
@@ -150,10 +151,7 @@ function isBusinessInfoQuestion(t: string) {
     return { any, flags }
 }
 
-function shortReply(s: string) {
-    // normaliza a 2–4 líneas como máximo
-    return s.trim().split('\n').slice(0, 4).join('\n')
-}
+function shortReply(s: string) { return s.trim().split('\n').slice(0, 4).join('\n') }
 
 /* ====== FAQ helpers ====== */
 function parseFAQ(faqText?: string) {
@@ -170,6 +168,24 @@ function parseFAQ(faqText?: string) {
         }
     }
     return pairs
+}
+
+/* ====== Detección de “última CTA” del bot (memoria corta sin schema) ====== */
+type LastCTA = 'precio' | 'beneficios' | 'disponibilidad' | 'fotos' | null
+
+function detectLastBotCTA(history: Array<{ from: MessageFrom; contenido: string }>): LastCTA {
+    // Miramos de atrás hacia adelante el último mensaje del BOT con palabras clave
+    for (let i = history.length - 1; i >= 0; i--) {
+        const m = history[i]
+        if (m.from !== MessageFrom.bot) continue
+        const t = normalizarTexto(m.contenido || '')
+        if (/precio|precios|vale|cuesta|costo|valor/.test(t)) return 'precio'
+        if (/beneficio|ventaja|caracteristica/.test(t)) return 'beneficios'
+        if (/disponibilidad|stock/.test(t)) return 'disponibilidad'
+        if (/foto|imagen|imagenes|fotos|ver foto/.test(t)) return 'fotos'
+        // Si fue una CTA genérica (nuestros CTAS), devolvemos null para que la IA decida con el input actual
+    }
+    return null
 }
 
 /* ====== Build deterministic business answers ====== */
@@ -231,13 +247,14 @@ ${catHeader}
 
     const reglas = `
 [REGLAS – ORIENTADAS A VENTAS]
-1) Prioriza la información de [NEGOCIO]/[OPERACIÓN]/[CATÁLOGO AUTORIZADO]/[FAQs]. Si falta un dato, dilo breve y ofrece alternativas útiles.
+1) Prioriza la info de [NEGOCIO]/[OPERACIÓN]/[CATÁLOGO AUTORIZADO]/[FAQs]. Si falta un dato, dilo breve y ofrece alternativas útiles (no inventes).
 2) No inventes teléfonos, correos, links, precios o stock si no están arriba.
-3) Mantén conversación humana y cordial. Puedes hacer small-talk en 1 línea y pivotar a compra.
+3) Tono humano, cálido y conversacional. Puedes hacer small-talk en 1 línea y luego guiar a la compra.
 4) Máx 2–4 líneas por respuesta. Usa viñetas cuando aporte claridad.
 5) No menciones que eres IA.
-6) Si el usuario insiste en algo fuera de contexto del negocio, reconduce con cortesía. Solo usa el mensaje de escalamiento como último recurso:
+6) Si el usuario pregunta algo fuera de contexto, reconduce con cortesía a lo relevante. Si no hay datos suficientes, di: "No sabría decirte con certeza; debo consultarlo." y ofrece escalar. Solo usa:
    "${mensajeEscalamiento}"
+   como último recurso.
 ${config?.disclaimers ? `7) Disclaimers del negocio:\n${config.disclaimers}` : ''}
 ${config?.palabrasClaveNegocio ? `8) Palabras clave del negocio: ${config.palabrasClaveNegocio}` : ''}
   `.trim()
@@ -282,7 +299,7 @@ async function chatComplete({
         return resp?.choices?.[0]?.message?.content ?? ''
     }
 
-    // 🔎 Texto: si el modelo contiene "proveedor/modelo" -> OpenRouter (Claude, Gemini, etc.)
+    // 🔎 Texto: OpenRouter (Claude, Gemini, etc.)
     if (isOpenRouterModel(normalized)) {
         if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY no configurada')
         const payload = { model: normalized, messages, temperature, max_tokens: maxTokens, max_output_tokens: maxTokens }
@@ -303,7 +320,7 @@ async function chatComplete({
                 : ''
     }
 
-    // 🔎 Texto con cliente OpenAI (por si pones un modelo OpenAI aquí)
+    // 🔎 Texto con cliente OpenAI
     const resp = await openai.chat.completions.create({
         model: normalizeForOpenAI(normalized),
         messages,
@@ -366,18 +383,17 @@ export const handleIAReply = async (
     })
 
     let mensaje = (mensajeArg || '').trim()
-    // 🔊 voz → usamos transcripción si ya existe (este archivo NO transcribe)
     if (!mensaje && ultimoCliente?.isVoiceNote && (ultimoCliente.transcription || '').trim()) {
         mensaje = String(ultimoCliente.transcription).trim()
     }
     const isImage = ultimoCliente?.mediaType === MediaType.image && !!ultimoCliente.mediaUrl
     const imageUrl = isImage ? String(ultimoCliente?.mediaUrl) : null
 
-    // 3) Historial breve
+    // 3) Historial breve (para memoria de CTA)
     const mensajesPrevios = await prisma.message.findMany({
         where: { conversationId: chatId },
         orderBy: { timestamp: 'asc' },
-        take: 12,
+        take: 16,
         select: { from: true, contenido: true },
     })
     const historial = mensajesPrevios
@@ -451,53 +467,12 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // 4.2 Imagen directa
+    // 4.2 Imagen directa solicitada
     if (isImageAsk(mensaje) && productosRelevantes.length && opts?.autoSend) {
-        const phone = opts?.toPhone || conversacion.phone
-        const imgs = await prisma.productImage.findMany({
-            where: { productId: { in: productosRelevantes.map((p: any) => p.id).filter(Boolean) }, url: { not: '' } },
-            orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }, { id: 'asc' }],
-            take: MAX_PRODUCTS_TO_SEND
+        const mediaRes = await sendProductImages({
+            chatId, conversacion, productosRelevantes, phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone
         })
-
-        const mediaSent: Array<{ productId: number; imageUrl: string; wamid?: string }> = []
-        for (const img of imgs) {
-            const prod = productosRelevantes.find((p: any) => p.id === img.productId)
-            if (!prod) continue
-            const caption = buildProductCaption(prod)
-            try {
-                const resp = await sendWhatsappMedia({
-                    empresaId: conversacion.empresaId,
-                    to: phone,
-                    url: img.url,
-                    type: 'image',
-                    caption,
-                    phoneNumberIdHint: opts?.phoneNumberId,
-                } as any)
-                const wamid =
-                    (resp as any)?.data?.messages?.[0]?.id ||
-                    (resp as any)?.messages?.[0]?.id ||
-                    (resp as any)?.outboundId || undefined
-
-                mediaSent.push({ productId: img.productId, imageUrl: img.url, wamid })
-                await prisma.message.create({
-                    data: {
-                        conversationId: chatId,
-                        empresaId: conversacion.empresaId,
-                        from: MessageFrom.bot,
-                        mediaType: MediaType.image,
-                        mediaUrl: img.url,
-                        caption,
-                        externalId: wamid,
-                        contenido: '',
-                    }
-                })
-            } catch (err: any) {
-                console.error('[sendWhatsappMedia] error:', err?.response?.data || err?.message || err)
-            }
-        }
-
-        const texto = mediaSent.length
+        const texto = mediaRes.length
             ? 'Te compartí imágenes del catálogo. ¿Quieres saber precios o disponibilidad?'
             : 'No encontré imágenes ahora. ¿Te comparto beneficios o precio?'
         const saved = await persistBotReply({
@@ -506,7 +481,7 @@ export const handleIAReply = async (
             sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
             phoneNumberId: opts?.phoneNumberId,
         })
-        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaSent }
+        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaRes }
     }
 
     // 4.3 Preguntas del negocio → responder desde BusinessConfig sin LLM
@@ -523,6 +498,70 @@ export const handleIAReply = async (
                 phoneNumberId: opts?.phoneNumberId,
             })
             return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+    }
+
+    /* ===== 4.4 Seguimiento de CTA: si el usuario dice “sí / dale / precio” etc. ===== */
+    const lastCTA = detectLastBotCTA(mensajesPrevios)
+    if ((isAffirmative(mensaje) || isProductIntent(mensaje) || isPriceQuestion(mensaje)) && productosRelevantes.length) {
+        // Si el usuario respondió afirmativo a la última CTA, cumplimos esa CTA
+        const want: LastCTA =
+            (isPriceQuestion(mensaje) && 'precio') ||
+            (/beneficio|ventaja/.test(normalizarTexto(mensaje)) && 'beneficios') ||
+            (/disponibilidad|stock/.test(normalizarTexto(mensaje)) && 'disponibilidad') ||
+            (/foto|imagen|fotos/.test(normalizarTexto(mensaje)) && 'fotos') ||
+            lastCTA
+
+        if (want) {
+            const p = productosRelevantes[0]
+            if (want === 'precio') {
+                const precio = p?.precioDesde != null ? formatMoney(p.precioDesde) : null
+                const texto = precio
+                    ? `*${p.nombre}*: desde ${precio}. ¿Deseas que confirme disponibilidad o prefieres ver imágenes?`
+                    : `De *${p.nombre}* no tengo precio cargado. ¿Te comparto beneficios o confirmo stock?`
+                const saved = await persistBotReply({
+                    conversationId: chatId, empresaId: conversacion.empresaId, texto,
+                    nuevoEstado: ConversationEstado.respondido,
+                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    phoneNumberId: opts?.phoneNumberId,
+                })
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            }
+            if (want === 'beneficios') {
+                const texto = buildBenefitsReply(p)
+                const saved = await persistBotReply({
+                    conversationId: chatId, empresaId: conversacion.empresaId, texto,
+                    nuevoEstado: ConversationEstado.respondido,
+                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    phoneNumberId: opts?.phoneNumberId,
+                })
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            }
+            if (want === 'disponibilidad') {
+                const texto = 'Puedo confirmarte *stock* ahora mismo. ¿Para cuántas unidades y en qué ciudad recibes?'
+                const saved = await persistBotReply({
+                    conversationId: chatId, empresaId: conversacion.empresaId, texto,
+                    nuevoEstado: ConversationEstado.en_proceso,
+                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    phoneNumberId: opts?.phoneNumberId,
+                })
+                return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            }
+            if (want === 'fotos' && opts?.autoSend) {
+                const mediaRes = await sendProductImages({
+                    chatId, conversacion, productosRelevantes, phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone
+                })
+                const texto = mediaRes.length
+                    ? 'Listo, te envié imágenes. ¿Te confirmo precio o stock?'
+                    : 'No tengo fotos ahora mismo. ¿Te comparto beneficios o precio?'
+                const saved = await persistBotReply({
+                    conversationId: chatId, empresaId: conversacion.empresaId, texto,
+                    nuevoEstado: ConversationEstado.respondido,
+                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    phoneNumberId: opts?.phoneNumberId,
+                })
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaRes }
+            }
         }
     }
 
@@ -604,10 +643,10 @@ export const handleIAReply = async (
         respuestaIA = reconduce
     }
 
-    // 8) Reglas finales de escalamiento (solo último recurso)
+    // 8) Reglas finales de escalamiento (último recurso)
     const iaConfianzaBaja =
         respuestaIA.length < 8 ||
-        /no estoy seguro|no tengo certeza|no cuento con esa info/i.test(respuestaIA)
+        /no estoy seguro|no tengo certeza|no cuento con esa info|no sabria decirte|no sabria decirte/i.test(normalizarTexto(respuestaIA))
 
     const motivoFinal = shouldEscalateChat({
         mensaje: mensaje || ultimoCliente?.caption || '',
@@ -642,61 +681,9 @@ export const handleIAReply = async (
     let mediaSent: Array<{ productId: number; imageUrl: string; wamid?: string }> = []
     const wantsProducts = isProductIntent(mensaje || ultimoCliente?.caption || '')
     if (wantsProducts && opts?.autoSend && (opts?.toPhone || conversacion.phone) && productosRelevantes.length) {
-        const phone = opts?.toPhone || conversacion.phone
-        const productIds = productosRelevantes.slice(0, MAX_PRODUCTS_TO_SEND).map((p: any) => p.id).filter(Boolean)
-
-        if (productIds.length) {
-            const imgs = await prisma.productImage.findMany({
-                where: { productId: { in: productIds }, url: { not: '' } },
-                orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }, { id: 'asc' }],
-                select: { id: true, productId: true, url: true, alt: true, isPrimary: true }
-            })
-
-            const mapByProduct = new Map<number, { url: string; alt: string }>()
-            for (const pid of productIds) {
-                const img = imgs.find(i => i.productId === pid)
-                if (img) mapByProduct.set(pid, { url: img.url, alt: img.alt || '' })
-            }
-
-            for (const pid of productIds) {
-                const prod = productosRelevantes.find((p: any) => p.id === pid)
-                const img = mapByProduct.get(pid)
-                if (!prod || !img) continue
-
-                const caption = buildProductCaption(prod)
-                try {
-                    const resp = await sendWhatsappMedia({
-                        empresaId: conversacion.empresaId,
-                        to: phone,
-                        url: img.url,
-                        type: 'image',
-                        caption,
-                        phoneNumberIdHint: opts?.phoneNumberId,
-                    } as any)
-
-                    const wamid =
-                        (resp as any)?.data?.messages?.[0]?.id ||
-                        (resp as any)?.messages?.[0]?.id ||
-                        (resp as any)?.outboundId || undefined
-
-                    mediaSent.push({ productId: pid, imageUrl: img.url, wamid })
-                    await prisma.message.create({
-                        data: {
-                            conversationId: chatId,
-                            empresaId: conversacion.empresaId,
-                            from: MessageFrom.bot,
-                            mediaType: MediaType.image,
-                            mediaUrl: img.url,
-                            caption,
-                            externalId: wamid,
-                            contenido: '',
-                        }
-                    })
-                } catch (err: any) {
-                    console.error('[sendWhatsappMedia] error:', err?.response?.data || err?.message || err)
-                }
-            }
-        }
+        mediaSent = await sendProductImages({
+            chatId, conversacion, productosRelevantes, phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone
+        })
     }
 
     return {
@@ -797,6 +784,26 @@ function buildProductCaption(p: {
     return lines.slice(0, 5).join('\n')
 }
 
+function buildBenefitsReply(p: {
+    nombre: string
+    beneficios?: string | null
+    caracteristicas?: string | null
+    precioDesde?: any | null
+}) {
+    const bens = String(p?.beneficios || '')
+        .split('\n')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .slice(0, 3)
+    const lines: string[] = []
+    lines.push(`*${p.nombre}* – Beneficios principales:`)
+    if (bens.length) lines.push(...bens.map((b) => `• ${b}`))
+    else lines.push('• Fórmula confiable y bien valorada por clientes.')
+    if (p.precioDesde != null) lines.push(`Precio desde: ${formatMoney(p.precioDesde)}.`)
+    lines.push('¿Te confirmo *stock* o prefieres ver *imágenes*?')
+    return shortReply(lines.join('\n'))
+}
+
 function formatMoney(val: any) {
     try {
         const n = Number(val)
@@ -805,4 +812,64 @@ function formatMoney(val: any) {
     } catch {
         return String(val)
     }
+}
+
+/* ===== Envío de imágenes helper ===== */
+async function sendProductImages({
+    chatId,
+    conversacion,
+    productosRelevantes,
+    phoneNumberId,
+    toOverride,
+}: {
+    chatId: number
+    conversacion: { empresaId: number; phone: string }
+    productosRelevantes: any[]
+    phoneNumberId?: string
+    toOverride?: string
+}) {
+    const phone = toOverride || conversacion.phone
+    const imgs = await prisma.productImage.findMany({
+        where: { productId: { in: productosRelevantes.map((p: any) => p.id).filter(Boolean) }, url: { not: '' } },
+        orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }, { id: 'asc' }],
+        take: MAX_PRODUCTS_TO_SEND
+    })
+
+    const mediaSent: Array<{ productId: number; imageUrl: string; wamid?: string }> = []
+    for (const img of imgs) {
+        const prod = productosRelevantes.find((p: any) => p.id === img.productId)
+        if (!prod) continue
+        const caption = buildProductCaption(prod)
+        try {
+            const resp = await sendWhatsappMedia({
+                empresaId: conversacion.empresaId,
+                to: phone,
+                url: img.url,
+                type: 'image',
+                caption,
+                phoneNumberIdHint: phoneNumberId,
+            } as any)
+            const wamid =
+                (resp as any)?.data?.messages?.[0]?.id ||
+                (resp as any)?.messages?.[0]?.id ||
+                (resp as any)?.outboundId || undefined
+
+            mediaSent.push({ productId: img.productId, imageUrl: img.url, wamid })
+            await prisma.message.create({
+                data: {
+                    conversationId: chatId,
+                    empresaId: conversacion.empresaId,
+                    from: MessageFrom.bot,
+                    mediaType: MediaType.image,
+                    mediaUrl: img.url,
+                    caption,
+                    externalId: wamid,
+                    contenido: '',
+                }
+            })
+        } catch (err: any) {
+            console.error('[sendWhatsappMedia] error:', err?.response?.data || err?.message || err)
+        }
+    }
+    return mediaSent
 }
