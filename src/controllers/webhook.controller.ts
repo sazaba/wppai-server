@@ -10,6 +10,9 @@ import {
 import { transcribeAudioBuffer } from '../services/transcription.service'
 import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy firmado
 
+// ⬇️ NUEVO: helper para cachear imágenes en Cloudflare Images
+import { cacheWhatsappMediaToCloudflare } from '../utils/cacheWhatsappMedia'
+
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
     const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -131,7 +134,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             contenido = transcription || '[nota de voz]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
         }
-        // 🖼️ IMAGEN
+        // 🖼️ IMAGEN (➡️ cache a Cloudflare Images con fallback al proxy)
         else if (msg.type === 'image' && msg.image?.id) {
             inboundMediaType = MediaType.image
             inboundMediaId = String(msg.image.id)
@@ -139,9 +142,22 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             captionForDb = (msg.image?.caption as string | undefined) || undefined
 
             contenido = captionForDb || '[imagen]'
-            if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
+
+            // 1) Intentar cachear en Cloudflare Images
+            try {
+                const accessToken = cuenta.accessToken // ya lo tienes en la cuenta
+                const { url } = await cacheWhatsappMediaToCloudflare({
+                    waMediaId: inboundMediaId,
+                    accessToken,
+                })
+                mediaUrlForFrontend = url // URL pública de CF Images (variant)
+            } catch (err) {
+                console.warn('[IMAGE] cache CF falló, uso proxy firmado:', (err as any)?.message || err)
+                // 2) Fallback a tu proxy firmado
+                if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
+            }
         }
-        // 🎞️ VIDEO
+        // 🎞️ VIDEO (se mantiene proxy firmado)
         else if (msg.type === 'video' && msg.video?.id) {
             inboundMediaType = MediaType.video
             inboundMediaId = String(msg.video.id)
@@ -151,7 +167,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             contenido = captionForDb || '[video]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
         }
-        // 📎 DOCUMENTO
+        // 📎 DOCUMENTO (se mantiene proxy firmado)
         else if (msg.type === 'document' && msg.document?.id) {
             inboundMediaType = MediaType.document
             inboundMediaId = String(msg.document.id)
@@ -163,7 +179,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
         }
 
-        // Guardar ENTRANTE
+        // Guardar ENTRANTE (🔁 ahora también persistimos mediaUrl si existe)
         const inboundData: any = {
             conversationId: conversation.id,
             empresaId,
@@ -172,6 +188,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             timestamp: ts,
             mediaType: inboundMediaType,
             mediaId: inboundMediaId,
+            mediaUrl: mediaUrlForFrontend, // 👈 NUEVO: guardar URL (CF o proxy)
             mimeType: inboundMime,
             transcription: transcription || undefined,
         }
@@ -261,7 +278,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         let botMessageId = result?.messageId ?? undefined
         let botContenido = (result?.mensaje || '').trim()
 
-        // Si no hubo messageId, creamos el registro nosotros como fallback
         if (botContenido && !botMessageId) {
             const creadoFallback = await prisma.message.create({
                 data: {
@@ -276,11 +292,9 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             console.log('[BOT] persistido fallback', { id: botMessageId })
         }
 
-        // Emitimos el mensaje del bot si hay contenido y un id (del handler o del fallback)
         if (botContenido && botMessageId) {
             const creado = await prisma.message.findUnique({ where: { id: botMessageId } })
 
-            // Si el handler modificó el estado de la conversación, reflejarlo también
             if (result?.estado && result.estado !== conversation.estado) {
                 await prisma.conversation.update({
                     where: { id: conversation.id },
@@ -296,7 +310,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     message: {
                         id: creado.id,
                         externalId: creado.externalId ?? null,
-                        from: 'bot', // 👈 el frontend espera 'bot'
+                        from: 'bot',
                         contenido: creado.contenido,
                         timestamp: creado.timestamp.toISOString(),
                     },
