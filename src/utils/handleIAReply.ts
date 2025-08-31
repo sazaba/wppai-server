@@ -1005,7 +1005,7 @@ import { openai } from '../lib/openai'
 import { ConversationEstado, MediaType, MessageFrom } from '@prisma/client'
 import { retrieveRelevantProducts } from './products.helper'
 
-// ⚠️ Import en namespace para tolerar distintas firmas/exports en tu servicio WPP
+// Import en namespace para tolerar diferencias de export
 import * as Wam from '../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../services/transcription.service'
 
@@ -1067,7 +1067,7 @@ const esRespuestaInvalida = (r: string) => {
     return email || link || tel || NO_DECIR.some(p => t.includes(p))
 }
 
-// ====== Lectura robusta de BusinessConfig (alias)
+/* ====== Lectura robusta de BusinessConfig (alias) ====== */
 const cfg = (c: any, k: string) => {
     if (!c) return ''
     const map: Record<string, string[]> = {
@@ -1115,9 +1115,12 @@ const cfg = (c: any, k: string) => {
     return ''
 }
 
-/* ============ Intents ============ */
+/* ============ Intents / matchers ============ */
+const isPrice = (t: string) =>
+    ['precio', 'cuesta', 'vale', 'costo', 'cuanto', 'cuánto', 'valor', 'exactamente'].some(k => nrm(t).includes(nrm(k)))
+
 const wantsImages = (t: string) =>
-    ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto', 'portafolio'].some(k => nrm(t).includes(nrm(k)))
+    ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto'].some(k => nrm(t).includes(nrm(k)))
 
 const wantsToBuy = (t: string) =>
     ['comprar', 'lo compro', 'lo quiero', 'quiero comprar', 'me lo llevo', 'cerrar compra', 'finalizar compra', 'hacer pedido', 'ordenar', 'pedido'].some(k => nrm(t).includes(nrm(k)))
@@ -1132,7 +1135,23 @@ const providesAddress = (t: string) =>
     ['direccion', 'dirección', 'dir', 'calle', 'cra', 'carrera', 'av', 'avenida', 'barrio', 'manzana', 'mz', 'casa', 'apto'].some(k => nrm(t).includes(nrm(k)))
 
 const providesCity = (t: string) =>
-    ['ciudad', 'municipio', 'poblacion', 'población', 'localidad', 'bogota', 'bogotá', 'medellin', 'medellín', 'cali', 'barranquilla', 'cartagena', 'manizales', 'pereira', 'armenia', 'bucaramanga', 'cúcuta'].some(k => nrm(t).includes(nrm(k)))
+    ['ciudad', 'municipio', 'poblacion', 'población', 'localidad', 'bogota', 'bogotá', 'medellin', 'medellín', 'cali', 'barranquilla', 'cartagena', 'manizales', 'pereira'].some(k => nrm(t).includes(nrm(k)))
+
+const isCatalogRequest = (t: string) => {
+    const s = nrm(t)
+    return (
+        s.includes('catalogo') ||
+        s.includes('catálogo') ||
+        s.includes('portafolio') ||
+        s.includes('productos disponibles') ||
+        (s.includes('lista') && s.includes('producto')) ||
+        s.includes('mostrar productos') ||
+        (s.includes('ver') && s.includes('producto'))
+    )
+}
+
+const isVoicePlaceholderText = (t?: string) =>
+    /^\s*\[(nota|nota de voz|audio|voice|voice note)[^\]]*\]\s*$/i.test(String(t || ''))
 
 /* ===== Helpers shipping: extraer ciudad/dirección ===== */
 const CITY_LIST = [
@@ -1180,7 +1199,20 @@ async function setShippingFromMessageIfMissing(orderId: number, msg: string) {
 }
 
 /* ===== Prompt mínimo (full-agent) ===== */
-function systemPrompt(c: any, _prods: any[], msgEsc: string, empresaNombre?: string) {
+function productsToPromptBlock(prods: any[]) {
+    if (!prods?.length) return ''
+    const lines = prods.slice(0, 7).map(p => {
+        const precio = p?.precioDesde != null ? ` — ${formatMoney(p.precioDesde)}` : ''
+        return `• ${p.nombre}${precio}`
+    })
+    return `
+[PRODUCTOS]
+${lines.join('\n')}
+Regla: solo puedes mencionar/recomendar productos que aparezcan en [PRODUCTOS]. Si no hay coincidencias, pregunta qué busca o ofrece enviar el catálogo. No inventes nombres.`
+        .trim()
+}
+
+function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: string) {
     const marca = (cfg(c, 'nombre') || empresaNombre || 'la marca')
     const envioCostoFijo = Number(cfg(c, 'envioCostoFijo') || 0) || 0
     const envioGratisDesde = Number(cfg(c, 'envioGratisDesde') || 0) || 0
@@ -1210,7 +1242,7 @@ ${cfg(c, 'faq')}
   `.trim()
 
     return `
-Eres un **asesor virtual de ${marca}**. Responde **solo** con datos del bloque superior (no inventes).
+Eres un **asesor virtual de ${marca}**. Responde **solo** con datos del bloque superior y de [PRODUCTOS] (no inventes). 
 Objetivo: conversación natural (2–5 líneas), cálida y sin repetir. Termina con una micro-CTA.
 
 Conducta:
@@ -1222,7 +1254,10 @@ Conducta:
 - Si no puedes ayudar de verdad, usa: "${msgEsc}".
 
 Sé flexible, humano y claro; guía a precio/beneficios/pago cuando aporte.
+
 ${info}
+
+${productsToPromptBlock(prods)}
 `.trim()
 }
 
@@ -1235,27 +1270,24 @@ async function chatComplete({
     temperature: number
     maxTokens: number
 }): Promise<string> {
-    // normaliza modelo y decide proveedor
-    let normalized = normId(model) || fallbackModel()
-    const hasSlash = normalized.includes('/') // indica OpenRouter
+    const normalized = normId(model) || fallbackModel()
     const hasImage = messages.some(m => Array.isArray(m.content) && (m.content as any[]).some((p: any) => p?.type === 'image_url'))
 
-    // Si usas OpenRouter y el modelo no trae prefijo, lo forzamos a openai/<name>
-    if (!hasSlash && OPENROUTER_API_KEY) {
-        // ejemplo: "gpt-4o-mini" -> "openai/gpt-4o-mini"
-        normalized = `openai/${normalized}`
-    }
-
-    // --- RUTA OPENROUTER (texto o visión) ---
-    if (normalized.includes('/')) {
-        if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY no configurada')
-        const payload = {
-            model: normalized,
+    if (hasImage) {
+        const resp = await openai.chat.completions.create({
+            model: normalizeForOpenAI(VISION_MODEL),
             messages,
             temperature,
+            max_completion_tokens: maxTokens as any,
+            // @ts-ignore
             max_tokens: maxTokens,
-            max_output_tokens: maxTokens
-        }
+        } as any)
+        return resp?.choices?.[0]?.message?.content ?? ''
+    }
+
+    if (isOR(normalized)) {
+        if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY no configurada')
+        const payload = { model: normalized, messages, temperature, max_tokens: maxTokens, max_output_tokens: maxTokens }
         const { data } = await axios.post(OPENROUTER_URL, payload, {
             headers: {
                 Authorization: `Bearer ${OPENROUTER_API_KEY}`,
@@ -1266,14 +1298,9 @@ async function chatComplete({
             timeout: Number(process.env.IA_HTTP_TIMEOUT_MS || 45000),
         })
         const content = data?.choices?.[0]?.message?.content
-        return typeof content === 'string'
-            ? content
-            : Array.isArray(content)
-                ? content.map((c: any) => c?.text || '').join(' ')
-                : ''
+        return typeof content === 'string' ? content : Array.isArray(content) ? content.map((c: any) => c?.text || '').join(' ') : ''
     }
 
-    // --- RUTA OPENAI SDK directo (solo si NO usas OpenRouter o sí tienes API key de OpenAI) ---
     const resp = await openai.chat.completions.create({
         model: normalizeForOpenAI(normalized),
         messages,
@@ -1285,9 +1312,7 @@ async function chatComplete({
     return resp?.choices?.[0]?.message?.content ?? ''
 }
 
-
 /* ==================== Wrappers seguros WAM ==================== */
-// Evitan errores de tipado/exports distintos en tu servicio
 type MaybeMediaInfo = string | { url?: string;[k: string]: any } | null | undefined
 
 async function getWamMediaUrlSafe(input: string): Promise<string | null> {
@@ -1323,6 +1348,7 @@ export const handleIAReply = async (
     mensajeArg: string,
     opts?: { toPhone?: string; autoSend?: boolean; phoneNumberId?: string }
 ): Promise<IAReplyResult | null> => {
+
     // 0) Conversación
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
@@ -1361,20 +1387,29 @@ export const handleIAReply = async (
     const ultimoCliente = await prisma.message.findFirst({
         where: { conversationId: chatId, from: 'client' },
         orderBy: { timestamp: 'desc' },
-        select: { id: true, mediaType: true, mediaUrl: true, caption: true, isVoiceNote: true, transcription: true, contenido: true, mimeType: true }
+        select: {
+            id: true, mediaType: true, mediaUrl: true, caption: true, isVoiceNote: true,
+            transcription: true, contenido: true, mimeType: true
+        }
     })
 
+    // Texto recibido
     let mensaje = (mensajeArg || '').trim()
 
     // 🔊 Voz → usar transcripción; si no hay, transcribir ahora
-    if (!mensaje && ultimoCliente?.isVoiceNote) {
-        let transcript = (ultimoCliente.transcription || '').trim()
+    const incomingWasVoice =
+        Boolean(ultimoCliente?.isVoiceNote) ||
+        ultimoCliente?.mediaType === MediaType.audio ||
+        (ultimoCliente?.mimeType || '').startsWith('audio/')
+
+    if ((mensaje.length === 0 || isVoicePlaceholderText(mensaje)) && incomingWasVoice) {
+        let transcript = (ultimoCliente?.transcription || '').trim()
         if (!transcript) {
             try {
                 let audioBuf: Buffer | null = null
 
                 // a) URL pública/firmada directa
-                if (ultimoCliente.mediaUrl && /^https?:\/\//i.test(String(ultimoCliente.mediaUrl))) {
+                if (ultimoCliente?.mediaUrl && /^https?:\/\//i.test(String(ultimoCliente.mediaUrl))) {
                     const { data } = await axios.get(String(ultimoCliente.mediaUrl), { responseType: 'arraybuffer', timeout: 30000 })
                     audioBuf = Buffer.from(data)
                 }
@@ -1394,14 +1429,14 @@ export const handleIAReply = async (
 
                 if (audioBuf && audioBuf.length) {
                     const guessedName =
-                        ultimoCliente.mimeType?.includes('mpeg') ? 'audio.mp3' :
-                            ultimoCliente.mimeType?.includes('wav') ? 'audio.wav' :
-                                ultimoCliente.mimeType?.includes('m4a') ? 'audio.m4a' :
-                                    ultimoCliente.mimeType?.includes('webm') ? 'audio.webm' : 'audio.ogg'
+                        ultimoCliente?.mimeType?.includes('mpeg') ? 'audio.mp3' :
+                            ultimoCliente?.mimeType?.includes('wav') ? 'audio.wav' :
+                                ultimoCliente?.mimeType?.includes('m4a') ? 'audio.m4a' :
+                                    ultimoCliente?.mimeType?.includes('webm') ? 'audio.webm' : 'audio.ogg'
 
                     transcript = await transcribeAudioBuffer(audioBuf, guessedName)
                     if (transcript) {
-                        await prisma.message.update({ where: { id: ultimoCliente.id }, data: { transcription: transcript } })
+                        await prisma.message.update({ where: { id: ultimoCliente!.id }, data: { transcription: transcript } })
                         console.log('[voice] ✅ transcripción guardada:', transcript.slice(0, 140))
                     } else {
                         console.warn('[voice] ❗ transcripción vacía')
@@ -1414,6 +1449,7 @@ export const handleIAReply = async (
             }
         }
         if (transcript) mensaje = transcript
+        else if (isVoicePlaceholderText(mensaje)) mensaje = '' // limpia placeholder si no salió transcripción
     }
 
     const isImage = ultimoCliente?.mediaType === MediaType.image && !!ultimoCliente.mediaUrl
@@ -1432,7 +1468,7 @@ export const handleIAReply = async (
                 await prisma.paymentReceipt.create({
                     data: {
                         orderId: order.id,
-                        messageId: ultimoCliente.id,
+                        messageId: ultimoCliente!.id,
                         imageUrl: imageUrl!,
                         method: inferMethodFromConfig(config) || 'transfer|link',
                         isVerified: false,
@@ -1485,7 +1521,7 @@ export const handleIAReply = async (
     // 3.1) Productos relevantes
     let productos: any[] = []
     try {
-        productos = await retrieveRelevantProducts(conversacion.empresaId, mensaje || (ultimoCliente?.caption ?? ''), 5)
+        productos = await retrieveRelevantProducts(conversacion.empresaId, mensaje || (ultimoCliente?.caption ?? ''), 7)
     } catch (e) {
         console.warn('[handleIAReply] retrieveRelevantProducts error:', (e as any)?.message || e)
         productos = []
@@ -1498,18 +1534,43 @@ export const handleIAReply = async (
                     empresaId: conversacion.empresaId,
                     OR: [{ nombre: { contains: tokens[0] } }, { descripcion: { contains: tokens[0] } }]
                 },
-                take: 5, orderBy: { id: 'asc' }
+                take: 7, orderBy: { id: 'asc' }
             })
         }
         if (!productos.length) {
             productos = await prisma.product.findMany({
                 where: { empresaId: conversacion.empresaId, disponible: true },
-                take: 3, orderBy: { id: 'asc' }
+                take: 5, orderBy: { id: 'asc' }
             })
         }
     }
 
-    /* ===== 4) Flujos transaccionales ===== */
+    /* ===== 4) Flujos específicos antes de IA ===== */
+
+    // 4.0 Catálogo / lista de productos
+    if (isCatalogRequest(mensaje)) {
+        const listado = await prisma.product.findMany({
+            where: { empresaId: conversacion.empresaId, disponible: true },
+            orderBy: { id: 'asc' },
+            take: 8,
+            select: { id: true, nombre: true, precioDesde: true }
+        })
+        if (listado.length) {
+            const lines = listado.map(p => `• ${p.nombre}${p.precioDesde != null ? ` — ${formatMoney(p.precioDesde)}` : ''}`)
+            const txt = [
+                'Estos son algunos productos disponibles:',
+                ...lines,
+                '¿Te envío *fotos* de alguno o prefieres que te comparta *precio* y *beneficios* primero?'
+            ].join('\n')
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: short(txt),
+                nuevoEstado: ConversationEstado.respondido,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+    }
 
     // 4.A Flujo de compra / link / transferencia / dirección
     const startedCheckout =
@@ -1603,7 +1664,7 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaSent }
     }
 
-    /* ===== 5) IA libre (anclada al BusinessConfig) ===== */
+    /* ===== 5) IA libre (anclada al BusinessConfig + [PRODUCTOS]) ===== */
     const baseMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }> = [
         { role: 'system', content: systemPrompt(config, productos, mensajeEscalamiento, empresa?.nombre) },
         ...historial
@@ -1678,7 +1739,7 @@ async function persistBotReply({ conversationId, empresaId, texto, nuevoEstado, 
     let wamid: string | undefined
     if (sendTo && String(sendTo).trim()) {
         try {
-            const resp = await (Wam as any).sendWhatsappMessage({ empresaId, to: normalizeToE164(sendTo!), body: texto, phoneNumberIdHint: phoneNumberId })
+            const resp = await Wam.sendWhatsappMessage({ empresaId, to: normalizeToE164(sendTo!), body: texto, phoneNumberIdHint: phoneNumberId })
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
             if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
             console.log('[persistBotReply] ✅ WhatsApp enviado, wamid:', wamid)
@@ -1713,7 +1774,7 @@ async function sendProductImages({ chatId, conversacion, productosRelevantes, ph
         const prod = productosRelevantes.find((p: any) => p.id === img.productId); if (!prod) continue
         const caption = buildProductCaption(prod)
         try {
-            const resp = await (Wam as any).sendWhatsappMedia({ empresaId: conversacion.empresaId, to: phone, url: img.url, type: 'image', caption, phoneNumberIdHint: phoneNumberId } as any)
+            const resp = await Wam.sendWhatsappMedia({ empresaId: conversacion.empresaId, to: phone, url: img.url, type: 'image', caption, phoneNumberIdHint: phoneNumberId } as any)
             const wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id || (resp as any)?.outboundId
             media.push({ productId: img.productId, imageUrl: img.url, wamid })
             await prisma.message.create({
@@ -1810,7 +1871,7 @@ function composePaymentLinkMessage(c: any, prod?: any) {
     return short(parts.join('\n'))
 }
 
-function composeBankTransferMessage(c: any, _prod?: any) {
+function composeBankTransferMessage(c: any, prod?: any) {
     const bank = {
         banco: String(cfg(c, 'bancoNombre') || '').trim(),
         titular: String(cfg(c, 'bancoTitular') || '').trim(),
