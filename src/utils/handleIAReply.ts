@@ -156,6 +156,10 @@ const Q = {
     GAR: ['garantia', 'garantía'],
     PROMO: ['promocion', 'promoción', 'promos', 'descuento', 'descuentos', 'oferta', 'ofertas'],
     CANAL: ['canal', 'contacto', 'atencion', 'soporte', 'hablar', 'comunicar'],
+
+    // NUEVOS:
+    FACT: ['factura', 'factura electronica', 'facturación', 'facturacion', 'rut', 'nit'],
+    POSV: ['postventa', 'post-venta', 'post venta', 'soporte devoluciones', 'devoluciones soporte', 'garantia soporte'],
 }
 const bizFlags = (t: string) => ({
     envios: anyIn(t, Q.ENVIO),
@@ -166,6 +170,11 @@ const bizFlags = (t: string) => ({
     garantia: anyIn(t, Q.GAR),
     promos: anyIn(t, Q.PROMO),
     canales: anyIn(t, Q.CANAL),
+
+    // NUEVOS:
+    fact: anyIn(t, Q.FACT),
+    postv: anyIn(t, Q.POSV),
+
     any: false as boolean,
 })
 const markAny = (f: ReturnType<typeof bizFlags>) => ({ ...f, any: Object.values(f).some(Boolean) })
@@ -189,20 +198,49 @@ const lastBotCTA = (hist: Array<{ from: MessageFrom; contenido: string }>): Last
 /* ====== Respuestas determinísticas de negocio ====== */
 const businessAnswer = (c: any, f: ReturnType<typeof bizFlags>) => {
     const parts: string[] = []
-    const em = { box: '📦', money: '💳', clock: '⏰', pin: '📍', refresh: '🔄', shield: '🛡️', tag: '🏷️', chat: '💬' }
+    const em = { box: '📦', money: '💳', clock: '⏰', pin: '📍', refresh: '🔄', shield: '🛡️', tag: '🏷️', chat: '💬', doc: '🧾', lifebuoy: '🛟' }
 
-    if (f.envios && String(cfg(c, 'enviosInfo')).trim()) parts.push(`${em.box} *Envíos:* ${cfg(c, 'enviosInfo')}`)
-    if (f.pagos && String(cfg(c, 'metodosPago')).trim()) parts.push(`${em.money} *Pagos:* ${cfg(c, 'metodosPago')}`)
-    if (f.horario && String(cfg(c, 'horarios')).trim()) parts.push(`${em.clock} *Horario:* ${cfg(c, 'horarios')}`)
+    // ENVÍOS: texto libre + (si hay) costo fijo / umbral gratis
+    if (f.envios) {
+        const envioTxt = String(cfg(c, 'enviosInfo') || '').trim()
+        const costoFijo = Number(cfg(c, 'envioCostoFijo') || 0) || 0
+        const gratisDesde = Number(cfg(c, 'envioGratisDesde') || 0) || 0
+        const extraCostos = (costoFijo || gratisDesde)
+            ? ` ${costoFijo ? `(Costo fijo: ${formatMoney(costoFijo)})` : ''}${gratisDesde ? ` (Gratis desde ${formatMoney(gratisDesde)})` : ''}`
+            : ''
+        if (envioTxt || extraCostos) parts.push(`${em.box} *Envíos:* ${envioTxt || 'Coordinamos envíos a nivel nacional.'}${extraCostos}`)
+    }
+
+    if (f.pagos && String(cfg(c, 'metodosPago')).trim())
+        parts.push(`${em.money} *Pagos:* ${cfg(c, 'metodosPago')}`)
+
+    if (f.horario && String(cfg(c, 'horarios')).trim())
+        parts.push(`${em.clock} *Horario:* ${cfg(c, 'horarios')}`)
+
     if (f.tienda) {
         const tf = Boolean(cfg(c, 'tiendaFisica'))
         const dir = tf ? (cfg(c, 'direccionTienda') || 'Tienda física disponible') : 'Por ahora solo atendemos online'
         parts.push(`${em.pin} *Tienda:* ${tf ? 'Sí' : 'No'}. ${dir}`)
     }
-    if (f.devol && String(cfg(c, 'politicasDevolucion')).trim()) parts.push(`${em.refresh} *Devoluciones:* ${cfg(c, 'politicasDevolucion')}`)
-    if (f.garantia && String(cfg(c, 'politicasGarantia')).trim()) parts.push(`${em.shield} *Garantía:* ${cfg(c, 'politicasGarantia')}`)
-    if (f.promos && String(cfg(c, 'promocionesInfo')).trim()) parts.push(`${em.tag} *Promos:* ${cfg(c, 'promocionesInfo')}`)
-    if (f.canales && String(cfg(c, 'canalesAtencion')).trim()) parts.push(`${em.chat} *Atención:* ${cfg(c, 'canalesAtencion')}`)
+
+    if (f.devol && String(cfg(c, 'politicasDevolucion')).trim())
+        parts.push(`${em.refresh} *Devoluciones:* ${cfg(c, 'politicasDevolucion')}`)
+
+    if (f.garantia && String(cfg(c, 'politicasGarantia')).trim())
+        parts.push(`${em.shield} *Garantía:* ${cfg(c, 'politicasGarantia')}`)
+
+    if (f.promos && String(cfg(c, 'promocionesInfo')).trim())
+        parts.push(`${em.tag} *Promos:* ${cfg(c, 'promocionesInfo')}`)
+
+    if (f.canales && String(cfg(c, 'canalesAtencion')).trim())
+        parts.push(`${em.chat} *Atención:* ${cfg(c, 'canalesAtencion')}`)
+
+    // NUEVOS bloques:
+    if (f.fact && String(cfg(c, 'facturaElectronicaInfo')).trim())
+        parts.push(`${em.doc} *Factura electrónica:* ${cfg(c, 'facturaElectronicaInfo')}`)
+
+    if (f.postv && String(cfg(c, 'soporteDevolucionesInfo')).trim())
+        parts.push(`${em.lifebuoy} *Post-venta:* ${cfg(c, 'soporteDevolucionesInfo')}`)
 
     if (!parts.length) return null
     return short(parts.join('\n'))
@@ -221,22 +259,34 @@ function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: stri
   ${p?.precioDesde != null ? `Precio desde: ${p.precioDesde}` : ''}`).join('\n\n')}\n`
             : ''
 
+    const envioCostoFijo = Number(cfg(c, 'envioCostoFijo') || 0) || 0
+    const envioGratisDesde = Number(cfg(c, 'envioGratisDesde') || 0) || 0
+
     const info = `
 [NEGOCIO]
 - Nombre: ${marca}
 - Descripción: ${cfg(c, 'descripcion')}
 - Tipo: ${cfg(c, 'businessType')}
+- Servicios/Portafolio:
+${cfg(c, 'servicios') || '- (no especificado)'}
 - Horarios: ${cfg(c, 'horarios')}
 
 [OPERACIÓN]
 - Envíos: ${cfg(c, 'enviosInfo')}
-- Métodos de pago: ${cfg(c, 'metodosPago')}
+- Envío (costos):
+  - Costo fijo: ${envioCostoFijo ? formatMoney(envioCostoFijo) : '—'}
+  - Gratis desde: ${envioGratisDesde ? formatMoney(envioGratisDesde) : '—'}
+- Métodos de pago (texto libre): ${cfg(c, 'metodosPago')}
 - Tienda física: ${cfg(c, 'tiendaFisica') ? 'Sí' : 'No'}${cfg(c, 'tiendaFisica') && cfg(c, 'direccionTienda') ? ` (Dirección: ${cfg(c, 'direccionTienda')})` : ''}
 - Devoluciones: ${cfg(c, 'politicasDevolucion')}
 - Garantía: ${cfg(c, 'politicasGarantia')}
 - Promociones: ${cfg(c, 'promocionesInfo')}
 - Canales de atención: ${cfg(c, 'canalesAtencion')}
 - Extras: ${cfg(c, 'extras')}
+
+[POST-VENTA]
+- Factura electrónica: ${cfg(c, 'facturaElectronicaInfo')}
+- Soporte devoluciones: ${cfg(c, 'soporteDevolucionesInfo')}
 
 [FAQs]
 ${cfg(c, 'faq')}
@@ -247,14 +297,15 @@ ${cat}
     const reglas = `
 [REGLAS]
 1) Habla como asesor humano: cercano, natural y útil. Puedes saludar breve y usar frases amistosas.
-2) Prioriza datos de [NEGOCIO]/[OPERACIÓN]/[CATÁLOGO]/[FAQs]. Si falta un dato, dilo sin inventar.
+2) Prioriza datos de [NEGOCIO]/[OPERACIÓN]/[POST-VENTA]/[CATÁLOGO]/[FAQs]. Si falta un dato, dilo sin inventar.
 3) Máx 2–4 líneas por respuesta; usa viñetas si suma.
 4) No menciones que eres IA.
-5) Si preguntan algo fuera del negocio, reconduce con elegancia hacia la compra/soporte. Si de verdad no hay info, di: "No sabría decirte con certeza; debo consultarlo." y ofrece escalar. Solo usa:
+5) Si preguntan algo fuera del negocio, reconduce con elegancia. Si de verdad no hay info, di: "No sabría decirte con certeza; debo consultarlo." y ofrece escalar. Solo usa:
    "${msgEsc}"
    como último recurso.
-${cfg(c, 'disclaimers') ? `6) Disclaimers:\n${cfg(c, 'disclaimers')}` : ''}
-${cfg(c, 'palabrasClaveNegocio') ? `7) Palabras clave: ${cfg(c, 'palabrasClaveNegocio')}` : ''}
+6) No inventes links ni datos de pago. Si debes hablar de pagos, explica opciones en general y ofrece compartir el link o datos *si el cliente lo pide*.
+${cfg(c, 'disclaimers') ? `7) Disclaimers:\n${cfg(c, 'disclaimers')}` : ''}
+${cfg(c, 'palabrasClaveNegocio') ? `8) Palabras clave: ${cfg(c, 'palabrasClaveNegocio')}` : ''}
   `.trim()
 
     return `Eres un asesor de "${marca}" con estilo cálido, sencillo y comercial.
