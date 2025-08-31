@@ -127,7 +127,71 @@ const CITY_LIST = [
     'soacha', 'santa marta', 'villavicencio', 'armenia', 'neiva', 'pasto'
 ].map(nrm)
 
-/* ===== Prompt con reglas anti-alucinación de productos ===== */
+/** ================== LÉXICO DINÁMICO POR EMPRESA ================== **/
+type BusinessLexicon = {
+    genericTerms: Set<string>
+    aliasMap: Map<string, string[]>
+    genericRegex: RegExp | null
+}
+const LEX_CACHE = new Map<number, BusinessLexicon>()
+
+const STOP = new Set([
+    'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al', 'a', 'en', 'con', 'para', 'por',
+    'quiero', 'saber', 'acerca', 'sobre', 'producto', 'productos', 'me', 'interesa', 'informacion', 'info',
+    'mas', 'precio', 'precios', 'tengo', 'hay', 'que', 'cual', 'cuál', 'ver', 'este', 'esa', 'ese', 'eso', 'si', 'sí'
+])
+
+function escapeReg(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+
+function tokenizeForBiz(s: string): string[] {
+    return String(s || '')
+        .toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w && w.length >= 3 && !STOP.has(w))
+}
+
+// Lee posibles campos categoria/tags/alias si existen; si no, usa nombre/descripcion
+async function loadBusinessLexicon(empresaId: number): Promise<BusinessLexicon> {
+    if (LEX_CACHE.has(empresaId)) return LEX_CACHE.get(empresaId)!
+    const productos = await prisma.product.findMany({
+        where: { empresaId, disponible: true },
+        // @ts-ignore (si no tienes estos campos no pasa nada, se degradan a string vacío)
+        select: { id: true, nombre: true, descripcion: true, slug: true, categoria: true, tags: true, alias: true }
+    })
+
+    const generic = new Set<string>()
+    const aliasMap = new Map<string, string[]>()
+
+    for (const p of productos) {
+        const cat = Array.isArray((p as any).categoria) ? (p as any).categoria : String((p as any).categoria || '').split(/[;,/|]/)
+        const tags = Array.isArray((p as any).tags) ? (p as any).tags : String((p as any).tags || '').split(/[;,/|]/)
+        const alias = Array.isArray((p as any).alias) ? (p as any).alias : String((p as any).alias || '').split(/[;,/|]/)
+
+        tokenizeForBiz(cat.join(' ')).forEach(w => generic.add(w))
+        tokenizeForBiz(tags.join(' ')).forEach(w => generic.add(w))
+        tokenizeForBiz(p.nombre).forEach(w => generic.add(w))
+
+        const a = alias.map((s: string) => s.trim()).filter(Boolean)
+        if (a.length) aliasMap.set(String(p.id), a)
+    }
+
+    const genericRegex = generic.size
+        ? new RegExp(`\\b(?:${Array.from(generic).map(escapeReg).join('|')})\\b`, 'i')
+        : null
+
+    const lex: BusinessLexicon = { genericTerms: generic, aliasMap, genericRegex }
+    LEX_CACHE.set(empresaId, lex)
+    return lex
+}
+
+function isGenericQueryForBiz(text: string, lex: BusinessLexicon): boolean {
+    if (!text || !lex.genericRegex) return false
+    return lex.genericRegex.test(text)
+}
+
+/* ===== Prompt anti-alucinación ===== */
 function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: string) {
     const marca = (cfg(c, 'nombre') || empresaNombre || 'la marca')
 
@@ -233,158 +297,52 @@ async function downloadWamMediaToBufferSafe(url: string): Promise<Buffer | null>
     return Buffer.isBuffer(out) ? out : out ? Buffer.from(out as any) : null
 }
 
-/* ======================== Producto helpers (FUZZY + MEMORIA) ======================== */
+/* ======================== Matcher de productos (agnóstico) ======================== */
+function tokensLite(s: string) { return tokenizeForBiz(s) }
+function jaccard(a: string[], b: string[]): number { const A = new Set(a), B = new Set(b); let i = 0; for (const x of A) if (B.has(x)) i++; return A.size || B.size ? i / (A.size + B.size - i) : 0 }
+function ngrams(s: string, n = 3) { const t = nrm(s).replace(/\s+/g, ''); if (t.length <= n) return [t]; const out: string[] = []; for (let i = 0; i <= t.length - n; i++) out.push(t.slice(i, i + n)); return out }
+function jaroW(a: string, b: string) { const s1 = nrm(a), s2 = nrm(b); if (s1 === s2) return 1; const mDist = Math.floor(Math.max(s1.length, s2.length) / 2) - 1; let m = 0, t = 0; const s1M = new Array(s1.length).fill(false), s2M = new Array(s2.length).fill(false); for (let i = 0; i < s1.length; i++) { const st = Math.max(0, i - mDist), en = Math.min(i + mDist + 1, s2.length); for (let j = st; j < en; j++) { if (s2M[j] || s1[i] !== s2[j]) continue; s1M[i] = s2M[j] = true; m++; break; } } if (!m) return 0; let k = 0; for (let i = 0; i < s1.length; i++) { if (!s1M[i]) continue; while (!s2M[k]) k++; if (s1[i] !== s2[k]) t++; k++; } const mt = t / 2; const j = (m / s1.length + m / s2.length + (m - mt) / m) / 3; let l = 0; while (l < 4 && l < s1.length && l < s2.length && s1[l] === s2[l]) l++; return j + l * 0.1 * (1 - j) }
 
-// stopwords comunes
-const STOP = new Set([
-    'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al', 'a', 'en', 'con', 'para', 'por',
-    'quiero', 'saber', 'sobre', 'producto', 'productos', 'gel', 'serum', 'suero', 'me', 'interesa',
-    'informacion', 'info', 'mas', 'precio', 'precios', 'tengo', 'hay', 'que', 'cual', 'cuál', 'ver'
-].map(nrm))
-
-function tokenize(s: string): string[] {
-    const t = nrm(s)
-    return t.split(' ').filter(w => w && w.length >= 2 && !STOP.has(w))
-}
-
-function jaccard(a: string[], b: string[]): number {
-    if (!a.length || !b.length) return 0
-    const A = new Set(a), B = new Set(b)
-    let inter = 0
-    for (const x of A) if (B.has(x)) inter++
-    return inter / (A.size + B.size - inter)
-}
-
-function charNgrams(s: string, n = 3): string[] {
-    const t = nrm(s).replace(/\s+/g, '')
-    if (t.length < n) return [t]
-    const out: string[] = []
-    for (let i = 0; i <= t.length - n; i++) out.push(t.slice(i, i + n))
-    return out
-}
-
-function jaroWinkler(a: string, b: string): number {
-    const s1 = nrm(a), s2 = nrm(b)
-    if (s1 === s2) return 1
-    const mDist = Math.floor(Math.max(s1.length, s2.length) / 2) - 1
-    let m = 0, t = 0
-    const s1Matches = new Array(s1.length).fill(false)
-    const s2Matches = new Array(s2.length).fill(false)
-
-    for (let i = 0; i < s1.length; i++) {
-        const start = Math.max(0, i - mDist), end = Math.min(i + mDist + 1, s2.length)
-        for (let j = start; j < end; j++) {
-            if (s2Matches[j]) continue
-            if (s1[i] !== s2[j]) continue
-            s1Matches[i] = true; s2Matches[j] = true; m++; break
-        }
-    }
-    if (m === 0) return 0
-
-    let k = 0
-    for (let i = 0; i < s1.length; i++) {
-        if (!s1Matches[i]) continue
-        while (!s2Matches[k]) k++
-        if (s1[i] !== s2[k]) t++
-        k++
-    }
-    const mt = t / 2
-    const jaro = (m / s1.length + m / s2.length + (m - mt) / m) / 3
-    let l = 0; const maxL = 4
-    while (l < Math.min(maxL, s1.length, s2.length) && s1[l] === s2[l]) l++
-    return jaro + l * 0.1 * (1 - jaro)
-}
-
-/** Frases/alias típicas → “pistas” que suben el score si aparecen */
-const PHRASES: Array<[RegExp, string[]]> = [
-    [/acido hialuronico|ácido hialurónico|hialuronico|hialurónico/i, ['acido', 'hialuronico']],
-    [/vitamina c|serum c/i, ['vitamina', 'c']],
-    [/hidratante/i, ['hidrata', 'hidratante']],
-]
-
-function scoreMatch(productName: string, query: string): number {
-    const pTokens = tokenize(productName)
-    const qTokens = tokenize(query)
-
-    // 1) tokens Jaccard
+function scoreMatchBiz(product: { nombre: string, slug?: string | null, descripcion?: string | null, alias?: string[] }, query: string) {
+    const pTokens = tokensLite(product.nombre)
+    const qTokens = tokensLite(query)
     const s1 = jaccard(pTokens, qTokens)
 
-    // 2) n-gram overlap
-    const pN = new Set(charNgrams(productName, 3))
-    const qN = new Set(charNgrams(query, 3))
-    let inter = 0
-    for (const g of pN) if (qN.has(g)) inter++
-    const s2 = pN.size ? inter / pN.size : 0
+    const pN = new Set(ngrams(product.nombre, 3)), qN = new Set(ngrams(query, 3))
+    let i = 0; for (const g of pN) if (qN.has(g)) i++
+    const s2 = pN.size ? i / pN.size : 0
 
-    // 3) jaro-winkler
-    const s3 = jaroWinkler(productName, query)
+    const s3 = jaroW(product.nombre, query)
 
-    // 4) bonus por frases clave
+    // bonus por alias
     let bonus = 0
-    for (const [re, tokens] of PHRASES) {
-        if (re.test(query)) {
-            const hit = tokens.filter(t => pTokens.includes(t)).length
-            if (hit) bonus += 0.05 * hit
-        }
+    for (const a of (product.alias || [])) {
+        bonus = Math.max(bonus, jaroW(a, query) * 0.15)
     }
-
-    // combinación ponderada
-    const score = 0.45 * s1 + 0.25 * s2 + 0.30 * s3 + bonus
-    return Math.min(1, score)
+    return Math.min(1, 0.45 * s1 + 0.25 * s2 + 0.30 * s3 + bonus)
 }
 
-async function findRequestedProduct(empresaId: number, text: string) {
-    const q = (text || '').trim()
-    if (!q) return null
+async function findRequestedProduct(empresaId: number, text: string, lex?: BusinessLexicon) {
+    const q = (text || '').trim(); if (!q) return null
 
-    const candidates = await prisma.product.findMany({
+    const prods = await prisma.product.findMany({
         where: { empresaId, disponible: true },
-        take: 50,
-        orderBy: { id: 'asc' },
-        select: { id: true, nombre: true, slug: true, precioDesde: true, descripcion: true }
+        select: { id: true, nombre: true, slug: true, descripcion: true }
     })
 
     let best: any = null, bestScore = 0
-    for (const p of candidates) {
-        const s = Math.max(
-            scoreMatch(p.nombre || '', q),
-            scoreMatch(p.slug || '', q),
-            scoreMatch(p.descripcion || '', q)
+    for (const p of prods) {
+        const alias = (lex?.aliasMap.get(String(p.id)) || [])
+        const score = Math.max(
+            scoreMatchBiz({ ...p, alias }, q),
+            scoreMatchBiz({ nombre: p.slug || '', alias }, q),
+            scoreMatchBiz({ nombre: p.descripcion || '', alias }, q),
         )
-        if (s > bestScore) { best = p; bestScore = s }
+        if (score > bestScore) { best = p; bestScore = score }
     }
-
     if (bestScore >= 0.85) return best
-    if (bestScore >= 0.72) return best
+    if (bestScore >= 0.72) return best   // umbral tolerante
     return null
-}
-
-/** === Memoria contextual basada en historial === */
-async function getLastMentionedProduct(conversationId: number, empresaId: number) {
-    // buscamos hacia atrás el último mensaje (cliente o bot) que haga match con un producto
-    const hist = await prisma.message.findMany({
-        where: { conversationId },
-        orderBy: { timestamp: 'desc' },
-        take: 40,
-        select: { contenido: true, caption: true }
-    })
-    for (const m of hist) {
-        const text = `${m.contenido || ''} ${m.caption || ''}`.trim()
-        if (!text) continue
-        const p = await findRequestedProduct(empresaId, text)
-        if (p) return p
-    }
-    return null
-}
-
-/** === Detección de “sí/ok/ese” para usar memoria === */
-function isAffirmative(t: string) {
-    const s = nrm(t)
-    return /^(si|sí|dale|ok|bueno|vale|claro|perfecto|listo|me interesa|quiero|de una|hágale|esa|ese|eso)\b/.test(s)
-}
-function mentionsThatOne(t: string) {
-    const s = nrm(t)
-    return /\b(ese|esa|eso|el mismo|el primero|el ultimo|el último)\b/.test(s)
 }
 
 function listProductsMessage(list: Array<{ nombre: string; precioDesde: any | null }>) {
@@ -423,7 +381,6 @@ export const handleIAReply = async (
         where: { id: conversacion.empresaId },
         select: { nombre: true }
     })
-
     const mensajeEscalamiento = 'Gracias por tu mensaje. En breve un compañero del equipo te contactará para ayudarte con más detalle.'
 
     if (!config) {
@@ -437,6 +394,9 @@ export const handleIAReply = async (
         })
         return { estado: ConversationEstado.requiere_agente, mensaje: mensajeEscalamiento, motivo: 'confianza_baja', messageId: escalado.messageId, wamid: escalado.wamid }
     }
+
+    // 1.b) Cargar léxico dinámico del negocio
+    const lexicon = await loadBusinessLexicon(conversacion.empresaId)
 
     // 2) Último mensaje del cliente (voz → transcripción; imagen → visión/pagos)
     const ultimoCliente = await prisma.message.findFirst({
@@ -548,13 +508,6 @@ export const handleIAReply = async (
         .slice(-10)
         .map(m => ({ role: m.from === 'client' ? 'user' : 'assistant', content: m.contenido } as const))
 
-    /** === memoria contextual: si el usuario dice "sí/ese/ok", usamos el último producto mencionado === */
-    const lastProd = await getLastMentionedProduct(chatId, conversacion.empresaId)
-    if ((isAffirmative(mensaje) || mentionsThatOne(mensaje)) && lastProd) {
-        // reescribimos el mensaje para dar contexto al LLM y a los matchers
-        mensaje = `${mensaje}. Continúa sobre ${lastProd.nombre}.`
-    }
-
     // 3.1) Traer productos relevantes
     let productos: any[] = []
     try {
@@ -583,7 +536,7 @@ export const handleIAReply = async (
     }
 
     // 4) Respuestas no-IA para catálogo y fotos validadas
-    if (asksCatalogue(mensaje)) {
+    if (asksCatalogue(mensaje) || isGenericQueryForBiz(mensaje, lexicon)) {
         const list = await prisma.product.findMany({
             where: { empresaId: conversacion.empresaId, disponible: true },
             take: 6, orderBy: { id: 'asc' },
@@ -599,9 +552,9 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // Si pide fotos → usar último producto si no menciona ninguno explícito
+    // Si pide fotos → solo enviar si hay match claro con un producto pedido
     if (wantsImages(mensaje) && opts?.autoSend && (opts?.toPhone || conversacion.phone)) {
-        const requested = await findRequestedProduct(conversacion.empresaId, mensaje || caption) || lastProd
+        const requested = await findRequestedProduct(conversacion.empresaId, mensaje || caption, lexicon)
         if (requested) {
             const mediaSent = await sendProductImages({
                 chatId,
