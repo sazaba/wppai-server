@@ -160,6 +160,9 @@ async function tryOpenRouterModels(
     base64: string,
     outFormat: 'wav' | 'mp3' | 'm4a' | 'ogg' | 'webm'
 ): Promise<string> {
+    // valor configurable desde .env, con default de 120 tokens
+    const MAX_TOKENS = Number(process.env.STT_MAX_TOKENS || 120);
+
     for (const model of CANDIDATE_MODELS) {
         try {
             const payload = {
@@ -168,12 +171,21 @@ async function tryOpenRouterModels(
                     {
                         role: 'user',
                         content: [
-                            { type: 'text', text: 'Transcribe exactamente este audio (mismo idioma). Solo el texto.' },
-                            { type: 'input_audio', input_audio: { data: base64, format: outFormat } },
+                            {
+                                type: 'text',
+                                text: 'Transcribe exactamente este audio (mismo idioma). Devuelve SOLO el texto, sin comillas.',
+                            },
+                            {
+                                type: 'input_audio',
+                                input_audio: { data: base64, format: outFormat },
+                            },
                         ],
                     },
                 ],
-            }
+                temperature: 0,
+                max_tokens: MAX_TOKENS,
+                max_output_tokens: MAX_TOKENS,
+            };
 
             const { data } = await axios.post(OPENROUTER_URL, payload, {
                 headers: {
@@ -183,26 +195,25 @@ async function tryOpenRouterModels(
                     'Content-Type': 'application/json',
                 },
                 timeout: Number(process.env.STT_HTTP_TIMEOUT_MS || 45000),
-                // validateStatus: () => true, // si quieres manejar códigos no-2xx manualmente
-            })
+            });
 
-            const raw = data?.choices?.[0]?.message?.content
-            let transcript = ''
-            if (typeof raw === 'string') transcript = raw
-            else if (Array.isArray(raw)) transcript = raw.map((c: any) => c?.text || '').join(' ')
-            transcript = (transcript || '').trim()
+            const raw = data?.choices?.[0]?.message?.content;
+            let transcript = '';
+            if (typeof raw === 'string') transcript = raw;
+            else if (Array.isArray(raw)) transcript = raw.map((c: any) => c?.text || '').join(' ');
+            transcript = (transcript || '').trim();
 
             if (transcript) {
-                console.log(`[STT] OK con modelo: ${model}`)
-                return transcript
+                console.log(`[STT] OK con modelo: ${model}`);
+                return transcript;
             }
         } catch (err: any) {
-            const code = err?.response?.status
-            const msg = err?.response?.data?.error?.message || err?.message
-            console.warn(`[STT] fallo con ${model}:`, code, msg)
-            // Probar siguiente en 401/403/404/422/429/timeouts, etc.
-            continue
+            const code = err?.response?.status;
+            const msg = err?.response?.data?.error?.message || err?.message;
+            console.warn(`[STT] fallo con ${model}:`, code, msg);
+            continue;
         }
     }
-    return ''
+    return '';
 }
+
