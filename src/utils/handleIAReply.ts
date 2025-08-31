@@ -127,7 +127,8 @@ const CITY_LIST = [
     'soacha', 'santa marta', 'villavicencio', 'armenia', 'neiva', 'pasto'
 ].map(nrm)
 
-/** ================== LÉXICO DINÁMICO POR EMPRESA ================== **/
+
+/** ================== LÉXICO DINÁMICO POR EMPRESA (seguro con tu esquema) ================== **/
 type BusinessLexicon = {
     genericTerms: Set<string>
     aliasMap: Map<string, string[]>
@@ -135,14 +136,12 @@ type BusinessLexicon = {
 }
 const LEX_CACHE = new Map<number, BusinessLexicon>()
 
+function escapeReg(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
 const STOP = new Set([
     'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al', 'a', 'en', 'con', 'para', 'por',
     'quiero', 'saber', 'acerca', 'sobre', 'producto', 'productos', 'me', 'interesa', 'informacion', 'info',
     'mas', 'precio', 'precios', 'tengo', 'hay', 'que', 'cual', 'cuál', 'ver', 'este', 'esa', 'ese', 'eso', 'si', 'sí'
 ])
-
-function escapeReg(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
-
 function tokenizeForBiz(s: string): string[] {
     return String(s || '')
         .toLowerCase()
@@ -152,29 +151,23 @@ function tokenizeForBiz(s: string): string[] {
         .filter(w => w && w.length >= 3 && !STOP.has(w))
 }
 
-// Lee posibles campos categoria/tags/alias si existen; si no, usa nombre/descripcion
+/** Lee lo que exista en tu schema: id, nombre, descripcion, slug (sin categoria/tags/alias). */
 async function loadBusinessLexicon(empresaId: number): Promise<BusinessLexicon> {
     if (LEX_CACHE.has(empresaId)) return LEX_CACHE.get(empresaId)!
+
+    // Consulta segura para tu modelo actual
     const productos = await prisma.product.findMany({
         where: { empresaId, disponible: true },
-        // @ts-ignore (si no tienes estos campos no pasa nada, se degradan a string vacío)
-        select: { id: true, nombre: true, descripcion: true, slug: true, categoria: true, tags: true, alias: true }
+        select: { id: true, nombre: true, descripcion: true, slug: true }
     })
 
+    // Construimos un léxico básico a partir de nombre y descripción
     const generic = new Set<string>()
-    const aliasMap = new Map<string, string[]>()
+    const aliasMap = new Map<string, string[]>() // vacío por ahora (no hay columna alias)
 
     for (const p of productos) {
-        const cat = Array.isArray((p as any).categoria) ? (p as any).categoria : String((p as any).categoria || '').split(/[;,/|]/)
-        const tags = Array.isArray((p as any).tags) ? (p as any).tags : String((p as any).tags || '').split(/[;,/|]/)
-        const alias = Array.isArray((p as any).alias) ? (p as any).alias : String((p as any).alias || '').split(/[;,/|]/)
-
-        tokenizeForBiz(cat.join(' ')).forEach(w => generic.add(w))
-        tokenizeForBiz(tags.join(' ')).forEach(w => generic.add(w))
         tokenizeForBiz(p.nombre).forEach(w => generic.add(w))
-
-        const a = alias.map((s: string) => s.trim()).filter(Boolean)
-        if (a.length) aliasMap.set(String(p.id), a)
+        tokenizeForBiz(p.descripcion || '').forEach(w => generic.add(w))
     }
 
     const genericRegex = generic.size
@@ -300,29 +293,20 @@ async function downloadWamMediaToBufferSafe(url: string): Promise<Buffer | null>
 /* ======================== Matcher de productos (agnóstico) ======================== */
 function tokensLite(s: string) { return tokenizeForBiz(s) }
 function jaccard(a: string[], b: string[]): number { const A = new Set(a), B = new Set(b); let i = 0; for (const x of A) if (B.has(x)) i++; return A.size || B.size ? i / (A.size + B.size - i) : 0 }
-function ngrams(s: string, n = 3) { const t = nrm(s).replace(/\s+/g, ''); if (t.length <= n) return [t]; const out: string[] = []; for (let i = 0; i <= t.length - n; i++) out.push(t.slice(i, i + n)); return out }
-function jaroW(a: string, b: string) { const s1 = nrm(a), s2 = nrm(b); if (s1 === s2) return 1; const mDist = Math.floor(Math.max(s1.length, s2.length) / 2) - 1; let m = 0, t = 0; const s1M = new Array(s1.length).fill(false), s2M = new Array(s2.length).fill(false); for (let i = 0; i < s1.length; i++) { const st = Math.max(0, i - mDist), en = Math.min(i + mDist + 1, s2.length); for (let j = st; j < en; j++) { if (s2M[j] || s1[i] !== s2[j]) continue; s1M[i] = s2M[j] = true; m++; break; } } if (!m) return 0; let k = 0; for (let i = 0; i < s1.length; i++) { if (!s1M[i]) continue; while (!s2M[k]) k++; if (s1[i] !== s2[k]) t++; k++; } const mt = t / 2; const j = (m / s1.length + m / s2.length + (m - mt) / m) / 3; let l = 0; while (l < 4 && l < s1.length && l < s2.length && s1[l] === s2[l]) l++; return j + l * 0.1 * (1 - j) }
+function ngrams(s: string, n = 3) { const t = (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ''); if (t.length <= n) return [t]; const out: string[] = []; for (let i = 0; i <= t.length - n; i++) out.push(t.slice(i, i + n)); return out }
+function jaroW(a: string, b: string) { const s1 = (a || '').toLowerCase(), s2 = (b || '').toLowerCase(); if (s1 === s2) return 1; const mDist = Math.floor(Math.max(s1.length, s2.length) / 2) - 1; let m = 0, t = 0; const s1M = new Array(s1.length).fill(false), s2M = new Array(s2.length).fill(false); for (let i = 0; i < s1.length; i++) { const st = Math.max(0, i - mDist), en = Math.min(i + mDist + 1, s2.length); for (let j = st; j < en; j++) { if (s2M[j] || s1[i] !== s2[j]) continue; s1M[i] = s2M[j] = true; m++; break; } } if (!m) return 0; let k = 0; for (let i = 0; i < s1.length; i++) { if (!s1M[i]) continue; while (!s2M[k]) k++; if (s1[i] !== s2[k]) t++; k++; } const mt = t / 2; const j = (m / s1.length + m / s2.length + (m - mt) / m) / 3; let l = 0; while (l < 4 && l < s1.length && l < s2.length && s1[l] === s2[l]) l++; return j + l * 0.1 * (1 - j) }
 
-function scoreMatchBiz(product: { nombre: string, slug?: string | null, descripcion?: string | null, alias?: string[] }, query: string) {
-    const pTokens = tokensLite(product.nombre)
-    const qTokens = tokensLite(query)
-    const s1 = jaccard(pTokens, qTokens)
-
-    const pN = new Set(ngrams(product.nombre, 3)), qN = new Set(ngrams(query, 3))
+function scoreMatchBiz(p: { nombre: string, slug?: string | null, descripcion?: string | null }, q: string) {
+    const s1 = jaccard(tokensLite(p.nombre), tokensLite(q))
+    const pN = new Set(ngrams(p.nombre, 3)), qN = new Set(ngrams(q, 3))
     let i = 0; for (const g of pN) if (qN.has(g)) i++
     const s2 = pN.size ? i / pN.size : 0
-
-    const s3 = jaroW(product.nombre, query)
-
-    // bonus por alias
-    let bonus = 0
-    for (const a of (product.alias || [])) {
-        bonus = Math.max(bonus, jaroW(a, query) * 0.15)
-    }
-    return Math.min(1, 0.45 * s1 + 0.25 * s2 + 0.30 * s3 + bonus)
+    const s3 = jaroW(p.nombre, q)
+    const sSlug = p.slug ? jaroW(p.slug, q) * 0.2 : 0
+    const sDesc = p.descripcion ? jaroW(p.descripcion, q) * 0.1 : 0
+    return Math.min(1, 0.45 * s1 + 0.25 * s2 + 0.30 * s3 + sSlug + sDesc)
 }
-
-async function findRequestedProduct(empresaId: number, text: string, lex?: BusinessLexicon) {
+async function findRequestedProduct(empresaId: number, text: string, _lex?: any) {
     const q = (text || '').trim(); if (!q) return null
 
     const prods = await prisma.product.findMany({
@@ -332,11 +316,10 @@ async function findRequestedProduct(empresaId: number, text: string, lex?: Busin
 
     let best: any = null, bestScore = 0
     for (const p of prods) {
-        const alias = (lex?.aliasMap.get(String(p.id)) || [])
         const score = Math.max(
-            scoreMatchBiz({ ...p, alias }, q),
-            scoreMatchBiz({ nombre: p.slug || '', alias }, q),
-            scoreMatchBiz({ nombre: p.descripcion || '', alias }, q),
+            scoreMatchBiz(p, q),
+            p.slug ? scoreMatchBiz({ nombre: p.slug }, q) : 0,
+            p.descripcion ? scoreMatchBiz({ nombre: p.descripcion }, q) : 0
         )
         if (score > bestScore) { best = p; bestScore = score }
     }
