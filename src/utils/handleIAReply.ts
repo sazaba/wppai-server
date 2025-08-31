@@ -233,32 +233,132 @@ async function downloadWamMediaToBufferSafe(url: string): Promise<Buffer | null>
     return Buffer.isBuffer(out) ? out : out ? Buffer.from(out as any) : null
 }
 
-/* ======================== Producto helpers ======================== */
+/* ======================== Producto helpers (FUZZY mejorado) ======================== */
+
+// stopwords comunes en consultas
+const STOP = new Set([
+    'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al', 'a', 'en', 'con', 'para', 'por',
+    'quiero', 'saber', 'sobre', 'producto', 'productos', 'gel', 'serum', 'suero', 'me', 'interesa',
+    'informacion', 'info', 'mas', 'precio', 'precios', 'tengo', 'hay', 'que', 'cual', 'cuál', 'ver'
+].map(nrm))
+
+function tokenize(s: string): string[] {
+    const t = nrm(s)
+    return t.split(' ').filter(w => w && w.length >= 2 && !STOP.has(w))
+}
+
+function jaccard(a: string[], b: string[]): number {
+    if (!a.length || !b.length) return 0
+    const A = new Set(a), B = new Set(b)
+    let inter = 0
+    for (const x of A) if (B.has(x)) inter++
+    return inter / (A.size + B.size - inter)
+}
+
+function charNgrams(s: string, n = 3): string[] {
+    const t = nrm(s).replace(/\s+/g, '')
+    if (t.length < n) return [t]
+    const out: string[] = []
+    for (let i = 0; i <= t.length - n; i++) out.push(t.slice(i, i + n))
+    return out
+}
+
+function jaroWinkler(a: string, b: string): number {
+    const s1 = nrm(a), s2 = nrm(b)
+    if (s1 === s2) return 1
+    const mDist = Math.floor(Math.max(s1.length, s2.length) / 2) - 1
+    let m = 0, t = 0
+    const s1Matches = new Array(s1.length).fill(false)
+    const s2Matches = new Array(s2.length).fill(false)
+
+    for (let i = 0; i < s1.length; i++) {
+        const start = Math.max(0, i - mDist), end = Math.min(i + mDist + 1, s2.length)
+        for (let j = start; j < end; j++) {
+            if (s2Matches[j]) continue
+            if (s1[i] !== s2[j]) continue
+            s1Matches[i] = true; s2Matches[j] = true; m++; break
+        }
+    }
+    if (m === 0) return 0
+
+    let k = 0
+    for (let i = 0; i < s1.length; i++) {
+        if (!s1Matches[i]) continue
+        while (!s2Matches[k]) k++
+        if (s1[i] !== s2[k]) t++
+        k++
+    }
+    const mt = t / 2
+    const jaro = (m / s1.length + m / s2.length + (m - mt) / m) / 3
+    let l = 0; const maxL = 4
+    while (l < Math.min(maxL, s1.length, s2.length) && s1[l] === s2[l]) l++
+    return jaro + l * 0.1 * (1 - jaro)
+}
+
+/** Frases/alias típicas → “pistas” que suben el score si aparecen */
+const PHRASES: Array<[RegExp, string[]]> = [
+    [/acido hialuronico|ácido hialurónico|hialuronico|hialurónico/i, ['acido', 'hialuronico']],
+    [/vitamina c|serum c/i, ['vitamina', 'c']],
+    [/hidratante/i, ['hidrata', 'hidratante']],
+]
+
 function scoreMatch(productName: string, query: string): number {
-    const p = nrm(productName)
-    const q = nrm(query)
-    if (!q) return 0
-    if (p === q) return 1
-    if (p.includes(q)) return 0.9
-    const words = q.split(' ').filter(w => w.length >= 3)
-    const hit = words.filter(w => p.includes(w)).length
-    return hit ? Math.min(0.85, hit / Math.max(2, words.length)) : 0
+    const pTokens = tokenize(productName)
+    const qTokens = tokenize(query)
+
+    // 1) tokens Jaccard
+    const s1 = jaccard(pTokens, qTokens)
+
+    // 2) n-gram overlap
+    const pN = new Set(charNgrams(productName, 3))
+    const qN = new Set(charNgrams(query, 3))
+    let inter = 0
+    for (const g of pN) if (qN.has(g)) inter++
+    const s2 = pN.size ? inter / pN.size : 0
+
+    // 3) jaro-winkler
+    const s3 = jaroWinkler(productName, query)
+
+    // 4) bonus por frases clave
+    let bonus = 0
+    for (const [re, tokens] of PHRASES) {
+        if (re.test(query)) {
+            const hit = tokens.filter(t => pTokens.includes(t)).length
+            if (hit) bonus += 0.05 * hit
+        }
+    }
+
+    // combinación ponderada
+    const score = 0.45 * s1 + 0.25 * s2 + 0.30 * s3 + bonus
+    return Math.min(1, score)
 }
 
 async function findRequestedProduct(empresaId: number, text: string) {
-    const q = nrm(text)
+    const q = (text || '').trim()
     if (!q) return null
+
+    // Traemos más candidatos; el filtro fino lo hacemos aquí
     const candidates = await prisma.product.findMany({
         where: { empresaId, disponible: true },
-        take: 20, orderBy: { id: 'asc' },
-        select: { id: true, nombre: true, slug: true, precioDesde: true }
+        take: 50,
+        orderBy: { id: 'asc' },
+        select: { id: true, nombre: true, slug: true, precioDesde: true, descripcion: true }
     })
+
     let best: any = null, bestScore = 0
     for (const p of candidates) {
-        const s = Math.max(scoreMatch(p.nombre, q), scoreMatch(p.slug || '', q))
+        const s = Math.max(
+            scoreMatch(p.nombre || '', q),
+            scoreMatch(p.slug || '', q),
+            scoreMatch(p.descripcion || '', q)
+        )
         if (s > bestScore) { best = p; bestScore = s }
     }
-    return bestScore >= 0.85 ? best : null
+
+    // Umbral alto; si no, aceptamos uno razonable
+    if (bestScore >= 0.85) return best
+    if (bestScore >= 0.72) return best
+    return null
 }
 
 function listProductsMessage(list: Array<{ nombre: string; precioDesde: any | null }>) {
