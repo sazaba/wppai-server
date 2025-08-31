@@ -233,9 +233,9 @@ async function downloadWamMediaToBufferSafe(url: string): Promise<Buffer | null>
     return Buffer.isBuffer(out) ? out : out ? Buffer.from(out as any) : null
 }
 
-/* ======================== Producto helpers (FUZZY mejorado) ======================== */
+/* ======================== Producto helpers (FUZZY + MEMORIA) ======================== */
 
-// stopwords comunes en consultas
+// stopwords comunes
 const STOP = new Set([
     'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al', 'a', 'en', 'con', 'para', 'por',
     'quiero', 'saber', 'sobre', 'producto', 'productos', 'gel', 'serum', 'suero', 'me', 'interesa',
@@ -337,7 +337,6 @@ async function findRequestedProduct(empresaId: number, text: string) {
     const q = (text || '').trim()
     if (!q) return null
 
-    // Traemos más candidatos; el filtro fino lo hacemos aquí
     const candidates = await prisma.product.findMany({
         where: { empresaId, disponible: true },
         take: 50,
@@ -355,10 +354,37 @@ async function findRequestedProduct(empresaId: number, text: string) {
         if (s > bestScore) { best = p; bestScore = s }
     }
 
-    // Umbral alto; si no, aceptamos uno razonable
     if (bestScore >= 0.85) return best
     if (bestScore >= 0.72) return best
     return null
+}
+
+/** === Memoria contextual basada en historial === */
+async function getLastMentionedProduct(conversationId: number, empresaId: number) {
+    // buscamos hacia atrás el último mensaje (cliente o bot) que haga match con un producto
+    const hist = await prisma.message.findMany({
+        where: { conversationId },
+        orderBy: { timestamp: 'desc' },
+        take: 40,
+        select: { contenido: true, caption: true }
+    })
+    for (const m of hist) {
+        const text = `${m.contenido || ''} ${m.caption || ''}`.trim()
+        if (!text) continue
+        const p = await findRequestedProduct(empresaId, text)
+        if (p) return p
+    }
+    return null
+}
+
+/** === Detección de “sí/ok/ese” para usar memoria === */
+function isAffirmative(t: string) {
+    const s = nrm(t)
+    return /^(si|sí|dale|ok|bueno|vale|claro|perfecto|listo|me interesa|quiero|de una|hágale|esa|ese|eso)\b/.test(s)
+}
+function mentionsThatOne(t: string) {
+    const s = nrm(t)
+    return /\b(ese|esa|eso|el mismo|el primero|el ultimo|el último)\b/.test(s)
 }
 
 function listProductsMessage(list: Array<{ nombre: string; precioDesde: any | null }>) {
@@ -522,6 +548,13 @@ export const handleIAReply = async (
         .slice(-10)
         .map(m => ({ role: m.from === 'client' ? 'user' : 'assistant', content: m.contenido } as const))
 
+    /** === memoria contextual: si el usuario dice "sí/ese/ok", usamos el último producto mencionado === */
+    const lastProd = await getLastMentionedProduct(chatId, conversacion.empresaId)
+    if ((isAffirmative(mensaje) || mentionsThatOne(mensaje)) && lastProd) {
+        // reescribimos el mensaje para dar contexto al LLM y a los matchers
+        mensaje = `${mensaje}. Continúa sobre ${lastProd.nombre}.`
+    }
+
     // 3.1) Traer productos relevantes
     let productos: any[] = []
     try {
@@ -566,9 +599,9 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // Si pide fotos → solo enviar si hay match claro con un producto pedido
+    // Si pide fotos → usar último producto si no menciona ninguno explícito
     if (wantsImages(mensaje) && opts?.autoSend && (opts?.toPhone || conversacion.phone)) {
-        const requested = await findRequestedProduct(conversacion.empresaId, mensaje || caption)
+        const requested = await findRequestedProduct(conversacion.empresaId, mensaje || caption) || lastProd
         if (requested) {
             const mediaSent = await sendProductImages({
                 chatId,
