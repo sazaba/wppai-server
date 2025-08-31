@@ -521,53 +521,6 @@ export const handleIAReply = async (
         })
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
-
-    // 4.1 Preguntas de negocio (usa DB)
-    const f = markAny(bizFlags(mensaje || ultimoCliente?.caption || ''))
-    if (f.any) {
-        const ans = businessAnswer(config, f)
-        if (ans) {
-            const saved = await persistBotReply({
-                conversationId: chatId,
-                empresaId: conversacion.empresaId,
-                texto: ans,
-                nuevoEstado: ConversationEstado.respondido,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-                phoneNumberId: opts?.phoneNumberId,
-            })
-            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-        }
-    }
-
-    // 4.2 Precio directo
-    if (isPrice(mensaje) && productos.length) {
-        const p = productos[0]
-        const precio = p?.precioDesde != null ? formatMoney(p.precioDesde) : null
-        const texto = precio
-            ? `*${p.nombre}*: desde ${precio}. ¿Te confirmo *stock* o prefieres ver *imágenes*?`
-            : `No tengo el precio cargado de *${p.nombre}*. ¿Te comparto *beneficios* o reviso *disponibilidad*?`
-        const saved = await persistBotReply({
-            conversationId: chatId, empresaId: conversacion.empresaId, texto,
-            nuevoEstado: ConversationEstado.respondido,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-            phoneNumberId: opts?.phoneNumberId,
-        })
-        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-    }
-
-    // 4.3 Imágenes directas
-    if (wantsImages(mensaje) && productos.length && opts?.autoSend) {
-        const mediaRes = await sendProductImages({ chatId, conversacion, productosRelevantes: productos, phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
-        const texto = mediaRes.length ? 'Te compartí imágenes del catálogo. ¿Quieres *precios* o confirmar *stock*?' : 'No encontré imágenes ahora. ¿Te paso *beneficios* o *precio*?'
-        const saved = await persistBotReply({
-            conversationId: chatId, empresaId: conversacion.empresaId, texto,
-            nuevoEstado: ConversationEstado.respondido,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-            phoneNumberId: opts?.phoneNumberId,
-        })
-        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaRes }
-    }
-
     // 4.4 Flujo de compra (nuevo): intención de comprar / pago / dirección
     if (wantsToBuy(mensaje) || askPaymentLink(mensaje) || askTransfer(mensaje) || providesAddress(mensaje) || providesCity(mensaje)) {
         const draft = await ensureDraftOrder(conversacion, config)
@@ -630,6 +583,53 @@ export const handleIAReply = async (
         })
         return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
+    // 4.1 Preguntas de negocio (usa DB)
+    const f = markAny(bizFlags(mensaje || ultimoCliente?.caption || ''))
+    if (f.any) {
+        const ans = businessAnswer(config, f)
+        if (ans) {
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId: conversacion.empresaId,
+                texto: ans,
+                nuevoEstado: ConversationEstado.respondido,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+    }
+
+    // 4.2 Precio directo
+    if (isPrice(mensaje) && productos.length) {
+        const p = productos[0]
+        const precio = p?.precioDesde != null ? formatMoney(p.precioDesde) : null
+        const texto = precio
+            ? `*${p.nombre}*: desde ${precio}. ¿Te confirmo *stock* o prefieres ver *imágenes*?`
+            : `No tengo el precio cargado de *${p.nombre}*. ¿Te comparto *beneficios* o reviso *disponibilidad*?`
+        const saved = await persistBotReply({
+            conversationId: chatId, empresaId: conversacion.empresaId, texto,
+            nuevoEstado: ConversationEstado.respondido,
+            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            phoneNumberId: opts?.phoneNumberId,
+        })
+        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+    }
+
+    // 4.3 Imágenes directas
+    if (wantsImages(mensaje) && productos.length && opts?.autoSend) {
+        const mediaRes = await sendProductImages({ chatId, conversacion, productosRelevantes: productos, phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
+        const texto = mediaRes.length ? 'Te compartí imágenes del catálogo. ¿Quieres *precios* o confirmar *stock*?' : 'No encontré imágenes ahora. ¿Te paso *beneficios* o *precio*?'
+        const saved = await persistBotReply({
+            conversationId: chatId, empresaId: conversacion.empresaId, texto,
+            nuevoEstado: ConversationEstado.respondido,
+            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            phoneNumberId: opts?.phoneNumberId,
+        })
+        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaRes }
+    }
+
+
 
     // 4.5 Seguimiento de CTA (memoria)
     const lastCTA = lastBotCTA(mensajesPrevios)
