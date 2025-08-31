@@ -53,7 +53,7 @@ const pick = <T,>(arr: T[]) => arr[Math.max(0, Math.floor(Math.random() * arr.le
 
 const CTAS = [
     '¿Te comparto *precios* o prefieres *beneficios*?',
-    '¿Quieres ver *fotos* o pasamos a *pago*?',
+    '¿Quieres ver *fotos* o pasamos a *precios*?',
     'Puedo enviarte *precios*, *promos* o *fotos*. ¿Qué te sirve?',
     '¿Seguimos con *precio* o mejor *beneficios* primero?',
 ]
@@ -120,7 +120,7 @@ const asksCatalogue = (t: string) =>
 const saysPaid = (t: string) =>
     ['ya pague', 'ya pagué', 'pago realizado', 'hice el pago', 'ya hice el pago', 'pagado'].some(k => nrm(t).includes(nrm(k)))
 
-/* ===== Detectar ciudad/dirección (nos sigue sirviendo para respuestas contextuales, sin crear checkout) ===== */
+/* ===== Detectar ciudad/dirección (sirve para contexto, no para checkout) ===== */
 const CITY_LIST = [
     'bogota', 'bogotá', 'medellin', 'medellín', 'cali', 'barranquilla', 'cartagena',
     'manizales', 'pereira', 'bucaramanga', 'cucuta', 'cúcuta', 'ibague', 'ibagué',
