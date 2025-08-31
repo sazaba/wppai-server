@@ -22,7 +22,6 @@ const RAW_MODEL =
     process.env.IA_MODEL ||
     'anthropic/claude-3.5-sonnet'
 
-// 🔓 Más libre por defecto (controlable con IA_TEMPERATURE)
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.55)
 const MAX_COMPLETION_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 420)
 
@@ -50,15 +49,15 @@ const nrm = (t: string) =>
 
 const pick = <T,>(arr: T[]) => arr[Math.max(0, Math.floor(Math.random() * arr.length))] as T
 
-// CTAs más variadas y suaves
+// CTAs más variadas y humanas (sin mencionar stock)
 const CTAS = [
-    '¿Te confirmo *stock*, *precio* o te cuento *beneficios*?',
-    '¿Prefieres ver *imágenes* o saber *precios*?',
-    'Puedo pasarte *promos*, *precio* o *disponibilidad*. ¿Qué te sirve?',
-    '¿Seguimos con *precio* o prefieres *beneficios* primero?',
+    '¿Te paso *precios* o prefieres *beneficios*?',
+    '¿Quieres ver *fotos* o te cuento *precios*?',
+    'Puedo compartirte *precios*, *promos* o *fotos*. ¿Qué te sirve?',
+    '¿Seguimos con *precio* o mejor *beneficios* primero?',
 ]
 
-// Frases que nunca debe decir
+// Evitar respuestas inválidas
 const NO_DECIR = ['soy una ia', 'modelo de lenguaje', 'inteligencia artificial'].map(nrm)
 const esRespuestaInvalida = (r: string) => {
     const t = nrm(r || '')
@@ -68,7 +67,7 @@ const esRespuestaInvalida = (r: string) => {
     return email || link || tel || NO_DECIR.some(p => t.includes(p))
 }
 
-// ====== Lectura ROBUSTA de BusinessConfig (acepta alias)
+// ====== Lectura robusta de BusinessConfig (alias)
 const cfg = (c: any, k: string) => {
     if (!c) return ''
     const map: Record<string, string[]> = {
@@ -90,7 +89,7 @@ const cfg = (c: any, k: string) => {
         faq: ['faq'],
         disclaimers: ['disclaimers'],
 
-        // nuevos de ecommerce
+        // ecommerce
         pagoLinkGenerico: ['pagoLinkGenerico'],
         pagoLinkProductoBase: ['pagoLinkProductoBase'],
         pagoNotas: ['pagoNotas'],
@@ -118,7 +117,7 @@ const cfg = (c: any, k: string) => {
 
 /* ============ Intents ============ */
 const isProductIntent = (t: string) =>
-    ['producto', 'productos', 'catalogo', 'catálogo', 'precio', 'precios', 'foto', 'fotos', 'imagen', 'imagenes', 'mostrar', 'ver', 'presentacion', 'beneficio', 'beneficios', 'caracteristica', 'caracteristicas', 'promocion', 'promoción', 'oferta', 'ofertas', 'disponibilidad', 'stock'].some(k => nrm(t).includes(nrm(k)))
+    ['producto', 'productos', 'catalogo', 'catálogo', 'precio', 'precios', 'foto', 'fotos', 'imagen', 'imagenes', 'mostrar', 'ver', 'presentacion', 'beneficio', 'beneficios', 'caracteristica', 'caracteristicas', 'promocion', 'promoción', 'oferta', 'ofertas', 'disponibilidad'].some(k => nrm(t).includes(nrm(k)))
 
 const isPrice = (t: string) =>
     ['precio', 'cuesta', 'vale', 'costo', 'cuanto', 'cuánto', 'valor', 'exactamente'].some(k => nrm(t).includes(nrm(k)))
@@ -129,44 +128,21 @@ const wantsImages = (t: string) =>
 const isAffirmative = (t: string) =>
     ['si', 'sí', 'dale', 'ok', 'listo', 'va', 'claro', 'perfecto', 'de una', 'me interesa', 'quiero', 'comprar', 'lo quiero', 'lo compro'].some(k => nrm(t).includes(k))
 
-// Intents de cierre/compra/pago/dirección
+// cierre/compra/pago/dirección
 const wantsToBuy = (t: string) =>
     ['comprar', 'lo compro', 'lo quiero', 'quiero comprar', 'me lo llevo', 'cerrar compra', 'finalizar compra', 'hacer pedido', 'ordenar', 'pedido'].some(k => nrm(t).includes(nrm(k)))
 
-const askPaymentLink = (t: string): boolean =>
-    [
-        'link de pago',
-        'enlace de pago',
-        'pagar con tarjeta',
-        'pse',
-        'nequi',
-        'daviplata',
-        'stripe',
-        'mercado pago',
-        'pagos online',
-        'pago online',
-    ].some(k => nrm(t).includes(nrm(k)))
+const askPaymentLink = (t: string) =>
+    ['link de pago', 'enlace de pago', 'pagar con tarjeta', 'pse', 'nequi', 'daviplata', 'stripe', 'mercado pago', 'pagos online', 'pago online'].some(k => nrm(t).includes(nrm(k)))
 
-const askTransfer = (t: string): boolean =>
-    [
-        'transferencia',
-        'bancaria',
-        'datos bancarios',
-        'cuenta',
-        'consignacion',
-        'consignación',
-        'ban',
-        'bancolombia',
-        'qr',
-        'nequi',
-        'daviplata',
-    ].some(k => nrm(t).includes(nrm(k)))
+const askTransfer = (t: string) =>
+    ['transferencia', 'bancaria', 'datos bancarios', 'cuenta', 'consignacion', 'consignación', 'ban', 'bancolombia', 'qr', 'nequi', 'daviplata'].some(k => nrm(t).includes(nrm(k)))
 
 const providesAddress = (t: string) =>
     ['direccion', 'dirección', 'dir', 'calle', 'cra', 'carrera', 'av', 'avenida', 'barrio', 'manzana', 'mz', 'casa', 'apto'].some(k => nrm(t).includes(nrm(k)))
 
 const providesCity = (t: string) =>
-    ['ciudad', 'municipio', 'poblacion', 'población', 'localidad', 'bogota', 'bogotá', 'medellin', 'cali', 'barranquilla', 'cartagena'].some(k => nrm(t).includes(nrm(k)))
+    ['ciudad', 'municipio', 'poblacion', 'población', 'localidad', 'bogota', 'bogotá', 'medellin', 'medellín', 'cali', 'barranquilla', 'cartagena', 'manizales', 'pereira'].some(k => nrm(t).includes(nrm(k)))
 
 /* ====== Intents de negocio (desde BusinessConfig) ====== */
 const anyIn = (t: string, arr: string[]) => arr.some(k => nrm(t).includes(nrm(k)))
@@ -179,8 +155,6 @@ const Q = {
     GAR: ['garantia', 'garantía'],
     PROMO: ['promocion', 'promoción', 'promos', 'descuento', 'descuentos', 'oferta', 'ofertas'],
     CANAL: ['canal', 'contacto', 'atencion', 'soporte', 'hablar', 'comunicar'],
-
-    // NUEVOS:
     FACT: ['factura', 'factura electronica', 'facturación', 'facturacion', 'rut', 'nit'],
     POSV: ['postventa', 'post-venta', 'post venta', 'soporte devoluciones', 'devoluciones soporte', 'garantia soporte'],
 }
@@ -193,26 +167,22 @@ const bizFlags = (t: string) => ({
     garantia: anyIn(t, Q.GAR),
     promos: anyIn(t, Q.PROMO),
     canales: anyIn(t, Q.CANAL),
-
-    // NUEVOS:
     fact: anyIn(t, Q.FACT),
     postv: anyIn(t, Q.POSV),
-
     any: false as boolean,
 })
 const markAny = (f: ReturnType<typeof bizFlags>) => ({ ...f, any: Object.values(f).some(Boolean) })
 
-const short = (s: string) => s.trim().split('\n').slice(0, 4).join('\n')
+const short = (s: string) => s.trim().split('\n').slice(0, 6).join('\n')
 
 /* ====== Memoria de CTA (sin tocar schema) ====== */
-type LastCTA = 'precio' | 'beneficios' | 'disponibilidad' | 'fotos' | null
+type LastCTA = 'precio' | 'beneficios' | 'fotos' | null
 const lastBotCTA = (hist: Array<{ from: MessageFrom; contenido: string }>): LastCTA => {
     for (let i = hist.length - 1; i >= 0; i--) {
         const m = hist[i]; if (m.from !== 'bot') continue
         const t = nrm(m.contenido || '')
         if (/precio|precios|vale|cuesta|costo|valor/.test(t)) return 'precio'
         if (/beneficio|ventaja|caracteristica/.test(t)) return 'beneficios'
-        if (/disponibilidad|stock/.test(t)) return 'disponibilidad'
         if (/foto|imagen|imagenes|fotos|ver foto/.test(t)) return 'fotos'
     }
     return null
@@ -223,7 +193,6 @@ const businessAnswer = (c: any, f: ReturnType<typeof bizFlags>) => {
     const parts: string[] = []
     const em = { box: '📦', money: '💳', clock: '⏰', pin: '📍', refresh: '🔄', shield: '🛡️', tag: '🏷️', chat: '💬', doc: '🧾', lifebuoy: '🛟' }
 
-    // ENVÍOS
     if (f.envios) {
         const envioTxt = String(cfg(c, 'enviosInfo') || '').trim()
         const costoFijo = Number(cfg(c, 'envioCostoFijo') || 0) || 0
@@ -258,7 +227,6 @@ const businessAnswer = (c: any, f: ReturnType<typeof bizFlags>) => {
     if (f.canales && String(cfg(c, 'canalesAtencion')).trim())
         parts.push(`${em.chat} *Atención:* ${cfg(c, 'canalesAtencion')}`)
 
-    // NUEVOS bloques:
     if (f.fact && String(cfg(c, 'facturaElectronicaInfo')).trim())
         parts.push(`${em.doc} *Factura electrónica:* ${cfg(c, 'facturaElectronicaInfo')}`)
 
@@ -269,7 +237,7 @@ const businessAnswer = (c: any, f: ReturnType<typeof bizFlags>) => {
     return short(parts.join('\n'))
 }
 
-/* ====== System prompt ====== */
+/* ====== System prompt (tono humano y fluido) ====== */
 function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: string) {
     const marca = (cfg(c, 'nombre') || empresaNombre || 'la marca')
 
@@ -299,7 +267,7 @@ ${cfg(c, 'servicios') || '- (no especificado)'}
 - Envío (costos):
   - Costo fijo: ${envioCostoFijo ? formatMoney(envioCostoFijo) : '—'}
   - Gratis desde: ${envioGratisDesde ? formatMoney(envioGratisDesde) : '—'}
-- Métodos de pago (texto libre): ${cfg(c, 'metodosPago')}
+- Métodos de pago: ${cfg(c, 'metodosPago')}
 - Tienda física: ${cfg(c, 'tiendaFisica') ? 'Sí' : 'No'}${cfg(c, 'tiendaFisica') && cfg(c, 'direccionTienda') ? ` (Dirección: ${cfg(c, 'direccionTienda')})` : ''}
 - Devoluciones: ${cfg(c, 'politicasDevolucion')}
 - Garantía: ${cfg(c, 'politicasGarantia')}
@@ -319,27 +287,25 @@ ${cat}
 
     const reglas = `
 [REGLAS]
-1) Habla como asesor humano: cercano, natural y útil. Puedes saludar breve y usar frases amistosas.
-2) Prioriza datos de [NEGOCIO]/[OPERACIÓN]/[POST-VENTA]/[CATÁLOGO]/[FAQs]. Si falta un dato, dilo sin inventar.
-3) Máx 2–4 líneas por respuesta; usa viñetas si suma.
+1) Tono natural, cálido y claro (como un buen asesor humano); no repitas.
+2) Prioriza datos de [NEGOCIO]/[OPERACIÓN]/[POST-VENTA]/[CATÁLOGO]/[FAQs]. Si falta algo, dilo sin inventar.
+3) 2–5 líneas por respuesta; usa viñetas solo si suma.
 4) No menciones que eres IA.
-5) Si preguntan algo fuera del negocio, reconduce con elegancia. Si de verdad no hay info, di: "No sabría decirte con certeza; debo consultarlo." y ofrece escalar. Solo usa:
+5) Si piden algo fuera del negocio, reconduce con elegancia. Solo usa:
    "${msgEsc}"
-   como último recurso.
-6) No inventes links ni datos de pago. Si debes hablar de pagos, explica opciones en general y ofrece compartir el link o datos *si el cliente lo pide*.
-${cfg(c, 'disclaimers') ? `7) Disclaimers:\n${cfg(c, 'disclaimers')}` : ''}
-${cfg(c, 'palabrasClaveNegocio') ? `8) Palabras clave: ${cfg(c, 'palabrasClaveNegocio')}` : ''}
+   si de verdad no hay forma de ayudar.
+6) No inventes links ni datos de pago. Si hablan de pagos, explica opciones y ofrece compartir link o datos.
   `.trim()
 
-    return `Eres un asesor de "${marca}" con estilo cálido, sencillo y comercial.
-Presenta la marca en 1 frase cuando tenga sentido y guía con micro-CTAs hacia precio, beneficios o disponibilidad.
+    return `Eres un asesor virtual de "${marca}" con estilo cercano y comercial.
+Presenta la marca en 1 frase cuando tenga sentido y guía con micro-CTAs hacia precio, beneficios o fotos (no preguntes por *stock*).
 
 ${info}
 
 ${reglas}
 
 [FORMATO]
-- Respuestas concisas (2–4 líneas), específicas y accionables.
+- Respuestas concisas (2–5 líneas), específicas y accionables.
 - Cierra con una micro-CTA contextual.`
 }
 
@@ -356,14 +322,14 @@ async function chatComplete({
     const hasImage = messages.some(m => Array.isArray(m.content) && m.content.some((p: any) => p?.type === 'image_url'))
 
     if (hasImage) {
-        console.log('[IA Vision] 🚀 Preparando llamada con modelo de visión:', VISION_MODEL)
-        const imageUrls = messages
-            .flatMap((m: any) => Array.isArray(m.content) ? m.content : [])
-            .filter((p: any) => p?.type === 'image_url')
-            .map((p: any) => p?.image_url?.url)
-        console.log('[IA Vision] URLs detectadas:', imageUrls)
-
-        console.log('[IA Vision] ▶️ Llamando OpenAI con modelo:', normalizeForOpenAI(VISION_MODEL))
+        console.log('[IA Vision] 🚀 Preparando llamada con modelo de visión:', normalizeForOpenAI(VISION_MODEL))
+        const urls: string[] = []
+        for (const m of messages) {
+            if (Array.isArray((m as any).content)) {
+                (m as any).content.forEach((p: any) => { if (p?.type === 'image_url' && p?.image_url?.url) urls.push(p.image_url.url) })
+            }
+        }
+        console.log('[IA Vision] URLs detectadas:', urls)
         const resp = await openai.chat.completions.create({
             model: normalizeForOpenAI(VISION_MODEL),
             messages,
@@ -379,7 +345,6 @@ async function chatComplete({
 
     if (isOR(normalized)) {
         if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY no configurada')
-        console.log('[IA Router] ▶️ Llamando OpenRouter con modelo:', normalized)
         const payload = { model: normalized, messages, temperature, max_tokens: maxTokens, max_output_tokens: maxTokens }
         const { data } = await axios.post(OPENROUTER_URL, payload, {
             headers: {
@@ -394,7 +359,6 @@ async function chatComplete({
         return typeof content === 'string' ? content : Array.isArray(content) ? content.map((c: any) => c?.text || '').join(' ') : ''
     }
 
-    console.log('[IA Text] ▶️ Llamando OpenAI con modelo:', normalizeForOpenAI(normalized))
     const resp = await openai.chat.completions.create({
         model: normalizeForOpenAI(normalized),
         messages,
@@ -404,6 +368,51 @@ async function chatComplete({
         max_tokens: maxTokens,
     } as any)
     return resp?.choices?.[0]?.message?.content ?? ''
+}
+
+/* ===== Helpers de shipping: extraer ciudad/dirección y persistir ===== */
+const CITY_LIST = [
+    'bogota', 'bogotá', 'medellin', 'medellín', 'cali', 'barranquilla', 'cartagena',
+    'manizales', 'pereira', 'bucaramanga', 'cucuta', 'cúcuta', 'ibague', 'ibagué',
+    'soacha', 'santa marta', 'villavicencio', 'armenia', 'neiva', 'pasto'
+].map(nrm)
+
+function extractCityAddress(raw: string): { city?: string; address?: string } {
+    const t = nrm(raw)
+    const out: { city?: string; address?: string } = {}
+    const hit = CITY_LIST.find(c => t.includes(c))
+    if (hit) out.city = hit
+
+    const addrMatch = /(?:calle|cll|cra|kr|carrera|av|avenida|transv|transversal|mz|manzana|#|\d{1,3}\s?#\s?\d)/i.test(raw)
+    if (addrMatch) {
+        const splitByDash = raw.split(/[-–]|:/)
+        if (splitByDash.length >= 2) {
+            const right = splitByDash.slice(1).join(' ').trim()
+            if (right.length >= 6) out.address = right
+        }
+        if (!out.address) {
+            const line = raw.split('\n').find(l => /(calle|cll|cra|kr|carrera|av|avenida|mz|manzana|#)/i.test(l))
+            if (line && line.trim().length >= 6) out.address = line.trim()
+        }
+    }
+    return out
+}
+
+async function setShippingFromMessageIfMissing(orderId: number, msg: string) {
+    const found = extractCityAddress(msg)
+    if (!found.city && !found.address) return { changed: false }
+
+    const order = await prisma.order.findUnique({ where: { id: orderId }, select: { city: true, address: true } })
+    const data: any = {}
+    if (found.city && !order?.city) data.city = found.city
+    if (found.address && !order?.address) data.address = found.address
+
+    if (Object.keys(data).length) {
+        await prisma.order.update({ where: { id: orderId }, data })
+        console.log('[checkout] 📝 Shipping actualizado desde mensaje:', data)
+        return { changed: true, data }
+    }
+    return { changed: false }
 }
 
 /* ========================= Core ========================= */
@@ -461,21 +470,22 @@ export const handleIAReply = async (
     }
     const isImage = ultimoCliente?.mediaType === MediaType.image && !!ultimoCliente.mediaUrl
     const imageUrl = isImage ? String(ultimoCliente?.mediaUrl) : null
+
+    // 2.1 Imagen → posible comprobante
     if (isImage) {
         console.log(`[handleIAReply] 📷 Imagen recibida en chat ${chatId}: ${imageUrl} caption: ${ultimoCliente?.caption || ''}`)
-    }
-
-    // 2.1 Si vino imagen del cliente: posible comprobante de pago
-    if (isImage) {
         const maybePayment = /comprobante|pago|recibo|transferencia|soporte|consignacion|consignación|voucher|dep[oó]sito|qr/i.test(
             (ultimoCliente?.caption || '') + ' ' + (ultimoCliente?.contenido || '')
         )
-        console.log('[handleIAReply] ¿Es comprobante?', !!maybePayment)
+        console.log('[handleIAReply] ¿Es comprobante?', maybePayment)
         if (maybePayment) {
-            // Creamos o ubicamos un pedido "pending" de esta conversación
             const order = await ensureDraftOrder(conversacion, config)
             console.log('[handleIAReply] 🧾 Asociando comprobante a order:', order.id)
-            // Guardar PaymentReceipt asociado al mensaje/imagen
+            try {
+                await prisma.order.update({ where: { id: order.id }, data: { status: 'pending_payment' } })
+                console.log('[handleIAReply] Order → pending_payment')
+            } catch { /* ignore */ }
+
             try {
                 await prisma.paymentReceipt.create({
                     data: {
@@ -484,14 +494,12 @@ export const handleIAReply = async (
                         imageUrl: imageUrl!,
                         method: inferMethodFromConfig(config) || 'transfer|link',
                         isVerified: false,
-                        rawOcrText: '', // (OCR futuro)
+                        rawOcrText: '',
                     }
                 })
-                await prisma.order.update({ where: { id: order.id }, data: { status: 'pending_payment' } })
-                console.log('[handleIAReply] Order → pending_payment')
-            } catch (e) {
-                console.warn('[handleIAReply] paymentReceipt create error:', (e as any)?.message || e)
-            }
+                console.log('[handleIAReply] ✅ PaymentReceipt guardado')
+            } catch (e) { console.warn('[handleIAReply] paymentReceipt create error:', (e as any)?.message || e) }
+
             const texto = [
                 '¡Gracias! Recibimos tu *comprobante* 🙌',
                 'Lo revisamos y te confirmamos por aquí.',
@@ -505,43 +513,11 @@ export const handleIAReply = async (
                 sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
                 phoneNumberId: opts?.phoneNumberId,
             })
-            console.log('[handleIAReply] ✅ PaymentReceipt guardado')
             return { estado: ConversationEstado.venta_en_proceso, mensaje: savedR.texto, messageId: savedR.messageId, wamid: savedR.wamid, media: [] }
         }
     }
 
-    // 2.2 Imagen NO comprobante: si parece fuera de catálogo → respuesta humana + sugerencia
-    if (isImage) {
-        const cap = nrm((ultimoCliente?.caption || '') + ' ' + (ultimoCliente?.contenido || ''))
-        const outKeywords = ['audifono', 'audifonos', 'headphone', 'jbl', 'parlante', 'televisor', 'celular', 'computador', 'zapato', 'tenis', 'camisa', 'pantalon', 'reloj', 'consola', 'ps5', 'xbox']
-        const isOutOfScope = outKeywords.some(k => cap.includes(k))
-        if (isOutOfScope) {
-            const listado = (await prisma.product.findMany({
-                where: { empresaId: conversacion.empresaId, disponible: true },
-                select: { nombre: true }, take: 4, orderBy: { id: 'asc' }
-            })).map(p => `• ${p.nombre}`).join('\n')
-
-            const texto = [
-                'Parece que esa imagen no es de nuestro catálogo 😊',
-                'Por ahora manejamos:',
-                listado || '• Productos de cuidado facial y rutinas de skincare',
-                pick(CTAS)
-            ].filter(Boolean).join('\n')
-
-            const saved = await persistBotReply({
-                conversationId: chatId,
-                empresaId: conversacion.empresaId,
-                texto,
-                nuevoEstado: ConversationEstado.respondido,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-                phoneNumberId: opts?.phoneNumberId,
-            })
-            console.log('[handleIAReply] Imagen fuera de catálogo → respuesta humana enviada.')
-            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-        }
-    }
-
-    // 3) Historial (para memoria)
+    // 3) Historial
     const mensajesPrevios = await prisma.message.findMany({
         where: { conversationId: chatId },
         orderBy: { timestamp: 'asc' },
@@ -578,15 +554,16 @@ export const handleIAReply = async (
             })
         }
     }
-    console.log('[handleIAReply] 🔎 productos candidatos:', productos.map(p => p?.nombre))
 
     /* ===== 4) Determinísticos antes de IA ===== */
 
-    // 4.0 Bienvenida humana si es de las primeras interacciones
+    // 4.0 Bienvenida humana (sin mencionar stock)
     const isEarly = mensajesPrevios.filter(m => m.from === 'bot' || m.from === 'client').length < 3
     if (isEarly && /hola|buenas|buenos dias|buenas tardes|buenas noches/i.test(mensaje)) {
         const desc = String(cfg(config, 'descripcion') || '').trim()
-        const linea = desc ? `¡Hola! Soy del equipo de *${marca}*. ${desc}` : `¡Hola! Soy del equipo de *${marca}*. Te ayudo con catálogo, promos y envíos.`
+        const linea = desc
+            ? `¡Hola! Soy del equipo de *${marca}*. ${desc}`
+            : `¡Hola! Soy del equipo de *${marca}*. Te ayudo con catálogo, precios y envíos.`
         const texto = `${linea}\n${pick(CTAS)}`
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId, texto,
@@ -597,89 +574,23 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    /* ===== 5) Flujo de compra / link / transferencia / dirección ===== */
-    const startedCheckout =
-        wantsToBuy(mensaje) || askPaymentLink(mensaje) || askTransfer(mensaje) || providesAddress(mensaje) || providesCity(mensaje)
-
-    if (startedCheckout) {
-        const draft = await ensureDraftOrder(conversacion, config)
-        console.log('[handleIAReply] 🛒 startedCheckout. mensaje:', mensaje)
-        console.log('[handleIAReply] draft order id:', draft.id, 'status:', draft.status)
-
-        // Guardamos city/address si vinieron en el texto
-        if (!draft.city && providesCity(mensaje)) {
-            const city = (mensaje.match(/(bogota|bogotá|medellin|cali|barranquilla|cartagena|manizales|ciudad:\s*([^\n]+))/i)?.[0] || '').replace(/^ciudad:\s*/i, '').trim()
-            if (city) {
-                await prisma.order.update({ where: { id: draft.id }, data: { city: city.toLowerCase() } })
-                console.log('[handleIAReply] City seteada:', city.toLowerCase())
-            }
-        }
-        if (!draft.address && providesAddress(mensaje)) {
-            const address = (mensaje.match(/(dir|dirección|direccion|calle|cra|carrera|av|avenida)[^\n]*/i)?.[0] || mensaje).trim()
-            if (address) {
-                await prisma.order.update({ where: { id: draft.id }, data: { address } })
-                console.log('[handleIAReply] Address seteada:', address)
-            }
-        }
-
-        // Si hay productos relevantes, agregamos primero (si no existe item)
-        if (productos.length) {
-            await upsertFirstItem(draft.id, productos[0])
-            await recalcOrderTotals(draft.id, config)
-        }
-
-        // Si pregunta por link de pago
-        if (askPaymentLink(mensaje)) {
-            console.log('[handleIAReply] 🔗 Solicitan link de pago')
-            const txt = composePaymentLinkMessage(config, productos[0])
+    // 4.x Catálogo completo corto (“¿qué productos vendes?”)
+    if (/(que|qué)\s+productos\s+vendes|catalogo|catálogo|lista\s+de\s+productos/i.test(mensaje)) {
+        const items = await prisma.product.findMany({
+            where: { empresaId: conversacion.empresaId, disponible: true },
+            orderBy: { id: 'asc' },
+            take: Math.max(2, Math.min(5, Number(process.env.MAX_PRODUCTS_TO_SEND || 3)))
+        })
+        if (items.length) {
+            const lines = items.map(p => `• *${p.nombre}*${p.precioDesde != null ? ` – desde ${formatMoney(p.precioDesde)}` : ''}`).join('\n')
+            const texto = `${lines}\n¿Te paso *fotos* o *precios* de alguno?`
             const saved = await persistBotReply({
-                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
-                nuevoEstado: ConversationEstado.venta_en_proceso,
+                conversationId: chatId, empresaId: conversacion.empresaId, texto,
+                nuevoEstado: ConversationEstado.respondido,
                 sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
                 phoneNumberId: opts?.phoneNumberId,
             })
-            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-        }
-
-        // Si pide transferencia / datos bancarios
-        if (askTransfer(mensaje)) {
-            console.log('[handleIAReply] 🧾 Solicitan transferencia')
-            const txt = composeBankTransferMessage(config, productos[0])
-            const saved = await persistBotReply({
-                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
-                nuevoEstado: ConversationEstado.venta_en_proceso,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-                phoneNumberId: opts?.phoneNumberId,
-            })
-            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-        }
-
-        // Recolección mínima de datos de envío (inteligente)
-        const freshDraft = await prisma.order.findUnique({ where: { id: draft.id } })
-        if (freshDraft?.city && freshDraft?.address) {
-            // Ya tengo ambos → ofrecer métodos de pago (con total)
-            const txt = composeCheckoutOptions(config, productos[0])
-            const saved = await persistBotReply({
-                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
-                nuevoEstado: ConversationEstado.venta_en_proceso,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-                phoneNumberId: opts?.phoneNumberId,
-            })
-            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-        } else {
-            // Falta uno de los datos → pedir SOLO el faltante
-            let ask = ''
-            if (!freshDraft?.city && freshDraft?.address) ask = '¿En qué *ciudad* recibes el pedido?'
-            else if (!freshDraft?.address && freshDraft?.city) ask = '¿Cuál es la *dirección* de entrega (calle, número, barrio)?'
-            else ask = 'Para coordinar el envío, ¿me compartes *ciudad* y *dirección* de entrega?'
-
-            const saved = await persistBotReply({
-                conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
-                nuevoEstado: ConversationEstado.venta_en_proceso,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-                phoneNumberId: opts?.phoneNumberId,
-            })
-            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
         }
     }
 
@@ -705,8 +616,8 @@ export const handleIAReply = async (
         const p = productos[0]
         const precio = p?.precioDesde != null ? formatMoney(p.precioDesde) : null
         const texto = precio
-            ? `*${p.nombre}*: desde ${precio}. ¿Te confirmo *stock* o prefieres ver *imágenes*?`
-            : `No tengo el precio cargado de *${p.nombre}*. ¿Te comparto *beneficios* o reviso *disponibilidad*?`
+            ? `*${p.nombre}*: desde ${precio}. ¿Quieres *fotos* o prefieres *beneficios*?`
+            : `De *${p.nombre}* no tengo precio cargado. ¿Te comparto *beneficios* o pasamos a *pago*?`
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId, texto,
             nuevoEstado: ConversationEstado.respondido,
@@ -716,10 +627,10 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // 4.3 Imágenes directas (solo producto en contexto)
+    // 4.3 Imágenes del producto en contexto
     if (wantsImages(mensaje) && productos.length && opts?.autoSend) {
-        const mediaRes = await sendProductImages({ chatId, conversacion, productosRelevantes: productos.slice(0, 1), phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
-        const texto = mediaRes.length ? 'Te compartí imágenes del catálogo. ¿Quieres *precios* o confirmar *stock*?' : 'No encontré imágenes ahora. ¿Te paso *beneficios* o *precio*?'
+        const mediaRes = await sendProductImages({ chatId, conversacion, productosRelevantes: [productos[0]], phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
+        const texto = mediaRes.length ? 'Te compartí *fotos* del producto. ¿Seguimos con *precio* o pasamos a *pago*?' : 'No encontré fotos ahora. ¿Te paso *beneficios* o *precio*?'
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId, texto,
             nuevoEstado: ConversationEstado.respondido,
@@ -729,13 +640,94 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaRes }
     }
 
-    // 4.5 Seguimiento de CTA (memoria)
+    // ===== 5) Flujo de compra / link / transferencia / dirección =====
+    const startedCheckout =
+        wantsToBuy(mensaje) || askPaymentLink(mensaje) || askTransfer(mensaje) || providesAddress(mensaje) || providesCity(mensaje)
+
+    if (startedCheckout) {
+        const draft = await ensureDraftOrder(conversacion, config)
+        console.log('[handleIAReply] draft order id:', draft.id, 'status:', draft.status)
+
+        // si hay producto relevante, usar primero
+        if (productos.length) {
+            await upsertFirstItem(draft.id, productos[0])
+            await recalcOrderTotals(draft.id, config)
+        }
+
+        // 👉 Nuevo: persistir ciudad/dirección si vinieron en el mensaje
+        await setShippingFromMessageIfMissing(draft.id, mensaje)
+        const freshDraft = await prisma.order.findUnique({ where: { id: draft.id }, select: { city: true, address: true } })
+
+        // link de pago
+        if (askPaymentLink(mensaje)) {
+            console.log('[handleIAReply] 🔗 Solicitan link de pago')
+            const txt = composePaymentLinkMessage(config, productos[0])
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
+                nuevoEstado: ConversationEstado.venta_en_proceso,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+
+        // transferencia
+        if (askTransfer(mensaje)) {
+            console.log('[handleIAReply] 🧾 Solicitan transferencia')
+            const txt = composeBankTransferMessage(config, productos[0])
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
+                nuevoEstado: ConversationEstado.venta_en_proceso,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+
+        // si faltan datos de envío, pedir SOLO lo que falte
+        if (!freshDraft?.city || !freshDraft?.address) {
+            let ask = ''
+            if (!freshDraft?.city && freshDraft?.address) ask = '¿En qué *ciudad* recibes el pedido?'
+            else if (!freshDraft?.address && freshDraft?.city) ask = '¿Cuál es la *dirección* de entrega (calle, número, barrio)?'
+            else ask = 'Para coordinar el envío, ¿me compartes *ciudad* y *dirección* de entrega?'
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
+                nuevoEstado: ConversationEstado.venta_en_proceso,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+
+        // ya hay ciudad y dirección → mostrar opciones de pago con total
+        await recalcOrderTotals(draft.id, config)
+        const orderNow = await prisma.order.findUnique({ where: { id: draft.id }, select: { subtotal: true, shippingCost: true, total: true } })
+        const envioEta = String(cfg(config, 'envioEntregaEstimado') || '').trim()
+        const hasLink = Boolean(String(cfg(config, 'pagoLinkGenerico') || cfg(config, 'pagoLinkProductoBase') || '').trim())
+        const hasBank = Boolean(String(cfg(config, 'bancoNombre') || cfg(config, 'transferenciaQRUrl') || '').trim())
+        const parts: string[] = []
+        parts.push('¡Perfecto! Para completar tu pedido puedes:')
+        if (hasLink) parts.push('• 💳 Pagar con *link* (tarjeta/PSE).')
+        if (hasBank) parts.push('• 🏦 Pagar por *transferencia bancaria*.')
+        if (!hasLink && !hasBank) parts.push('• Confirmar por aquí y coordinamos el pago.')
+        parts.push(`Total a pagar: *${formatMoney(orderNow?.total ?? 0)}*.`)
+        if (envioEta) parts.push(`⏰ Entrega estimada: ${envioEta}.`)
+        const txt = short(parts.join('\n'))
+        const saved = await persistBotReply({
+            conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
+            nuevoEstado: ConversationEstado.venta_en_proceso,
+            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            phoneNumberId: opts?.phoneNumberId,
+        })
+        return { estado: ConversationEstado.venta_en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+    }
+
+    // 4.5 Seguimiento de CTA
     const lastCTA = lastBotCTA(mensajesPrevios)
     if ((isAffirmative(mensaje) || isProductIntent(mensaje) || isPrice(mensaje)) && productos.length) {
         const want: LastCTA =
             (isPrice(mensaje) && 'precio') ||
             (/beneficio|ventaja/.test(nrm(mensaje)) && 'beneficios') ||
-            (/disponibilidad|stock/.test(nrm(mensaje)) && 'disponibilidad') ||
             (/foto|imagen|fotos/.test(nrm(mensaje)) && 'fotos') ||
             lastCTA
 
@@ -744,8 +736,8 @@ export const handleIAReply = async (
             if (want === 'precio') {
                 const precio = p?.precioDesde != null ? formatMoney(p.precioDesde) : null
                 const texto = precio
-                    ? `*${p.nombre}*: desde ${precio}. ¿Te confirmo *stock* o prefieres *imágenes*?`
-                    : `De *${p.nombre}* no tengo precio en sistema. ¿Te paso *beneficios* o reviso *disponibilidad*?`
+                    ? `*${p.nombre}*: desde ${precio}. ¿Quieres *fotos* o prefieres *beneficios*?`
+                    : `De *${p.nombre}* no tengo precio en sistema. ¿Te paso *beneficios* o avanzamos a *pago*?`
                 const saved = await persistBotReply({ conversationId: chatId, empresaId: conversacion.empresaId, texto, nuevoEstado: ConversationEstado.respondido, sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined, phoneNumberId: opts?.phoneNumberId })
                 return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
@@ -754,21 +746,16 @@ export const handleIAReply = async (
                 const saved = await persistBotReply({ conversationId: chatId, empresaId: conversacion.empresaId, texto, nuevoEstado: ConversationEstado.respondido, sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined, phoneNumberId: opts?.phoneNumberId })
                 return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
-            if (want === 'disponibilidad') {
-                const texto = 'Con gusto verifico *stock*. ¿Para cuántas unidades y en qué ciudad recibes?'
-                const saved = await persistBotReply({ conversationId: chatId, empresaId: conversacion.empresaId, texto, nuevoEstado: ConversationEstado.en_proceso, sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined, phoneNumberId: opts?.phoneNumberId })
-                return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-            }
             if (want === 'fotos' && opts?.autoSend) {
-                const mediaRes = await sendProductImages({ chatId, conversacion, productosRelevantes: productos.slice(0, 1), phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
-                const texto = mediaRes.length ? 'Listo, envié imágenes. ¿Seguimos con *precio* o *disponibilidad*?' : 'No tengo fotos ahora mismo. ¿Te comparto *beneficios* o *precio*?'
+                const mediaRes = await sendProductImages({ chatId, conversacion, productosRelevantes: [productos[0]], phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
+                const texto = mediaRes.length ? 'Listo, envié *fotos*. ¿Seguimos con *precio* o *pago*?' : 'No tengo fotos ahora mismo. ¿Te comparto *beneficios* o *precio*?'
                 const saved = await persistBotReply({ conversationId: chatId, empresaId: conversacion.empresaId, texto, nuevoEstado: ConversationEstado.respondido, sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined, phoneNumberId: opts?.phoneNumberId })
                 return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaRes }
             }
         }
     }
 
-    /* ===== 5) IA ===== */
+    /* ===== 5) IA (tono humano) ===== */
     const baseMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }> = [
         { role: 'system', content: systemPrompt(config, productos, mensajeEscalamiento, empresa?.nombre) },
         ...historial
@@ -783,6 +770,7 @@ export const handleIAReply = async (
     try {
         console.log('[handleIAReply] 🧠 Llamando chatComplete con modelo:', imageUrl ? VISION_MODEL : RAW_MODEL)
         respuesta = (await chatComplete({ model: imageUrl ? VISION_MODEL : RAW_MODEL, messages: baseMessages, temperature: TEMPERATURE, maxTokens: MAX_COMPLETION_TOKENS }))?.trim()
+        console.log('[handleIAReply] 📝 Respuesta IA final:', respuesta)
     } catch (e) {
         try {
             respuesta = (await chatComplete({ model: fallbackModel(), messages: baseMessages, temperature: TEMPERATURE, maxTokens: MAX_COMPLETION_TOKENS }))?.trim()
@@ -800,12 +788,11 @@ export const handleIAReply = async (
     }
 
     respuesta = (respuesta || '').trim()
-    console.log('[handleIAReply] 📝 Respuesta IA final:', respuesta)
     if (!respuesta || esRespuestaInvalida(respuesta)) {
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId: conversacion.empresaId,
-            texto: 'No sabría decirte con certeza; debo consultarlo. Si deseas, lo escalo con un asesor humano.',
+            texto: 'No sabría decirte con certeza; debo consultarlo. Si quieres, lo escalo con un asesor humano.',
             nuevoEstado: ConversationEstado.requiere_agente,
             sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
             phoneNumberId: opts?.phoneNumberId,
@@ -822,10 +809,10 @@ export const handleIAReply = async (
         phoneNumberId: opts?.phoneNumberId,
     })
 
-    // Envío proactivo de imágenes si aplica (solo 1 producto en contexto)
+    // Envío proactivo de imágenes si aplica (solo del producto en contexto)
     let mediaSent: Array<{ productId: number; imageUrl: string; wamid?: string }> = []
     if (isProductIntent(mensaje || ultimoCliente?.caption || '') && opts?.autoSend && (opts?.toPhone || conversacion.phone) && productos.length) {
-        mediaSent = await sendProductImages({ chatId, conversacion, productosRelevantes: productos.slice(0, 1), phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
+        mediaSent = await sendProductImages({ chatId, conversacion, productosRelevantes: [productos[0]], phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
     }
 
     return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaSent }
@@ -848,6 +835,7 @@ async function persistBotReply({ conversationId, empresaId, texto, nuevoEstado, 
             const resp = await sendWhatsappMessage({ empresaId, to: normalizeToE164(sendTo!), body: texto, phoneNumberIdHint: phoneNumberId })
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
             if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
+            console.log('[persistBotReply] ✅ WhatsApp enviado, wamid:', wamid)
         } catch (err: any) {
             console.error('[persistBotReply] ERROR WhatsApp:', err?.response?.data || err?.message || err)
         }
@@ -862,7 +850,7 @@ function buildBenefitsReply(p: { nombre: string; beneficios?: string | null; car
     if (bens.length) lines.push(...bens.map(b => `• ${b}`))
     else lines.push('• Fórmula efectiva y bien valorada.')
     if (p.precioDesde != null) lines.push(`Precio desde: ${formatMoney(p.precioDesde)}.`)
-    lines.push('¿Te confirmo *stock* o prefieres ver *imágenes*?')
+    lines.push('¿Quieres *fotos* o prefieres *pagar* de una vez?')
     return short(lines.join('\n'))
 }
 
@@ -924,14 +912,12 @@ async function ensureDraftOrder(
     conversacion: { id: number; empresaId: number; phone: string; nombre?: string | null },
     c: any
 ) {
-    // Busca pedido pendiente por conversación
     let order = await prisma.order.findFirst({
         where: { empresaId: conversacion.empresaId, conversationId: conversacion.id, status: { in: ['pending', 'pending_payment', 'created'] } },
         orderBy: { id: 'desc' }
     })
     if (order) return order
 
-    // Crea nuevo
     order = await prisma.order.create({
         data: {
             empresaId: conversacion.empresaId,
@@ -954,7 +940,6 @@ async function upsertFirstItem(orderId: number, prod: any) {
     const exists = await prisma.orderItem.findFirst({ where: { orderId, productId: prod.id } })
     if (exists) return exists
     const price = Number(prod?.precioDesde ?? 0) || 0
-    console.log('[handleIAReply] Producto agregado a order:', prod.nombre)
     return prisma.orderItem.create({
         data: { orderId, productId: prod.id, name: prod.nombre, price, qty: 1, total: price }
     })
@@ -1009,30 +994,4 @@ function composeBankTransferMessage(c: any, prod?: any) {
     if (bank.notas) parts.push(`ℹ️ ${bank.notas}`)
     parts.push('Al hacer la transferencia, envíame el *comprobante* (foto) por aquí.')
     return short(parts.join('\n'))
-}
-
-function composeCheckoutOptions(c: any, prod?: any) {
-    const hasLink = Boolean(String(cfg(c, 'pagoLinkGenerico') || cfg(c, 'pagoLinkProductoBase') || '').trim())
-    const hasBank = Boolean(String(cfg(c, 'bancoNombre') || cfg(c, 'transferenciaQRUrl') || '').trim())
-    const envioEta = String(cfg(c, 'envioEntregaEstimado') || '').trim()
-    const parts: string[] = []
-    parts.push('¡Perfecto! Para completar tu pedido puedes:')
-    if (hasLink) parts.push('• 💳 Pagar con *link* (tarjeta/PSE).')
-    if (hasBank) parts.push('• 🏦 Pagar por *transferencia bancaria*.')
-    if (!hasLink && !hasBank) parts.push('• Confirmar por aquí y coordinamos el pago.')
-    // Añadimos total si existe order
-    parts.push(`Total a pagar: *${formatMoneyTotalFromLastOrder()}*.`)
-    if (envioEta) parts.push(`⏰ Entrega estimada: ${envioEta}.`)
-    return short(parts.join('\n'))
-}
-
-// Lee el último total calculado para el mensaje de checkout (simple helper local)
-function formatMoneyTotalFromLastOrder(): string {
-    // Este helper solo se usa para dar contexto de total en composeCheckoutOptions,
-    // pero como no tenemos el orderId aquí, guardamos el total en memoria de proceso si quieres.
-    // Para mantener compatibilidad sin estado, devolvemos un placeholder que ya calculamos y
-    // persistimos en recalcOrderTotals -> luego el flujo normalmente envía los totales correctos
-    // en los mensajes previos. Si quieres precisión absoluta, mueve composeCheckoutOptions dentro
-    // del bloque donde tienes el draft y pásale el total directo.
-    return 'consulta tu total en el mensaje anterior'
 }
