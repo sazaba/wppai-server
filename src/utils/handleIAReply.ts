@@ -5,6 +5,8 @@ import { openai } from '../lib/openai'
 import { ConversationEstado, MediaType, MessageFrom } from '@prisma/client'
 import { retrieveRelevantProducts } from './products.helper'
 import { sendWhatsappMessage, sendWhatsappMedia } from '../services/whatsapp.service'
+// (Opcional) está importado pero no lo usamos en este flujo actual.
+// import { shouldEscalateChat } from './shouldEscalate'
 
 type IAReplyResult = {
     estado: ConversationEstado
@@ -180,16 +182,36 @@ const wantsToBuy = (t: string) =>
     ['comprar', 'lo compro', 'lo quiero', 'quiero comprar', 'me lo llevo', 'cerrar compra', 'finalizar compra', 'hacer pedido', 'ordenar', 'pedido'].some(
         (k) => nrm(t).includes(nrm(k))
     )
+// === Intents adicionales (faltaban) ===
+const askPaymentLink = (t: string): boolean =>
+    [
+        'link de pago',
+        'enlace de pago',
+        'pagar con tarjeta',
+        'pse',
+        'nequi',
+        'daviplata',
+        'stripe',
+        'mercado pago',
+        'pagos online',
+        'pago online',
+    ].some(k => nrm(t).includes(nrm(k)))
 
-const askPaymentLink = (t: string) =>
-    ['link de pago', 'enlace de pago', 'pagar con tarjeta', 'pse', 'nequi', 'daviplata', 'stripe', 'mercado pago', 'pagos online', 'pago online'].some(
-        (k) => nrm(t).includes(nrm(k))
-    )
+const askTransfer = (t: string): boolean =>
+    [
+        'transferencia',
+        'bancaria',
+        'datos bancarios',
+        'cuenta',
+        'consignacion',
+        'consignación',
+        'ban',
+        'bancolombia',
+        'qr',
+        'nequi',
+        'daviplata',
+    ].some(k => nrm(t).includes(nrm(k)))
 
-const askTransfer = (t: string) =>
-    ['transferencia', 'bancaria', 'datos bancarios', 'cuenta', 'consignacion', 'consignación', 'ban', 'bancolombia', 'qr', 'nequi', 'daviplata'].some(
-        (k) => nrm(t).includes(nrm(k))
-    )
 
 // Estas dos solo se usan dentro del flujo de checkout
 const providesAddress = (t: string) =>
@@ -308,7 +330,7 @@ ${reglas}
 - Si el usuario pide catálogo, sugiere 3–6 items con "desde" y CTA.`
 }
 
-/* ==================== LLM ==================== */
+/* ==================== LLM call (con logs) ==================== */
 async function chatComplete({
     model,
     messages,
@@ -325,43 +347,69 @@ async function chatComplete({
         (m) => Array.isArray(m.content) && m.content.some((p: any) => p?.type === 'image_url')
     )
 
+    // 👀 Logs de visión
     if (hasImage) {
+        console.log('[IA Vision] 🚀 Preparando llamada con modelo de visión:', VISION_MODEL)
+        const imgPayloads = messages.flatMap((m) =>
+            Array.isArray(m.content) ? m.content.filter((p: any) => p.type === 'image_url') : []
+        )
+        console.log('[IA Vision] URLs detectadas:', imgPayloads.map((p: any) => p.image_url?.url))
+    }
+
+    try {
+        if (hasImage) {
+            console.log('[IA Vision] ▶️ Llamando OpenAI con modelo:', normalizeForOpenAI(VISION_MODEL))
+            const resp = await openai.chat.completions.create({
+                model: normalizeForOpenAI(VISION_MODEL),
+                messages,
+                temperature,
+                max_completion_tokens: maxTokens as any,
+                // @ts-ignore
+                max_tokens: maxTokens,
+            } as any)
+            const out = resp?.choices?.[0]?.message?.content ?? ''
+            console.log('[IA Vision] ✅ Respuesta visión:', out)
+            return out
+        }
+
+        if (isOR(normalized)) {
+            console.log('[IA Router] ▶️ OpenRouter con modelo:', normalized)
+            const payload = { model: normalized, messages, temperature, max_tokens: maxTokens, max_output_tokens: maxTokens }
+            const { data } = await axios.post(OPENROUTER_URL, payload, {
+                headers: {
+                    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': process.env.OPENROUTER_REFERRER || 'http://localhost:3000',
+                    'X-Title': process.env.OPENROUTER_APP_NAME || 'WPP AI SaaS',
+                },
+                timeout: HTTP_TIMEOUT,
+            })
+            const content = data?.choices?.[0]?.message?.content
+            const out = typeof content === 'string'
+                ? content
+                : Array.isArray(content)
+                    ? content.map((c: any) => c?.text || '').join(' ')
+                    : ''
+            console.log('[IA Router] ✅ Respuesta texto (OpenRouter):', out)
+            return out
+        }
+
+        console.log('[IA Text] ▶️ OpenAI con modelo:', normalizeForOpenAI(normalized))
         const resp = await openai.chat.completions.create({
-            model: normalizeForOpenAI(VISION_MODEL),
+            model: normalizeForOpenAI(normalized),
             messages,
             temperature,
             max_completion_tokens: maxTokens as any,
             // @ts-ignore
             max_tokens: maxTokens,
         } as any)
-        return resp?.choices?.[0]?.message?.content ?? ''
+        const out = resp?.choices?.[0]?.message?.content ?? ''
+        console.log('[IA Text] ✅ Respuesta texto:', out)
+        return out
+    } catch (err: any) {
+        console.error('[IA ERROR]', err?.response?.data || err?.message || err)
+        throw err
     }
-
-    if (isOR(normalized)) {
-        if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY no configurada')
-        const payload = { model: normalized, messages, temperature, max_tokens: maxTokens, max_output_tokens: maxTokens }
-        const { data } = await axios.post(OPENROUTER_URL, payload, {
-            headers: {
-                Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-                'Content-Type': 'application/json',
-                'HTTP-Referer': process.env.OPENROUTER_REFERRER || 'http://localhost:3000',
-                'X-Title': process.env.OPENROUTER_APP_NAME || 'WPP AI SaaS',
-            },
-            timeout: HTTP_TIMEOUT,
-        })
-        const content = data?.choices?.[0]?.message?.content
-        return typeof content === 'string' ? content : Array.isArray(content) ? content.map((c: any) => c?.text || '').join(' ') : ''
-    }
-
-    const resp = await openai.chat.completions.create({
-        model: normalizeForOpenAI(normalized),
-        messages,
-        temperature,
-        max_completion_tokens: maxTokens as any,
-        // @ts-ignore
-        max_tokens: maxTokens,
-    } as any)
-    return resp?.choices?.[0]?.message?.content ?? ''
 }
 
 /* ========================= Core ========================= */
@@ -379,6 +427,7 @@ export const handleIAReply = async (
         console.warn(`[handleIAReply] 🔒 La conversación ${chatId} está cerrada.`)
         return null
     }
+    console.log('[handleIAReply] ▶️ chat:', chatId, 'empresa:', conversacion.empresaId)
 
     // Config & empresa
     const config = await prisma.businessConfig.findFirst({
@@ -394,6 +443,7 @@ export const handleIAReply = async (
         'Gracias por tu mensaje. En breve un compañero del equipo te contactará para ayudarte con más detalle.'
 
     if (!config) {
+        console.warn('[handleIAReply] ⚠️ Sin BusinessConfig; escalando.')
         const escalado = await persistBotReply({
             conversationId: chatId,
             empresaId: conversacion.empresaId,
@@ -428,16 +478,23 @@ export const handleIAReply = async (
     const isImage = ultimoCliente?.mediaType === MediaType.image && !!ultimoCliente.mediaUrl
     const imageUrl = isImage ? String(ultimoCliente?.mediaUrl) : null
 
+    if (isImage) {
+        console.log(`[handleIAReply] 📷 Imagen recibida en chat ${chatId}:`, imageUrl, 'caption:', ultimoCliente?.caption)
+    }
+
     /* ========== 1) Imagen: ¿comprobante de pago? ========== */
     if (isImage) {
         const maybePayment = /comprobante|pago|recibo|transferencia|soporte|consignacion|consignación|voucher|dep[oó]sito|qr/i.test(
             (ultimoCliente?.caption || '') + ' ' + (ultimoCliente?.contenido || '')
         )
+        console.log('[handleIAReply] ¿Es comprobante?', maybePayment)
         if (maybePayment) {
             const order = await ensureDraftOrder(conversacion, config)
+            console.log('[handleIAReply] 🧾 Asociando comprobante a order:', order.id)
             // marca orden como pendiente de validación de pago
             if (order.status !== 'pending_payment') {
                 await prisma.order.update({ where: { id: order.id }, data: { status: 'pending_payment' } })
+                console.log('[handleIAReply] Order → pending_payment')
             }
             try {
                 await prisma.paymentReceipt.create({
@@ -450,6 +507,7 @@ export const handleIAReply = async (
                         rawOcrText: '', // OCR futuro
                     },
                 })
+                console.log('[handleIAReply] ✅ PaymentReceipt guardado')
             } catch (e) {
                 console.warn('[handleIAReply] paymentReceipt create error:', (e as any)?.message || e)
             }
@@ -508,9 +566,11 @@ export const handleIAReply = async (
             })
         }
     }
+    console.log('[handleIAReply] 🔎 productos candidatos:', productos.map(p => p?.nombre))
 
     /* ====== 3.1 Catálogo cuando lo piden ====== */
     if (wantsCatalog(mensaje)) {
+        console.log('[handleIAReply] Intent: catálogo')
         const texto = await catalogReply(conversacion.empresaId)
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId, texto,
@@ -541,22 +601,33 @@ export const handleIAReply = async (
         wantsToBuy(mensaje) || askPaymentLink(mensaje) || askTransfer(mensaje) || providesAddress(mensaje) || providesCity(mensaje)
 
     if (startedCheckout) {
+        console.log('[handleIAReply] 🛒 startedCheckout. mensaje:', mensaje)
         const draft = await ensureDraftOrder(conversacion, config)
+        console.log('[handleIAReply] draft order id:', draft.id, 'status:', draft.status)
 
         // Parse y guarda city/address si aparece
         const parsed = parseAddressCity(mensaje)
-        if (parsed.city && !draft.city) await prisma.order.update({ where: { id: draft.id }, data: { city: parsed.city } })
-        if (parsed.address && !draft.address) await prisma.order.update({ where: { id: draft.id }, data: { address: parsed.address } })
+        if (parsed.city && !draft.city) {
+            await prisma.order.update({ where: { id: draft.id }, data: { city: parsed.city } })
+            console.log('[handleIAReply] City seteada:', parsed.city)
+        }
+        if (parsed.address && !draft.address) {
+            await prisma.order.update({ where: { id: draft.id }, data: { address: parsed.address } })
+            console.log('[handleIAReply] Address seteada:', parsed.address)
+        }
 
         // Si hay producto relevante, agregar (default 1 ud) y recalcular totales
         if (productos.length) {
             await upsertFirstItem(draft.id, productos[0])
+            console.log('[handleIAReply] Producto agregado a order:', productos[0].nombre)
         }
         await recalcOrderTotals(draft.id, config)
         const freshOrder = await prisma.order.findUnique({ where: { id: draft.id } })
+        console.log('[handleIAReply] 💵 Totales -> subtotal:', freshOrder?.subtotal, 'envío:', freshOrder?.shippingCost, 'total:', freshOrder?.total)
 
         // Link de pago con total
         if (askPaymentLink(mensaje)) {
+            console.log('[handleIAReply] 🧾 Solicitan link de pago')
             const txt = composePaymentLinkMessage(config, productos[0], freshOrder!)
             const saved = await persistBotReply({
                 conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
@@ -569,6 +640,7 @@ export const handleIAReply = async (
 
         // Transferencia con total
         if (askTransfer(mensaje)) {
+            console.log('[handleIAReply] 🧾 Solicitan transferencia')
             const txt = composeBankTransferMessage(config, productos[0], freshOrder!)
             const saved = await persistBotReply({
                 conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
@@ -608,6 +680,7 @@ export const handleIAReply = async (
 
     /* ====== 6) Imagen de producto ajeno (no hay match) ====== */
     if (isImage && !productos.length) {
+        console.log('[handleIAReply] 📷 Imagen NO coincide con catálogo; ofrecer alternativas')
         const disponibles = await prisma.product.findMany({
             where: { empresaId: conversacion.empresaId, disponible: true },
             take: 5,
@@ -629,6 +702,7 @@ export const handleIAReply = async (
 
     /* ====== 7) Precio directo ====== */
     if (isPrice(mensaje) && productos.length) {
+        console.log('[handleIAReply] Intent: precio')
         const p = productos[0]
         const precio = p?.precioDesde != null ? formatMoney(p.precioDesde) : null
         const texto = precio
@@ -645,6 +719,7 @@ export const handleIAReply = async (
 
     /* ====== 8) Imágenes directas ====== */
     if (wantsImages(mensaje) && productos.length && opts?.autoSend) {
+        console.log('[handleIAReply] Intent: imágenes de producto')
         const mediaRes = await sendProductImages({ chatId, conversacion, productosRelevantes: productos, phoneNumberId: opts?.phoneNumberId, toOverride: opts?.toPhone })
         const texto = mediaRes.length ? 'Te compartí imágenes del catálogo. ¿Quieres *precios* o confirmar *stock*?' : 'No encontré imágenes ahora. ¿Te paso *beneficios* o *precio*?'
         const saved = await persistBotReply({
@@ -659,6 +734,7 @@ export const handleIAReply = async (
     /* ====== 9) Seguimiento de CTA ====== */
     const lastCTA = lastBotCTA(mensajesPrevios)
     if ((isAffirmative(mensaje) || isProductIntent(mensaje) || isPrice(mensaje)) && productos.length) {
+        console.log('[handleIAReply] Intent: seguimiento CTA →', lastCTA)
         const want: LastCTA =
             (isPrice(mensaje) && 'precio') ||
             (/beneficio|ventaja/.test(nrm(mensaje)) && 'beneficios') ||
@@ -718,8 +794,10 @@ export const handleIAReply = async (
 
     let respuesta = ''
     try {
+        console.log('[handleIAReply] 🧠 Llamando chatComplete con modelo:', imageUrl ? VISION_MODEL : RAW_MODEL)
         respuesta = (await chatComplete({ model: imageUrl ? VISION_MODEL : RAW_MODEL, messages: baseMessages, temperature: TEMPERATURE, maxTokens: MAX_COMPLETION_TOKENS }))?.trim()
     } catch (e) {
+        console.warn('[handleIAReply] ❗️Fallo modelo principal, usando fallback:', fallbackModel())
         try {
             respuesta = (await chatComplete({ model: fallbackModel(), messages: baseMessages, temperature: TEMPERATURE, maxTokens: MAX_COMPLETION_TOKENS }))?.trim()
         } catch (e2) {
@@ -734,6 +812,7 @@ export const handleIAReply = async (
     }
 
     respuesta = (respuesta || '').trim()
+    console.log('[handleIAReply] 📝 Respuesta IA final:', respuesta)
     if (!respuesta || esRespuestaInvalida(respuesta)) {
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId,
@@ -792,6 +871,7 @@ async function persistBotReply({
             const resp = await sendWhatsappMessage({ empresaId, to: normalizeToE164(sendTo!), body: texto, phoneNumberIdHint: phoneNumberId })
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
             if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
+            console.log('[persistBotReply] ✅ WhatsApp enviado, wamid:', wamid)
         } catch (err: any) {
             console.error('[persistBotReply] ERROR WhatsApp:', err?.response?.data || err?.message || err)
         }
@@ -954,41 +1034,6 @@ function composeCheckoutOptions(c: any, prod?: any, order?: any) {
     if (order) parts.push(`Total a pagar: *${formatMoney(order.total)}*.`)
     if (envioEta) parts.push(`⏰ Entrega estimada: ${envioEta}.`)
     parts.push('¿Qué método prefieres?')
-    return short(parts.join('\n'))
-}
-
-/* ====== Business Q&A simple ====== */
-function maybeBusinessAnswer(c: any, t: string) {
-    const anyIn = (txt: string, arr: string[]) => arr.some((k) => nrm(txt).includes(nrm(k)))
-    const Q = {
-        ENVIO: ['envio', 'envios', 'envíos', 'domicilio', 'a domicilio', 'hacen envios', 'hacen envíos'],
-        PAGO: ['pago', 'pagos', 'metodos de pago', 'tarjeta', 'transferencia', 'contraentrega', 'contra entrega'],
-        HORARIO: ['horario', 'atienden', 'abren', 'cierran'],
-        TIENDA: ['tienda fisica', 'tienda física', 'direccion', 'dirección', 'donde quedan', 'ubicacion', 'ubicación'],
-        DEV: ['devolucion', 'devolución', 'cambio', 'cambios', 'reembolso'],
-        GAR: ['garantia', 'garantía'],
-        PROMO: ['promocion', 'promoción', 'promos', 'descuento', 'descuentos', 'oferta', 'ofertas'],
-        CANAL: ['canal', 'contacto', 'atencion', 'soporte', 'hablar', 'comunicar'],
-    }
-    const parts: string[] = []
-    const em = { box: '📦', money: '💳', clock: '⏰', pin: '📍', refresh: '🔄', shield: '🛡️', tag: '🏷️', chat: '💬' }
-    const envioTxt = String(cfg(c, 'enviosInfo') || '').trim()
-    const costoFijo = Number(cfg(c, 'envioCostoFijo') || 0) || 0
-    const gratisDesde = Number(cfg(c, 'envioGratisDesde') || 0) || 0
-    const extraCostos = (costoFijo || gratisDesde) ? ` ${costoFijo ? `(Costo fijo: ${formatMoney(costoFijo)})` : ''}${gratisDesde ? ` (Gratis desde ${formatMoney(gratisDesde)})` : ''}` : ''
-    if (anyIn(t, Q.ENVIO) && (envioTxt || extraCostos)) parts.push(`${em.box} *Envíos:* ${envioTxt || 'Coordinamos envíos a nivel nacional.'}${extraCostos}`)
-    if (anyIn(t, Q.PAGO) && String(cfg(c, 'metodosPago')).trim()) parts.push(`${em.money} *Pagos:* ${cfg(c, 'metodosPago')}`)
-    if (anyIn(t, Q.HORARIO) && String(cfg(c, 'horarios')).trim()) parts.push(`${em.clock} *Horario:* ${cfg(c, 'horarios')}`)
-    if (anyIn(t, Q.TIENDA)) {
-        const tf = Boolean(cfg(c, 'tiendaFisica'))
-        const dir = tf ? (cfg(c, 'direccionTienda') || 'Tienda física disponible') : 'Por ahora solo atendemos online'
-        parts.push(`${em.pin} *Tienda:* ${tf ? 'Sí' : 'No'}. ${dir}`)
-    }
-    if (anyIn(t, Q.DEV) && String(cfg(c, 'politicasDevolucion')).trim()) parts.push(`${em.refresh} *Devoluciones:* ${cfg(c, 'politicasDevolucion')}`)
-    if (anyIn(t, Q.GAR) && String(cfg(c, 'politicasGarantia')).trim()) parts.push(`${em.shield} *Garantía:* ${cfg(c, 'politicasGarantia')}`)
-    if (anyIn(t, Q.PROMO) && String(cfg(c, 'promocionesInfo')).trim()) parts.push(`${em.tag} *Promos:* ${cfg(c, 'promocionesInfo')}`)
-    if (anyIn(t, Q.CANAL) && String(cfg(c, 'canalesAtencion')).trim()) parts.push(`${em.chat} *Atención:* ${cfg(c, 'canalesAtencion')}`)
-    if (!parts.length) return null
     return short(parts.join('\n'))
 }
 
