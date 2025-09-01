@@ -10,6 +10,22 @@ datasource db {
 /**
  * ========== Enums ==========
  */
+/// Perfil general de la IA por empresa
+enum AiMode {
+  ecommerce
+  agente
+}
+
+/// Especialidad del agente (expandible)
+enum AgentSpecialty {
+  generico
+  medico
+  dermatologia
+  nutricion
+  psicologia
+  odontologia
+}
+
 enum ConversationEstado {
   pendiente
   respondido
@@ -181,6 +197,13 @@ model BusinessConfig {
   extras               String  @db.Text
   palabrasClaveNegocio String  @default("")
 
+  // ===== Perfil de IA (personalizado)
+  aiMode           AiMode         @default(ecommerce) // ecommerce | agente
+  agentSpecialty   AgentSpecialty @default(generico) // médico, dermatología, nutrición, etc.
+  agentPrompt      String?        @db.Text // tono/instrucciones específicas del negocio
+  agentScope       String?        @db.Text // qué atiende / qué no atiende
+  agentDisclaimers String?        @db.Text // descargos de responsabilidad
+
   // ===== Pagos (link OPCIONAL + transferencia)
   pagoLinkGenerico     String  @default("") // opcional
   pagoLinkProductoBase String  @default("") // opcional (para SKU/qty)
@@ -302,7 +325,7 @@ model ProductImage {
 }
 
 /**
- * ========== NUEVO: Pedidos & Pagos ==========
+ * ========== Pedidos & Pagos ==========
  */
 model Order {
   id             Int     @id @default(autoincrement())

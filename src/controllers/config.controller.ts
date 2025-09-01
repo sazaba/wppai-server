@@ -10,8 +10,12 @@ const nOrNull = (v: any) => {
     const num = Number(v)
     return Number.isFinite(num) ? num : null
 }
+const oneOf = <T extends string>(raw: any, allowed: readonly T[], def: T): T => {
+    const v = String(raw ?? "").toLowerCase() as T
+    return (allowed as readonly string[]).includes(v) ? (v as T) : def
+}
 
-// GET /api/config
+// === GET /api/config
 export async function getConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
@@ -23,7 +27,7 @@ export async function getConfig(req: Request, res: Response) {
     }
 }
 
-// PUT /api/config
+// === PUT /api/config
 export async function upsertConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
 
@@ -35,6 +39,24 @@ export async function upsertConfig(req: Request, res: Response) {
     const horarios = s(req.body?.horarios)
     const businessType = s(req.body?.businessType || "servicios")
     const disclaimers = s(req.body?.disclaimers)
+
+    // --- NUEVO: Perfil IA / Agente
+    // Enums válidos (coinciden con Prisma)
+    const aiMode = oneOf(req.body?.aiMode, ["ecommerce", "agente"] as const, "ecommerce")
+    const agentSpecialty = oneOf(
+        req.body?.agentSpecialty,
+        ["generico", "medico", "dermatologia", "nutricion", "psicologia", "odontologia"] as const,
+        "generico"
+    )
+
+    // Si el modo no es "agente", guardamos los campos del agente como NULL
+    // (en Prisma están definidos como String? @db.Text)
+    const agentPrompt =
+        aiMode === "agente" ? (s(req.body?.agentPrompt) || null) : null
+    const agentScope =
+        aiMode === "agente" ? (s(req.body?.agentScope) || null) : null
+    const agentDisclaimers =
+        aiMode === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
 
     // Operación
     const enviosInfo = s(req.body?.enviosInfo)
@@ -57,7 +79,7 @@ export async function upsertConfig(req: Request, res: Response) {
     const pagoLinkGenerico = s(req.body?.pagoLinkGenerico)
     const pagoLinkProductoBase = s(req.body?.pagoLinkProductoBase)
     const pagoNotasRaw = req.body?.pagoNotas // puede ser null
-    const pagoNotas = (pagoNotasRaw === null) ? null : s(pagoNotasRaw) || null
+    const pagoNotas = pagoNotasRaw === null ? null : s(pagoNotasRaw) || null
 
     const bancoNombre = s(req.body?.bancoNombre)
     const bancoTitular = s(req.body?.bancoTitular)
@@ -76,7 +98,7 @@ export async function upsertConfig(req: Request, res: Response) {
     const facturaElectronicaInfo = s(req.body?.facturaElectronicaInfo)
     const soporteDevolucionesInfo = s(req.body?.soporteDevolucionesInfo)
 
-    // Reglas mínimas para no guardar vacío del todo (igual que antes)
+    // Reglas mínimas para no guardar vacío
     if (!nombre || !descripcion || !faq || !horarios) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
@@ -91,6 +113,13 @@ export async function upsertConfig(req: Request, res: Response) {
             horarios,
             businessType,
             disclaimers,
+
+            // perfil IA
+            aiMode,             // enum AiMode (ecommerce | agente)
+            agentSpecialty,     // enum AgentSpecialty
+            agentPrompt,        // String? (null si no aplica)
+            agentScope,         // String? (null si no aplica)
+            agentDisclaimers,   // String? (null si no aplica)
 
             // operación
             enviosInfo,
@@ -132,8 +161,7 @@ export async function upsertConfig(req: Request, res: Response) {
             soporteDevolucionesInfo,
         }
 
-        // Quitar claves Decimal que vengan null para no sobrescribir con null si tu
-        // formulario no envía el campo (opcional)
+        // Evita sobreescribir con null si tu formulario no envía los campos decimal
         if (data.envioCostoFijo === null) delete data.envioCostoFijo
         if (data.envioGratisDesde === null) delete data.envioGratisDesde
 
@@ -149,7 +177,7 @@ export async function upsertConfig(req: Request, res: Response) {
     }
 }
 
-// GET /api/config/all (opcional)
+// === GET /api/config/all (opcional)
 export async function getAllConfigs(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
@@ -164,7 +192,7 @@ export async function getAllConfigs(req: Request, res: Response) {
     }
 }
 
-// DELETE /api/config/:id
+// === DELETE /api/config/:id
 export async function deleteConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const id = Number(req.params.id)
@@ -181,10 +209,10 @@ export async function deleteConfig(req: Request, res: Response) {
     }
 }
 
-// DELETE /api/config?withCatalog=1
+// === DELETE /api/config?withCatalog=1
 export async function resetConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
-    const withCatalog = ['1', 'true', 'yes'].includes(String(req.query.withCatalog || '').toLowerCase())
+    const withCatalog = ["1", "true", "yes"].includes(String(req.query.withCatalog || "").toLowerCase())
 
     try {
         await prisma.$transaction(async (tx) => {
