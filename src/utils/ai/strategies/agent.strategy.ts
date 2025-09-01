@@ -308,27 +308,27 @@ function clampConcise(text: string, maxLines = 5, maxChars = 420): string {
 }
 function formatConcise(text: string): string {
     let t = String(text || '').trim()
-    if (!t) return '¿Podrías contarme un poco más para orientarte mejor?'
+    if (!t) return '¿Puedes contarme un poco más?'
 
-    // Si ya trae viñetas, solo acorta
-    const hasBullet = /^[•\-]/m.test(t)
-    t = clampConcise(t, 3, 260)
+    // Normaliza espacios y saltos
+    t = t.replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
 
-    if (hasBullet) {
-        // Garantiza pregunta final
-        if (!/[¿?]\s*$/.test(t)) {
-            t += '\n¿Puedes decirme desde cuándo y qué síntomas tienes?'
-        }
-        return t
+    // Si ya viene con viñeta, toma solo la primera y agrega una pregunta
+    if (/^[•\-]/m.test(t)) {
+        const [firstLine, ...rest] = t.split('\n').filter(Boolean)
+        // Busca una pregunta en el resto o en todo el texto
+        const qMatch = t.match(/[^.\n!?]*\?[^?\n]*$/)
+        const question = (qMatch ? qMatch[0] : '¿Puedes darme un detalle más?').trim()
+        return clampConcise(`${firstLine.trim()}\n${question}`, 2, 180)
     }
 
-    // Convertir primeras 2 oraciones en viñetas y cerrar con pregunta
+    // Convierte a "1 viñeta + 1 pregunta"
     const sents = t.split(/(?<=[.!?])\s+/).filter(Boolean)
-    const bullets = sents.slice(0, 2).map(s => `• ${s.replace(/\s+/g, ' ').trim()}`)
-    let question = sents.find(s => /[?]$/.test(s))
-    if (!question) question = '¿Puedes decirme desde cuándo y qué síntomas tienes?'
+    const first = (sents.find(s => !/[?]\s*$/.test(s)) || sents[0] || t).replace(/\s+/g, ' ').trim()
+    const question = (sents.find(s => /[?]\s*$/.test(s)) || '¿Puedes darme un detalle más?').trim()
 
-    return clampConcise([...bullets, question].join('\n'), 3, 260)
+    const out = `• ${first}\n${question}`
+    return clampConcise(out, 2, 180)
 }
 
 
