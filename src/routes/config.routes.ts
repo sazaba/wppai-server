@@ -4,27 +4,20 @@ import { verificarJWT } from "../middleware/auth.middleware"
 import {
     getConfig,
     upsertConfig,
+    upsertAgentConfig,   // ⬅️ nuevo import
     getAllConfigs,
     deleteConfig,
     resetConfig,
 } from "../controllers/config.controller"
 
 const r = Router()
-
-// Proteger todo
 r.use(verificarJWT)
 
-/**
- * Base URL montada: /api/config
- */
-r.get("/", getConfig)            // GET    /api/config
-r.put("/", upsertConfig)         // PUT    /api/config
-r.get("/all", getAllConfigs)     // GET    /api/config/all
-
-// ✅ Más claro: reset como POST explícito (antes tenías DELETE "/")
-r.post("/reset", resetConfig)    // POST   /api/config/reset?withCatalog=1
-
-// Borrar una versión puntual por id (si usas histórico)
-r.delete("/:id", deleteConfig)   // DELETE /api/config/:id
+r.get("/", getConfig)
+r.put("/", upsertConfig)
+r.put("/agent", upsertAgentConfig)   // ⬅️ NUEVO ENDPOINT
+r.get("/all", getAllConfigs)
+r.post("/reset", resetConfig)
+r.delete("/:id", deleteConfig)
 
 export default r

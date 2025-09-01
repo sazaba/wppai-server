@@ -1,8 +1,14 @@
 // server/src/controllers/config.controller.ts
 import { Request, Response } from "express"
 import prisma from "../lib/prisma"
+import {
+    AiMode,
+    AgentSpecialty,
+    BusinessType,
+    Prisma,
+} from "@prisma/client"
 
-// Helpers de normalización
+// Helpers básicos
 const s = (v: any, def = "") => (v === undefined || v === null ? def : String(v).trim())
 const b = (v: any, def = false) => (v === undefined || v === null ? def : Boolean(v))
 const nOrNull = (v: any) => {
@@ -13,6 +19,26 @@ const nOrNull = (v: any) => {
 const oneOf = <T extends string>(raw: any, allowed: readonly T[], def: T): T => {
     const v = String(raw ?? "").toLowerCase() as T
     return (allowed as readonly string[]).includes(v) ? (v as T) : def
+}
+
+// ---- Mapeadores string -> enum Prisma
+const toBusinessType = (v: "servicios" | "productos"): BusinessType =>
+    v === "productos" ? BusinessType.productos : BusinessType.servicios
+
+const toAiMode = (v: "ecommerce" | "agente"): AiMode =>
+    v === "agente" ? AiMode.agente : AiMode.ecommerce
+
+const toAgentSpecialty = (
+    v: "generico" | "medico" | "dermatologia" | "nutricion" | "psicologia" | "odontologia"
+): AgentSpecialty => {
+    switch (v) {
+        case "medico": return AgentSpecialty.medico
+        case "dermatologia": return AgentSpecialty.dermatologia
+        case "nutricion": return AgentSpecialty.nutricion
+        case "psicologia": return AgentSpecialty.psicologia
+        case "odontologia": return AgentSpecialty.odontologia
+        default: return AgentSpecialty.generico
+    }
 }
 
 // === GET /api/config
@@ -37,26 +63,27 @@ export async function upsertConfig(req: Request, res: Response) {
     const servicios = s(req.body?.servicios)
     const faq = s(req.body?.faq)
     const horarios = s(req.body?.horarios)
-    const businessType = s(req.body?.businessType || "servicios")
+
+    // ⬅️ CORREGIDO: string union + enum Prisma
+    const businessTypeStr = oneOf(req.body?.businessType, ["servicios", "productos"] as const, "servicios")
+    const businessType = toBusinessType(businessTypeStr)
+
     const disclaimers = s(req.body?.disclaimers)
 
-    // --- NUEVO: Perfil IA / Agente
-    // Enums válidos (coinciden con Prisma)
-    const aiMode = oneOf(req.body?.aiMode, ["ecommerce", "agente"] as const, "ecommerce")
-    const agentSpecialty = oneOf(
+    // IA / Agente
+    const aiModeStr = oneOf(req.body?.aiMode, ["ecommerce", "agente"] as const, "ecommerce")
+    const aiMode = toAiMode(aiModeStr)
+
+    const agentSpecialtyStr = oneOf(
         req.body?.agentSpecialty,
         ["generico", "medico", "dermatologia", "nutricion", "psicologia", "odontologia"] as const,
         "generico"
     )
+    const agentSpecialty = toAgentSpecialty(agentSpecialtyStr)
 
-    // Si el modo no es "agente", guardamos los campos del agente como NULL
-    // (en Prisma están definidos como String? @db.Text)
-    const agentPrompt =
-        aiMode === "agente" ? (s(req.body?.agentPrompt) || null) : null
-    const agentScope =
-        aiMode === "agente" ? (s(req.body?.agentScope) || null) : null
-    const agentDisclaimers =
-        aiMode === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
+    const agentPrompt = aiMode === AiMode.agente ? (s(req.body?.agentPrompt) || null) : null
+    const agentScope = aiMode === AiMode.agente ? (s(req.body?.agentScope) || null) : null
+    const agentDisclaimers = aiMode === AiMode.agente ? (s(req.body?.agentDisclaimers) || null) : null
 
     // Operación
     const enviosInfo = s(req.body?.enviosInfo)
@@ -70,15 +97,15 @@ export async function upsertConfig(req: Request, res: Response) {
     const extras = s(req.body?.extras)
     const palabrasClaveNegocio = s(req.body?.palabrasClaveNegocio)
 
-    // 🔐 Escalamiento
+    // Escalamiento
     const escalarSiNoConfia = b(req.body?.escalarSiNoConfia, true)
     const escalarPalabrasClave = s(req.body?.escalarPalabrasClave)
     const escalarPorReintentos = Number(req.body?.escalarPorReintentos ?? 0) || 0
 
-    // 🛒 Ecommerce — pagos (link + transferencia)
+    // Pagos
     const pagoLinkGenerico = s(req.body?.pagoLinkGenerico)
     const pagoLinkProductoBase = s(req.body?.pagoLinkProductoBase)
-    const pagoNotasRaw = req.body?.pagoNotas // puede ser null
+    const pagoNotasRaw = req.body?.pagoNotas
     const pagoNotas = pagoNotasRaw === null ? null : s(pagoNotasRaw) || null
 
     const bancoNombre = s(req.body?.bancoNombre)
@@ -88,23 +115,25 @@ export async function upsertConfig(req: Request, res: Response) {
     const bancoDocumento = s(req.body?.bancoDocumento)
     const transferenciaQRUrl = s(req.body?.transferenciaQRUrl)
 
-    // 🚚 Envío
+    // Envío
     const envioTipo = s(req.body?.envioTipo)
     const envioEntregaEstimado = s(req.body?.envioEntregaEstimado)
     const envioCostoFijo = nOrNull(req.body?.envioCostoFijo)
     const envioGratisDesde = nOrNull(req.body?.envioGratisDesde)
 
-    // 🧾 Post-venta
+    // Post-venta
     const facturaElectronicaInfo = s(req.body?.facturaElectronicaInfo)
     const soporteDevolucionesInfo = s(req.body?.soporteDevolucionesInfo)
 
-    // Reglas mínimas para no guardar vacío
+    // Validación mínima
     if (!nombre || !descripcion || !faq || !horarios) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
 
     try {
-        const data: any = {
+        // Tipado explícito para Prisma (evita 'as any')
+        const data: Prisma.BusinessConfigUncheckedCreateInput = {
+            empresaId, // este campo se ignora en update
             // base
             nombre,
             descripcion,
@@ -114,12 +143,12 @@ export async function upsertConfig(req: Request, res: Response) {
             businessType,
             disclaimers,
 
-            // perfil IA
-            aiMode,             // enum AiMode (ecommerce | agente)
-            agentSpecialty,     // enum AgentSpecialty
-            agentPrompt,        // String? (null si no aplica)
-            agentScope,         // String? (null si no aplica)
-            agentDisclaimers,   // String? (null si no aplica)
+            // IA
+            aiMode,
+            agentSpecialty,
+            agentPrompt,
+            agentScope,
+            agentDisclaimers,
 
             // operación
             enviosInfo,
@@ -138,10 +167,10 @@ export async function upsertConfig(req: Request, res: Response) {
             escalarPalabrasClave,
             escalarPorReintentos,
 
-            // ecommerce pagos
+            // pagos
             pagoLinkGenerico,
             pagoLinkProductoBase,
-            pagoNotas, // TEXT nullable
+            pagoNotas,
 
             bancoNombre,
             bancoTitular,
@@ -153,22 +182,25 @@ export async function upsertConfig(req: Request, res: Response) {
             // envíos
             envioTipo,
             envioEntregaEstimado,
-            envioCostoFijo,   // Decimal? -> Prisma acepta number | string
-            envioGratisDesde, // Decimal?
+            envioCostoFijo: envioCostoFijo as any,   // Prisma acepta number; mantenemos compat
+            envioGratisDesde: envioGratisDesde as any,
 
             // post-venta
             facturaElectronicaInfo,
             soporteDevolucionesInfo,
         }
 
-        // Evita sobreescribir con null si tu formulario no envía los campos decimal
-        if (data.envioCostoFijo === null) delete data.envioCostoFijo
-        if (data.envioGratisDesde === null) delete data.envioGratisDesde
+        // No sobreescribir a null los decimales si no vinieron
+        const toUpdate: Prisma.BusinessConfigUncheckedUpdateInput = { ...data }
+        delete (toUpdate as any).empresaId
+        if (envioCostoFijo === null) delete (toUpdate as any).envioCostoFijo
+        if (envioGratisDesde === null) delete (toUpdate as any).envioGratisDesde
 
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
+
         const cfg = existente
-            ? await prisma.businessConfig.update({ where: { empresaId }, data })
-            : await prisma.businessConfig.create({ data: { empresaId, ...data } })
+            ? await prisma.businessConfig.update({ where: { empresaId }, data: toUpdate })
+            : await prisma.businessConfig.create({ data })
 
         return res.json(cfg)
     } catch (error) {
@@ -177,7 +209,50 @@ export async function upsertConfig(req: Request, res: Response) {
     }
 }
 
-// === GET /api/config/all (opcional)
+/**
+ * === PUT /api/config/agent
+ * Guarda SOLO el modo/parametría del agente.
+ */
+export async function upsertAgentConfig(req: Request, res: Response) {
+    const empresaId = (req as any).user?.empresaId as number
+
+    const aiModeStr = oneOf(req.body?.aiMode, ["ecommerce", "agente"] as const, "agente")
+    const agentSpecialtyStr = oneOf(
+        req.body?.agentSpecialty,
+        ["generico", "medico", "dermatologia", "nutricion", "psicologia", "odontologia"] as const,
+        "generico"
+    )
+
+    const aiMode = toAiMode(aiModeStr)
+    const agentSpecialty = toAgentSpecialty(agentSpecialtyStr)
+
+    const agentPrompt = s(req.body?.agentPrompt) || null
+    const agentScope = s(req.body?.agentScope) || null
+    const agentDisclaimers = s(req.body?.agentDisclaimers) || null
+
+    try {
+        const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
+
+        const data: Prisma.BusinessConfigUncheckedUpdateInput = {
+            aiMode,
+            agentSpecialty,
+            agentPrompt,
+            agentScope,
+            agentDisclaimers,
+        }
+
+        const cfg = existente
+            ? await prisma.businessConfig.update({ where: { empresaId }, data })
+            : await prisma.businessConfig.create({ data: { empresaId, ...data } as Prisma.BusinessConfigUncheckedCreateInput })
+
+        return res.json(cfg)
+    } catch (error) {
+        console.error("[upsertAgentConfig] error:", error)
+        return res.status(500).json({ error: "No se pudo guardar la configuración del agente" })
+    }
+}
+
+// === GET /api/config/all
 export async function getAllConfigs(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
@@ -209,7 +284,7 @@ export async function deleteConfig(req: Request, res: Response) {
     }
 }
 
-// === DELETE /api/config?withCatalog=1
+// === POST /api/config/reset?withCatalog=1
 export async function resetConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const withCatalog = ["1", "true", "yes"].includes(String(req.query.withCatalog || "").toLowerCase())
