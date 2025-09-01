@@ -50,7 +50,7 @@ export async function handleAgentReply(args: {
         },
     })
 
-    // 2) Cargar solo lo necesario para modo agente
+    // 2) Solo lo necesario para modo agente
     const [bc, empresa] = await Promise.all([
         prisma.businessConfig.findUnique({
             where: { empresaId },
@@ -59,7 +59,7 @@ export async function handleAgentReply(args: {
                 agentPrompt: true,
                 agentScope: true,
                 agentDisclaimers: true,
-                nombre: true, // nombre comercial si lo tienes cargado ahí
+                nombre: true,
             },
         }),
         prisma.empresa.findUnique({ where: { id: empresaId }, select: { nombre: true } }),
@@ -122,26 +122,29 @@ export async function handleAgentReply(args: {
         }
     }
 
-    // 5) Prompt del agente (solo campos de agente) + nombre
+    // 5) Prompt ULTRA COMPACTO (solo-agente) + presupuesto de prompt
     const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
-    const especialidad = agent.specialty || bc?.agentSpecialty || 'generico'
+    const especialidad = (agent.specialty || bc?.agentSpecialty || 'generico') as AgentSpecialty
 
-    const BASE_SYSTEM = [
-        negocioName ? `Te presentas como asistente de orientación de ${humanSpecialty(especialidad as AgentSpecialty)} de "${negocioName}".`
-            : `Eres un asistente de orientación de ${humanSpecialty(especialidad as AgentSpecialty)}.`,
-        `Responde en **3–5 líneas** máximo, claro y empático.`,
-        `No diagnostiques ni prescribas. No reemplazas una consulta clínica.`,
-        `Mantente estrictamente en el ámbito de ${humanSpecialty(especialidad as AgentSpecialty)}; si te preguntan algo fuera, dilo y reconduce.`,
-        (agent.scope || bc?.agentScope) ? `Ámbito del servicio: ${agent.scope || bc?.agentScope}` : '',
-        (agent.disclaimers || bc?.agentDisclaimers) ? `Incluye cuando corresponda: ${agent.disclaimers || bc?.agentDisclaimers}` : '',
+    const nameLine = negocioName
+        ? `Asistente de orientación de ${humanSpecialty(especialidad)} de "${negocioName}".`
+        : `Asistente de orientación de ${humanSpecialty(especialidad)}.`
+
+    const lineScope = softTrim(agent.scope || bc?.agentScope, 160)
+    const lineDisc = softTrim(agent.disclaimers || bc?.agentDisclaimers, 160)
+    const extraInst = softTrim(agent.prompt || bc?.agentPrompt, 160)
+
+    const system = [
+        nameLine,
+        'Responde en 3–5 líneas, tono claro y empático.',
+        'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
+        `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
+        lineScope ? `Ámbito: ${lineScope}` : '',
+        lineDisc ? `Incluye cuando aplique: ${lineDisc}` : '',
+        extraInst ? `Sigue estas instrucciones: ${extraInst}` : '',
     ].filter(Boolean).join('\n')
 
-    const system = (agent.prompt || bc?.agentPrompt)?.trim()
-        ? `${BASE_SYSTEM}\n\nInstrucciones del negocio:\n${(agent.prompt || bc?.agentPrompt)!.trim()}`
-        : BASE_SYSTEM
-
     const messages: Array<any> = [{ role: 'system', content: system }]
-
     if (imageUrl) {
         messages.push({
             role: 'user',
@@ -154,10 +157,13 @@ export async function handleAgentReply(args: {
         messages.push({ role: 'user', content: userText || 'Hola' })
     }
 
-    // 6) LLM con control de presupuesto (retry si 402) y límite de longitud
+    // Presupuestar prompt total (prompt budget objetivo ~90 tokens)
+    budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 90))
+
+    // 6) LLM con retry 402 y salida corta
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
-    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.5)
-    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 128) // bajo por diseño para WhatsApp
+    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.4)
+    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 80)
 
     let texto = ''
     try {
@@ -170,7 +176,7 @@ export async function handleAgentReply(args: {
     // Recorte server-side (máx. 5 líneas / 420 chars)
     texto = clampConcise(texto, 5, 420)
 
-    // 7) Persistir y responder (en modo agente no hacemos pagos ni flujos comerciales)
+    // 7) Persistir y responder
     const saved = await persistBotReply({
         conversationId: chatId,
         empresaId,
@@ -189,7 +195,7 @@ export async function handleAgentReply(args: {
     }
 }
 
-/* ===== helpers ===== */
+/* ================= helpers ================= */
 
 async function runChatWithBudget(opts: {
     model: string
@@ -198,30 +204,30 @@ async function runChatWithBudget(opts: {
     maxTokens: number
 }): Promise<string> {
     const { model, messages, temperature } = opts
-    let maxTokens = opts.maxTokens
+    const firstMax = opts.maxTokens
 
     if (process.env.DEBUG_AI === '1') {
         console.log('[AGENT] model =', model)
         console.log('[AGENT] OPENAI_API_KEY set =', !!process.env.OPENAI_API_KEY)
-        console.log('[AGENT] maxTokens try #1 =', maxTokens)
+        console.log('[AGENT] max_tokens try #1 =', firstMax)
     }
 
     try {
         const resp1 = await openai.chat.completions.create({
-            model, messages, temperature, max_tokens: maxTokens,
+            model, messages, temperature, max_tokens: firstMax,
         } as any)
         return resp1?.choices?.[0]?.message?.content?.trim() || ''
     } catch (err: any) {
         const msg = String(err?.response?.data || err?.message || '')
         if (process.env.DEBUG_AI === '1') console.error('[AGENT] first call error:', msg)
 
-        // Detecta límite de créditos y reduce tokens
         const affordable = parseAffordableTokens(msg)
-        const retryTokens = (typeof affordable === 'number' && Number.isFinite(affordable))
-            ? Math.max(16, Math.min(affordable - 3, 96))
-            : 96
+        const retryTokens =
+            (typeof affordable === 'number' && Number.isFinite(affordable))
+                ? Math.max(16, Math.min(affordable - 3, 32)) // retry más agresivo
+                : 32
 
-        if (process.env.DEBUG_AI === '1') console.log('[AGENT] retry with maxTokens =', retryTokens)
+        if (process.env.DEBUG_AI === '1') console.log('[AGENT] retry with max_tokens =', retryTokens)
 
         const resp2 = await openai.chat.completions.create({
             model, messages, temperature, max_tokens: retryTokens,
@@ -231,7 +237,11 @@ async function runChatWithBudget(opts: {
 }
 
 function parseAffordableTokens(message: string): number | null {
-    const m = message.match(/afford\s+(\d+)/i) || message.match(/only\s+(\d+)\s+tokens?/i)
+    // ejemplos proveedores: "can only afford 53", "Prompt tokens limit exceeded: 154 > 105"
+    const m =
+        message.match(/afford\s+(\d+)/i) ||
+        message.match(/only\s+(\d+)\s+tokens?/i) ||
+        message.match(/exceeded:\s*(\d+)\s*>\s*\d+/i)
     if (m && m[1]) {
         const n = Number(m[1])
         return Number.isFinite(n) ? n : null
@@ -239,7 +249,52 @@ function parseAffordableTokens(message: string): number | null {
     return null
 }
 
-/** Recorta a N líneas y M caracteres, limpia espacios y evita párrafos muy largos */
+// ===== prompt budgeting =====
+function softTrim(s: string | null | undefined, max = 140) {
+    const t = (s || '').trim()
+    if (!t) return ''
+    return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, '') + '…'
+}
+function approxTokens(str: string) { return Math.ceil((str || '').length / 4) }
+
+function budgetMessages(messages: any[], budgetPromptTokens = 90) {
+    const sys = messages.find((m: any) => m.role === 'system')
+    const user = messages.find((m: any) => m.role === 'user')
+    if (!sys) return messages
+
+    const sysText = String(sys.content || '')
+    const userText = typeof user?.content === 'string'
+        ? user?.content
+        : Array.isArray(user?.content)
+            ? String(user?.content?.[0]?.text || '') : ''
+
+    let total = approxTokens(sysText) + approxTokens(userText)
+    if (total <= budgetPromptTokens) return messages
+
+    // 1) reducir system: deja 5 líneas clave
+    const lines = sysText.split('\n').map(l => l.trim()).filter(Boolean)
+    const keep: string[] = []
+    for (const l of lines) {
+        if (/Asistente de orientación|Responde en|No diagnostiques|Mantente solo|Ámbito:|Incluye cuando/i.test(l)) {
+            keep.push(l)
+        }
+        if (keep.length >= 5) break
+    }
+    sys.content = keep.join('\n')
+
+    // 2) recorte user a 160 chars
+    if (typeof user?.content === 'string') {
+        const ut = String(user.content)
+        user.content = ut.length > 160 ? ut.slice(0, 160) : ut
+    } else if (Array.isArray(user?.content)) {
+        const ut = String(user.content?.[0]?.text || '')
+        user.content[0].text = ut.length > 160 ? ut.slice(0, 160) : ut
+    }
+
+    return messages
+}
+
+// ===== formatting / misc =====
 function clampConcise(text: string, maxLines = 5, maxChars = 420): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
@@ -275,10 +330,7 @@ async function persistBotReply({
     const msg = await prisma.message.create({
         data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId },
     })
-    await prisma.conversation.update({
-        where: { id: conversationId },
-        data: { estado: nuevoEstado },
-    })
+    await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } })
 
     let wamid: string | undefined
     if (to && String(to).trim()) {
