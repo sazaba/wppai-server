@@ -375,3 +375,7 @@ export async function resetConfig(req: Request, res: Response) {
         return res.status(500).json({ error: "No se pudo reiniciar la configuración" })
     }
 }
+
+// 👇 pega esta línea justo después
+export const resetConfigDelete = resetConfig
+

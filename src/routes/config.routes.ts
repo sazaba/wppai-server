@@ -8,6 +8,8 @@ import {
     getAllConfigs,
     deleteConfig,
     resetConfig,
+    resetConfigDelete,
+
 } from "../controllers/config.controller"
 
 const r = Router()
@@ -18,6 +20,8 @@ r.put("/", upsertConfig)
 r.put("/agent", upsertAgentConfig)   // ⬅️ NUEVO ENDPOINT
 r.get("/all", getAllConfigs)
 r.post("/reset", resetConfig)
+r.delete("/", resetConfigDelete)
 r.delete("/:id", deleteConfig)
+
 
 export default r
