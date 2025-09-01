@@ -112,13 +112,16 @@ const cfg = (c: any, k: string) => {
 
 /* ============ Intents ============ */
 const wantsImages = (t: string) =>
-    ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto', 'mandame fotos', 'envíame fotos', 'enviame fotos'].some(k => nrm(t).includes(nrm(k)))
+    ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto', 'mandame fotos', 'envíame fotos', 'enviame fotos']
+        .some(k => nrm(t).includes(nrm(k)))
 
 const asksCatalogue = (t: string) =>
-    ['lista de productos', 'productos disponibles', 'portafolio', 'catálogo', 'catalogo', 'que productos', 'cuáles tienes', 'cuales tienes'].some(k => nrm(t).includes(nrm(k)))
+    ['lista de productos', 'productos disponibles', 'portafolio', 'catálogo', 'catalogo', 'que productos', 'cuáles tienes', 'cuales tienes']
+        .some(k => nrm(t).includes(nrm(k)))
 
 const saysPaid = (t: string) =>
-    ['ya pague', 'ya pagué', 'pago realizado', 'hice el pago', 'ya hice el pago', 'pagado', 'comprobante'].some(k => nrm(t).includes(nrm(k)))
+    ['ya pague', 'ya pagué', 'pago realizado', 'hice el pago', 'ya hice el pago', 'pagado', 'comprobante']
+        .some(k => nrm(t).includes(nrm(k)))
 
 /* ===== Prompt con reglas anti-alucinación ===== */
 function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: string) {
@@ -323,7 +326,12 @@ function scoreQueryAgainst(entry: IndexEntry, query: string, recentNames: string
     return Math.max(j * 0.6 + d * 0.4 + hard + boost, 0)
 }
 
-async function inferBestProduct(empresaId: number, text: string, recentProductNames: string[], bizKeywords: string): Promise<{ id: number, nombre: string } | null> {
+async function inferBestProduct(
+    empresaId: number,
+    text: string,
+    recentProductNames: string[],
+    bizKeywords: string
+): Promise<{ id: number, nombre: string } | null> {
     const { items } = await buildProductIndex(empresaId)
     const q = nrm(text)
 
@@ -345,6 +353,19 @@ async function inferBestProduct(empresaId: number, text: string, recentProductNa
 
     // umbral flexible
     return bestScore >= 0.62 ? { id: best!.id, nombre: best!.nombre } : null
+}
+
+/* ---------- helpers de catálogo (faltante) ---------- */
+type ProductListItem = { nombre: string; precioDesde: any | null }
+function listProductsMessage(list: ProductListItem[]): string {
+    const lines: string[] = []
+    lines.push('Tenemos estas opciones disponibles ahora mismo:')
+    for (const p of (list || []).slice(0, 6)) {
+        const price = p?.precioDesde != null ? ` — desde ${formatMoney(p.precioDesde)}` : ''
+        lines.push(`• *${p?.nombre || ''}*${price}`)
+    }
+    lines.push('¿Quieres *fotos* de alguno o prefieres que te pase el *precio* de un producto en particular?')
+    return lines.join('\n').trim().split('\n').slice(0, 10).join('\n')
 }
 
 /* ========================= Core ========================= */
@@ -534,42 +555,76 @@ export const handleIAReply = async (
     }
 
     // Si pide fotos → infiere producto de forma fuzzy (usa index + historial)
-    if (wantsImages(mensaje) && opts?.autoSend && (opts?.toPhone || conversacion.phone)) {
-        // quitar palabras tipo "envíame/mándame fotos de"
-        const clean = nrm(mensaje).replace(/\b(foto|fotos|imagen|imagenes|imágenes|mandame|mándame|enviame|envíame|muestra|mostrar)\b/g, ' ')
-        const inferred = await inferBestProduct(conversacion.empresaId, clean || caption || mensaje, recentProductNames, cfg(config, 'palabrasClaveNegocio'))
+    {
+        const hasDestination =
+            Boolean(opts?.autoSend) && Boolean((opts?.toPhone ?? conversacion.phone));
 
-        if (inferred) {
-            const mediaSent = await sendProductImages({
-                chatId,
-                conversacion: { empresaId: conversacion.empresaId, phone: conversacion.phone },
-                productosRelevantes: [{ id: inferred.id, nombre: inferred.nombre }],
-                phoneNumberId: opts?.phoneNumberId,
-                toOverride: opts?.toPhone
-            })
-            const follow = `Te compartí fotos de *${inferred.nombre}*. ¿Deseas saber el *precio* o ver *alternativas*?`
-            const saved = await persistBotReply({
-                conversationId: chatId, empresaId: conversacion.empresaId, texto: follow,
-                nuevoEstado: ConversationEstado.respondido,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-                phoneNumberId: opts?.phoneNumberId,
-            })
-            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaSent }
-        } else {
-            // desambiguación breve (sin repetir catálogo completo)
-            const names = (await prisma.product.findMany({
-                where: { empresaId: conversacion.empresaId, disponible: true },
-                take: 3, orderBy: { id: 'asc' },
-                select: { nombre: true }
-            })).map(p => `*${p.nombre}*`)
-            const ask = `¿De cuál producto quieres fotos? ${names.length ? `Ej.: ${names.join(' / ')}` : ''}`
-            const saved = await persistBotReply({
-                conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
-                nuevoEstado: conversacion.estado,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-                phoneNumberId: opts?.phoneNumberId,
-            })
-            return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        if (wantsImages(mensaje) && hasDestination) {
+            // quitar palabras tipo "envíame/mándame fotos de"
+            const CLEAN_WORDS = [
+                'foto', 'fotos', 'imagen', 'imagenes',
+                'mandame', 'enviame', 'muestra', 'mostrar'
+            ];
+            const CLEAN_RE = new RegExp(`\\b(?:${CLEAN_WORDS.join('|')})\\b`, 'g');
+
+            const clean = nrm(mensaje).replace(CLEAN_RE, ' ').trim();
+
+            const inferred = await inferBestProduct(
+                conversacion.empresaId,
+                clean || caption || mensaje,
+                recentProductNames,
+                String(cfg(config, 'palabrasClaveNegocio') || '')
+            );
+
+            if (inferred) {
+                const mediaSent = await sendProductImages({
+                    chatId,
+                    conversacion: { empresaId: conversacion.empresaId, phone: conversacion.phone },
+                    productosRelevantes: [{ id: inferred.id, nombre: inferred.nombre }],
+                    phoneNumberId: opts?.phoneNumberId,
+                    toOverride: opts?.toPhone
+                });
+                const follow = `Te compartí fotos de *${inferred.nombre}*. ¿Deseas saber el *precio* o ver *alternativas*?`;
+                const saved = await persistBotReply({
+                    conversationId: chatId,
+                    empresaId: conversacion.empresaId,
+                    texto: follow,
+                    nuevoEstado: ConversationEstado.respondido,
+                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    phoneNumberId: opts?.phoneNumberId,
+                });
+                return {
+                    estado: ConversationEstado.respondido,
+                    mensaje: saved.texto,
+                    messageId: saved.messageId,
+                    wamid: saved.wamid,
+                    media: mediaSent
+                };
+            } else {
+                const names = (await prisma.product.findMany({
+                    where: { empresaId: conversacion.empresaId, disponible: true },
+                    take: 3,
+                    orderBy: { id: 'asc' },
+                    select: { nombre: true }
+                })).map(p => `*${p.nombre}*`);
+
+                const ask = `¿De cuál producto quieres fotos? ${names.length ? `Ej.: ${names.join(' / ')}` : ''}`;
+                const saved = await persistBotReply({
+                    conversationId: chatId,
+                    empresaId: conversacion.empresaId,
+                    texto: ask,
+                    nuevoEstado: conversacion.estado,
+                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    phoneNumberId: opts?.phoneNumberId,
+                });
+                return {
+                    estado: conversacion.estado,
+                    mensaje: saved.texto,
+                    messageId: saved.messageId,
+                    wamid: saved.wamid,
+                    media: []
+                };
+            }
         }
     }
 
