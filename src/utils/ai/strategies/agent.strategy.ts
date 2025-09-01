@@ -7,7 +7,7 @@ import {
     MediaType,
     MessageFrom,
     AgentSpecialty,
-    BusinessConfig
+    BusinessConfig,
 } from '@prisma/client'
 import * as Wam from '../../../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../../../services/transcription.service'
@@ -33,7 +33,7 @@ export async function handleAgentReply(args: {
     // 1) Conversación y último mensaje del cliente
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
-        select: { id: true, estado: true, phone: true }
+        select: { id: true, estado: true, phone: true },
     })
     if (!conversacion) return null
 
@@ -48,14 +48,12 @@ export async function handleAgentReply(args: {
             isVoiceNote: true,
             transcription: true,
             contenido: true,
-            mimeType: true
-        }
+            mimeType: true,
+        },
     })
 
     // 2) BusinessConfig (contexto del negocio y políticas)
-    const bc = await prisma.businessConfig.findUnique({
-        where: { empresaId }
-    })
+    const bc = await prisma.businessConfig.findUnique({ where: { empresaId } })
 
     // 3) Preparar texto del usuario (prioriza transcripción si es nota de voz)
     let userText = (mensajeArg || '').trim()
@@ -67,21 +65,22 @@ export async function handleAgentReply(args: {
                 if (last.mediaUrl && /^https?:\/\//i.test(String(last.mediaUrl))) {
                     const { data } = await axios.get(String(last.mediaUrl), {
                         responseType: 'arraybuffer',
-                        timeout: 30000
+                        timeout: 30000,
                     })
                     audioBuf = Buffer.from(data)
                 }
                 if (audioBuf) {
                     const name =
-                        last.mimeType?.includes('mpeg') ? 'audio.mp3' :
-                            last.mimeType?.includes('wav') ? 'audio.wav' :
-                                last.mimeType?.includes('m4a') ? 'audio.m4a' :
-                                    last.mimeType?.includes('webm') ? 'audio.webm' : 'audio.ogg'
+                        last.mimeType?.includes('mpeg') ? 'audio.mp3'
+                            : last.mimeType?.includes('wav') ? 'audio.wav'
+                                : last.mimeType?.includes('m4a') ? 'audio.m4a'
+                                    : last.mimeType?.includes('webm') ? 'audio.webm'
+                                        : 'audio.ogg'
                     transcript = await transcribeAudioBuffer(audioBuf, name)
                     if (transcript) {
                         await prisma.message.update({
                             where: { id: last.id },
-                            data: { transcription: transcript }
+                            data: { transcription: transcript },
                         })
                     }
                 }
@@ -94,8 +93,8 @@ export async function handleAgentReply(args: {
         if (transcript) userText = transcript
     }
 
-    const isImage = last?.mediaType === MediaType.image && !!last.mediaUrl
-    const imageUrl = isImage ? String(last.mediaUrl) : null
+    const isImage = last?.mediaType === MediaType.image && !!last?.mediaUrl
+    const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
 
     // 4) Mensaje “pregunta” si envían solo una imagen sin texto
@@ -107,14 +106,14 @@ export async function handleAgentReply(args: {
             texto: ask,
             nuevoEstado: conversacion.estado,
             to: toPhone ?? conversacion.phone,
-            phoneNumberId
+            phoneNumberId,
         })
         return {
             estado: conversacion.estado,
             mensaje: saved.texto,
             messageId: saved.messageId,
             wamid: saved.wamid,
-            media: []
+            media: [],
         }
     }
 
@@ -126,27 +125,25 @@ export async function handleAgentReply(args: {
         bc?.metodosPago ? `- Métodos de pago: ${bc.metodosPago}` : '',
         bc?.direccionTienda ? `- Dirección: ${bc.direccionTienda}` : '',
         bc?.politicasDevolucion ? `- Devoluciones: ${bc.politicasDevolucion}` : '',
-        bc?.politicasGarantia ? `- Garantía: ${bc.politicasGarantia}` : ''
+        bc?.politicasGarantia ? `- Garantía: ${bc.politicasGarantia}` : '',
     ].filter(Boolean).join('\n')
 
     const BASE_SYSTEM = [
         `Eres un asistente de ${humanSpecialty(agent.specialty)} para orientación general del negocio "${negocio}".`,
-        `Habla con calidez, naturalidad y precisión. Evita sonar robótico.`,
+        `Habla con calidez, naturalidad y precisión. Evita sonar robótico. Responde en como máximo 6 líneas.`,
         `No diagnostiques ni prescribas medicamentos. No reemplazas una consulta clínica.`,
-        `Brinda recomendaciones generales de autocuidado, higiene, hábitos saludables y cuándo consultar.`,
-        `Si detectas signos de alarma, sugiere buscar atención presencial o urgencias de inmediato.`,
-        `No salgas del ámbito de ${humanSpecialty(agent.specialty)}. Si preguntan algo fuera de ese ámbito, responde amablemente que no corresponde y reconduce la conversación.`,
-        agent.scope ? `Ámbito de atención del servicio: ${agent.scope}` : '',
-        agent.disclaimers ? `Disclaimers que debes incluir cuando corresponda: ${agent.disclaimers}` : '',
-        datosOperativos ? `Información del negocio (para referencia cuando aplique):\n${datosOperativos}` : '',
-        bc?.disclaimers ? `Disclaimers del negocio: ${bc.disclaimers}` : ''
+        `Ofrece recomendaciones de autocuidado y cuándo consultar. Si hay signos de alarma, sugiere atención presencial o urgencias.`,
+        `No salgas del ámbito de ${humanSpecialty(agent.specialty)} y reconduce si preguntan algo fuera.`,
+        agent.scope ? `Ámbito del servicio: ${agent.scope}` : '',
+        agent.disclaimers ? `Incluye estos disclaimers cuando corresponda: ${agent.disclaimers}` : '',
+        datosOperativos ? `Info del negocio (cuando aplique):\n${datosOperativos}` : '',
+        bc?.disclaimers ? `Disclaimers del negocio: ${bc.disclaimers}` : '',
     ].filter(Boolean).join('\n')
 
     const system = agent.prompt?.trim()
-        ? `${BASE_SYSTEM}\n\nInstrucciones específicas del negocio:\n${agent.prompt.trim()}`
+        ? `${BASE_SYSTEM}\n\nInstrucciones del negocio:\n${agent.prompt.trim()}`
         : BASE_SYSTEM
 
-    // OpenAI messages
     const messages: Array<any> = [{ role: 'system', content: system }]
 
     if (imageUrl) {
@@ -154,41 +151,26 @@ export async function handleAgentReply(args: {
             role: 'user',
             content: [
                 { type: 'text', text: userText || caption || 'Analiza la imagen con prudencia clínica y brinda orientación general.' },
-                { type: 'image_url', image_url: { url: imageUrl } }
-            ]
+                { type: 'image_url', image_url: { url: imageUrl } },
+            ],
         })
     } else {
         messages.push({ role: 'user', content: userText || 'Hola' })
     }
 
-    // 6) LLM (sin params conflictivos + logs)
+    // 6) LLM con control de presupuesto (retry si 402)
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.5)
-    const maxTokens = Number(process.env.IA_MAX_TOKENS ?? 420)
+    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 320)
 
     let texto = ''
     try {
-        if (process.env.DEBUG_AI === '1') {
-            console.log('[AGENT] model=', model)
-            console.log('[AGENT] OPENAI_API_KEY set =', !!process.env.OPENAI_API_KEY)
-            console.log('[AGENT] messages.len=', messages.length)
-            console.log('[AGENT] system head=', String(messages?.[0]?.content || '').slice(0, 200))
-        }
-
-        const resp = await openai.chat.completions.create({
-            model,
-            messages,
-            temperature,
-            max_tokens: maxTokens
-        } as any)
-
-        texto = resp?.choices?.[0]?.message?.content?.trim() || ''
+        texto = await runChatWithBudget({ model, messages, temperature, maxTokens: defaultMax })
     } catch (err: any) {
-        console.error('[AGENT] OpenAI error:', err?.response?.data || err?.message || err)
+        console.error('[AGENT] OpenAI error (final):', err?.response?.data || err?.message || err)
         texto = 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
     }
 
-    // Forzar mínimo “saludo/empatía” si quedó vacío por alguna razón
     if (!texto) {
         texto = 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
     }
@@ -202,14 +184,14 @@ export async function handleAgentReply(args: {
             texto: 'Gracias por la información. Para darte una atención adecuada, te conectaré con un profesional humano en breve. 🙌',
             nuevoEstado: ConversationEstado.requiere_agente,
             to: toPhone ?? conversacion.phone,
-            phoneNumberId
+            phoneNumberId,
         })
         return {
             estado: ConversationEstado.requiere_agente,
             mensaje: saved.texto,
             messageId: saved.messageId,
             wamid: saved.wamid,
-            media: []
+            media: [],
         }
     }
 
@@ -220,7 +202,7 @@ export async function handleAgentReply(args: {
         texto,
         nuevoEstado: ConversationEstado.respondido,
         to: toPhone ?? conversacion.phone,
-        phoneNumberId
+        phoneNumberId,
     })
 
     return {
@@ -228,11 +210,67 @@ export async function handleAgentReply(args: {
         mensaje: saved.texto,
         messageId: saved.messageId,
         wamid: saved.wamid,
-        media: []
+        media: [],
     }
 }
 
 /* ===== helpers ===== */
+
+async function runChatWithBudget(opts: {
+    model: string
+    messages: any[]
+    temperature: number
+    maxTokens: number
+}): Promise<string> {
+    const { model, messages, temperature } = opts
+    let maxTokens = opts.maxTokens
+
+    if (process.env.DEBUG_AI === '1') {
+        console.log('[AGENT] model =', model)
+        console.log('[AGENT] OPENAI_API_KEY set =', !!process.env.OPENAI_API_KEY)
+        console.log('[AGENT] maxTokens try #1 =', maxTokens)
+    }
+
+    try {
+        const resp1 = await openai.chat.completions.create({
+            model,
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+        } as any)
+        return resp1?.choices?.[0]?.message?.content?.trim() || ''
+    } catch (err: any) {
+        const msg = String(err?.response?.data || err?.message || '')
+        if (process.env.DEBUG_AI === '1') console.error('[AGENT] first call error:', msg)
+
+        // Detecta límite de créditos y reduce tokens
+        const affordable = parseAffordableTokens(msg) // number | null
+        let retryTokens = 96
+        if (typeof affordable === 'number' && Number.isFinite(affordable)) {
+            retryTokens = Math.max(16, Math.min(affordable - 3, 128))
+        }
+        if (process.env.DEBUG_AI === '1') console.log('[AGENT] retry with maxTokens =', retryTokens)
+
+        const resp2 = await openai.chat.completions.create({
+            model,
+            messages,
+            temperature,
+            max_tokens: retryTokens,
+        } as any)
+        return resp2?.choices?.[0]?.message?.content?.trim() || ''
+    }
+}
+
+function parseAffordableTokens(message: string): number | null {
+    // Busca "can only afford 53" u otros textos similares
+    const m = message.match(/afford\s+(\d+)/i) || message.match(/only\s+(\d+)\s+tokens?/i)
+    if (m && m[1]) {
+        const n = Number(m[1])
+        return Number.isFinite(n) ? n : null
+    }
+    return null
+}
+
 function humanSpecialty(s: AgentSpecialty) {
     switch (s) {
         case 'medico': return 'medicina general'
@@ -265,7 +303,6 @@ function computeEscalation(
         if (distrust.some(k => t.includes(k))) return true
     }
 
-    // Reintentos: aquí podrías leer un contador en DB si lo estás guardando
     return false
 }
 
@@ -275,7 +312,7 @@ async function persistBotReply({
     texto,
     nuevoEstado,
     to,
-    phoneNumberId
+    phoneNumberId,
 }: {
     conversationId: number
     empresaId: number
@@ -285,11 +322,11 @@ async function persistBotReply({
     phoneNumberId?: string
 }) {
     const msg = await prisma.message.create({
-        data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId }
+        data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId },
     })
     await prisma.conversation.update({
         where: { id: conversationId },
-        data: { estado: nuevoEstado }
+        data: { estado: nuevoEstado },
     })
 
     let wamid: string | undefined
@@ -299,14 +336,13 @@ async function persistBotReply({
                 empresaId,
                 to: normalizeToE164(to),
                 body: texto,
-                phoneNumberIdHint: phoneNumberId
+                phoneNumberIdHint: phoneNumberId,
             })
-            // Cloud API variantes
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
             if (wamid) {
                 await prisma.message.update({
                     where: { id: msg.id },
-                    data: { externalId: wamid }
+                    data: { externalId: wamid },
                 })
             }
         } catch { /* noop */ }
