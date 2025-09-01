@@ -7,6 +7,7 @@ import { retrieveRelevantProducts } from './products.helper'
 import * as Wam from '../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../services/transcription.service'
 import { runFullAgent, AgentDecision } from '../agent/fullAgent'
+import { setFocus, getFocus } from '../utils/cacheWhatsappMedia' // 👈 foco en memoria
 
 type IAReplyResult = {
     estado: ConversationEstado
@@ -119,6 +120,16 @@ const asksCatalogue = (t: string) =>
 const saysPaid = (t: string) =>
     ['ya pague', 'ya pagué', 'pago realizado', 'hice el pago', 'ya hice el pago', 'pagado', 'comprobante']
         .some(k => nrm(t).includes(nrm(k)))
+
+type Intent = 'ASK_PRICE' | 'ASK_BENEFITS' | 'ASK_PHOTOS' | 'LIST_PRODUCTS' | 'UNKNOWN'
+function detectIntent(text: string): Intent {
+    const t = (text || '').toLowerCase()
+    if (/\b(precio|precios|cu[aá]nto vale|cu[aá]nto cuesta|valor|costo)\b/.test(t)) return 'ASK_PRICE'
+    if (/\b(beneficio|beneficios|para qu[eé]|sirve)\b/.test(t)) return 'ASK_BENEFITS'
+    if (/\b(foto|fotos|imagen|im[aá]genes|muestr[ao]|\benv[ií]ame)\b/.test(t)) return 'ASK_PHOTOS'
+    if (/\b(productos?|portafolio|cat[aá]logo|catalogo|lista)\b/.test(t)) return 'LIST_PRODUCTS'
+    return 'UNKNOWN'
+}
 
 /* ===== Prompt con reglas anti-alucinación ===== */
 function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: string) {
@@ -356,6 +367,36 @@ function listProductsMessage(list: ProductListItem[]): string {
     return lines.join('\n').trim().split('\n').slice(0, 10).join('\n')
 }
 
+/* ---------- resolver producto para responder precio ---------- */
+async function resolveProductForAnswer({
+    conversationId, empresaId, text, recentProductNames, bizKeywords
+}: {
+    conversationId: number; empresaId: number; text: string; recentProductNames: string[]; bizKeywords: string
+}) {
+    // 1) foco en memoria
+    const focusedId = getFocus(conversationId)
+    if (focusedId) {
+        const p = await prisma.product.findUnique({ where: { id: focusedId } })
+        if (p) return { product: p }
+    }
+    // 2) inferir por texto
+    const inferred = await inferBestProduct(empresaId, text, recentProductNames, bizKeywords)
+    if (inferred) {
+        const p = await prisma.product.findUnique({ where: { id: inferred.id } })
+        if (p) return { product: p }
+    }
+    // 3) candidatos
+    const cands = await retrieveRelevantProducts(empresaId, text, 4)
+    if (cands?.length === 1) return { product: cands[0] }
+    if (cands?.length) return { candidates: cands.map(c => ({ id: c.id, nombre: c.nombre })) }
+    return {}
+}
+async function answerPriceMessage(p: any): Promise<string> {
+    if (!p) return '¿De qué producto deseas el precio?'
+    if (p.precioDesde == null) return `Por ahora no tengo precio cargado para *${p.nombre}*. ¿Quieres que te confirmemos el valor por aquí?`
+    return `El precio de *${p.nombre}* es ${formatMoney(p.precioDesde)}. ¿Te lo reservo?`
+}
+
 /* ========================= Core ========================= */
 export const handleIAReply = async (
     chatId: number,
@@ -536,6 +577,39 @@ export const handleIAReply = async (
             phoneNumberId: opts?.phoneNumberId,
         })
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+    }
+
+    // 4.0 INTENT → primero precio
+    const intent = detectIntent(mensaje)
+    if (intent === 'ASK_PRICE') {
+        const { product, candidates } = await resolveProductForAnswer({
+            conversationId: chatId,
+            empresaId: conversacion.empresaId,
+            text: mensaje || caption || '',
+            recentProductNames,
+            bizKeywords: String(cfg(config, 'palabrasClaveNegocio') || '')
+        })
+        if (product) {
+            const txt = await answerPriceMessage(product)
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
+                nuevoEstado: ConversationEstado.respondido,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+        if (candidates?.length) {
+            const lines = candidates.slice(0, 5).map((c: any) => `• *${c.nombre}*`).join('\n')
+            const ask = `¿De cuál te comparto el precio?\n${lines}`
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
+                nuevoEstado: conversacion.estado,
+                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                phoneNumberId: opts?.phoneNumberId,
+            })
+            return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid }
+        }
     }
 
     // 4.1 Full Agent (si decide 'images', las enviamos)
@@ -754,8 +828,12 @@ async function sendProductImages({ chatId, conversacion, productosRelevantes, ph
     })
 
     const media: Array<{ productId: number; imageUrl: string; wamid?: string }> = []
+    let firstProductIdSent: number | null = null
+
     for (const img of imgs) {
         const prod = productosRelevantes.find((p: any) => p.id === img.productId); if (!prod) continue
+        if (!firstProductIdSent) firstProductIdSent = img.productId
+
         const caption = buildProductCaption(prod)
         try {
             const resp = await Wam.sendWhatsappMedia({ empresaId: conversacion.empresaId, to: phone, url: img.url, type: 'image', caption, phoneNumberIdHint: phoneNumberId } as any)
@@ -766,6 +844,10 @@ async function sendProductImages({ chatId, conversacion, productosRelevantes, ph
             })
         } catch (err: any) { console.error('[sendWhatsappMedia] error:', err?.response?.data || err?.message || err) }
     }
+
+    // ✅ recordar el “producto en foco” en memoria (sin tocar la BD)
+    if (firstProductIdSent) setFocus(chatId, firstProductIdSent)
+
     return media
 }
 

@@ -10,8 +10,8 @@ import {
 import { transcribeAudioBuffer } from '../services/transcription.service'
 import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy firmado
 
-// ⬇️ NUEVO: helper para cachear imágenes en Cloudflare Images
-import { cacheWhatsappMediaToCloudflare } from '../utils/cacheWhatsappMedia'
+// ⬇️ Cachear imágenes en Cloudflare Images
+import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsappMedia' // 👈 limpiamos foco al (re)abrir conv
 
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
@@ -83,6 +83,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversation = await prisma.conversation.create({
                 data: { phone: fromWa, estado: ConversationEstado.pendiente, empresaId },
             })
+            // 🧠 limpiar foco por si acaso (nueva conv)
+            clearFocus(conversation.id)
             console.log('[CONV] creada', { id: conversation.id, phone: fromWa })
         } else if (conversation.estado === ConversationEstado.cerrado) {
             await prisma.conversation.update({
@@ -90,6 +92,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 data: { estado: ConversationEstado.pendiente },
             })
             conversation.estado = ConversationEstado.pendiente
+            // 🧠 limpiar foco al reabrir
+            clearFocus(conversation.id)
             console.log('[CONV] reabierta', { id: conversation.id })
         }
 
@@ -123,7 +127,9 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 const guessedName =
                     inboundMime?.includes('mp3') ? 'nota-voz.mp3'
                         : inboundMime?.includes('wav') ? 'nota-voz.wav'
-                            : 'nota-voz.ogg'
+                            : inboundMime?.includes('m4a') ? 'nota-voz.m4a'
+                                : inboundMime?.includes('webm') ? 'nota-voz.webm'
+                                    : 'nota-voz.ogg'
 
                 const texto = await transcribeAudioBuffer(buf, guessedName)
                 transcription = (texto || '').trim()
@@ -188,7 +194,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             timestamp: ts,
             mediaType: inboundMediaType,
             mediaId: inboundMediaId,
-            mediaUrl: mediaUrlForFrontend, // 👈 NUEVO: guardar URL (CF o proxy)
+            mediaUrl: mediaUrlForFrontend, // 👈 CF o proxy
             mimeType: inboundMime,
             transcription: transcription || undefined,
         }
