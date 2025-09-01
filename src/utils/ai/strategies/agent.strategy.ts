@@ -176,8 +176,9 @@ export async function handleAgentReply(args: {
     }
 
     // Recorte server-side (máx. 5 líneas / 420 chars)
-    texto = clampConcise(texto, 4, 300)
+    texto = clampConcise(texto, 4, 340)
     texto = formatConcise(texto)
+
 
 
     // 7) Persistir y responder
@@ -299,39 +300,62 @@ function budgetMessages(messages: any[], budgetPromptTokens = 90) {
 }
 
 // ===== formatting / misc =====
-function clampConcise(text: string, maxLines = 5, maxChars = 420): string {
+function clampConcise(text: string, maxLines = 4, maxChars = 360): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
-    if (!t) return 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
-    if (t.length > maxChars) t = t.slice(0, maxChars).replace(/\s+[^\s]*$/, '').trim() + '…'
+    if (!t) return t
+
+    // 1) Limite por caracteres: recorta en límite de oración si es posible
+    if (t.length > maxChars) {
+        const slice = t.slice(0, maxChars + 1)
+        const cutAt = Math.max(
+            slice.lastIndexOf('. '),
+            slice.lastIndexOf('! '),
+            slice.lastIndexOf('? '),
+            slice.lastIndexOf('\n')
+        )
+        t = (cutAt > 40 ? slice.slice(0, cutAt + 1) : slice.slice(0, maxChars)).trim()
+        if (!/[.!?…]$/.test(t)) t = t.replace(/\s+[^\s]*$/, '').trim() + '…'
+    }
+
+    // 2) Limite por líneas
     const lines = t.split('\n').filter(Boolean)
-    if (lines.length > maxLines) t = lines.slice(0, maxLines).join('\n')
+    if (lines.length > maxLines) {
+        t = lines.slice(0, maxLines).join('\n').trim()
+        if (!/[.!?…]$/.test(t)) t += '…'
+    }
+
     return t
 }
+
 function formatConcise(text: string): string {
     let t = String(text || '').trim()
     if (!t) return '¿Podrías contarme un poco más para ayudarte mejor?'
 
-    // Normaliza texto y acorta a 2–4 líneas / ~300 chars
-    t = t.replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
-    t = clampConcise(t, 4, 300)
+    // Normaliza y quita viñetas si el modelo metió alguna
+    t = t.replace(/^[•\-]\s*/gm, '').replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
 
-    // Elimina viñetas si el modelo metió alguna
-    t = t.replace(/^[•\-]\s*/gm, '').trim()
+    // 1) Compacta al objetivo base (un poco más amplio)
+    t = clampConcise(t, 4, 340)
 
-    // Asegura cierre con llamada a la acción o pregunta breve si no hay signos de interrogación
-    if (!/[?¿]/.test(t)) {
-        t = clampConcise(`${t}\n¿Puedes darme un detalle más?`, 4, 320)
+    // 2) Si no hay ninguna pregunta, intenta añadir una SOLO si hay espacio suficiente
+    const hasQuestion = /[?¿]/.test(t)
+    if (!hasQuestion) {
+        const tail = '¿Puedes darme un detalle más?'
+        if (t.length + 1 + tail.length <= 360) {
+            t = `${t}\n${tail}`
+        }
+        // Re-clamp suave si nos pasamos por poco
+        t = clampConcise(t, 4, 360)
     }
 
-    // Emoji opcional (30% de las veces), máximo 1, si no tiene ya emoji
+    // 3) Emoji opcional (30%), máx 1, solo si no hay ya un emoji
     if (!/[^\w\s.,;:()¿?¡!]/.test(t) && Math.random() < 0.30) {
         const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '🧴', '💬', '🫶']
-        const pick = EMOJIS[Math.floor(Math.random() * EMOJIS.length)]
-        t = t.replace(/\s*$/, ` ${pick}`)
+        t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`
     }
-
     return t
 }
+
 
 
 
