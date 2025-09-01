@@ -1,4 +1,3 @@
-// server/src/utils/ai/strategies/agent.strategy.ts
 import axios from 'axios'
 import prisma from '../../../lib/prisma'
 import { openai } from '../../../lib/openai'
@@ -52,8 +51,11 @@ export async function handleAgentReply(args: {
         },
     })
 
-    // 2) BusinessConfig (contexto del negocio y políticas)
-    const bc = await prisma.businessConfig.findUnique({ where: { empresaId } })
+    // 2) BusinessConfig + Empresa (para nombre confiable)
+    const [bc, empresa] = await Promise.all([
+        prisma.businessConfig.findUnique({ where: { empresaId } }),
+        prisma.empresa.findUnique({ where: { id: empresaId }, select: { nombre: true } }),
+    ])
 
     // 3) Preparar texto del usuario (prioriza transcripción si es nota de voz)
     let userText = (mensajeArg || '').trim()
@@ -85,9 +87,7 @@ export async function handleAgentReply(args: {
                     }
                 }
             } catch (e) {
-                if (process.env.DEBUG_AI === '1') {
-                    console.error('[AGENT] Transcription error:', (e as any)?.message || e)
-                }
+                if (process.env.DEBUG_AI === '1') console.error('[AGENT] Transcription error:', (e as any)?.message || e)
             }
         }
         if (transcript) userText = transcript
@@ -97,7 +97,7 @@ export async function handleAgentReply(args: {
     const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
 
-    // 4) Mensaje “pregunta” si envían solo una imagen sin texto
+    // 4) Si mandan solo imagen, pregunta
     if (isImage && !userText && !caption) {
         const ask = 'Veo tu foto 😊 ¿Quieres que te ayude a interpretarla o tienes alguna pregunta específica?'
         const saved = await persistBotReply({
@@ -117,8 +117,9 @@ export async function handleAgentReply(args: {
         }
     }
 
-    // 5) Construcción del prompt del agente (guardrails + contexto negocio)
-    const negocio = bc?.nombre || 'nuestro servicio'
+    // 5) Prompt del agente (guardrails + negocio)
+    const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
+    const negocioLabel = negocioName ? `del negocio "${negocioName}"` : 'de la empresa'
     const datosOperativos = [
         bc?.horarios ? `- Horarios: ${bc.horarios}` : '',
         bc?.canalesAtencion ? `- Canales de atención: ${bc.canalesAtencion}` : '',
@@ -129,14 +130,14 @@ export async function handleAgentReply(args: {
     ].filter(Boolean).join('\n')
 
     const BASE_SYSTEM = [
-        `Eres un asistente de ${humanSpecialty(agent.specialty)} para orientación general del negocio "${negocio}".`,
-        `Habla con calidez, naturalidad y precisión. Evita sonar robótico. Responde en como máximo 6 líneas.`,
+        `Eres un asistente de ${humanSpecialty(agent.specialty)} ${negocioLabel}.`,
+        `Sé concreto: responde en **3–5 líneas** máximo, con viñetas si ayuda. Tono cálido y claro.`,
         `No diagnostiques ni prescribas medicamentos. No reemplazas una consulta clínica.`,
-        `Ofrece recomendaciones de autocuidado y cuándo consultar. Si hay signos de alarma, sugiere atención presencial o urgencias.`,
-        `No salgas del ámbito de ${humanSpecialty(agent.specialty)} y reconduce si preguntan algo fuera.`,
+        `Ofrece medidas generales y cuándo consultar. Ante signos de alarma, sugiere atención presencial o urgencias.`,
+        `No salgas del ámbito de ${humanSpecialty(agent.specialty)}; si preguntan algo fuera, indícalo y reconduce.`,
         agent.scope ? `Ámbito del servicio: ${agent.scope}` : '',
         agent.disclaimers ? `Incluye estos disclaimers cuando corresponda: ${agent.disclaimers}` : '',
-        datosOperativos ? `Info del negocio (cuando aplique):\n${datosOperativos}` : '',
+        datosOperativos ? `Datos del negocio (solo si aplican):\n${datosOperativos}` : '',
         bc?.disclaimers ? `Disclaimers del negocio: ${bc.disclaimers}` : '',
     ].filter(Boolean).join('\n')
 
@@ -158,10 +159,10 @@ export async function handleAgentReply(args: {
         messages.push({ role: 'user', content: userText || 'Hola' })
     }
 
-    // 6) LLM con control de presupuesto (retry si 402)
+    // 6) LLM con control de presupuesto (y respuestas cortas)
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.5)
-    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 320)
+    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 160) // más bajo para evitar paredes de texto
 
     let texto = ''
     try {
@@ -171,11 +172,10 @@ export async function handleAgentReply(args: {
         texto = 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
     }
 
-    if (!texto) {
-        texto = 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
-    }
+    // Recorte server-side para garantizar brevedad (5 líneas / 450 chars)
+    texto = clampConcise(texto, 5, 450)
 
-    // 7) Escalamiento automático si aplica
+    // 7) Escalamiento si aplica
     const shouldEscalate = computeEscalation(userText, bc)
     if (shouldEscalate) {
         const saved = await persistBotReply({
@@ -243,12 +243,11 @@ async function runChatWithBudget(opts: {
         const msg = String(err?.response?.data || err?.message || '')
         if (process.env.DEBUG_AI === '1') console.error('[AGENT] first call error:', msg)
 
-        // Detecta límite de créditos y reduce tokens
-        const affordable = parseAffordableTokens(msg) // number | null
-        let retryTokens = 96
-        if (typeof affordable === 'number' && Number.isFinite(affordable)) {
-            retryTokens = Math.max(16, Math.min(affordable - 3, 128))
-        }
+        const affordable = parseAffordableTokens(msg)
+        const retryTokens = (typeof affordable === 'number' && Number.isFinite(affordable))
+            ? Math.max(16, Math.min(affordable - 3, 96))
+            : 96
+
         if (process.env.DEBUG_AI === '1') console.log('[AGENT] retry with maxTokens =', retryTokens)
 
         const resp2 = await openai.chat.completions.create({
@@ -262,13 +261,24 @@ async function runChatWithBudget(opts: {
 }
 
 function parseAffordableTokens(message: string): number | null {
-    // Busca "can only afford 53" u otros textos similares
     const m = message.match(/afford\s+(\d+)/i) || message.match(/only\s+(\d+)\s+tokens?/i)
     if (m && m[1]) {
         const n = Number(m[1])
         return Number.isFinite(n) ? n : null
     }
     return null
+}
+
+/** Recorta a N líneas y M caracteres, limpia espacios dobles */
+function clampConcise(text: string, maxLines = 5, maxChars = 450): string {
+    let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+    if (!t) return 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
+    // Cortar por caracteres
+    if (t.length > maxChars) t = t.slice(0, maxChars).replace(/\s+[^\s]*$/, '').trim() + '…'
+    // Cortar por líneas
+    const lines = t.split('\n').filter(Boolean)
+    if (lines.length > maxLines) t = lines.slice(0, maxLines).join('\n')
+    return t
 }
 
 function humanSpecialty(s: AgentSpecialty) {
@@ -290,19 +300,14 @@ function computeEscalation(
 ) {
     if (!bc) return false
     const t = (text || '').toLowerCase()
-
-    // Palabras clave
     if (bc.escalarPalabrasClave) {
         const tokens = bc.escalarPalabrasClave.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
         if (tokens.some(k => t.includes(k))) return true
     }
-
-    // “No confía” (heurística simple)
     if (bc.escalarSiNoConfia) {
         const distrust = ['no confío', 'no confio', 'no me sirve', 'habla un humano', 'asesor humano', 'quiero hablar con alguien']
         if (distrust.some(k => t.includes(k))) return true
     }
-
     return false
 }
 
