@@ -127,15 +127,22 @@ const CITY_LIST = [
     'soacha', 'santa marta', 'villavicencio', 'armenia', 'neiva', 'pasto'
 ].map(nrm)
 
-
-/** ================== LÉXICO DINÁMICO POR EMPRESA (seguro con tu esquema) ================== **/
+/** ================== LÉXICO DINÁMICO POR EMPRESA (configurable) ================== **/
 type BusinessLexicon = {
     genericTerms: Set<string>
-    aliasMap: Map<string, string[]>
+    buckets: Record<string, string[]>          // sinónimos configurables por negocio
     genericRegex: RegExp | null
 }
 const LEX_CACHE = new Map<number, BusinessLexicon>()
 
+function safeJSON<T = any>(v: any): T | null {
+    try {
+        if (!v) return null
+        if (typeof v === 'object') return v as T
+        if (typeof v === 'string') return JSON.parse(v) as T
+    } catch { }
+    return null
+}
 function escapeReg(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
 const STOP = new Set([
     'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'al', 'a', 'en', 'con', 'para', 'por',
@@ -151,30 +158,51 @@ function tokenizeForBiz(s: string): string[] {
         .filter(w => w && w.length >= 3 && !STOP.has(w))
 }
 
-/** Lee lo que exista en tu schema: id, nombre, descripcion, slug (sin categoria/tags/alias). */
+/** Carga léxico desde productos + buckets configurables */
 async function loadBusinessLexicon(empresaId: number): Promise<BusinessLexicon> {
     if (LEX_CACHE.has(empresaId)) return LEX_CACHE.get(empresaId)!
 
-    // Consulta segura para tu modelo actual
-    const productos = await prisma.product.findMany({
-        where: { empresaId, disponible: true },
-        select: { id: true, nombre: true, descripcion: true, slug: true }
-    })
+    const [productos, conf] = await Promise.all([
+        prisma.product.findMany({
+            where: { empresaId, disponible: true },
+            select: { id: true, nombre: true, descripcion: true, slug: true }
+        }),
+        prisma.businessConfig.findFirst({
+            where: { empresaId },
+            orderBy: { updatedAt: 'desc' },
+            select: { extras: true, palabrasClaveNegocio: true }
+        })
+    ])
 
-    // Construimos un léxico básico a partir de nombre y descripción
+    // 1) buckets por negocio
+    let buckets: Record<string, string[]> = {}
+    const extrasObj = safeJSON(conf?.extras)
+    const pknObj = safeJSON(conf?.palabrasClaveNegocio)
+    if (extrasObj && extrasObj.keywordBuckets && typeof extrasObj.keywordBuckets === 'object') {
+        buckets = extrasObj.keywordBuckets
+    } else if (pknObj && pknObj.keywordBuckets && typeof pknObj.keywordBuckets === 'object') {
+        buckets = pknObj.keywordBuckets
+    } else if (process.env.IA_KEYWORD_BUCKETS_DEFAULT) {
+        const envBuckets = safeJSON<Record<string, string[]>>(process.env.IA_KEYWORD_BUCKETS_DEFAULT)
+        if (envBuckets) buckets = envBuckets
+    }
+
+    // 2) términos genéricos a partir de nombre/descripcion
     const generic = new Set<string>()
-    const aliasMap = new Map<string, string[]>() // vacío por ahora (no hay columna alias)
-
     for (const p of productos) {
         tokenizeForBiz(p.nombre).forEach(w => generic.add(w))
         tokenizeForBiz(p.descripcion || '').forEach(w => generic.add(w))
+    }
+    // también añade sinónimos de buckets para mejorar catálogo genérico
+    for (const arr of Object.values(buckets)) {
+        for (const syn of arr) tokenizeForBiz(syn).forEach(w => generic.add(w))
     }
 
     const genericRegex = generic.size
         ? new RegExp(`\\b(?:${Array.from(generic).map(escapeReg).join('|')})\\b`, 'i')
         : null
 
-    const lex: BusinessLexicon = { genericTerms: generic, aliasMap, genericRegex }
+    const lex: BusinessLexicon = { genericTerms: generic, buckets, genericRegex }
     LEX_CACHE.set(empresaId, lex)
     return lex
 }
@@ -290,13 +318,27 @@ async function downloadWamMediaToBufferSafe(url: string): Promise<Buffer | null>
     return Buffer.isBuffer(out) ? out : out ? Buffer.from(out as any) : null
 }
 
-/* ======================== Matcher de productos (agnóstico) ======================== */
+/* ======================== Matcher de productos (agnóstico + buckets) ======================== */
 function tokensLite(s: string) { return tokenizeForBiz(s) }
 function jaccard(a: string[], b: string[]): number { const A = new Set(a), B = new Set(b); let i = 0; for (const x of A) if (B.has(x)) i++; return A.size || B.size ? i / (A.size + B.size - i) : 0 }
 function ngrams(s: string, n = 3) { const t = (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ''); if (t.length <= n) return [t]; const out: string[] = []; for (let i = 0; i <= t.length - n; i++) out.push(t.slice(i, i + n)); return out }
 function jaroW(a: string, b: string) { const s1 = (a || '').toLowerCase(), s2 = (b || '').toLowerCase(); if (s1 === s2) return 1; const mDist = Math.floor(Math.max(s1.length, s2.length) / 2) - 1; let m = 0, t = 0; const s1M = new Array(s1.length).fill(false), s2M = new Array(s2.length).fill(false); for (let i = 0; i < s1.length; i++) { const st = Math.max(0, i - mDist), en = Math.min(i + mDist + 1, s2.length); for (let j = st; j < en; j++) { if (s2M[j] || s1[i] !== s2[j]) continue; s1M[i] = s2M[j] = true; m++; break; } } if (!m) return 0; let k = 0; for (let i = 0; i < s1.length; i++) { if (!s1M[i]) continue; while (!s2M[k]) k++; if (s1[i] !== s2[k]) t++; k++; } const mt = t / 2; const j = (m / s1.length + m / s2.length + (m - mt) / m) / 3; let l = 0; while (l < 4 && l < s1.length && l < s2.length && s1[l] === s2[l]) l++; return j + l * 0.1 * (1 - j) }
 
-function scoreMatchBiz(p: { nombre: string, slug?: string | null, descripcion?: string | null }, q: string) {
+function bucketHits(text: string, buckets: Record<string, string[]>): string[] {
+    const q = nrm(text)
+    const hits: string[] = []
+    for (const [bucket, arr] of Object.entries(buckets || {})) {
+        if (arr.some(w => q.includes(nrm(w)))) hits.push(bucket)
+    }
+    return hits
+}
+function productMatchesBuckets(prod: { nombre: string; slug?: string | null; descripcion?: string | null }, hits: string[], buckets: Record<string, string[]>): boolean {
+    const tgt = `${nrm(prod.nombre)} ${nrm(prod.slug || '')} ${nrm(prod.descripcion || '')}`
+    return hits.every(b => (buckets[b] || []).some(w => tgt.includes(nrm(w))))
+}
+
+function scoreMatchBiz(p: { nombre: string, slug?: string | null, descripcion?: string | null }, q: string, hits: string[], buckets: Record<string, string[]>) {
+    // base fuzzy
     const s1 = jaccard(tokensLite(p.nombre), tokensLite(q))
     const pN = new Set(ngrams(p.nombre, 3)), qN = new Set(ngrams(q, 3))
     let i = 0; for (const g of pN) if (qN.has(g)) i++
@@ -304,27 +346,40 @@ function scoreMatchBiz(p: { nombre: string, slug?: string | null, descripcion?: 
     const s3 = jaroW(p.nombre, q)
     const sSlug = p.slug ? jaroW(p.slug, q) * 0.2 : 0
     const sDesc = p.descripcion ? jaroW(p.descripcion, q) * 0.1 : 0
-    return Math.min(1, 0.45 * s1 + 0.25 * s2 + 0.30 * s3 + sSlug + sDesc)
+
+    // boost por buckets
+    const boost = productMatchesBuckets(p, hits, buckets) ? 0.35 : 0
+
+    return Math.min(1, 0.45 * s1 + 0.25 * s2 + 0.30 * s3 + sSlug + sDesc + boost)
 }
-async function findRequestedProduct(empresaId: number, text: string, _lex?: any) {
+
+async function findRequestedProduct(empresaId: number, text: string, lex: BusinessLexicon) {
     const q = (text || '').trim(); if (!q) return null
+    const hits = bucketHits(q, lex.buckets)
 
     const prods = await prisma.product.findMany({
         where: { empresaId, disponible: true },
-        select: { id: true, nombre: true, slug: true, descripcion: true }
+        select: { id: true, nombre: true, slug: true, descripcion: true, precioDesde: true }
     })
 
+    // Si los buckets acotan a una sola opción, devuélvela directo
+    if (hits.length) {
+        const filtered = prods.filter(p => productMatchesBuckets(p, hits, lex.buckets))
+        if (filtered.length === 1) return filtered[0]
+    }
+
+    // Scoring fuzzy + boost
     let best: any = null, bestScore = 0
     for (const p of prods) {
         const score = Math.max(
-            scoreMatchBiz(p, q),
-            p.slug ? scoreMatchBiz({ nombre: p.slug }, q) : 0,
-            p.descripcion ? scoreMatchBiz({ nombre: p.descripcion }, q) : 0
+            scoreMatchBiz(p, q, hits, lex.buckets),
+            p.slug ? scoreMatchBiz({ nombre: p.slug, slug: '', descripcion: '' }, q, hits, lex.buckets) : 0,
+            p.descripcion ? scoreMatchBiz({ nombre: p.descripcion, slug: '', descripcion: '' }, q, hits, lex.buckets) : 0
         )
         if (score > bestScore) { best = p; bestScore = score }
     }
     if (bestScore >= 0.85) return best
-    if (bestScore >= 0.72) return best   // umbral tolerante
+    if (bestScore >= 0.72) return best // tolerante
     return null
 }
 
@@ -378,7 +433,7 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.requiere_agente, mensaje: mensajeEscalamiento, motivo: 'confianza_baja', messageId: escalado.messageId, wamid: escalado.wamid }
     }
 
-    // 1.b) Cargar léxico dinámico del negocio
+    // 1.b) Cargar léxico dinámico del negocio (incluye keywordBuckets configurables)
     const lexicon = await loadBusinessLexicon(conversacion.empresaId)
 
     // 2) Último mensaje del cliente (voz → transcripción; imagen → visión/pagos)
@@ -518,7 +573,7 @@ export const handleIAReply = async (
         }
     }
 
-    // 4) Respuestas no-IA para catálogo y fotos validadas
+    // 4) Respuestas no-IA para catálogo (detecta consultas genéricas con el léxico)
     if (asksCatalogue(mensaje) || isGenericQueryForBiz(mensaje, lexicon)) {
         const list = await prisma.product.findMany({
             where: { empresaId: conversacion.empresaId, disponible: true },
@@ -535,7 +590,7 @@ export const handleIAReply = async (
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // Si pide fotos → solo enviar si hay match claro con un producto pedido
+    // Si pide fotos → deducir producto con buckets + fuzzy
     if (wantsImages(mensaje) && opts?.autoSend && (opts?.toPhone || conversacion.phone)) {
         const requested = await findRequestedProduct(conversacion.empresaId, mensaje || caption, lexicon)
         if (requested) {
