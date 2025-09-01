@@ -178,23 +178,24 @@ model BusinessConfig {
   id           Int          @id @default(autoincrement())
   empresaId    Int          @unique
   nombre       String       @default("")
-  descripcion  String       @db.Text
-  servicios    String       @db.Text
-  faq          String       @db.Text
-  horarios     String       @db.Text
+  // 🔽 Hacemos opcionales los TEXT que antes eran requeridos
+  descripcion  String?      @db.Text
+  servicios    String?      @db.Text
+  faq          String?      @db.Text
+  horarios     String?      @db.Text
   businessType BusinessType @default(servicios)
-  disclaimers  String       @db.Text
+  disclaimers  String?      @db.Text
 
   // ===== Operación del negocio
-  enviosInfo           String  @db.Text
-  metodosPago          String  @db.Text
+  enviosInfo           String? @db.Text
+  metodosPago          String? @db.Text
   tiendaFisica         Boolean @default(false)
   direccionTienda      String  @default("")
-  politicasDevolucion  String  @db.Text
-  politicasGarantia    String  @db.Text
-  promocionesInfo      String  @db.Text
-  canalesAtencion      String  @db.Text
-  extras               String  @db.Text
+  politicasDevolucion  String? @db.Text
+  politicasGarantia    String? @db.Text
+  promocionesInfo      String? @db.Text
+  canalesAtencion      String? @db.Text
+  extras               String? @db.Text
   palabrasClaveNegocio String  @default("")
 
   // ===== Perfil de IA (personalizado)
@@ -207,7 +208,7 @@ model BusinessConfig {
   // ===== Pagos (link OPCIONAL + transferencia)
   pagoLinkGenerico     String  @default("") // opcional
   pagoLinkProductoBase String  @default("") // opcional (para SKU/qty)
-  pagoNotas            String? @db.Text // instrucciones/ref. (TEXT sin default)
+  pagoNotas            String? @db.Text // instrucciones/ref. (TEXT opcional)
 
   bancoNombre        String @default("") // transferencia
   bancoTitular       String @default("")
