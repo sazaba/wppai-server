@@ -136,15 +136,15 @@ export async function handleAgentReply(args: {
 
     const system = [
         nameLine,
-        'Responde en 1–2 líneas, estilo telegrama, muy conciso y empático.',
-        'Formato: 1 viñeta (•) con lo esencial + termina con 1 pregunta breve.',
-        'Máximo 1 emoji opcional.',
+        'Responde en 2–4 líneas, claro y empático. Sé específico, evita párrafos largos.',
+        'Puedes usar 1 emoji ocasionalmente (no siempre).',
         'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
         `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
         lineScope ? `Ámbito: ${lineScope}` : '',
         lineDisc ? `Incluye cuando aplique: ${lineDisc}` : '',
-        extraInst ? `Sigue estas instrucciones: ${extraInst}` : '',
+        extraInst ? `Sigue estas instrucciones del negocio: ${extraInst}` : '',
     ].filter(Boolean).join('\n')
+
 
     const messages: Array<any> = [{ role: 'system', content: system }]
     if (imageUrl) {
@@ -176,8 +176,9 @@ export async function handleAgentReply(args: {
     }
 
     // Recorte server-side (máx. 5 líneas / 420 chars)
-    texto = clampConcise(texto, 3, 260)
+    texto = clampConcise(texto, 4, 300)
     texto = formatConcise(texto)
+
 
     // 7) Persistir y responder
     const saved = await persistBotReply({
@@ -308,28 +309,30 @@ function clampConcise(text: string, maxLines = 5, maxChars = 420): string {
 }
 function formatConcise(text: string): string {
     let t = String(text || '').trim()
-    if (!t) return '¿Puedes contarme un poco más?'
+    if (!t) return '¿Podrías contarme un poco más para ayudarte mejor?'
 
-    // Normaliza espacios y saltos
+    // Normaliza texto y acorta a 2–4 líneas / ~300 chars
     t = t.replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
+    t = clampConcise(t, 4, 300)
 
-    // Si ya viene con viñeta, toma solo la primera y agrega una pregunta
-    if (/^[•\-]/m.test(t)) {
-        const [firstLine, ...rest] = t.split('\n').filter(Boolean)
-        // Busca una pregunta en el resto o en todo el texto
-        const qMatch = t.match(/[^.\n!?]*\?[^?\n]*$/)
-        const question = (qMatch ? qMatch[0] : '¿Puedes darme un detalle más?').trim()
-        return clampConcise(`${firstLine.trim()}\n${question}`, 2, 180)
+    // Elimina viñetas si el modelo metió alguna
+    t = t.replace(/^[•\-]\s*/gm, '').trim()
+
+    // Asegura cierre con llamada a la acción o pregunta breve si no hay signos de interrogación
+    if (!/[?¿]/.test(t)) {
+        t = clampConcise(`${t}\n¿Puedes darme un detalle más?`, 4, 320)
     }
 
-    // Convierte a "1 viñeta + 1 pregunta"
-    const sents = t.split(/(?<=[.!?])\s+/).filter(Boolean)
-    const first = (sents.find(s => !/[?]\s*$/.test(s)) || sents[0] || t).replace(/\s+/g, ' ').trim()
-    const question = (sents.find(s => /[?]\s*$/.test(s)) || '¿Puedes darme un detalle más?').trim()
+    // Emoji opcional (30% de las veces), máximo 1, si no tiene ya emoji
+    if (!/[^\w\s.,;:()¿?¡!]/.test(t) && Math.random() < 0.30) {
+        const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '🧴', '💬', '🫶']
+        const pick = EMOJIS[Math.floor(Math.random() * EMOJIS.length)]
+        t = t.replace(/\s*$/, ` ${pick}`)
+    }
 
-    const out = `• ${first}\n${question}`
-    return clampConcise(out, 2, 180)
+    return t
 }
+
 
 
 function humanSpecialty(s: AgentSpecialty) {
