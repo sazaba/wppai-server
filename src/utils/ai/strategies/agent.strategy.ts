@@ -6,7 +6,6 @@ import {
     MediaType,
     MessageFrom,
     AgentSpecialty,
-    BusinessConfig,
 } from '@prisma/client'
 import * as Wam from '../../../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../../../services/transcription.service'
@@ -51,9 +50,18 @@ export async function handleAgentReply(args: {
         },
     })
 
-    // 2) BusinessConfig + Empresa (para nombre confiable)
+    // 2) Cargar solo lo necesario para modo agente
     const [bc, empresa] = await Promise.all([
-        prisma.businessConfig.findUnique({ where: { empresaId } }),
+        prisma.businessConfig.findUnique({
+            where: { empresaId },
+            select: {
+                agentSpecialty: true,
+                agentPrompt: true,
+                agentScope: true,
+                agentDisclaimers: true,
+                nombre: true, // nombre comercial si lo tienes cargado ahí
+            },
+        }),
         prisma.empresa.findUnique({ where: { id: empresaId }, select: { nombre: true } }),
     ])
 
@@ -80,10 +88,7 @@ export async function handleAgentReply(args: {
                                         : 'audio.ogg'
                     transcript = await transcribeAudioBuffer(audioBuf, name)
                     if (transcript) {
-                        await prisma.message.update({
-                            where: { id: last.id },
-                            data: { transcription: transcript },
-                        })
+                        await prisma.message.update({ where: { id: last.id }, data: { transcription: transcript } })
                     }
                 }
             } catch (e) {
@@ -117,32 +122,22 @@ export async function handleAgentReply(args: {
         }
     }
 
-    // 5) Prompt del agente (guardrails + negocio)
+    // 5) Prompt del agente (solo campos de agente) + nombre
     const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
-    const negocioLabel = negocioName ? `del negocio "${negocioName}"` : 'de la empresa'
-    const datosOperativos = [
-        bc?.horarios ? `- Horarios: ${bc.horarios}` : '',
-        bc?.canalesAtencion ? `- Canales de atención: ${bc.canalesAtencion}` : '',
-        bc?.metodosPago ? `- Métodos de pago: ${bc.metodosPago}` : '',
-        bc?.direccionTienda ? `- Dirección: ${bc.direccionTienda}` : '',
-        bc?.politicasDevolucion ? `- Devoluciones: ${bc.politicasDevolucion}` : '',
-        bc?.politicasGarantia ? `- Garantía: ${bc.politicasGarantia}` : '',
-    ].filter(Boolean).join('\n')
+    const especialidad = agent.specialty || bc?.agentSpecialty || 'generico'
 
     const BASE_SYSTEM = [
-        `Eres un asistente de ${humanSpecialty(agent.specialty)} ${negocioLabel}.`,
-        `Sé concreto: responde en **3–5 líneas** máximo, con viñetas si ayuda. Tono cálido y claro.`,
-        `No diagnostiques ni prescribas medicamentos. No reemplazas una consulta clínica.`,
-        `Ofrece medidas generales y cuándo consultar. Ante signos de alarma, sugiere atención presencial o urgencias.`,
-        `No salgas del ámbito de ${humanSpecialty(agent.specialty)}; si preguntan algo fuera, indícalo y reconduce.`,
-        agent.scope ? `Ámbito del servicio: ${agent.scope}` : '',
-        agent.disclaimers ? `Incluye estos disclaimers cuando corresponda: ${agent.disclaimers}` : '',
-        datosOperativos ? `Datos del negocio (solo si aplican):\n${datosOperativos}` : '',
-        bc?.disclaimers ? `Disclaimers del negocio: ${bc.disclaimers}` : '',
+        negocioName ? `Te presentas como asistente de orientación de ${humanSpecialty(especialidad as AgentSpecialty)} de "${negocioName}".`
+            : `Eres un asistente de orientación de ${humanSpecialty(especialidad as AgentSpecialty)}.`,
+        `Responde en **3–5 líneas** máximo, claro y empático.`,
+        `No diagnostiques ni prescribas. No reemplazas una consulta clínica.`,
+        `Mantente estrictamente en el ámbito de ${humanSpecialty(especialidad as AgentSpecialty)}; si te preguntan algo fuera, dilo y reconduce.`,
+        (agent.scope || bc?.agentScope) ? `Ámbito del servicio: ${agent.scope || bc?.agentScope}` : '',
+        (agent.disclaimers || bc?.agentDisclaimers) ? `Incluye cuando corresponda: ${agent.disclaimers || bc?.agentDisclaimers}` : '',
     ].filter(Boolean).join('\n')
 
-    const system = agent.prompt?.trim()
-        ? `${BASE_SYSTEM}\n\nInstrucciones del negocio:\n${agent.prompt.trim()}`
+    const system = (agent.prompt || bc?.agentPrompt)?.trim()
+        ? `${BASE_SYSTEM}\n\nInstrucciones del negocio:\n${(agent.prompt || bc?.agentPrompt)!.trim()}`
         : BASE_SYSTEM
 
     const messages: Array<any> = [{ role: 'system', content: system }]
@@ -159,10 +154,10 @@ export async function handleAgentReply(args: {
         messages.push({ role: 'user', content: userText || 'Hola' })
     }
 
-    // 6) LLM con control de presupuesto (y respuestas cortas)
+    // 6) LLM con control de presupuesto (retry si 402) y límite de longitud
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.5)
-    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 160) // más bajo para evitar paredes de texto
+    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 128) // bajo por diseño para WhatsApp
 
     let texto = ''
     try {
@@ -172,30 +167,10 @@ export async function handleAgentReply(args: {
         texto = 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
     }
 
-    // Recorte server-side para garantizar brevedad (5 líneas / 450 chars)
-    texto = clampConcise(texto, 5, 450)
+    // Recorte server-side (máx. 5 líneas / 420 chars)
+    texto = clampConcise(texto, 5, 420)
 
-    // 7) Escalamiento si aplica
-    const shouldEscalate = computeEscalation(userText, bc)
-    if (shouldEscalate) {
-        const saved = await persistBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto: 'Gracias por la información. Para darte una atención adecuada, te conectaré con un profesional humano en breve. 🙌',
-            nuevoEstado: ConversationEstado.requiere_agente,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        })
-        return {
-            estado: ConversationEstado.requiere_agente,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        }
-    }
-
-    // 8) Persistir y responder
+    // 7) Persistir y responder (en modo agente no hacemos pagos ni flujos comerciales)
     const saved = await persistBotReply({
         conversationId: chatId,
         empresaId,
@@ -233,16 +208,14 @@ async function runChatWithBudget(opts: {
 
     try {
         const resp1 = await openai.chat.completions.create({
-            model,
-            messages,
-            temperature,
-            max_tokens: maxTokens,
+            model, messages, temperature, max_tokens: maxTokens,
         } as any)
         return resp1?.choices?.[0]?.message?.content?.trim() || ''
     } catch (err: any) {
         const msg = String(err?.response?.data || err?.message || '')
         if (process.env.DEBUG_AI === '1') console.error('[AGENT] first call error:', msg)
 
+        // Detecta límite de créditos y reduce tokens
         const affordable = parseAffordableTokens(msg)
         const retryTokens = (typeof affordable === 'number' && Number.isFinite(affordable))
             ? Math.max(16, Math.min(affordable - 3, 96))
@@ -251,10 +224,7 @@ async function runChatWithBudget(opts: {
         if (process.env.DEBUG_AI === '1') console.log('[AGENT] retry with maxTokens =', retryTokens)
 
         const resp2 = await openai.chat.completions.create({
-            model,
-            messages,
-            temperature,
-            max_tokens: retryTokens,
+            model, messages, temperature, max_tokens: retryTokens,
         } as any)
         return resp2?.choices?.[0]?.message?.content?.trim() || ''
     }
@@ -269,13 +239,11 @@ function parseAffordableTokens(message: string): number | null {
     return null
 }
 
-/** Recorta a N líneas y M caracteres, limpia espacios dobles */
-function clampConcise(text: string, maxLines = 5, maxChars = 450): string {
+/** Recorta a N líneas y M caracteres, limpia espacios y evita párrafos muy largos */
+function clampConcise(text: string, maxLines = 5, maxChars = 420): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return 'Gracias por escribirnos. ¿Podrías contarme un poco más para ayudarte mejor?'
-    // Cortar por caracteres
     if (t.length > maxChars) t = t.slice(0, maxChars).replace(/\s+[^\s]*$/, '').trim() + '…'
-    // Cortar por líneas
     const lines = t.split('\n').filter(Boolean)
     if (lines.length > maxLines) t = lines.slice(0, maxLines).join('\n')
     return t
@@ -294,30 +262,8 @@ function humanSpecialty(s: AgentSpecialty) {
 
 function normalizeToE164(n: string) { return String(n || '').replace(/[^\d]/g, '') }
 
-function computeEscalation(
-    text: string,
-    bc?: Pick<BusinessConfig, 'escalarSiNoConfia' | 'escalarPalabrasClave' | 'escalarPorReintentos'> | null
-) {
-    if (!bc) return false
-    const t = (text || '').toLowerCase()
-    if (bc.escalarPalabrasClave) {
-        const tokens = bc.escalarPalabrasClave.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-        if (tokens.some(k => t.includes(k))) return true
-    }
-    if (bc.escalarSiNoConfia) {
-        const distrust = ['no confío', 'no confio', 'no me sirve', 'habla un humano', 'asesor humano', 'quiero hablar con alguien']
-        if (distrust.some(k => t.includes(k))) return true
-    }
-    return false
-}
-
 async function persistBotReply({
-    conversationId,
-    empresaId,
-    texto,
-    nuevoEstado,
-    to,
-    phoneNumberId,
+    conversationId, empresaId, texto, nuevoEstado, to, phoneNumberId,
 }: {
     conversationId: number
     empresaId: number
@@ -338,18 +284,10 @@ async function persistBotReply({
     if (to && String(to).trim()) {
         try {
             const resp = await Wam.sendWhatsappMessage({
-                empresaId,
-                to: normalizeToE164(to),
-                body: texto,
-                phoneNumberIdHint: phoneNumberId,
+                empresaId, to: normalizeToE164(to), body: texto, phoneNumberIdHint: phoneNumberId,
             })
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
-            if (wamid) {
-                await prisma.message.update({
-                    where: { id: msg.id },
-                    data: { externalId: wamid },
-                })
-            }
+            if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
         } catch { /* noop */ }
     }
     return { messageId: msg.id, texto, wamid }
