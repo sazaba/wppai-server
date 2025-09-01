@@ -2,30 +2,31 @@
 import prisma from '../lib/prisma'
 import { handleEcommerceIAReply, type IAReplyResult } from './handleIAReply.ecommerce'
 import { handleAgentReply } from './ai/strategies/agent.strategy'
+import { AiMode, AgentSpecialty, ConversationEstado } from '@prisma/client'
 
 /**
  * Orquestador: decide la estrategia según BusinessConfig.aiMode
  * - aiMode = ecommerce  -> delega a lógica existente (intacta)
  * - aiMode = agente     -> usa el agente personalizado (con specialty)
- *
- * La firma se mantiene igual a la de tu implementación original para no romper callers.
  */
 export const handleIAReply = async (
     chatId: number,
     mensajeArg: string,
     opts?: { toPhone?: string; autoSend?: boolean; phoneNumberId?: string }
 ): Promise<IAReplyResult | null> => {
-    // Leer conversación
+    // 1) Leer conversación
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
         select: { id: true, estado: true, empresaId: true, phone: true },
     })
-    if (!conversacion || conversacion.estado === 'cerrado') {
+    if (!conversacion) return null
+
+    if (conversacion.estado === ConversationEstado.cerrado) {
         console.warn(`[handleIAReply] 🔒 La conversación ${chatId} está cerrada.`)
         return null
     }
 
-    // Leer config mínima para decidir estrategia
+    // 2) Leer config mínima para decidir estrategia
     const config = await prisma.businessConfig.findFirst({
         where: { empresaId: conversacion.empresaId },
         orderBy: { updatedAt: 'desc' },
@@ -36,13 +37,12 @@ export const handleIAReply = async (
             agentPrompt: true,
             agentScope: true,
             agentDisclaimers: true,
-        }
-
+        },
     })
 
-    const mode = config?.aiMode || 'ecommerce'
+    const mode = config?.aiMode ?? AiMode.ecommerce
 
-    if (mode === 'agente') {
+    if (mode === AiMode.agente) {
         return handleAgentReply({
             chatId,
             empresaId: conversacion.empresaId,
@@ -50,15 +50,14 @@ export const handleIAReply = async (
             toPhone: opts?.toPhone ?? conversacion.phone,
             phoneNumberId: opts?.phoneNumberId,
             agent: {
-                specialty: (config?.agentSpecialty as any) || 'generico',
-                prompt: config?.agentPrompt || '',
-                scope: config?.agentScope || '',
-                disclaimers: config?.agentDisclaimers || '',
+                specialty: (config?.agentSpecialty ?? AgentSpecialty.generico),
+                prompt: config?.agentPrompt ?? '',
+                scope: config?.agentScope ?? '',
+                disclaimers: config?.agentDisclaimers ?? '',
             },
         })
     }
 
-    // Default/back-compat → e-commerce intacto
+    // 3) Default/back-compat → e-commerce intacto
     return handleEcommerceIAReply(chatId, mensajeArg, opts)
 }
-
