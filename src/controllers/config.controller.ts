@@ -1,12 +1,9 @@
 // server/src/controllers/config.controller.ts
 import { Request, Response } from "express"
 import prisma from "../lib/prisma"
-import {
-    AiMode,
-    AgentSpecialty,
-    BusinessType,
-    Prisma,
-} from "@prisma/client"
+// 👉 Importa tipos (solo para TypeScript) y el namespace Prisma para inputs
+import type { AiMode, AgentSpecialty, BusinessType, Prisma as PrismaTypes } from "@prisma/client"
+import { Prisma } from "@prisma/client" // <-- runtime para *inputs* (UncheckedCreate/UpdateInput)
 
 // Helpers básicos
 const s = (v: any, def = "") => (v === undefined || v === null ? def : String(v).trim())
@@ -21,25 +18,19 @@ const oneOf = <T extends string>(raw: any, allowed: readonly T[], def: T): T => 
     return (allowed as readonly string[]).includes(v) ? (v as T) : def
 }
 
-// ---- Mapeadores string -> enum Prisma
+// ---- Mapeadores string -> *tipos* de Prisma (sin usar valores runtime)
 const toBusinessType = (v: "servicios" | "productos"): BusinessType =>
-    v === "productos" ? BusinessType.productos : BusinessType.servicios
+    (v === "productos" ? "productos" : "servicios") as BusinessType
 
 const toAiMode = (v: "ecommerce" | "agente"): AiMode =>
-    v === "agente" ? AiMode.agente : AiMode.ecommerce
+    (v === "agente" ? "agente" : "ecommerce") as AiMode
 
 const toAgentSpecialty = (
     v: "generico" | "medico" | "dermatologia" | "nutricion" | "psicologia" | "odontologia"
-): AgentSpecialty => {
-    switch (v) {
-        case "medico": return AgentSpecialty.medico
-        case "dermatologia": return AgentSpecialty.dermatologia
-        case "nutricion": return AgentSpecialty.nutricion
-        case "psicologia": return AgentSpecialty.psicologia
-        case "odontologia": return AgentSpecialty.odontologia
-        default: return AgentSpecialty.generico
-    }
-}
+): AgentSpecialty =>
+    (["medico", "dermatologia", "nutricion", "psicologia", "odontologia"].includes(v)
+        ? v
+        : "generico") as AgentSpecialty
 
 // === GET /api/config
 export async function getConfig(req: Request, res: Response) {
@@ -64,7 +55,6 @@ export async function upsertConfig(req: Request, res: Response) {
     const faq = s(req.body?.faq)
     const horarios = s(req.body?.horarios)
 
-    // ⬅️ CORREGIDO: string union + enum Prisma
     const businessTypeStr = oneOf(req.body?.businessType, ["servicios", "productos"] as const, "servicios")
     const businessType = toBusinessType(businessTypeStr)
 
@@ -81,9 +71,10 @@ export async function upsertConfig(req: Request, res: Response) {
     )
     const agentSpecialty = toAgentSpecialty(agentSpecialtyStr)
 
-    const agentPrompt = aiMode === AiMode.agente ? (s(req.body?.agentPrompt) || null) : null
-    const agentScope = aiMode === AiMode.agente ? (s(req.body?.agentScope) || null) : null
-    const agentDisclaimers = aiMode === AiMode.agente ? (s(req.body?.agentDisclaimers) || null) : null
+    // Comparaciones con strings (runtime-safe)
+    const agentPrompt = aiMode === "agente" ? (s(req.body?.agentPrompt) || null) : null
+    const agentScope = aiMode === "agente" ? (s(req.body?.agentScope) || null) : null
+    const agentDisclaimers = aiMode === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
 
     // Operación
     const enviosInfo = s(req.body?.enviosInfo)
@@ -131,9 +122,9 @@ export async function upsertConfig(req: Request, res: Response) {
     }
 
     try {
-        // Tipado explícito para Prisma (evita 'as any')
+        // Usa los tipos del *namespace* Prisma solo para inputs
         const data: Prisma.BusinessConfigUncheckedCreateInput = {
-            empresaId, // este campo se ignora en update
+            empresaId,
             // base
             nombre,
             descripcion,
@@ -182,7 +173,7 @@ export async function upsertConfig(req: Request, res: Response) {
             // envíos
             envioTipo,
             envioEntregaEstimado,
-            envioCostoFijo: envioCostoFijo as any,   // Prisma acepta number; mantenemos compat
+            envioCostoFijo: envioCostoFijo as any,
             envioGratisDesde: envioGratisDesde as any,
 
             // post-venta
@@ -190,7 +181,6 @@ export async function upsertConfig(req: Request, res: Response) {
             soporteDevolucionesInfo,
         }
 
-        // No sobreescribir a null los decimales si no vinieron
         const toUpdate: Prisma.BusinessConfigUncheckedUpdateInput = { ...data }
         delete (toUpdate as any).empresaId
         if (envioCostoFijo === null) delete (toUpdate as any).envioCostoFijo
@@ -243,7 +233,9 @@ export async function upsertAgentConfig(req: Request, res: Response) {
 
         const cfg = existente
             ? await prisma.businessConfig.update({ where: { empresaId }, data })
-            : await prisma.businessConfig.create({ data: { empresaId, ...data } as Prisma.BusinessConfigUncheckedCreateInput })
+            : await prisma.businessConfig.create({
+                data: { empresaId, ...data } as Prisma.BusinessConfigUncheckedCreateInput,
+            })
 
         return res.json(cfg)
     } catch (error) {
