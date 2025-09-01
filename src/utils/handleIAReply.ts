@@ -371,7 +371,31 @@ function listProductsMessage(list: ProductListItem[]): string {
     return lines.join('\n').trim().split('\n').slice(0, 10).join('\n')
 }
 
-/* ---------- NUEVO: resolver producto en foco ---------- */
+/* ---------- NUEVO: memoria de foco + resolución ---------- */
+const focusMem = new Map<number, { productId: number; at: number }>()
+const FOCUS_TTL = 30 * 60 * 1000 // 30 min
+function setFocus(chatId: number, productId: number) {
+    focusMem.set(chatId, { productId, at: Date.now() })
+}
+function getFocus(chatId: number): number | null {
+    const it = focusMem.get(chatId)
+    if (!it) return null
+    if (Date.now() - it.at > FOCUS_TTL) { focusMem.delete(chatId); return null }
+    return it.productId
+}
+
+// buscar nombre explícito dentro de un texto
+async function explicitProductByName(empresaId: number, text: string): Promise<{ id: number; nombre: string } | null> {
+    const q = nrm(text)
+    if (!q) return null
+    const rows = await prisma.product.findMany({
+        where: { empresaId, disponible: true },
+        select: { id: true, nombre: true }
+    })
+    const hit = rows.find(r => q.includes(nrm(r.nombre)))
+    return hit ? { id: hit.id, nombre: hit.nombre } : null
+}
+
 async function resolveFocusProductId(opts: {
     empresaId: number,
     chatId: number,
@@ -380,33 +404,29 @@ async function resolveFocusProductId(opts: {
 }): Promise<number | null> {
     const { empresaId, chatId, agent, explicit } = opts
 
-    // 1) prioridad: agente ya eligió imágenes con productId
+    // 0) foco en memoria
+    const current = getFocus(chatId)
+    if (current) {
+        const ok = await prisma.product.findUnique({ where: { id: current }, select: { id: true, empresaId: true, disponible: true } })
+        if (ok && ok.empresaId === empresaId && ok.disponible) return ok.id
+    }
+
+    // 1) agente → ids de imágenes
     const firstFromImages = agent?.images?.find(i => i?.productId)?.productId
     if (firstFromImages) return firstFromImages
 
-    // 2) un solo producto claro por agente
+    // 2) un solo producto por agente
     if (agent?.products?.length === 1 && agent.products[0]?.id) {
         return agent.products[0].id
     }
 
-    // 3) nombre explícito del usuario (búsqueda por nombre)
-    // nombre explícito del usuario (búsqueda por nombre)
+    // 3) nombre explícito
     if (explicit?.name) {
-        const q = nrm(explicit.name)
-        const cand = await prisma.product.findFirst({
-            where: {
-                empresaId,
-                disponible: true,
-                nombre: { contains: q }    // ← sin "mode"
-            },
-            select: { id: true },
-            orderBy: { id: 'asc' },
-        })
-        if (cand?.id) return cand.id
+        const e = await explicitProductByName(empresaId, explicit.name)
+        if (e?.id) return e.id
     }
 
-
-    // 4) deducir por captions de imágenes enviadas por el bot
+    // 4) deducir por captions de las últimas imágenes del bot
     const lastBotImgs = await prisma.message.findMany({
         where: { conversationId: chatId, from: 'bot', mediaType: MediaType.image },
         orderBy: { timestamp: 'desc' },
@@ -535,7 +555,7 @@ export const handleIAReply = async (
                 empresaId: conversacion.empresaId,
                 texto,
                 nuevoEstado: ConversationEstado.venta_en_proceso,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                sendTo: opts?.toPhone ?? conversacion.phone,
                 phoneNumberId: opts?.phoneNumberId,
             })
             return { estado: ConversationEstado.venta_en_proceso, mensaje: savedR.texto, messageId: savedR.messageId, wamid: savedR.wamid, media: [] }
@@ -547,23 +567,23 @@ export const handleIAReply = async (
             const saved = await persistBotReply({
                 conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
                 nuevoEstado: conversacion.estado, // no cambiar estado
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                sendTo: opts?.toPhone ?? conversacion.phone,
                 phoneNumberId: opts?.phoneNumberId,
             })
             return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
         }
     }
 
-    // 3) Historial corto y nombres mencionados
+    // 3) Historial (hasta 30 mensajes) y nombres mencionados
     const mensajesPrevios = await prisma.message.findMany({
         where: { conversationId: chatId },
         orderBy: { timestamp: 'asc' },
-        take: 30,
+        take: 60,                              // traemos más y luego filtramos con contenido
         select: { from: true, contenido: true },
     })
     const historial = mensajesPrevios
         .filter(m => (m.contenido || '').trim().length > 0)
-        .slice(-12)
+        .slice(-30)                            // ← ahora usa 30 mensajes
         .map(m => ({ role: m.from === 'client' ? 'user' : 'assistant', content: m.contenido } as const))
 
     const recentAssistant = historial.filter(h => h.role === 'assistant').map(h => h.content.toString()).join('\n')
@@ -572,7 +592,7 @@ export const handleIAReply = async (
         const avail = await prisma.product.findMany({
             where: { empresaId: conversacion.empresaId, disponible: true },
             select: { nombre: true },
-            take: 20
+            take: 40
         })
         const body = nrm(recentAssistant)
         for (const p of avail) {
@@ -607,20 +627,32 @@ export const handleIAReply = async (
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
             nuevoEstado: ConversationEstado.respondido,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            sendTo: opts?.toPhone ?? conversacion.phone,
             phoneNumberId: opts?.phoneNumberId,
         })
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // 4.1) Atajo de PRECIOS usando “producto en foco”
+    // 4.1) PRECIOS usando “producto en foco” (explícito → foco → fuzzy)
     if (wantsPrice(mensaje)) {
-        const focusId = await resolveFocusProductId({
+        let focusId = await resolveFocusProductId({
             empresaId: conversacion.empresaId,
             chatId,
             explicit: { name: mensaje }
         })
+
+        if (!focusId) {
+            const inferred = await inferBestProduct(
+                conversacion.empresaId,
+                mensaje || caption,
+                recentProductNames,
+                String(cfg(config, 'palabrasClaveNegocio') || '')
+            )
+            focusId = inferred?.id ?? null
+        }
+
         if (focusId) {
+            setFocus(chatId, focusId)
             const p = await prisma.product.findUnique({
                 where: { id: focusId },
                 select: { nombre: true, precioDesde: true }
@@ -630,12 +662,13 @@ export const handleIAReply = async (
                 const saved = await persistBotReply({
                     conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
                     nuevoEstado: ConversationEstado.respondido,
-                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    sendTo: opts?.toPhone ?? conversacion.phone,
                     phoneNumberId: opts?.phoneNumberId,
                 })
                 return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
         }
+
         // sin foco → lista corta
         const list = await prisma.product.findMany({
             where: { empresaId: conversacion.empresaId, disponible: true },
@@ -646,55 +679,112 @@ export const handleIAReply = async (
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
             nuevoEstado: ConversationEstado.respondido,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            sendTo: opts?.toPhone ?? conversacion.phone,
             phoneNumberId: opts?.phoneNumberId,
         })
         return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // 4.2) Si pide FOTOS → usar foco (o inferir) y enviar SOLO ese producto
+    // 4.2) FOTOS → resolver un único producto y enviar
     {
-        const hasDestination = Boolean(opts?.autoSend) && Boolean((opts?.toPhone ?? conversacion.phone))
+        const destination = (opts?.toPhone ?? conversacion.phone) // ✅ ya no depende de autoSend
+        const hasDestination = Boolean(destination)
+
         if (wantsImages(mensaje) && hasDestination) {
-            const CLEAN_WORDS = ['foto', 'fotos', 'imagen', 'imagenes', 'mandame', 'enviame', 'muestra', 'mostrar']
+            const CLEAN_WORDS = ['foto', 'fotos', 'imagen', 'imagenes', 'imágenes', 'mandame', 'enviame', 'envíame', 'muestra', 'mostrar', 'de', 'del']
             const CLEAN_RE = new RegExp(`\\b(?:${CLEAN_WORDS.join('|')})\\b`, 'g')
-            const clean = nrm(mensaje).replace(CLEAN_RE, ' ').trim()
+            const baseText = (mensaje || '').replace(CLEAN_RE, ' ').trim()
 
-            const inferred = await inferBestProduct(
-                conversacion.empresaId,
-                clean || caption || mensaje,
-                recentProductNames,
-                String(cfg(config, 'palabrasClaveNegocio') || '')
-            )
+            let target: { id: number; nombre: string } | null = null
 
-            const focusId = await resolveFocusProductId({
-                empresaId: conversacion.empresaId,
-                chatId,
-                explicit: { name: clean || caption || '' }
-            }) ?? inferred?.id ?? null
+            // foco actual
+            const fId = getFocus(chatId)
+            if (fId) {
+                const row = await prisma.product.findUnique({ where: { id: fId }, select: { id: true, nombre: true, disponible: true, empresaId: true } })
+                if (row && row.disponible && row.empresaId === conversacion.empresaId) target = { id: row.id, nombre: row.nombre }
+            }
 
-            if (focusId) {
-                const focusProd = await prisma.product.findUnique({
-                    where: { id: focusId },
+            // nombre explícito
+            if (!target) {
+                const e = await explicitProductByName(conversacion.empresaId, baseText || caption)
+                if (e) target = e
+            }
+
+            // fuzzy
+            if (!target) {
+                const inferred = await inferBestProduct(
+                    conversacion.empresaId,
+                    baseText || caption || mensaje,
+                    recentProductNames,
+                    String(cfg(config, 'palabrasClaveNegocio') || '')
+                )
+                if (inferred) target = inferred
+            }
+
+            // desambiguación (top2 por contains + similitud)
+            if (!target) {
+                const q = nrm(baseText || caption || mensaje)
+                const prods = await prisma.product.findMany({
+                    where: {
+                        empresaId: conversacion.empresaId,
+                        disponible: true,
+                        OR: [
+                            { nombre: { contains: q } },
+                            { descripcion: { contains: q } },
+                            { beneficios: { contains: q } },
+                            { caracteristicas: { contains: q } },
+                        ]
+                    },
+                    take: 6, orderBy: { id: 'asc' },
                     select: { id: true, nombre: true }
                 })
+                const scored = prods
+                    .map(p => ({ p, s: jaccard(new Set(tokensOf(nrm(p.nombre))), new Set(tokensOf(q))) }))
+                    .sort((a, b) => b.s - a.s)
+                    .slice(0, 2)
+
+                if (scored[0] && (scored.length === 1 || (scored[0].s - (scored[1]?.s ?? 0)) >= 0.15)) {
+                    target = { id: scored[0].p.id, nombre: scored[0].p.nombre }
+                } else if (scored.length === 2) {
+                    const ask = `¿De cuál producto quieres *fotos*?\n1) *${scored[0].p.nombre}*\n2) *${scored[1].p.nombre}*`
+                    const saved = await persistBotReply({
+                        conversationId: chatId,
+                        empresaId: conversacion.empresaId,
+                        texto: ask,
+                        nuevoEstado: conversacion.estado,
+                        sendTo: destination,
+                        phoneNumberId: opts?.phoneNumberId,
+                    })
+                    return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+                }
+            }
+
+            if (target) {
+                setFocus(chatId, target.id)
                 const mediaSent = await sendProductImages({
                     chatId,
-                    conversacion: { empresaId: conversacion.empresaId, phone: conversacion.phone },
-                    productosRelevantes: focusProd ? [focusProd] : [{ id: focusId, nombre: inferred?.nombre || 'Producto' }],
+                    conversacion: { empresaId: conversacion.empresaId, phone: destination },
+                    productosRelevantes: [{ id: target.id, nombre: target.nombre }],
                     phoneNumberId: opts?.phoneNumberId,
-                    toOverride: opts?.toPhone
+                    toOverride: destination
                 })
-                const follow = `Te compartí fotos de *${focusProd?.nombre || inferred?.nombre || 'el producto'}*. ¿Deseas saber el *precio* o ver *alternativas*?`
+
+                const follow = `Te compartí fotos de *${target.nombre}*. ¿Quieres el *precio* o ver *alternativas*?`
                 const saved = await persistBotReply({
                     conversationId: chatId,
                     empresaId: conversacion.empresaId,
                     texto: follow,
                     nuevoEstado: ConversationEstado.respondido,
-                    sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                    sendTo: destination,
                     phoneNumberId: opts?.phoneNumberId,
                 })
-                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaSent }
+                return {
+                    estado: ConversationEstado.respondido,
+                    mensaje: saved.texto,
+                    messageId: saved.messageId,
+                    wamid: saved.wamid,
+                    media: mediaSent
+                }
             }
 
             // Sin foco claro → pedir precisión
@@ -710,7 +800,7 @@ export const handleIAReply = async (
                 empresaId: conversacion.empresaId,
                 texto: ask,
                 nuevoEstado: conversacion.estado,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                sendTo: destination,
                 phoneNumberId: opts?.phoneNumberId,
             })
             return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
@@ -746,7 +836,7 @@ export const handleIAReply = async (
                 empresaId: conversacion.empresaId,
                 texto: pick(CTAS),
                 nuevoEstado: conversacion.estado,
-                sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+                sendTo: opts?.toPhone ?? conversacion.phone,
                 phoneNumberId: opts?.phoneNumberId,
             })
             return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid }
@@ -760,7 +850,7 @@ export const handleIAReply = async (
             empresaId: conversacion.empresaId,
             texto: 'Puedo ayudarte con *precios*, *beneficios* o *fotos*. ¿Qué te comparto?',
             nuevoEstado: conversacion.estado,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+            sendTo: opts?.toPhone ?? conversacion.phone,
             phoneNumberId: opts?.phoneNumberId,
         })
         return { estado: conversacion.estado, mensaje: saved.texto, motivo: 'confianza_baja', messageId: saved.messageId, wamid: saved.wamid }
@@ -771,7 +861,7 @@ export const handleIAReply = async (
         empresaId: conversacion.empresaId,
         texto: respuesta,
         nuevoEstado: ConversationEstado.respondido,
-        sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
+        sendTo: opts?.toPhone ?? conversacion.phone,
         phoneNumberId: opts?.phoneNumberId,
     })
 
@@ -787,6 +877,7 @@ async function persistBotReply({ conversationId, empresaId, texto, nuevoEstado, 
     const msg = await prisma.message.create({
         data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId, mediaType: null, mediaUrl: null, mimeType: null, caption: null, isVoiceNote: false, transcription: null } as any,
     })
+    // 👉 mantener estado habitual, salvo cuando explícitamente se pasa (pago)
     await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } })
 
     let wamid: string | undefined
