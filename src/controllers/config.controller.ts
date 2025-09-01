@@ -203,6 +203,7 @@ export async function upsertConfig(req: Request, res: Response) {
  * === PUT /api/config/agent
  * Guarda SOLO el modo/parametría del agente.
  */
+// === PUT /api/config/agent
 export async function upsertAgentConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
 
@@ -221,21 +222,99 @@ export async function upsertAgentConfig(req: Request, res: Response) {
     const agentDisclaimers = s(req.body?.agentDisclaimers) || null
 
     try {
-        const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
+        // ⚠️ Campos obligatorios sin default en tu schema:
+        // descripcion, servicios, faq, horarios, disclaimers,
+        // enviosInfo, metodosPago, politicasDevolucion, politicasGarantia,
+        // promocionesInfo, canalesAtencion, extras
+        //
+        // Si el registro NO existe, los rellenamos con strings vacíos
+        // (válidos para TEXT) para no romper validaciones de Prisma.
+        const createMinimos: Prisma.BusinessConfigUncheckedCreateInput = {
+            empresaId,
+            // base
+            nombre: "",                    // tiene default("") en schema, pero lo enviamos igual
+            descripcion: s(req.body?.descripcion) || "",
+            servicios: s(req.body?.servicios) || "",
+            faq: s(req.body?.faq) || "",
+            horarios: s(req.body?.horarios) || "",
+            businessType: "servicios",
+            disclaimers: s(req.body?.disclaimers) || "",
 
-        const data: Prisma.BusinessConfigUncheckedUpdateInput = {
+            // IA
             aiMode,
             agentSpecialty,
             agentPrompt,
             agentScope,
             agentDisclaimers,
+
+            // operación (mínimos requeridos)
+            enviosInfo: s(req.body?.enviosInfo) || "",
+            metodosPago: s(req.body?.metodosPago) || "",
+            tiendaFisica: false,
+            direccionTienda: "",
+
+            politicasDevolucion: s(req.body?.politicasDevolucion) || "",
+            politicasGarantia: s(req.body?.politicasGarantia) || "",
+            promocionesInfo: s(req.body?.promocionesInfo) || "",
+            canalesAtencion: s(req.body?.canalesAtencion) || "",
+            extras: s(req.body?.extras) || "",
+            palabrasClaveNegocio: "",
+
+            // pagos (tienen defaults en schema; los enviamos igual por claridad)
+            pagoLinkGenerico: "",
+            pagoLinkProductoBase: "",
+            pagoNotas: null,
+
+            bancoNombre: "",
+            bancoTitular: "",
+            bancoTipoCuenta: "",
+            bancoNumeroCuenta: "",
+            bancoDocumento: "",
+            transferenciaQRUrl: "",
+
+            // envíos (no son obligatorios)
+            envioTipo: "",
+            envioEntregaEstimado: "",
+            envioCostoFijo: undefined as any,
+            envioGratisDesde: undefined as any,
+
+            // post-venta (tienen default en schema)
+            facturaElectronicaInfo: "",
+            soporteDevolucionesInfo: "",
+
+            // escalamiento (tienen defaults en schema; los dejamos por compatibilidad)
+            escalarSiNoConfia: true,
+            escalarPalabrasClave: "",
+            escalarPorReintentos: 0,
         }
 
-        const cfg = existente
-            ? await prisma.businessConfig.update({ where: { empresaId }, data })
-            : await prisma.businessConfig.create({
-                data: { empresaId, ...data } as Prisma.BusinessConfigUncheckedCreateInput,
-            })
+        const updateSoloAgente: Prisma.BusinessConfigUncheckedUpdateInput = {
+            aiMode,
+            agentSpecialty,
+            agentPrompt,
+            agentScope,
+            agentDisclaimers,
+            // 👇 Si el front envía algunos de estos campos junto con el cambio del agente,
+            // aprovecha y actualízalos; si no vienen, no los toques.
+            ...(req.body?.descripcion !== undefined && { descripcion: s(req.body.descripcion) }),
+            ...(req.body?.servicios !== undefined && { servicios: s(req.body.servicios) }),
+            ...(req.body?.faq !== undefined && { faq: s(req.body.faq) }),
+            ...(req.body?.horarios !== undefined && { horarios: s(req.body.horarios) }),
+            ...(req.body?.disclaimers !== undefined && { disclaimers: s(req.body.disclaimers) }),
+            ...(req.body?.enviosInfo !== undefined && { enviosInfo: s(req.body.enviosInfo) }),
+            ...(req.body?.metodosPago !== undefined && { metodosPago: s(req.body.metodosPago) }),
+            ...(req.body?.politicasDevolucion !== undefined && { politicasDevolucion: s(req.body.politicasDevolucion) }),
+            ...(req.body?.politicasGarantia !== undefined && { politicasGarantia: s(req.body.politicasGarantia) }),
+            ...(req.body?.promocionesInfo !== undefined && { promocionesInfo: s(req.body.promocionesInfo) }),
+            ...(req.body?.canalesAtencion !== undefined && { canalesAtencion: s(req.body.canalesAtencion) }),
+            ...(req.body?.extras !== undefined && { extras: s(req.body.extras) }),
+        }
+
+        const cfg = await prisma.businessConfig.upsert({
+            where: { empresaId },
+            update: updateSoloAgente,
+            create: createMinimos,
+        })
 
         return res.json(cfg)
     } catch (error) {
@@ -243,6 +322,7 @@ export async function upsertAgentConfig(req: Request, res: Response) {
         return res.status(500).json({ error: "No se pudo guardar la configuración del agente" })
     }
 }
+
 
 // === GET /api/config/all
 export async function getAllConfigs(req: Request, res: Response) {
