@@ -33,8 +33,6 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || process.env.OPENAI_
 const VISION_MODEL = process.env.IA_VISION_MODEL || 'gpt-4o-mini'
 
 const MAX_PRODUCTS_TO_SEND = Number(process.env.MAX_PRODUCTS_TO_SEND || 3)
-const PRODUCT_INDEX_TTL_MS = Number(process.env.PRODUCT_INDEX_TTL_MS || 5 * 60_000) // 5 min
-const MIN_MATCH_SCORE = Number(process.env.MIN_MATCH_SCORE || 0.58)
 
 /* ============ Utils ============ */
 const normId = (m: string) => (m?.trim() === 'google/gemini-2.0-flash-lite' ? 'google/gemini-2.0-flash-lite-001' : m?.trim())
@@ -114,148 +112,20 @@ const cfg = (c: any, k: string) => {
 
 /* ============ Intents ============ */
 const wantsImages = (t: string) =>
-    ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto', 'envia fotos', 'mandame fotos', 'enviame fotos']
-        .some(k => nrm(t).includes(nrm(k)))
+    ['imagen', 'imagenes', 'imágenes', 'foto', 'fotos', 'ver foto', 'ver imagen', 'muestra foto', 'mandame fotos', 'envíame fotos', 'enviame fotos'].some(k => nrm(t).includes(nrm(k)))
 
 const asksCatalogue = (t: string) =>
-    ['lista de productos', 'productos disponibles', 'portafolio', 'catálogo', 'catalogo']
-        .some(k => nrm(t).includes(nrm(k)))
+    ['lista de productos', 'productos disponibles', 'portafolio', 'catálogo', 'catalogo', 'que productos', 'cuáles tienes', 'cuales tienes'].some(k => nrm(t).includes(nrm(k)))
 
 const saysPaid = (t: string) =>
-    ['ya pague', 'ya pagué', 'pago realizado', 'hice el pago', 'ya hice el pago', 'pagado', 'transferencia hecha', 'envio comprobante', 'comprobante']
-        .some(k => nrm(t).includes(nrm(k)))
+    ['ya pague', 'ya pagué', 'pago realizado', 'hice el pago', 'ya hice el pago', 'pagado', 'comprobante'].some(k => nrm(t).includes(nrm(k)))
 
-/* ======================== Fuzzy index ======================== */
-
-type ProdLite = {
-    id: number
-    nombre: string
-    slug?: string | null
-    descripcion?: string | null
-    beneficios?: string | null
-    caracteristicas?: string | null
-    precioDesde?: any | null
-}
-
-type IndexEntry = ProdLite & { keywords: string[], keyset: Set<string>, digits: Set<string> }
-
-const indexCache = new Map<number, { at: number, items: IndexEntry[], unionKeyset: Set<string> }>()
-
-const tokenize = (s: string) => nrm(s).split(' ').filter(w => w.length >= 2)
-const extractDigits = (s: string) => {
-    const out = new Set<string>()
-    const re = /\b\d{1,4}(?:%|[.,]\d+)?\b/g
-    const m = s.match(re)
-    if (m) m.forEach(v => out.add(v.replace(',', '.')))
-    return out
-}
-
-async function buildProductIndex(empresaId: number): Promise<{ items: IndexEntry[], unionKeyset: Set<string> }> {
-    const now = Date.now()
-    const cached = indexCache.get(empresaId)
-    if (cached && now - cached.at < PRODUCT_INDEX_TTL_MS) return cached
-
-    const rows = await prisma.product.findMany({
-        where: { empresaId, disponible: true },
-        orderBy: { id: 'asc' },
-        select: {
-            id: true, nombre: true, slug: true, descripcion: true,
-            beneficios: true, caracteristicas: true, precioDesde: true, disponible: true
-        }
-    })
-
-    const items: IndexEntry[] = rows.map((p) => {
-        const bag: string[] = []
-        bag.push(p.nombre || '')
-        if (p.slug) bag.push(p.slug)
-        if (p.descripcion) bag.push(p.descripcion)
-        if (p.beneficios) bag.push(p.beneficios)
-        if (p.caracteristicas) bag.push(p.caracteristicas)
-
-        const keywords = Array.from(new Set(bag.flatMap(tokenize)))
-        const digits = extractDigits(bag.join(' '))
-        return { ...p, keywords, keyset: new Set(keywords), digits }
-    })
-
-    const unionKeyset = new Set<string>()
-    items.forEach(it => it.keyset.forEach(k => unionKeyset.add(k)))
-
-    const packed = { at: now, items, unionKeyset }
-    indexCache.set(empresaId, packed)
-    return { items, unionKeyset }
-}
-
-function similarityScoreQueryToProduct(q: string, entry: IndexEntry): number {
-    const qTokens = tokenize(q)
-    if (!qTokens.length) return 0
-
-    const qSet = new Set(qTokens)
-    const inter = new Set<string>()
-    qTokens.forEach(t => { if (entry.keyset.has(t)) inter.add(t) })
-    const union = new Set<string>([...entry.keyset, ...qSet])
-
-    let jaccard = inter.size / Math.max(1, union.size)
-
-    // Substring boosts
-    const pName = nrm(entry.nombre)
-    const qn = nrm(q)
-    if (pName.includes(qn)) jaccard += 0.25
-    if (qn.includes(pName)) jaccard += 0.15
-
-    // 2-gram phrase boost
-    for (let i = 0; i < qTokens.length - 1; i++) {
-        const pair = `${qTokens[i]} ${qTokens[i + 1]}`
-        if (pName.includes(pair)) { jaccard += 0.12; break }
-    }
-
-    // digits/percentages (15 / 15%)
-    const qDigits = extractDigits(q)
-    qDigits.forEach(d => { if (entry.digits.has(d) || pName.includes(d)) jaccard += 0.08 })
-
-    if (jaccard > 1) jaccard = 1
-    return jaccard
-}
-
-async function searchProductsFuzzy(empresaId: number, query: string, topN = 5) {
-    const { items } = await buildProductIndex(empresaId)
-    const scored = items
-        .map(it => ({ p: it, s: similarityScoreQueryToProduct(query, it) }))
-        .filter(x => x.s > 0)
-        .sort((a, b) => b.s - a.s)
-        .slice(0, topN)
-    return scored
-}
-
-async function findRequestedProduct(empresaId: number, text: string) {
-    const best = (await searchProductsFuzzy(empresaId, text, 1))[0]
-    return best && best.s >= MIN_MATCH_SCORE ? best.p : null
-}
-
-function listProductsMessage(list: Array<{ nombre: string; precioDesde: any | null }>) {
-    const lines: string[] = []
-    lines.push('Tenemos estas opciones disponibles ahora mismo:')
-    for (const p of list.slice(0, 6)) {
-        const price = p.precioDesde != null ? ` — desde ${formatMoney(p.precioDesde)}` : ''
-        lines.push(`• *${p.nombre}*${price}`)
-    }
-    lines.push('¿Quieres *fotos* de alguno o prefieres que te pase el *precio* de un producto en particular?')
-    return short(lines.join('\n'))
-}
-
-async function topListForGreeting(empresaId: number) {
-    const rows = await prisma.product.findMany({
-        where: { empresaId, disponible: true },
-        orderBy: { id: 'asc' }, take: 2, select: { nombre: true, precioDesde: true }
-    })
-    return rows
-}
-
-/* ===== Prompt anti-alucinación ===== */
+/* ===== Prompt con reglas anti-alucinación ===== */
 function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: string) {
     const marca = (cfg(c, 'nombre') || empresaNombre || 'la marca')
 
     const inventario = prods
-        .map((p: any) => `- ${p.nombre}${p.precioDesde != null ? ` — ${formatMoney(p.precioDesde)}` : ''}`)
+        .map(p => `- ${p.nombre}${p.precioDesde != null ? ` — ${formatMoney(p.precioDesde)}` : ''}`)
         .join('\n')
 
     const info = `
@@ -265,19 +135,19 @@ function systemPrompt(c: any, prods: any[], msgEsc: string, empresaNombre?: stri
 - Portafolio: usa EXCLUSIVAMENTE nombres y datos reales de productos de la base.
 - Horarios: ${cfg(c, 'horarios')}
 
-[PRODUCTOS RELEVANTES PARA ESTA PREGUNTA]
+[PRODUCTOS DISPONIBLES (muestra parcial/relevante)]
 ${inventario || '- (sin coincidencias claras)'}
   `.trim()
 
     return `
 Eres un **asesor de ${marca}**. Regla principal: **no inventes** nombres de productos. 
-Si el cliente pide un producto que no está en la lista, indica que no lo encuentras y ofrece alternativas reales del listado.
-Respuestas cortas (2–5 líneas) con CTA. No menciones ser IA ni compartas links externos.
+Si el cliente pide un producto que no está en la lista, responde que no lo encuentras y ofrece alternativas reales.
+Respuestas cortas (2–5 líneas) y con CTA breve. No menciones ser IA ni compartas links externos.
 
 Si llega una **imagen**:
 - Analízala en el contexto del negocio.
-- Si parece **comprobante** o el cliente dice que pagó: agradece y aclara que el equipo verificará manualmente (no pidas más datos).
-- Si es otra imagen, pregunta cómo ayudar con esa foto.
+- Si parece **comprobante** de pago o el cliente dice que pagó: agradece y aclara que el equipo verificará manualmente.
+- Si es otra imagen, pregunta amablemente cómo ayudar con esa foto.
 
 Si no puedes ayudar con certeza, usa: "${msgEsc}".
 
@@ -336,7 +206,7 @@ async function chatComplete({
     return resp?.choices?.[0]?.message?.content ?? ''
 }
 
-/* ==================== Wrappers seguros WAM ==================== */
+/* ==================== Wrappers WAM ==================== */
 type MaybeMediaInfo = string | { url?: string;[k: string]: any } | null | undefined
 
 async function getWamMediaUrlSafe(input: string): Promise<string | null> {
@@ -354,6 +224,127 @@ async function downloadWamMediaToBufferSafe(url: string): Promise<Buffer | null>
     if (typeof fn !== 'function') return null
     const out = await fn(url)
     return Buffer.isBuffer(out) ? out : out ? Buffer.from(out as any) : null
+}
+
+/* ======================== Index de productos (fuzzy) ======================== */
+type IndexEntry = {
+    id: number
+    nombre: string
+    slug: string
+    precioDesde: any | null
+    text: string   // texto normalizado concatenado
+}
+
+const indexCache: Map<number, { items: IndexEntry[]; at: number }> = new Map()
+const PRODUCT_INDEX_TTL_MS = 1000 * 60 * 5 // 5 minutos
+
+function tokensOf(s: string): string[] {
+    return nrm(s).split(' ').filter(w => w.length >= 2)
+}
+function jaccard(a: Set<string>, b: Set<string>) {
+    const inter = new Set([...a].filter(x => b.has(x))).size
+    const uni = new Set([...a, ...b]).size || 1
+    return inter / uni
+}
+function dice(a: Set<string>, b: Set<string>) {
+    const inter = new Set([...a].filter(x => b.has(x))).size
+    return (2 * inter) / ((a.size || 1) + (b.size || 1))
+}
+function containsAll(a: Set<string>, b: Set<string>) {
+    for (const t of b) if (!a.has(t)) return false
+    return true
+}
+
+async function buildProductIndex(empresaId: number): Promise<{ items: IndexEntry[], at: number }> {
+    const now = Date.now()
+    const cached = indexCache.get(empresaId)
+    if (cached && now - cached.at < PRODUCT_INDEX_TTL_MS) return cached
+
+    const rows = await prisma.product.findMany({
+        where: { empresaId, disponible: true },
+        orderBy: { id: 'asc' },
+        select: {
+            id: true, nombre: true, slug: true,
+            descripcion: true, beneficios: true, caracteristicas: true,
+            precioDesde: true, disponible: true
+        }
+    })
+
+    const items: IndexEntry[] = rows.map(r => {
+        const text = nrm([
+            r.nombre,
+            r.slug,
+            r.descripcion,
+            r.beneficios,
+            r.caracteristicas
+        ].join(' '))
+        return { id: r.id, nombre: r.nombre, slug: r.slug, precioDesde: r.precioDesde, text }
+    })
+
+    const out = { items, at: now }
+    indexCache.set(empresaId, out)
+    return out
+}
+
+function synonymsBase(bizKeywords: string) {
+    const base = new Map<string, string[]>([
+        ['serum', ['serum', 'suerum', 'sérum', 'vit c', 'vitamina c', 'vitamin c', 'suero']],
+        ['hialuronico', ['hialuronico', 'hialurónico', 'acido hialuronico', 'ácido hialurónico', 'gel hialuronico', 'gel acido']],
+        ['hidratante', ['hidratante', 'crema', 'gel hidratante']],
+    ])
+    const extra = String(bizKeywords || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+    if (extra.length) base.set('extra', extra)
+    return base
+}
+
+function scoreQueryAgainst(entry: IndexEntry, query: string, recentNames: string[]): number {
+    const q = nrm(query)
+    if (!q) return 0
+    const qset = new Set(tokensOf(q))
+    const tset = new Set(tokensOf(entry.text))
+
+    // boosts por menciones recientes del nombre exacto
+    let boost = recentNames.some(n => nrm(n) === nrm(entry.nombre)) ? 0.15 : 0
+
+    // coincidencia exacta/substring
+    if (entry.text.includes(q)) return 0.98 + boost
+    if (entry.nombre && nrm(entry.nombre).includes(q)) return 0.95 + boost
+
+    // similitudes de conjuntos
+    const j = jaccard(qset, tset)
+    const d = dice(qset, tset)
+
+    // si todas las palabras clave de la consulta están en el producto, sube
+    const hard = containsAll(tset, qset) ? 0.12 : 0
+
+    return Math.max(j * 0.6 + d * 0.4 + hard + boost, 0)
+}
+
+async function inferBestProduct(empresaId: number, text: string, recentProductNames: string[], bizKeywords: string): Promise<{ id: number, nombre: string } | null> {
+    const { items } = await buildProductIndex(empresaId)
+    const q = nrm(text)
+
+    // aplicar sinónimos (expandir la consulta)
+    const syn = synonymsBase(bizKeywords)
+    let expanded = q
+    for (const [, arr] of syn) {
+        for (const k of arr) {
+            if (q.includes(nrm(k))) { expanded += ' ' + nrm(k) }
+        }
+    }
+
+    let best: IndexEntry | null = null
+    let bestScore = 0
+    for (const it of items) {
+        const s = scoreQueryAgainst(it, expanded, recentProductNames)
+        if (s > bestScore) { best = it; bestScore = s }
+    }
+
+    // umbral flexible
+    return bestScore >= 0.62 ? { id: best!.id, nombre: best!.nombre } : null
 }
 
 /* ========================= Core ========================= */
@@ -382,19 +373,7 @@ export const handleIAReply = async (
         select: { nombre: true }
     })
 
-    const mensajeEscalamiento = 'Gracias por tu mensaje. En breve un compañero del equipo te contactará para ayudarte con más detalle.'
-
-    if (!config) {
-        const escalado = await persistBotReply({
-            conversationId: chatId,
-            empresaId: conversacion.empresaId,
-            texto: mensajeEscalamiento,
-            nuevoEstado: null, // no cambies estado aquí
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-            phoneNumberId: opts?.phoneNumberId,
-        })
-        return { estado: conversacion.estado, mensaje: mensajeEscalamiento, motivo: 'confianza_baja', messageId: escalado.messageId, wamid: escalado.wamid }
-    }
+    const mensajeEscalamiento = 'Gracias por tu mensaje. ¿Podrías darme un poco más de contexto?'
 
     // 2) Último mensaje del cliente (voz → transcripción; imagen → visión/pagos)
     const ultimoCliente = await prisma.message.findFirst({
@@ -460,10 +439,10 @@ export const handleIAReply = async (
     // 2.1 Imagen → comprobante o consulta genérica
     if (isImage) {
         const maybePayment = /comprobante|pago|recibo|transferencia|voucher|dep[oó]sito|qr/i.test(
-            (ultimoCliente?.caption || '') + ' ' + (ultimoCliente?.contenido || '') + ' ' + (mensaje || '')
+            (ultimoCliente?.caption || '') + ' ' + (ultimoCliente?.contenido || '')
         )
         if (maybePayment || saysPaid(mensaje)) {
-            // Cambia a venta_en_proceso (verificación manual)
+            // Cambiar estado a venta_en_proceso (verificación manual) — ÚNICO cambio de estado
             const texto = [
                 '¡Gracias! Recibimos tu *comprobante* / confirmación de pago 🙌',
                 'Nuestro equipo validará el pago y te confirmará por aquí.',
@@ -486,7 +465,7 @@ export const handleIAReply = async (
             const ask = 'Veo tu foto 😊 ¿Te ayudo con algo de esa imagen? (por ejemplo: precio, disponibilidad, alternativas o cómo usarlo)'
             const saved = await persistBotReply({
                 conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
-                nuevoEstado: null,
+                nuevoEstado: conversacion.estado, // no cambiar estado
                 sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
                 phoneNumberId: opts?.phoneNumberId,
             })
@@ -494,70 +473,50 @@ export const handleIAReply = async (
         }
     }
 
-    // 3) Historial corto (últimos con contenido)
+    // 3) Historial corto (últimos con contenido) y nombres mencionados
     const mensajesPrevios = await prisma.message.findMany({
         where: { conversationId: chatId },
         orderBy: { timestamp: 'asc' },
-        take: 20,
+        take: 30,
         select: { from: true, contenido: true },
     })
     const historial = mensajesPrevios
         .filter(m => (m.contenido || '').trim().length > 0)
-        .slice(-10)
+        .slice(-12)
         .map(m => ({ role: m.from === 'client' ? 'user' : 'assistant', content: m.contenido } as const))
 
-    // 3.1) Productos relevantes (fuzzy total base)
+    // candidates mencionados por el bot recientemente
+    const recentAssistant = historial.filter(h => h.role === 'assistant').map(h => h.content.toString()).join('\n')
+    const recentProductNames: string[] = []
+    try {
+        const avail = await prisma.product.findMany({
+            where: { empresaId: conversacion.empresaId, disponible: true },
+            select: { nombre: true },
+            take: 20
+        })
+        const body = nrm(recentAssistant)
+        for (const p of avail) {
+            const name = nrm(p.nombre)
+            if (name && body.includes(name)) recentProductNames.push(p.nombre)
+        }
+    } catch { /* ignore */ }
+
+    // 3.1) Traer productos relevantes (para el prompt) – fallback simple
     let productos: any[] = []
     try {
-        const fuzzy = await searchProductsFuzzy(conversacion.empresaId, mensaje || caption || '', 5)
-        productos = fuzzy.map(x => ({ id: x.p.id, nombre: x.p.nombre, precioDesde: x.p.precioDesde }))
-        if (!productos.length) {
-            productos = await retrieveRelevantProducts(conversacion.empresaId, mensaje || (ultimoCliente?.caption ?? ''), 5)
-        }
-        if (!productos.length) {
-            productos = await prisma.product.findMany({
-                where: { empresaId: conversacion.empresaId, disponible: true },
-                take: 5, orderBy: { id: 'asc' },
-                select: { id: true, nombre: true, precioDesde: true }
-            })
-        }
+        productos = await retrieveRelevantProducts(conversacion.empresaId, mensaje || (ultimoCliente?.caption ?? ''), 5)
     } catch (e) {
-        console.warn('[handleIAReply] productos error:', (e as any)?.message || e)
+        console.warn('[handleIAReply] retrieveRelevantProducts error:', (e as any)?.message || e)
+        productos = []
+    }
+    if (!productos.length) {
         productos = await prisma.product.findMany({
             where: { empresaId: conversacion.empresaId, disponible: true },
-            take: 5, orderBy: { id: 'asc' },
-            select: { id: true, nombre: true, precioDesde: true }
+            take: 5, orderBy: { id: 'asc' }
         })
     }
 
-    // 4) Rápidos (saludo / envíos / catálogo)
-    const lower = nrm(mensaje)
-    const isGreeting = ['hola', 'buenas', 'buenos dias', 'buenas tardes', 'buenas noches'].some(g => lower === g || lower.startsWith(g))
-    if (isGreeting) {
-        const list = await topListForGreeting(conversacion.empresaId)
-        const intro = `¡Hola! ¿En qué puedo ayudarte hoy?`
-        const txt = list.length ? `${intro}\n\n${listProductsMessage(list)}` : intro
-        const saved = await persistBotReply({
-            conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
-            nuevoEstado: null,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-            phoneNumberId: opts?.phoneNumberId,
-        })
-        return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-    }
-
-    const envioRegex = /(env[ií]o|env[ií]an|domicilio|entrega|mandan)\b/i
-    if (envioRegex.test(mensaje)) {
-        const info = cfg(config, 'enviosInfo') || `Hacemos envíos a nivel nacional. ${cfg(config, 'envioEntregaEstimado') ? `Entrega estimada: ${cfg(config, 'envioEntregaEstimado')}.` : ''}`
-        const saved = await persistBotReply({
-            conversationId: chatId, empresaId: conversacion.empresaId, texto: info,
-            nuevoEstado: null,
-            sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
-            phoneNumberId: opts?.phoneNumberId,
-        })
-        return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-    }
-
+    // 4) Respuestas no-IA para catálogo y fotos validadas
     if (asksCatalogue(mensaje)) {
         const list = await prisma.product.findMany({
             where: { empresaId: conversacion.empresaId, disponible: true },
@@ -567,33 +526,37 @@ export const handleIAReply = async (
         const txt = listProductsMessage(list)
         const saved = await persistBotReply({
             conversationId: chatId, empresaId: conversacion.empresaId, texto: txt,
-            nuevoEstado: null,
+            nuevoEstado: ConversationEstado.respondido, // mantenemos sin forzar cambios
             sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
             phoneNumberId: opts?.phoneNumberId,
         })
-        return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
     }
 
-    // Fotos → sólo si hay match claro
+    // Si pide fotos → infiere producto de forma fuzzy (usa index + historial)
     if (wantsImages(mensaje) && opts?.autoSend && (opts?.toPhone || conversacion.phone)) {
-        const requested = await findRequestedProduct(conversacion.empresaId, mensaje || caption)
-        if (requested) {
+        // quitar palabras tipo "envíame/mándame fotos de"
+        const clean = nrm(mensaje).replace(/\b(foto|fotos|imagen|imagenes|imágenes|mandame|mándame|enviame|envíame|muestra|mostrar)\b/g, ' ')
+        const inferred = await inferBestProduct(conversacion.empresaId, clean || caption || mensaje, recentProductNames, cfg(config, 'palabrasClaveNegocio'))
+
+        if (inferred) {
             const mediaSent = await sendProductImages({
                 chatId,
                 conversacion: { empresaId: conversacion.empresaId, phone: conversacion.phone },
-                productosRelevantes: [requested],
+                productosRelevantes: [{ id: inferred.id, nombre: inferred.nombre }],
                 phoneNumberId: opts?.phoneNumberId,
                 toOverride: opts?.toPhone
             })
-            const follow = `Te compartí fotos de *${requested.nombre}*. ¿Deseas saber el *precio* o ver *alternativas*?`
+            const follow = `Te compartí fotos de *${inferred.nombre}*. ¿Deseas saber el *precio* o ver *alternativas*?`
             const saved = await persistBotReply({
                 conversationId: chatId, empresaId: conversacion.empresaId, texto: follow,
-                nuevoEstado: null,
+                nuevoEstado: ConversationEstado.respondido,
                 sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
                 phoneNumberId: opts?.phoneNumberId,
             })
-            return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaSent }
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: mediaSent }
         } else {
+            // desambiguación breve (sin repetir catálogo completo)
             const names = (await prisma.product.findMany({
                 where: { empresaId: conversacion.empresaId, disponible: true },
                 take: 3, orderBy: { id: 'asc' },
@@ -602,7 +565,7 @@ export const handleIAReply = async (
             const ask = `¿De cuál producto quieres fotos? ${names.length ? `Ej.: ${names.join(' / ')}` : ''}`
             const saved = await persistBotReply({
                 conversationId: chatId, empresaId: conversacion.empresaId, texto: ask,
-                nuevoEstado: null,
+                nuevoEstado: conversacion.estado,
                 sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
                 phoneNumberId: opts?.phoneNumberId,
             })
@@ -610,8 +573,7 @@ export const handleIAReply = async (
         }
     }
 
-    /* ===== 5) IA (RAG liviano, SIN cambiar estado) ===== */
-    const domainGuard = productos.length >= 2 ? listProductsMessage(productos) : ''
+    /* ===== 5) IA (anclada a BusinessConfig + productos, SIN flujo de compra; no cambia estado salvo pago) ===== */
     const baseMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }> = [
         { role: 'system', content: systemPrompt(config, productos, mensajeEscalamiento, empresa?.nombre) },
         ...historial
@@ -638,8 +600,8 @@ export const handleIAReply = async (
             const saved = await persistBotReply({
                 conversationId: chatId,
                 empresaId: conversacion.empresaId,
-                texto: domainGuard || pick(CTAS),
-                nuevoEstado: null,
+                texto: pick(CTAS),
+                nuevoEstado: conversacion.estado,
                 sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
                 phoneNumberId: opts?.phoneNumberId,
             })
@@ -652,8 +614,8 @@ export const handleIAReply = async (
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId: conversacion.empresaId,
-            texto: domainGuard || 'Puedo ayudarte con nuestro portafolio. ¿Sobre cuál producto te gustaría saber más?',
-            nuevoEstado: null,
+            texto: 'Puedo ayudarte con *precios*, *beneficios* o *fotos*. ¿Qué te comparto?',
+            nuevoEstado: conversacion.estado,
             sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
             phoneNumberId: opts?.phoneNumberId,
         })
@@ -664,26 +626,26 @@ export const handleIAReply = async (
         conversationId: chatId,
         empresaId: conversacion.empresaId,
         texto: respuesta,
-        nuevoEstado: null,
+        nuevoEstado: ConversationEstado.respondido,
         sendTo: opts?.autoSend ? (opts?.toPhone || conversacion.phone) : undefined,
         phoneNumberId: opts?.phoneNumberId,
     })
 
-    return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+    return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
 }
 
 /* ===================== Persistencia & helpers ===================== */
 function normalizeToE164(n: string) { return String(n || '').replace(/[^\d]/g, '') }
 
 async function persistBotReply({ conversationId, empresaId, texto, nuevoEstado, sendTo, phoneNumberId }: {
-    conversationId: number; empresaId: number; texto: string; nuevoEstado?: ConversationEstado | null; sendTo?: string; phoneNumberId?: string;
+    conversationId: number; empresaId: number; texto: string; nuevoEstado: ConversationEstado; sendTo?: string; phoneNumberId?: string;
 }) {
     const msg = await prisma.message.create({
         data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId, mediaType: null, mediaUrl: null, mimeType: null, caption: null, isVoiceNote: false, transcription: null } as any,
     })
-    if (typeof nuevoEstado !== 'undefined' && nuevoEstado !== null) {
-        await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } })
-    }
+    // 👉 mantener estado habitual, salvo cuando explícitamente se pasa (pago)
+    await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } })
+
     let wamid: string | undefined
     if (sendTo && String(sendTo).trim()) {
         try {
