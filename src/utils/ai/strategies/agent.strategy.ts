@@ -136,7 +136,9 @@ export async function handleAgentReply(args: {
 
     const system = [
         nameLine,
-        'Responde en 3–5 líneas, tono claro y empático.',
+        'Responde en 1–2 líneas, estilo telegrama, muy conciso y empático.',
+        'Formato: 1 viñeta (•) con lo esencial + termina con 1 pregunta breve.',
+        'Máximo 1 emoji opcional.',
         'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
         `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
         lineScope ? `Ámbito: ${lineScope}` : '',
@@ -174,7 +176,8 @@ export async function handleAgentReply(args: {
     }
 
     // Recorte server-side (máx. 5 líneas / 420 chars)
-    texto = clampConcise(texto, 5, 420)
+    texto = clampConcise(texto, 3, 260)
+    texto = formatConcise(texto)
 
     // 7) Persistir y responder
     const saved = await persistBotReply({
@@ -303,6 +306,31 @@ function clampConcise(text: string, maxLines = 5, maxChars = 420): string {
     if (lines.length > maxLines) t = lines.slice(0, maxLines).join('\n')
     return t
 }
+function formatConcise(text: string): string {
+    let t = String(text || '').trim()
+    if (!t) return '¿Podrías contarme un poco más para orientarte mejor?'
+
+    // Si ya trae viñetas, solo acorta
+    const hasBullet = /^[•\-]/m.test(t)
+    t = clampConcise(t, 3, 260)
+
+    if (hasBullet) {
+        // Garantiza pregunta final
+        if (!/[¿?]\s*$/.test(t)) {
+            t += '\n¿Puedes decirme desde cuándo y qué síntomas tienes?'
+        }
+        return t
+    }
+
+    // Convertir primeras 2 oraciones en viñetas y cerrar con pregunta
+    const sents = t.split(/(?<=[.!?])\s+/).filter(Boolean)
+    const bullets = sents.slice(0, 2).map(s => `• ${s.replace(/\s+/g, ' ').trim()}`)
+    let question = sents.find(s => /[?]$/.test(s))
+    if (!question) question = '¿Puedes decirme desde cuándo y qué síntomas tienes?'
+
+    return clampConcise([...bullets, question].join('\n'), 3, 260)
+}
+
 
 function humanSpecialty(s: AgentSpecialty) {
     switch (s) {
