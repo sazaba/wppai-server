@@ -17,7 +17,7 @@ export const handleIAReply = async (
     // 1) Leer conversación
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
-        select: { id: true, estado: true, empresaId: true, phone: true },
+        select: { id: true, estado: true, empresaId: true, phone: true }
     })
     if (!conversacion) return null
 
@@ -36,8 +36,8 @@ export const handleIAReply = async (
             agentSpecialty: true,
             agentPrompt: true,
             agentScope: true,
-            agentDisclaimers: true,
-        },
+            agentDisclaimers: true
+        }
     })
 
     const mode = config?.aiMode ?? AiMode.ecommerce
@@ -53,8 +53,8 @@ export const handleIAReply = async (
                 specialty: (config?.agentSpecialty ?? AgentSpecialty.generico),
                 prompt: config?.agentPrompt ?? '',
                 scope: config?.agentScope ?? '',
-                disclaimers: config?.agentDisclaimers ?? '',
-            },
+                disclaimers: config?.agentDisclaimers ?? ''
+            }
         })
     }
 
