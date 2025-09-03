@@ -17,6 +17,17 @@ const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)              
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min adjuntar imagen reciente
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s ventana idempotencia in-memory
 
+// ===== Idempotencia por inbound (sin DB) =====
+// Bloquea respuestas repetidas para el mismo mensaje entrante (message.id) por una ventana corta.
+const processedInbound = new Map<number, number>() // messageId -> timestamp ms
+function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
+    const now = Date.now()
+    const prev = processedInbound.get(messageId)
+    if (prev && (now - prev) <= windowMs) return true
+    processedInbound.set(messageId, now)
+    return false
+}
+
 export type AgentConfig = {
     specialty: AgentSpecialty
     prompt: string
@@ -56,6 +67,22 @@ export async function handleAgentReply(args: {
             timestamp: true,
         },
     })
+
+    if (process.env.DEBUG_AI === '1') {
+        console.log('[AGENT] handleAgentReply enter', {
+            chatId, empresaId,
+            lastId: last?.id, lastTs: last?.timestamp, lastType: last?.mediaType,
+            hasCaption: !!(last?.caption && String(last.caption).trim()),
+            hasContenido: !!(last?.contenido && String(last.contenido).trim()),
+            mensajeArgLen: (args.mensajeArg || '').length,
+        })
+    }
+
+    // 🔒 Guard: si ya procesamos este inbound (last.id) recientemente, salir
+    if (last?.id && seenInboundRecently(last.id)) {
+        if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip: inbound already processed', { lastId: last.id })
+        return null
+    }
 
     // 2) Config del negocio
     const [bc, empresa] = await Promise.all([
@@ -110,12 +137,12 @@ export async function handleAgentReply(args: {
     const caption = String(last?.caption || '').trim()
 
     // ====== REGLA DE ORO (sin DB): Debounce por conversación para evitar dobles respuestas ======
-    // - Texto normal: aplicamos debounce global.
-    // - Imagen con caption: aplicamos debounce específico y respondemos.
-    // - Imagen sin caption: NO respondemos aquí (defer al texto posterior).
+    // - Imagen con caption/userText: respondemos una sola vez (texto + imagen) y marcamos replied.
+    // - Imagen sin caption: NO respondemos aquí; defer al texto posterior.
+    // - Texto normal: aplicamos debounce por conversación.
     if (isImage) {
         if (caption || userText) {
-            // Imagen con texto en el mismo webhook => responder una sola vez (texto + imagen)
+            // Imagen con texto en el mismo evento => responder una sola vez (texto + imagen)
             if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
                 if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip (debounce): image+caption same webhook')
                 return null
@@ -379,7 +406,7 @@ async function answerWithLLM(opts: {
 
 // Historial: últimos N mensajes en formato compacto
 async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
-    const where: any = { conversationId }
+    const where: Prisma.MessageWhereInput = { conversationId }
     if (excludeMessageId) where.id = { not: excludeMessageId }
 
     const rows = await prisma.message.findMany({
@@ -637,7 +664,7 @@ async function persistBotReply({
 // Mapa: conversación -> { afterMs: timestamp del último msg cliente respondido, repliedAtMs: cuándo respondimos }
 const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>()
 
-function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = 120_000) {
+function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = REPLY_DEDUP_WINDOW_MS) {
     const now = Date.now()
     const prev = recentReplies.get(conversationId)
     const clientMs = clientTs.getTime()
