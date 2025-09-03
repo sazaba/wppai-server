@@ -13,7 +13,7 @@ import { transcribeAudioBuffer } from '../../../services/transcription.service'
 import type { IAReplyResult } from '../../handleIAReply.ecommerce'
 
 /** Config imagen/texto */
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)               // 1s re-chequeo (no respondemos desde imagen sola)
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                 // 1s re-chequeo (no respondemos desde imagen sola)
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min adjuntar imagen reciente
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s ventana idempotencia in-memory
 
@@ -21,9 +21,9 @@ const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_00
  *  - Limitamos por líneas (no por caracteres) para evitar cortes a media frase.
  *  - El modelo ya viene breve por IA_MAX_TOKENS.
  */
-const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 15)    // líneas duras
-const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000) // tope blando, ya no cortamos por chars
-const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)   // tokens del LLM (breve de origen)
+const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 15)     // líneas duras
+const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)   // tope blando, no cortamos por chars
+const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 128)  // tokens del LLM (ligeramente más aire para cerrar frases)
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
 
 // ===== Idempotencia por inbound (sin DB) =====
@@ -258,6 +258,9 @@ export async function handleAgentReply(args: {
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
 
+    // NUEVO: cerrar bonito si quedó cortado
+    texto = closeNicely(texto)
+
     // 9) Post-formateo + marca/web (solo líneas)
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
@@ -364,6 +367,9 @@ async function answerWithLLM(opts: {
         console.error('[AGENT] OpenAI error (final):', err?.response?.data || err?.message || err)
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
+
+    // NUEVO: cerrar bonito si quedó cortado
+    texto = closeNicely(texto)
 
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
@@ -550,6 +556,7 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
 }
 
 // ===== formatting / misc =====
+
 // Soft clamp: SOLO líneas, no recortamos por caracteres para evitar “Te recom…”
 function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
@@ -582,6 +589,21 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
     return t
 }
 
+// === NUEVO: helpers para cerrar bonito ===
+function endsWithPunctuation(t: string) {
+    return /[.!?…]\s*$/.test((t || '').trim())
+}
+
+function closeNicely(raw: string): string {
+    let t = (raw || '').trim()
+    if (!t) return t
+    if (endsWithPunctuation(t)) return t
+    // Quitar última palabra "a medias" y cerrar con puntos suspensivos
+    t = t.replace(/\s+[^\s]*$/, '').trim()
+    if (!t) return raw.trim()
+    return `${t}…`
+}
+
 function maybeInjectBrand(text: string, businessPrompt?: string): string {
     const p = String(businessPrompt || '')
     const urlMatch = p.match(/(https?:\/\/[^\s]+|www\.[^\s]+)/i)
@@ -589,6 +611,9 @@ function maybeInjectBrand(text: string, businessPrompt?: string): string {
     const brand = /leavid/i.test(p) ? 'Leavid Skincare' : ''
 
     if (!brand && !url) return text
+
+    // Solo inyecta si el texto terminó en puntuación (evita "corte abrupto" + marca)
+    if (!endsWithPunctuation(text)) return text
 
     const low = text.toLowerCase()
     const alreadyHas = (brand && low.includes(brand.toLowerCase())) || (url && low.includes(url.toLowerCase()))
@@ -653,7 +678,6 @@ async function persistBotReply({
 
 /** ===== Idempotencia in-memory (sin DB) ===== */
 const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>()
-
 function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = REPLY_DEDUP_WINDOW_MS) {
     const now = Date.now()
     const prev = recentReplies.get(conversationId)
@@ -665,7 +689,6 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
     recentReplies.set(conversationId, { afterMs: clientMs, repliedAtMs: now })
     return false
 }
-
 function markActuallyReplied(conversationId: number, clientTs: Date) {
     const now = Date.now()
     recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now })
