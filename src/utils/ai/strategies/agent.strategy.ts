@@ -21,9 +21,9 @@ const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_00
  *  - Limitamos por líneas (no por caracteres) para evitar cortes a media frase.
  *  - El modelo ya viene breve por IA_MAX_TOKENS.
  */
-const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 15)     // líneas duras
+const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)     // líneas duras
 const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)   // tope blando, no cortamos por chars
-const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 128)  // tokens del LLM (ligeramente más aire para cerrar frases)
+const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)  // tokens del LLM (ligeramente más aire para cerrar frases)
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
 
 // ===== Idempotencia por inbound (sin DB) =====
