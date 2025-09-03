@@ -17,14 +17,16 @@ const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)              
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min adjuntar imagen reciente
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s ventana idempotencia in-memory
 
-/** ===== Respuesta breve (acortador configurable) ===== */
-const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 2)         // líneas duras
-const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 220)       // caracteres duros
-const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 60)      // tokens del LLM (antes 100)
-const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1' // permitir 1 emoji opcional
+/** ===== Respuesta breve (soft clamp) =====
+ *  - Limitamos por líneas (no por caracteres) para evitar cortes a media frase.
+ *  - El modelo ya viene breve por IA_MAX_TOKENS.
+ */
+const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 4)    // líneas duras
+const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000) // tope blando, ya no cortamos por chars
+const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 80)   // tokens del LLM (breve de origen)
+const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
 
 // ===== Idempotencia por inbound (sin DB) =====
-// Bloquea respuestas repetidas para el mismo mensaje entrante (message.id) por una ventana corta.
 const processedInbound = new Map<number, number>() // messageId -> timestamp ms
 function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
     const now = Date.now()
@@ -142,13 +144,9 @@ export async function handleAgentReply(args: {
     const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
 
-    // ====== REGLA DE ORO (sin DB): Debounce por conversación para evitar dobles respuestas ======
-    // - Imagen con caption/userText: respondemos una sola vez (texto + imagen) y marcamos replied.
-    // - Imagen sin caption: NO respondemos aquí; defer al texto posterior.
-    // - Texto normal: aplicamos debounce por conversación.
+    // ====== Debounce por conversación ======
     if (isImage) {
         if (caption || userText) {
-            // Imagen con texto en el mismo evento => responder una sola vez (texto + imagen)
             if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
                 if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip (debounce): image+caption same webhook')
                 return null
@@ -169,17 +167,14 @@ export async function handleAgentReply(args: {
                 phoneNumberId,
             })
 
-            // Marca que SÍ respondimos (idempotencia in-memory)
             if (last?.timestamp) markActuallyReplied(chatId, last.timestamp)
             return resp
         } else {
-            // Imagen SIN texto ⇒ no respondemos aquí; el texto posterior se encargará y adjuntará la imagen reciente
             if (process.env.DEBUG_AI === '1') console.log('[AGENT] Image-only: defer to upcoming text')
             await sleep(IMAGE_WAIT_MS)
             return null
         }
     } else {
-        // Flujo de texto normal: evita duplicar si ya respondimos "después" de este mensaje del cliente
         if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
             if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip (debounce): normal text flow')
             return null
@@ -211,7 +206,7 @@ export async function handleAgentReply(args: {
         extraInst ? `Sigue estas instrucciones del negocio: ${extraInst}` : '',
     ].filter(Boolean).join('\n')
 
-    // 6) Historial reciente como contexto (últimos 10 mensajes)
+    // 6) Historial reciente
     const history = await getRecentHistory(chatId, last?.id, 10)
 
     // 7) Construcción de mensajes (adjunta imagen reciente si solo hay texto)
@@ -251,10 +246,10 @@ export async function handleAgentReply(args: {
     // Presupuestar prompt total (incluye historial)
     budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
 
-    // 8) LLM con retry 402 y salida corta
+    // 8) LLM con retry y salida corta (tokens)
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
-    const defaultMax = IA_MAX_TOKENS // <<–– acortador: forzar respuesta corta
+    const defaultMax = IA_MAX_TOKENS
 
     let texto = ''
     try {
@@ -264,7 +259,7 @@ export async function handleAgentReply(args: {
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
 
-    // 9) Post-formateo + inyección de marca/web si falta (usando límites)
+    // 9) Post-formateo + marca/web (solo líneas)
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
     const businessPrompt: string | undefined =
@@ -283,7 +278,6 @@ export async function handleAgentReply(args: {
         phoneNumberId,
     })
 
-    // Marca idempotente efectiva (texto normal)
     if (!isImage && last?.timestamp) markActuallyReplied(chatId, last.timestamp)
 
     return {
@@ -334,8 +328,7 @@ async function answerWithLLM(opts: {
     const system = [
         nameLine,
         `Actúa como ${persona}. Habla en primera persona (yo), tono profesional y cercano.`,
-        `Responde ULTRABREVE: tratando maximo de hacerlo en 3 lineas`,
-        'Responde ULTRABREVE, claro y empático. Sé específico y evita párrafos largos.',
+        'Responde en 2–4 líneas, claro y empático. Sé específico y evita párrafos largos.',
         'Puedes usar 1 emoji ocasionalmente (no siempre).',
         'Si corresponde, puedes mencionar productos del negocio y su web.',
         `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
@@ -363,7 +356,7 @@ async function answerWithLLM(opts: {
 
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
-    const defaultMax = IA_MAX_TOKENS // <<–– acortador
+    const defaultMax = IA_MAX_TOKENS
 
     let texto = ''
     try {
@@ -390,7 +383,6 @@ async function answerWithLLM(opts: {
         phoneNumberId,
     })
 
-    // Marca idempotente efectiva usando el mensaje de referencia si lo tenemos
     try {
         if (lastIdToExcludeFromHistory) {
             const ref = await prisma.message.findUnique({
@@ -559,30 +551,16 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
 }
 
 // ===== formatting / misc =====
-function clampConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_CHARS): string {
+// Soft clamp: SOLO líneas, no recortamos por caracteres para evitar “Te recom…”
+function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return t
 
-    // 1) Corte duro por caracteres
-    if (t.length > maxChars) {
-        const slice = t.slice(0, maxChars + 1)
-        const cutAt = Math.max(
-            slice.lastIndexOf('. '),
-            slice.lastIndexOf('! '),
-            slice.lastIndexOf('? '),
-            slice.lastIndexOf('\n')
-        )
-        t = (cutAt > 30 ? slice.slice(0, cutAt + 1) : slice.slice(0, maxChars)).trim()
-        if (!/[.!?…]$/.test(t)) t = t.replace(/\s+[^\s]*$/, '').trim() + '…'
-    }
-
-    // 2) Corte duro por líneas
     const lines = t.split('\n').filter(Boolean)
     if (lines.length > maxLines) {
         t = lines.slice(0, maxLines).join('\n').trim()
         if (!/[.!?…]$/.test(t)) t += '…'
     }
-
     return t
 }
 
@@ -590,17 +568,17 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
     let t = String(text || '').trim()
     if (!t) return 'Gracias por escribirnos. ¿Cómo puedo ayudarte?'
 
-    // Limpieza mínima
+    // Limpieza ligera
     t = t.replace(/^[•\-]\s*/gm, '').replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
 
-    // Recorte final
+    // Recorte final SOLO por líneas
     t = clampConcise(t, maxLines, maxChars)
 
-    // 1 emoji opcional si cabe y el texto no contiene ya símbolos “raros”
-    if (allowEmoji && t.length < maxChars - 2 && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
+    // 1 emoji opcional si el texto es “limpio”
+    if (allowEmoji && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
         const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '🧴', '💬', '🫶']
         t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`
-        t = clampConcise(t, maxLines, maxChars) // revalida longitud tras añadir emoji
+        t = clampConcise(t, maxLines, maxChars)
     }
     return t
 }
@@ -619,12 +597,8 @@ function maybeInjectBrand(text: string, businessPrompt?: string): string {
 
     const tail = `Más info: ${brand || ''}${brand && url ? ' – ' : ''}${url || ''}`.trim()
     const candidate = `${text}\n${tail}`.trim()
-
-    // Solo añade si cabe dentro del límite global
-    if (candidate.length <= IA_MAX_CHARS) {
-        return clampConcise(candidate, IA_MAX_LINES, IA_MAX_CHARS)
-    }
-    return text
+    // Revalidamos SOLO por líneas
+    return clampConcise(candidate, IA_MAX_LINES, IA_MAX_CHARS)
 }
 
 function humanSpecialty(s: AgentSpecialty) {
@@ -679,7 +653,6 @@ async function persistBotReply({
 }
 
 /** ===== Idempotencia in-memory (sin DB) ===== */
-// Mapa: conversación -> { afterMs: timestamp del último msg cliente respondido, repliedAtMs: cuándo respondimos }
 const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>()
 
 function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = REPLY_DEDUP_WINDOW_MS) {
@@ -690,7 +663,6 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
     if (prev && prev.afterMs >= clientMs && (now - prev.repliedAtMs) <= windowMs) {
         return true
     }
-    // Registramos la intención de responder a este clientTs (antirebote)
     recentReplies.set(conversationId, { afterMs: clientMs, repliedAtMs: now })
     return false
 }
@@ -700,11 +672,11 @@ function markActuallyReplied(conversationId: number, clientTs: Date) {
     recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now })
 }
 
-/** ===== (Opcional) Guard DB: evitar doble respuesta reciente por timestamp (queda disponible si quieres usarlo) ===== */
+/** ===== (Opcional) Guard DB ===== */
 async function alreadyRepliedAfter(
     conversationId: number,
     afterTs: Date,
-    windowMs = 90_000 // 90s
+    windowMs = 90_000
 ) {
     const bot = await prisma.message.findFirst({
         where: {
