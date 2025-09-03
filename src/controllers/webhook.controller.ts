@@ -13,19 +13,6 @@ import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy f
 // ⬇️ Cachear imágenes en Cloudflare Images
 import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsappMedia' // 👈 limpiamos foco al (re)abrir conv
 
-/** ========= Deduplicación de eventos por WAMID (in-memory) ========= **/
-const WAMID_TTL_MS = Number(process.env.WAMID_TTL_MS ?? 120_000) // 120s
-const seenWamids = new Map<string, number>() // wamid -> timestamp guardado
-
-function seenRecentlyWamid(id: string, ttl = WAMID_TTL_MS) {
-    const now = Date.now()
-    const prev = seenWamids.get(id)
-    // limpiar expirados oportunistamente
-    if (prev && now - prev <= ttl) return true
-    seenWamids.set(id, now)
-    return false
-}
-
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
     const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -73,17 +60,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         if (!value?.messages?.[0]) return res.status(200).json({ ignored: true })
 
         const msg: any = value.messages[0]
-
-        // **Deduplicación por WAMID**: si ya procesamos este ID hace poco, salimos
-        // (evita reintentos de Meta o re-envíos por replays/red)
-        const uniqueId = String(msg.id || '')
-        if (uniqueId && seenRecentlyWamid(uniqueId)) {
-            if (process.env.DEBUG_AI === '1') {
-                console.log('[WEBHOOK] Skip duplicated wamid:', uniqueId)
-            }
-            return res.status(200).json({ dedup: true })
-        }
-
         const phoneNumberId: string | undefined = value?.metadata?.phone_number_id
         const fromWa: string | undefined = msg.from
         const ts: Date = msg.timestamp ? new Date(parseInt(msg.timestamp as string, 10) * 1000) : new Date()
@@ -137,6 +113,9 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         let mediaUrlForFrontend: string | undefined
         let captionForDb: string | undefined
 
+        // ⚐ Flag para decidir si llamamos a IA en este webhook
+        let skipIAForThisWebhook = false
+
         // 🔊 NOTA DE VOZ / AUDIO
         if (msg.type === 'audio' && msg.audio?.id) {
             inboundMediaType = MediaType.audio
@@ -163,6 +142,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = transcription || '[nota de voz]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
+            // 🛈 Para audio sí dejamos pasar a IA (tu lógica ya trata el caso sin transcripción)
         }
         // 🖼️ IMAGEN (➡️ cache a Cloudflare Images con fallback al proxy)
         else if (msg.type === 'image' && msg.image?.id) {
@@ -186,6 +166,11 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 // 2) Fallback a tu proxy firmado
                 if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
             }
+
+            // ❗ Clave: si es imagen SIN caption ⇒ NO llamar IA en este webhook
+            if (!captionForDb) {
+                skipIAForThisWebhook = true
+            }
         }
         // 🎞️ VIDEO (se mantiene proxy firmado)
         else if (msg.type === 'video' && msg.video?.id) {
@@ -196,6 +181,9 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = captionForDb || '[video]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
+
+            // (opcional) si quieres el mismo comportamiento que imagen:
+            // if (!captionForDb) skipIAForThisWebhook = true
         }
         // 📎 DOCUMENTO (se mantiene proxy firmado)
         else if (msg.type === 'document' && msg.document?.id) {
@@ -207,6 +195,9 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = filename ? `[documento] ${filename}` : '[documento]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
+
+            // (opcional) mismo criterio que imagen/video:
+            // if (!captionForDb) skipIAForThisWebhook = true
         }
 
         // Guardar ENTRANTE (🔁 ahora también persistimos mediaUrl si existe)
@@ -260,6 +251,14 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
         // 3) IA → RESPUESTA (auto envía y persiste)
+        // 👇 Si es imagen SIN caption, NO invocamos IA (esperamos el texto siguiente)
+        if (skipIAForThisWebhook) {
+            if (process.env.DEBUG_AI === '1') {
+                console.log('[IA] Skip: imagen sin caption; esperamos texto para responder.')
+            }
+            return res.status(200).json({ success: true, skipped: 'image_without_caption' })
+        }
+
         console.log('[IA] Llamando handleIAReply con:', {
             conversationId: conversation.id,
             empresaId,
