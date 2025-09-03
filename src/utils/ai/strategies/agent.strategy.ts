@@ -17,6 +17,12 @@ const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)              
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min adjuntar imagen reciente
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s ventana idempotencia in-memory
 
+/** ===== Respuesta breve (acortador configurable) ===== */
+const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 2)         // líneas duras
+const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 220)       // caracteres duros
+const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 60)      // tokens del LLM (antes 100)
+const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1' // permitir 1 emoji opcional
+
 // ===== Idempotencia por inbound (sin DB) =====
 // Bloquea respuestas repetidas para el mismo mensaje entrante (message.id) por una ventana corta.
 const processedInbound = new Map<number, number>() // messageId -> timestamp ms
@@ -248,7 +254,7 @@ export async function handleAgentReply(args: {
     // 8) LLM con retry 402 y salida corta
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
-    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 100)
+    const defaultMax = IA_MAX_TOKENS // <<–– acortador: forzar respuesta corta
 
     let texto = ''
     try {
@@ -258,9 +264,9 @@ export async function handleAgentReply(args: {
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
 
-    // 9) Post-formateo + inyección de marca/web si falta
-    texto = clampConcise(texto, 4, 340)
-    texto = formatConcise(texto)
+    // 9) Post-formateo + inyección de marca/web si falta (usando límites)
+    texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
+    texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
     const businessPrompt: string | undefined =
         (agent?.prompt && agent.prompt.trim()) ||
         (bc?.agentPrompt && bc.agentPrompt.trim()) ||
@@ -331,7 +337,6 @@ async function answerWithLLM(opts: {
         `Responde ULTRABREVE: tratando maximo de hacerlo en 3 lineas`,
         'Responde ULTRABREVE, claro y empático. Sé específico y evita párrafos largos.',
         'Puedes usar 1 emoji ocasionalmente (no siempre).',
-        'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
         'Si corresponde, puedes mencionar productos del negocio y su web.',
         `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
         lineScope ? `Ámbito: ${lineScope}` : '',
@@ -358,7 +363,7 @@ async function answerWithLLM(opts: {
 
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
-    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 100)
+    const defaultMax = IA_MAX_TOKENS // <<–– acortador
 
     let texto = ''
     try {
@@ -368,8 +373,8 @@ async function answerWithLLM(opts: {
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
 
-    texto = clampConcise(texto, 4, 340)
-    texto = formatConcise(texto)
+    texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
+    texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
     const businessPrompt: string | undefined =
         (agent?.prompt && agent.prompt.trim()) ||
         (bc?.agentPrompt && bc.agentPrompt.trim()) ||
@@ -554,10 +559,11 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
 }
 
 // ===== formatting / misc =====
-function clampConcise(text: string, maxLines = 4, maxChars = 360): string {
+function clampConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_CHARS): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return t
 
+    // 1) Corte duro por caracteres
     if (t.length > maxChars) {
         const slice = t.slice(0, maxChars + 1)
         const cutAt = Math.max(
@@ -566,10 +572,11 @@ function clampConcise(text: string, maxLines = 4, maxChars = 360): string {
             slice.lastIndexOf('? '),
             slice.lastIndexOf('\n')
         )
-        t = (cutAt > 40 ? slice.slice(0, cutAt + 1) : slice.slice(0, maxChars)).trim()
+        t = (cutAt > 30 ? slice.slice(0, cutAt + 1) : slice.slice(0, maxChars)).trim()
         if (!/[.!?…]$/.test(t)) t = t.replace(/\s+[^\s]*$/, '').trim() + '…'
     }
 
+    // 2) Corte duro por líneas
     const lines = t.split('\n').filter(Boolean)
     if (lines.length > maxLines) {
         t = lines.slice(0, maxLines).join('\n').trim()
@@ -579,16 +586,21 @@ function clampConcise(text: string, maxLines = 4, maxChars = 360): string {
     return t
 }
 
-function formatConcise(text: string): string {
+function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_CHARS, allowEmoji = IA_ALLOW_EMOJI): string {
     let t = String(text || '').trim()
-    if (!t) return 'Gracias por escribirnos. Podemos ayudarte con orientación general.'
+    if (!t) return 'Gracias por escribirnos. ¿Cómo puedo ayudarte?'
 
+    // Limpieza mínima
     t = t.replace(/^[•\-]\s*/gm, '').replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
-    t = clampConcise(t, 4, 340)
 
-    if (!/[^\w\s.,;:()¿?¡!]/.test(t) && Math.random() < 0.30) {
+    // Recorte final
+    t = clampConcise(t, maxLines, maxChars)
+
+    // 1 emoji opcional si cabe y el texto no contiene ya símbolos “raros”
+    if (allowEmoji && t.length < maxChars - 2 && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
         const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '🧴', '💬', '🫶']
         t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`
+        t = clampConcise(t, maxLines, maxChars) // revalida longitud tras añadir emoji
     }
     return t
 }
@@ -606,8 +618,13 @@ function maybeInjectBrand(text: string, businessPrompt?: string): string {
     if (alreadyHas) return text
 
     const tail = `Más info: ${brand || ''}${brand && url ? ' – ' : ''}${url || ''}`.trim()
-    const out = clampConcise(`${text}\n${tail}`, 4, 360)
-    return out
+    const candidate = `${text}\n${tail}`.trim()
+
+    // Solo añade si cabe dentro del límite global
+    if (candidate.length <= IA_MAX_CHARS) {
+        return clampConcise(candidate, IA_MAX_LINES, IA_MAX_CHARS)
+    }
+    return text
 }
 
 function humanSpecialty(s: AgentSpecialty) {
