@@ -125,7 +125,7 @@ export async function handleAgentReply(args: {
     // 5) System + presupuesto
     const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
     const especialidad = (agent.specialty || bc?.agentSpecialty || 'generico') as AgentSpecialty
-
+    const persona = personaLabel(especialidad)
     const nameLine = negocioName
         ? `Asistente de orientación de ${humanSpecialty(especialidad)} de "${negocioName}".`
         : `Asistente de orientación de ${humanSpecialty(especialidad)}.`
@@ -136,15 +136,16 @@ export async function handleAgentReply(args: {
 
     const system = [
         nameLine,
+        `Actúa como ${persona}. Habla en primera persona (yo), tono profesional y cercano.`,
         'Responde en 2–4 líneas, claro y empático. Sé específico y evita párrafos largos.',
         'Puedes usar 1 emoji ocasionalmente (no siempre).',
-        'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
         'Si corresponde, puedes mencionar productos del negocio y su web.',
         `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
         lineScope ? `Ámbito: ${lineScope}` : '',
         lineDisc ? `Incluye cuando aplique: ${lineDisc}` : '',
         extraInst ? `Sigue estas instrucciones del negocio: ${extraInst}` : '',
     ].filter(Boolean).join('\n')
+
 
     // 6) Historial reciente como contexto (últimos 10 mensajes)
     const history = await getRecentHistory(chatId, last?.id, 10)
@@ -440,6 +441,17 @@ function humanSpecialty(s: AgentSpecialty) {
         default: return 'salud'
     }
 }
+function personaLabel(s: AgentSpecialty) {
+    switch (s) {
+        case 'dermatologia': return 'un asistente virtual de dermatología'
+        case 'medico': return 'un asistente virtual de medicina general'
+        case 'nutricion': return 'un asistente virtual de nutrición'
+        case 'psicologia': return 'un asistente virtual de psicología'
+        case 'odontologia': return 'un asistente virtual de odontología'
+        default: return 'un asistente virtual de salud'
+    }
+}
+
 
 function normalizeToE164(n: string) { return String(n || '').replace(/[^\d]/g, '') }
 
