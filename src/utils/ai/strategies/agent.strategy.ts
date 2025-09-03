@@ -328,7 +328,8 @@ async function answerWithLLM(opts: {
     const system = [
         nameLine,
         `Actúa como ${persona}. Habla en primera persona (yo), tono profesional y cercano.`,
-        'Responde en 2–4 líneas, claro y empático. Sé específico y evita párrafos largos.',
+        `Responde ULTRABREVE: tratando maximo de hacerlo en 3 lineas`,
+        'Responde ULTRABREVE, claro y empático. Sé específico y evita párrafos largos.',
         'Puedes usar 1 emoji ocasionalmente (no siempre).',
         'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
         'Si corresponde, puedes mencionar productos del negocio y su web.',
