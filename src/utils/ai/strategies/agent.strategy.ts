@@ -13,8 +13,9 @@ import { transcribeAudioBuffer } from '../../../services/transcription.service'
 import type { IAReplyResult } from '../../handleIAReply.ecommerce'
 
 /** Config imagen/texto */
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)               // 1s re-chequeo
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)               // 1s re-chequeo (no respondemos desde imagen sola)
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min adjuntar imagen reciente
+const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s ventana idempotencia in-memory
 
 export type AgentConfig = {
     specialty: AgentSpecialty
@@ -108,74 +109,48 @@ export async function handleAgentReply(args: {
     const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
 
-    // ❗ Guard global: si ya respondimos después del último mensaje del cliente, no duplicar
-    if (last?.timestamp && await alreadyRepliedAfter(chatId, last.timestamp)) {
-        if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip: already replied after last client msg')
-        return null
-    }
+    // ====== REGLA DE ORO (sin DB): Debounce por conversación para evitar dobles respuestas ======
+    // - Texto normal: aplicamos debounce global.
+    // - Imagen con caption: aplicamos debounce específico y respondemos.
+    // - Imagen sin caption: NO respondemos aquí (defer al texto posterior).
+    if (isImage) {
+        if (caption || userText) {
+            // Imagen con texto en el mismo webhook => responder una sola vez (texto + imagen)
+            if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
+                if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip (debounce): image+caption same webhook')
+                return null
+            }
 
-    // 4) Si llega SOLO imagen: esperar 1s y re-chequear si llegó texto nuevo
-    if (isImage && !userText && !caption) {
-        await sleep(IMAGE_WAIT_MS)
+            const comboText = (userText || caption || '').trim() || 'Hola'
+            const resp = await answerWithLLM({
+                chatId,
+                empresaId,
+                agent,
+                negocio: empresa,
+                bc,
+                userText: comboText,
+                effectiveImageUrl: imageUrl,
+                attachRecentIfTextOnly: false,
+                lastIdToExcludeFromHistory: last?.id,
+                toPhone,
+                phoneNumberId,
+            })
 
-        // Tipado explícito del where para evitar choques de inferencia
-        const whereFresh: Prisma.MessageWhereInput = {
-            conversationId: chatId,
-            from: MessageFrom.client,
-            OR: [
-                { contenido: { not: '' } },
-                { AND: [{ caption: { not: null } }, { caption: { not: '' } }] },
-                { isVoiceNote: true },
-            ],
-        }
-        if (last?.timestamp) {
-            whereFresh.timestamp = { gt: last.timestamp as Date }
-        }
-
-        const freshText = await prisma.message.findFirst({
-            where: whereFresh,
-            orderBy: { timestamp: 'desc' },
-            select: {
-                id: true,
-                contenido: true,
-                caption: true,
-                isVoiceNote: true,
-                transcription: true,
-                mediaType: true,
-                mediaUrl: true,
-                mimeType: true,
-                timestamp: true,
-            },
-        })
-
-        if (!freshText) {
+            // Marca que SÍ respondimos (idempotencia in-memory)
+            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp)
+            return resp
+        } else {
+            // Imagen SIN texto ⇒ no respondemos aquí; el texto posterior se encargará y adjuntará la imagen reciente
+            if (process.env.DEBUG_AI === '1') console.log('[AGENT] Image-only: defer to upcoming text')
+            await sleep(IMAGE_WAIT_MS)
             return null
         }
-
-        let followupText = String(freshText.contenido || freshText.caption || '').trim()
-        if (!followupText && freshText.isVoiceNote) {
-            followupText = String(freshText.transcription || '').trim()
-        }
-
-        // ❗ Guard específico: si ya respondimos después del texto detectado, evita doble respuesta
-        if (freshText.timestamp && await alreadyRepliedAfter(chatId, freshText.timestamp)) {
-            if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip: already replied after freshText')
+    } else {
+        // Flujo de texto normal: evita duplicar si ya respondimos "después" de este mensaje del cliente
+        if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
+            if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip (debounce): normal text flow')
             return null
         }
-
-        return await answerWithLLM({
-            chatId,
-            empresaId,
-            agent,
-            negocio: empresa,
-            bc,
-            userText: followupText || 'Hola',
-            effectiveImageUrl: imageUrl,
-            attachRecentIfTextOnly: false,
-            lastIdToExcludeFromHistory: freshText.id,
-            toPhone,
-            phoneNumberId,
-        })
     }
 
     // 5) System + presupuesto
@@ -274,6 +249,9 @@ export async function handleAgentReply(args: {
         to: toPhone ?? conversacion.phone,
         phoneNumberId,
     })
+
+    // Marca idempotente efectiva (texto normal)
+    if (!isImage && last?.timestamp) markActuallyReplied(chatId, last.timestamp)
 
     return {
         estado: ConversationEstado.respondido,
@@ -378,6 +356,17 @@ async function answerWithLLM(opts: {
         to: toPhone,
         phoneNumberId,
     })
+
+    // Marca idempotente efectiva usando el mensaje de referencia si lo tenemos
+    try {
+        if (lastIdToExcludeFromHistory) {
+            const ref = await prisma.message.findUnique({
+                where: { id: lastIdToExcludeFromHistory },
+                select: { timestamp: true },
+            })
+            if (ref?.timestamp) markActuallyReplied(chatId, ref.timestamp)
+        }
+    } catch { /* noop */ }
 
     return {
         estado: ConversationEstado.respondido,
@@ -644,7 +633,29 @@ async function persistBotReply({
     return { messageId: msg.id, texto, wamid }
 }
 
-/** ===== Idempotencia: evitar doble respuesta por webhooks ===== */
+/** ===== Idempotencia in-memory (sin DB) ===== */
+// Mapa: conversación -> { afterMs: timestamp del último msg cliente respondido, repliedAtMs: cuándo respondimos }
+const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>()
+
+function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = 120_000) {
+    const now = Date.now()
+    const prev = recentReplies.get(conversationId)
+    const clientMs = clientTs.getTime()
+
+    if (prev && prev.afterMs >= clientMs && (now - prev.repliedAtMs) <= windowMs) {
+        return true
+    }
+    // Registramos la intención de responder a este clientTs (antirebote)
+    recentReplies.set(conversationId, { afterMs: clientMs, repliedAtMs: now })
+    return false
+}
+
+function markActuallyReplied(conversationId: number, clientTs: Date) {
+    const now = Date.now()
+    recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now })
+}
+
+/** ===== (Opcional) Guard DB: evitar doble respuesta reciente por timestamp (queda disponible si quieres usarlo) ===== */
 async function alreadyRepliedAfter(
     conversationId: number,
     afterTs: Date,
