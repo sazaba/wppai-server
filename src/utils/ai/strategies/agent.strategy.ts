@@ -41,7 +41,7 @@ export async function handleAgentReply(args: {
     if (!conversacion) return null
 
     const last = await prisma.message.findFirst({
-        where: { conversationId: chatId, from: 'client' },
+        where: { conversationId: chatId, from: MessageFrom.client },
         orderBy: { timestamp: 'desc' },
         select: {
             id: true,
@@ -108,6 +108,11 @@ export async function handleAgentReply(args: {
     const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
 
+    // ❗ Guard global: si ya respondimos después del último mensaje del cliente, no duplicar
+    if (last?.timestamp && await alreadyRepliedAfter(chatId, last.timestamp)) {
+        if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip: already replied after last client msg')
+        return null
+    }
 
     // 4) Si llega SOLO imagen: esperar 1s y re-chequear si llegó texto nuevo
     if (isImage && !userText && !caption) {
@@ -116,18 +121,13 @@ export async function handleAgentReply(args: {
         // Tipado explícito del where para evitar choques de inferencia
         const whereFresh: Prisma.MessageWhereInput = {
             conversationId: chatId,
-            from: MessageFrom.client, // enum seguro
+            from: MessageFrom.client,
             OR: [
-                // Si 'contenido' es no-nullable, 'not: ""' funciona perfecto.
-                // Si fuera nullable, también funciona (excluye vacío).
                 { contenido: { not: '' } },
-                // En caption (normalmente nullable) excluimos null y vacío
                 { AND: [{ caption: { not: null } }, { caption: { not: '' } }] },
                 { isVoiceNote: true },
             ],
         }
-
-        // Agrega timestamp solo si existe (evita undefined en where)
         if (last?.timestamp) {
             whereFresh.timestamp = { gt: last.timestamp as Date }
         }
@@ -144,6 +144,7 @@ export async function handleAgentReply(args: {
                 mediaType: true,
                 mediaUrl: true,
                 mimeType: true,
+                timestamp: true,
             },
         })
 
@@ -154,6 +155,12 @@ export async function handleAgentReply(args: {
         let followupText = String(freshText.contenido || freshText.caption || '').trim()
         if (!followupText && freshText.isVoiceNote) {
             followupText = String(freshText.transcription || '').trim()
+        }
+
+        // ❗ Guard específico: si ya respondimos después del texto detectado, evita doble respuesta
+        if (freshText.timestamp && await alreadyRepliedAfter(chatId, freshText.timestamp)) {
+            if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip: already replied after freshText')
+            return null
         }
 
         return await answerWithLLM({
@@ -170,7 +177,6 @@ export async function handleAgentReply(args: {
             phoneNumberId,
         })
     }
-
 
     // 5) System + presupuesto
     const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
@@ -206,9 +212,9 @@ export async function handleAgentReply(args: {
         const recentImage = await prisma.message.findFirst({
             where: {
                 conversationId: chatId,
-                from: 'client',
+                from: MessageFrom.client,
                 mediaType: MediaType.image,
-                timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) as any },
+                timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) },
             },
             orderBy: { timestamp: 'desc' },
             select: { mediaUrl: true, caption: true },
@@ -395,7 +401,7 @@ async function getRecentHistory(conversationId: number, excludeMessageId?: numbe
     })
 
     return rows.reverse().map(r => {
-        const role = r.from === 'client' ? 'user' : 'assistant'
+        const role = r.from === MessageFrom.client ? 'user' : 'assistant'
         const content = softTrim(r.contenido || '', 220)
         return { role, content }
     })
@@ -636,4 +642,24 @@ async function persistBotReply({
         } catch { /* noop */ }
     }
     return { messageId: msg.id, texto, wamid }
+}
+
+/** ===== Idempotencia: evitar doble respuesta por webhooks ===== */
+async function alreadyRepliedAfter(
+    conversationId: number,
+    afterTs: Date,
+    windowMs = 90_000 // 90s
+) {
+    const bot = await prisma.message.findFirst({
+        where: {
+            conversationId,
+            from: MessageFrom.bot,
+            timestamp: { gt: afterTs },
+        },
+        orderBy: { timestamp: 'desc' },
+        select: { timestamp: true },
+    })
+    if (!bot) return false
+    const now = Date.now()
+    return now - bot.timestamp.getTime() <= windowMs
 }
