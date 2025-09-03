@@ -15,8 +15,6 @@ import {
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
 // ✅ normaliza (evita espacios o comillas perdidas de la UI del host)
 const JWT_SECRET = (process.env.JWT_SECRET ?? 'dev-secret').trim()
-// App ID para verificar suscripción real
-const META_APP_ID = (process.env.META_APP_ID ?? '').trim()
 
 /* ===================== Types locales ===================== */
 type MulterReq = Request & { file?: Express.Multer.File }
@@ -86,6 +84,7 @@ function resolveEmpresaIdFromRequest(req: Request): { empresaId: number | null; 
 }
 
 /** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
+/** 🔎 2do intento (fallback): inferir empresaId por mediaId desde tu DB */
 async function resolveEmpresaIdByMediaId(mediaId: string): Promise<number | null> {
     try {
         // 1) Coincidencia directa por mediaId (lo normal hoy)
@@ -93,48 +92,25 @@ async function resolveEmpresaIdByMediaId(mediaId: string): Promise<number | null
             where: { mediaId },
             select: { empresaId: true, id: true },
             orderBy: { id: 'desc' },
-        })
-        if (direct?.empresaId) return direct.empresaId
+        });
+        if (direct?.empresaId) return direct.empresaId;
 
         // 2) Histórico: si alguna vez guardaste en mediaUrl rutas tipo /media/:id
         const viaUrl = await prisma.message.findFirst({
             where: { mediaUrl: { contains: `/media/${mediaId}` } },
             select: { empresaId: true, id: true },
             orderBy: { id: 'desc' },
-        })
-        if (viaUrl?.empresaId) return viaUrl.empresaId
+        });
+        if (viaUrl?.empresaId) return viaUrl.empresaId;
 
-        return null
+        return null;
     } catch (e: any) {
-        console.warn('[resolveEmpresaIdByMediaId] DB error:', e?.message || e)
-        return null
+        console.warn('[resolveEmpresaIdByMediaId] DB error:', e?.message || e);
+        return null;
     }
 }
 
-/* ===================== Meta helpers extendidos ===================== */
 
-/** Lista apps suscritas al WABA y confirma que esté nuestra app */
-async function assertAppSubscribed(wabaId: string, accessToken: string) {
-    if (!META_APP_ID) {
-        console.warn('[assertAppSubscribed] META_APP_ID vacío; no se validará suscripción.')
-        return
-    }
-    const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-    })
-    const list: any[] = Array.isArray(data?.data) ? data.data : []
-    const ok = list.some((a: any) => String(a?.id) === String(META_APP_ID))
-    if (!ok) throw new Error('La app no quedó suscrita al WABA (no aparece en subscribed_apps).')
-}
-
-/** Obtiene info del número actual en Graph */
-async function fetchPhoneNumberInfo(phoneNumberId: string, accessToken: string) {
-    const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}`, {
-        params: { fields: 'display_phone_number,verified_name,name_status,wa_id,account_mode' },
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-    })
-    return data
-}
 
 /**
  * ¿Existe la plantilla en Meta?
@@ -233,34 +209,6 @@ export const vincular = async (req: Request, res: Response) => {
                 throw new Error(`No pudimos suscribir tu WABA a la app. Detalle: ${msg}`)
             })
 
-        // 2.1) Verificación inmediata de suscripción (si hay META_APP_ID)
-        try {
-            await assertAppSubscribed(wabaId, accessToken)
-        } catch (e: any) {
-            // Si falla, devolvemos 500 para que el front reintente y no marque conectado "falso"
-            console.warn('[vincular] assertAppSubscribed falló:', e?.message || e)
-            return res.status(500).json({ ok: false, error: 'La app no quedó suscrita al WABA. Intenta nuevamente.' })
-        }
-
-        // 2.2) (Opcional, no bloqueante) Asegura una plantilla fallback
-        ensureFallbackTemplateInMeta({
-            accessToken,
-            wabaId,
-            name: 'hello_fallback',
-            lang: 'es',
-        }).catch((e) => console.warn('[vincular] ensureFallbackTemplateInMeta warn:', e?.message || e))
-
-        // 2.3) (Opcional) Si no vino displayPhoneNumber, lo consultamos
-        let displayPhoneNumberFinal = displayPhoneNumber || null
-        try {
-            if (!displayPhoneNumberFinal) {
-                const info = await fetchPhoneNumberInfo(phoneNumberId, accessToken)
-                displayPhoneNumberFinal = info?.display_phone_number || null
-            }
-        } catch (e) {
-            console.warn('[vincular] fetchPhoneNumberInfo warn:', (e as any)?.message || e)
-        }
-
         // 3) Guardar/actualizar credenciales
         await prisma.whatsappAccount.upsert({
             where: { empresaId },
@@ -269,7 +217,7 @@ export const vincular = async (req: Request, res: Response) => {
                 phoneNumberId,
                 wabaId,
                 businessId: businessId || null,
-                displayPhoneNumber: displayPhoneNumberFinal,
+                displayPhoneNumber: displayPhoneNumber || null,
                 updatedAt: new Date(),
             },
             create: {
@@ -278,7 +226,7 @@ export const vincular = async (req: Request, res: Response) => {
                 phoneNumberId,
                 wabaId,
                 businessId: businessId || null,
-                displayPhoneNumber: displayPhoneNumberFinal,
+                displayPhoneNumber: displayPhoneNumber || null,
             },
         })
 
@@ -310,64 +258,6 @@ export const estadoWhatsappAccount = async (req: Request, res: Response) => {
     } catch (err) {
         console.error('[estadoWhatsappAccount] error:', err)
         return res.status(500).json({ ok: false, error: 'Error al consultar estado' })
-    }
-}
-
-/**
- * GET /api/whatsapp/estado-detallado
- * - Confirma suscripción real al WABA
- * - Trae estado del número (wa_id, name_status, account_mode)
- */
-export const estadoDetallado = async (req: Request, res: Response) => {
-    try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-        const wa = await prisma.whatsappAccount.findUnique({ where: { empresaId } })
-        if (!wa) return res.json({ ok: true, connected: false, reason: 'no_account' })
-
-        const { accessToken, wabaId, phoneNumberId } = wa
-        const hdrs = { Authorization: `Bearer ${accessToken}` }
-        const base = `https://graph.facebook.com/${FB_VERSION}`
-
-        // A) ¿app suscrita?
-        let appSubscribed = false
-        try {
-            const subs = await axios.get(`${base}/${wabaId}/subscribed_apps`, { headers: hdrs }).then(r => r.data?.data || [])
-            if (META_APP_ID) appSubscribed = subs.some((a: any) => String(a?.id) === String(META_APP_ID))
-            else {
-                // Si no hay META_APP_ID, al menos verificamos que haya apps suscritas
-                appSubscribed = Array.isArray(subs) && subs.length > 0
-            }
-        } catch (e) {
-            console.warn('[estadoDetallado] subscribed_apps warn:', (e as any)?.message || e)
-        }
-
-        // B) estado del número
-        let numInfo: any = null
-        try {
-            numInfo = await fetchPhoneNumberInfo(phoneNumberId, accessToken)
-        } catch (e) {
-            console.warn('[estadoDetallado] fetchPhoneNumberInfo warn:', (e as any)?.message || e)
-        }
-
-        const connected = Boolean(appSubscribed && numInfo?.wa_id && numInfo?.display_phone_number)
-
-        return res.json({
-            ok: true,
-            connected,
-            diagnostics: {
-                appSubscribed,
-                number: {
-                    display_phone_number: numInfo?.display_phone_number ?? null,
-                    wa_id: numInfo?.wa_id ?? null,
-                    account_mode: numInfo?.account_mode ?? null, // LIVE/SANDBOX
-                    name_status: numInfo?.name_status ?? null,   // APPROVED/PENDING/REJECTED
-                },
-            },
-        })
-    } catch (e: any) {
-        return res.status(400).json({ ok: false, error: e?.response?.data || e?.message || 'Error estado-detallado' })
     }
 }
 
@@ -695,24 +585,24 @@ export const streamMediaById = async (req: Request, res: Response) => {
         path: req.originalUrl,
         hasT: typeof req.query?.t === 'string',
         authHdr: req.headers.authorization ? 'yes' : 'no',
-    })
-    res.setHeader('X-Handler', 'streamMediaById')
+    });
+    res.setHeader('X-Handler', 'streamMediaById');
     try {
-        const { mediaId } = req.params as { mediaId: string }
-        if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' })
+        const { mediaId } = req.params as { mediaId: string };
+        if (!mediaId) return res.status(400).json({ ok: false, error: 'mediaId requerido' });
 
         // 1) Intento por token / req.user
-        const attempt = resolveEmpresaIdFromRequest(req)
+        const attempt = resolveEmpresaIdFromRequest(req);
 
         // 2) Fallback por DB si falla
-        let empresaId = attempt.empresaId
+        let empresaId = attempt.empresaId;
         if (!empresaId) {
-            empresaId = await resolveEmpresaIdByMediaId(mediaId)
+            empresaId = await resolveEmpresaIdByMediaId(mediaId);
             if (empresaId) {
-                console.log(`[streamMediaById] Fallback DB OK → empresaId=${empresaId} (mediaId=${mediaId})`)
+                console.log(`[streamMediaById] Fallback DB OK → empresaId=${empresaId} (mediaId=${mediaId})`);
             }
         } else {
-            console.log(`[streamMediaById] Auth via ${attempt.why} → empresaId=${empresaId}`)
+            console.log(`[streamMediaById] Auth via ${attempt.why} → empresaId=${empresaId}`);
         }
 
         if (!empresaId) {
@@ -720,38 +610,38 @@ export const streamMediaById = async (req: Request, res: Response) => {
                 mediaId,
                 hasQueryToken: typeof req.query?.t === 'string',
                 why: attempt.why,
-            })
+            });
             return res.status(401).json({
                 ok: false,
                 error: 'No autorizado',
                 reason: attempt.why || 'not_found_in_db',
                 mediaId,
-            })
+            });
         }
 
-        const accessToken = await getAccessToken(empresaId)
+        const accessToken = await getAccessToken(empresaId);
 
         // 3) Obtener URL firmada de Graph (con mime y tamaño)
         const meta = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${mediaId}`, {
             params: { fields: 'url,mime_type,file_size' },
             headers: { Authorization: `Bearer ${accessToken}` },
             timeout: 15000,
-        })
-        const mediaUrl = meta?.data?.url
-        const mime = meta?.data?.mime_type as string | undefined
+        });
+        const mediaUrl = meta?.data?.url;
+        const mime = meta?.data?.mime_type as string | undefined;
 
         if (!mediaUrl) {
-            console.warn('[streamMediaById] 404 Meta url vacía', { mediaId, empresaId })
-            return res.status(404).json({ ok: false, error: 'Media no encontrada' })
+            console.warn('[streamMediaById] 404 Meta url vacía', { mediaId, empresaId });
+            return res.status(404).json({ ok: false, error: 'Media no encontrada' });
         }
 
         // 4) Descargar y streamear (pasando Range si viene)
-        const range = req.headers.range as string | undefined
+        const range = req.headers.range as string | undefined;
         const file = await axios.get(mediaUrl, {
             responseType: 'stream',
             headers: { Authorization: `Bearer ${accessToken}`, ...(range ? { Range: range } : {}) },
             timeout: 30000,
-        })
+        });
 
         // Copiamos cabeceras útiles (mejora video/seek)
         const pass = [
@@ -762,29 +652,29 @@ export const streamMediaById = async (req: Request, res: Response) => {
             'etag',
             'last-modified',
             'cache-control',
-        ] as const
+        ] as const;
         for (const h of pass) {
-            const v = (file.headers as any)[h]
-            if (v !== undefined) res.setHeader(h, v)
+            const v = (file.headers as any)[h];
+            if (v !== undefined) res.setHeader(h, v);
         }
-        if (!file.headers['content-type'] && mime) res.setHeader('Content-Type', mime)
-        res.setHeader('Content-Disposition', 'inline')
-        if (!file.headers['cache-control']) res.setHeader('Cache-Control', 'private, max-age=300')
+        if (!file.headers['content-type'] && mime) res.setHeader('Content-Type', mime);
+        res.setHeader('Content-Disposition', 'inline');
+        if (!file.headers['cache-control']) res.setHeader('Cache-Control', 'private, max-age=300');
 
-        res.status(file.status === 206 ? 206 : 200)
-        file.data.pipe(res)
+        res.status(file.status === 206 ? 206 : 200);
+        file.data.pipe(res);
     } catch (err: any) {
-        const status = err?.response?.status
-        const data = err?.response?.data
-        if (status === 404) return res.status(404).json({ ok: false, error: 'Media no encontrada' })
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        if (status === 404) return res.status(404).json({ ok: false, error: 'Media no encontrada' });
         if (status === 401 || status === 403) {
-            console.warn('[streamMediaById] 401/403 desde Graph:', data)
-            return res.status(401).json({ ok: false, error: 'No autorizado para este media' })
+            console.warn('[streamMediaById] 401/403 desde Graph:', data);
+            return res.status(401).json({ ok: false, error: 'No autorizado para este media' });
         }
-        console.error('[streamMediaById] error:', data || err.message || err)
-        return res.status(500).json({ ok: false, error: 'No se pudo obtener la media' })
+        console.error('[streamMediaById] error:', data || err.message || err);
+        return res.status(500).json({ ok: false, error: 'No se pudo obtener la media' });
     }
-}
+};
 
 /* =============================================================================
  * Utilidades
