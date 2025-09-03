@@ -13,6 +13,19 @@ import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy f
 // ⬇️ Cachear imágenes en Cloudflare Images
 import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsappMedia' // 👈 limpiamos foco al (re)abrir conv
 
+/** ========= Deduplicación de eventos por WAMID (in-memory) ========= **/
+const WAMID_TTL_MS = Number(process.env.WAMID_TTL_MS ?? 120_000) // 120s
+const seenWamids = new Map<string, number>() // wamid -> timestamp guardado
+
+function seenRecentlyWamid(id: string, ttl = WAMID_TTL_MS) {
+    const now = Date.now()
+    const prev = seenWamids.get(id)
+    // limpiar expirados oportunistamente
+    if (prev && now - prev <= ttl) return true
+    seenWamids.set(id, now)
+    return false
+}
+
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
     const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -60,6 +73,17 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         if (!value?.messages?.[0]) return res.status(200).json({ ignored: true })
 
         const msg: any = value.messages[0]
+
+        // **Deduplicación por WAMID**: si ya procesamos este ID hace poco, salimos
+        // (evita reintentos de Meta o re-envíos por replays/red)
+        const uniqueId = String(msg.id || '')
+        if (uniqueId && seenRecentlyWamid(uniqueId)) {
+            if (process.env.DEBUG_AI === '1') {
+                console.log('[WEBHOOK] Skip duplicated wamid:', uniqueId)
+            }
+            return res.status(200).json({ dedup: true })
+        }
+
         const phoneNumberId: string | undefined = value?.metadata?.phone_number_id
         const fromWa: string | undefined = msg.from
         const ts: Date = msg.timestamp ? new Date(parseInt(msg.timestamp as string, 10) * 1000) : new Date()
