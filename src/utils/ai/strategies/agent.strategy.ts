@@ -1,5 +1,6 @@
 import axios from 'axios'
 import prisma from '../../../lib/prisma'
+import type { Prisma } from '@prisma/client'
 import { openai } from '../../../lib/openai'
 import {
     ConversationEstado,
@@ -10,6 +11,10 @@ import {
 import * as Wam from '../../../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../../../services/transcription.service'
 import type { IAReplyResult } from '../../handleIAReply.ecommerce'
+
+/** Config imagen/texto */
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)               // 1s re-chequeo
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min adjuntar imagen reciente
 
 export type AgentConfig = {
     specialty: AgentSpecialty
@@ -47,10 +52,11 @@ export async function handleAgentReply(args: {
             transcription: true,
             contenido: true,
             mimeType: true,
+            timestamp: true,
         },
     })
 
-    // 2) Configuración del negocio
+    // 2) Config del negocio
     const [bc, empresa] = await Promise.all([
         prisma.businessConfig.findUnique({
             where: { empresaId },
@@ -65,7 +71,7 @@ export async function handleAgentReply(args: {
         prisma.empresa.findUnique({ where: { id: empresaId }, select: { nombre: true } }),
     ])
 
-    // 3) Preparar texto del usuario (prioriza transcripción si es nota de voz)
+    // 3) Preparar texto (prioriza transcripción si es nota de voz)
     let userText = (mensajeArg || '').trim()
     if (!userText && last?.isVoiceNote) {
         let transcript = (last.transcription || '').trim()
@@ -102,25 +108,69 @@ export async function handleAgentReply(args: {
     const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
 
-    // 4) Si mandan solo imagen, pregunta breve
+
+    // 4) Si llega SOLO imagen: esperar 1s y re-chequear si llegó texto nuevo
     if (isImage && !userText && !caption) {
-        const ask = 'Veo tu foto 😊 ¿Quieres que te ayude a interpretarla o tienes alguna pregunta específica?'
-        const saved = await persistBotReply({
+        await sleep(IMAGE_WAIT_MS)
+
+        // Tipado explícito del where para evitar choques de inferencia
+        const whereFresh: Prisma.MessageWhereInput = {
             conversationId: chatId,
+            from: MessageFrom.client, // enum seguro
+            OR: [
+                // Si 'contenido' es no-nullable, 'not: ""' funciona perfecto.
+                // Si fuera nullable, también funciona (excluye vacío).
+                { contenido: { not: '' } },
+                // En caption (normalmente nullable) excluimos null y vacío
+                { AND: [{ caption: { not: null } }, { caption: { not: '' } }] },
+                { isVoiceNote: true },
+            ],
+        }
+
+        // Agrega timestamp solo si existe (evita undefined en where)
+        if (last?.timestamp) {
+            whereFresh.timestamp = { gt: last.timestamp as Date }
+        }
+
+        const freshText = await prisma.message.findFirst({
+            where: whereFresh,
+            orderBy: { timestamp: 'desc' },
+            select: {
+                id: true,
+                contenido: true,
+                caption: true,
+                isVoiceNote: true,
+                transcription: true,
+                mediaType: true,
+                mediaUrl: true,
+                mimeType: true,
+            },
+        })
+
+        if (!freshText) {
+            return null
+        }
+
+        let followupText = String(freshText.contenido || freshText.caption || '').trim()
+        if (!followupText && freshText.isVoiceNote) {
+            followupText = String(freshText.transcription || '').trim()
+        }
+
+        return await answerWithLLM({
+            chatId,
             empresaId,
-            texto: ask,
-            nuevoEstado: conversacion.estado,
-            to: toPhone ?? conversacion.phone,
+            agent,
+            negocio: empresa,
+            bc,
+            userText: followupText || 'Hola',
+            effectiveImageUrl: imageUrl,
+            attachRecentIfTextOnly: false,
+            lastIdToExcludeFromHistory: freshText.id,
+            toPhone,
             phoneNumberId,
         })
-        return {
-            estado: conversacion.estado,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        }
     }
+
 
     // 5) System + presupuesto
     const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
@@ -132,13 +182,14 @@ export async function handleAgentReply(args: {
 
     const lineScope = softTrim(agent.scope || bc?.agentScope, 160)
     const lineDisc = softTrim(agent.disclaimers || bc?.agentDisclaimers, 160)
-    const extraInst = softTrim(agent.prompt || bc?.agentPrompt, 220) // un poco más de espacio para marca/web
+    const extraInst = softTrim(agent.prompt || bc?.agentPrompt, 220)
 
     const system = [
         nameLine,
         `Actúa como ${persona}. Habla en primera persona (yo), tono profesional y cercano.`,
         'Responde en 2–4 líneas, claro y empático. Sé específico y evita párrafos largos.',
         'Puedes usar 1 emoji ocasionalmente (no siempre).',
+        'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
         'Si corresponde, puedes mencionar productos del negocio y su web.',
         `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
         lineScope ? `Ámbito: ${lineScope}` : '',
@@ -146,27 +197,47 @@ export async function handleAgentReply(args: {
         extraInst ? `Sigue estas instrucciones del negocio: ${extraInst}` : '',
     ].filter(Boolean).join('\n')
 
-
     // 6) Historial reciente como contexto (últimos 10 mensajes)
     const history = await getRecentHistory(chatId, last?.id, 10)
 
+    // 7) Construcción de mensajes (adjunta imagen reciente si solo hay texto)
+    let effectiveImageUrl = imageUrl
+    if (!effectiveImageUrl && userText) {
+        const recentImage = await prisma.message.findFirst({
+            where: {
+                conversationId: chatId,
+                from: 'client',
+                mediaType: MediaType.image,
+                timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) as any },
+            },
+            orderBy: { timestamp: 'desc' },
+            select: { mediaUrl: true, caption: true },
+        })
+        if (recentImage?.mediaUrl) {
+            effectiveImageUrl = String(recentImage.mediaUrl)
+            if (!caption && recentImage.caption) {
+                userText = `${userText}\n\nNota de la imagen: ${recentImage.caption}`
+            }
+        }
+    }
+
     const messages: Array<any> = [{ role: 'system', content: system }, ...history]
-    if (imageUrl) {
+    if (effectiveImageUrl) {
         messages.push({
             role: 'user',
             content: [
                 { type: 'text', text: userText || caption || 'Analiza la imagen con prudencia clínica y brinda orientación general.' },
-                { type: 'image_url', image_url: { url: imageUrl } },
+                { type: 'image_url', image_url: { url: effectiveImageUrl } },
             ],
         })
     } else {
-        messages.push({ role: 'user', content: userText || 'Hola' })
+        messages.push({ role: 'user', content: userText || caption || 'Hola' })
     }
 
     // Presupuestar prompt total (incluye historial)
     budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
 
-    // 7) LLM con retry 402 y salida corta
+    // 8) LLM con retry 402 y salida corta
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
     const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
     const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 100)
@@ -179,21 +250,16 @@ export async function handleAgentReply(args: {
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
 
-    // 8) Post-formateo + inyección de marca/web si falta
-    // 8) Post-formateo + inyección de marca/web si falta
+    // 9) Post-formateo + inyección de marca/web si falta
     texto = clampConcise(texto, 4, 340)
     texto = formatConcise(texto)
-
-    // toma el prompt del negocio desde el agente o, si no, desde la config de la empresa
     const businessPrompt: string | undefined =
         (agent?.prompt && agent.prompt.trim()) ||
         (bc?.agentPrompt && bc.agentPrompt.trim()) ||
         undefined
-
     texto = maybeInjectBrand(texto, businessPrompt)
 
-
-    // 9) Persistir y responder
+    // 10) Persistir y responder
     const saved = await persistBotReply({
         conversationId: chatId,
         empresaId,
@@ -214,6 +280,108 @@ export async function handleAgentReply(args: {
 
 /* ================= helpers ================= */
 
+function sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function answerWithLLM(opts: {
+    chatId: number
+    empresaId: number
+    agent: AgentConfig
+    negocio: { nombre?: string } | null
+    bc: any
+    userText: string
+    effectiveImageUrl?: string | null
+    attachRecentIfTextOnly?: boolean
+    lastIdToExcludeFromHistory?: number
+    toPhone?: string
+    phoneNumberId?: string
+}): Promise<IAReplyResult | null> {
+    const {
+        chatId, empresaId, agent, negocio, bc,
+        userText, effectiveImageUrl,
+        lastIdToExcludeFromHistory, toPhone, phoneNumberId
+    } = opts
+
+    const negocioName = (bc?.nombre || negocio?.nombre || '').trim()
+    const especialidad = (agent.specialty || bc?.agentSpecialty || 'generico') as AgentSpecialty
+    const persona = personaLabel(especialidad)
+    const nameLine = negocioName
+        ? `Asistente de orientación de ${humanSpecialty(especialidad)} de "${negocioName}".`
+        : `Asistente de orientación de ${humanSpecialty(especialidad)}.`
+
+    const lineScope = softTrim(agent.scope || bc?.agentScope, 160)
+    const lineDisc = softTrim(agent.disclaimers || bc?.agentDisclaimers, 160)
+    const extraInst = softTrim(agent.prompt || bc?.agentPrompt, 220)
+
+    const system = [
+        nameLine,
+        `Actúa como ${persona}. Habla en primera persona (yo), tono profesional y cercano.`,
+        'Responde en 2–4 líneas, claro y empático. Sé específico y evita párrafos largos.',
+        'Puedes usar 1 emoji ocasionalmente (no siempre).',
+        'No diagnostiques ni prescribas. No reemplazas consulta clínica.',
+        'Si corresponde, puedes mencionar productos del negocio y su web.',
+        `Mantente solo en ${humanSpecialty(especialidad)}; si preguntan fuera, indícalo y reconduce.`,
+        lineScope ? `Ámbito: ${lineScope}` : '',
+        lineDisc ? `Incluye cuando aplique: ${lineDisc}` : '',
+        extraInst ? `Sigue estas instrucciones del negocio: ${extraInst}` : '',
+    ].filter(Boolean).join('\n')
+
+    const history = await getRecentHistory(chatId, lastIdToExcludeFromHistory, 10)
+
+    const messages: Array<any> = [{ role: 'system', content: system }, ...history]
+    if (effectiveImageUrl) {
+        messages.push({
+            role: 'user',
+            content: [
+                { type: 'text', text: userText || 'Hola' },
+                { type: 'image_url', image_url: { url: effectiveImageUrl } },
+            ],
+        })
+    } else {
+        messages.push({ role: 'user', content: userText || 'Hola' })
+    }
+
+    budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
+
+    const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
+    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
+    const defaultMax = Number(process.env.IA_MAX_TOKENS ?? 100)
+
+    let texto = ''
+    try {
+        texto = await runChatWithBudget({ model, messages, temperature, maxTokens: defaultMax })
+    } catch (err: any) {
+        console.error('[AGENT] OpenAI error (final):', err?.response?.data || err?.message || err)
+        texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
+    }
+
+    texto = clampConcise(texto, 4, 340)
+    texto = formatConcise(texto)
+    const businessPrompt: string | undefined =
+        (agent?.prompt && agent.prompt.trim()) ||
+        (bc?.agentPrompt && bc.agentPrompt.trim()) ||
+        undefined
+    texto = maybeInjectBrand(texto, businessPrompt)
+
+    const saved = await persistBotReply({
+        conversationId: chatId,
+        empresaId,
+        texto,
+        nuevoEstado: ConversationEstado.respondido,
+        to: toPhone,
+        phoneNumberId,
+    })
+
+    return {
+        estado: ConversationEstado.respondido,
+        mensaje: saved.texto,
+        messageId: saved.messageId,
+        wamid: saved.wamid,
+        media: [],
+    }
+}
+
 // Historial: últimos N mensajes en formato compacto
 async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
     const where: any = { conversationId }
@@ -228,7 +396,7 @@ async function getRecentHistory(conversationId: number, excludeMessageId?: numbe
 
     return rows.reverse().map(r => {
         const role = r.from === 'client' ? 'user' : 'assistant'
-        const content = softTrim(r.contenido || '', 220) // ~55 tokens
+        const content = softTrim(r.contenido || '', 220)
         return { role, content }
     })
 }
@@ -260,7 +428,7 @@ async function runChatWithBudget(opts: {
         const affordable = parseAffordableTokens(msg)
         const retryTokens =
             (typeof affordable === 'number' && Number.isFinite(affordable))
-                ? Math.max(12, Math.min(affordable - 1, 48)) // permite budgets muy bajos
+                ? Math.max(12, Math.min(affordable - 1, 48))
                 : 32
 
         if (process.env.DEBUG_AI === '1') console.log('[AGENT] retry with max_tokens =', retryTokens)
@@ -305,7 +473,6 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
 
     let total = approxTokens(sysText) + approxTokens(userText)
 
-    // incluye historial en el conteo
     for (const m of messages) {
         if (m.role !== 'system' && m !== user) {
             const t = typeof m.content === 'string'
@@ -319,7 +486,6 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
 
     if (total <= budgetPromptTokens) return messages
 
-    // 1) reducir system a 5 líneas clave
     const lines = sysText.split('\n').map(l => l.trim()).filter(Boolean)
     const keep: string[] = []
     for (const l of lines) {
@@ -330,7 +496,6 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     }
     ; (sys as any).content = keep.join('\n') || lines.slice(0, 5).join('\n')
 
-    // 2) recorte user a 200 chars
     if (typeof user?.content === 'string') {
         const ut = String(user.content)
         user.content = ut.length > 200 ? ut.slice(0, 200) : ut
@@ -339,7 +504,6 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
         user.content[0].text = ut.length > 200 ? ut.slice(0, 200) : ut
     }
 
-    // 3) recorta historial si aún excede (de más antiguo a más nuevo)
     let budget = budgetPromptTokens
     const sizeOf = (c: any) => approxTokens(typeof c === 'string'
         ? c
@@ -371,7 +535,6 @@ function clampConcise(text: string, maxLines = 4, maxChars = 360): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return t
 
-    // 1) Limite por caracteres: recorta en límite de oración si es posible
     if (t.length > maxChars) {
         const slice = t.slice(0, maxChars + 1)
         const cutAt = Math.max(
@@ -384,7 +547,6 @@ function clampConcise(text: string, maxLines = 4, maxChars = 360): string {
         if (!/[.!?…]$/.test(t)) t = t.replace(/\s+[^\s]*$/, '').trim() + '…'
     }
 
-    // 2) Limite por líneas
     const lines = t.split('\n').filter(Boolean)
     if (lines.length > maxLines) {
         t = lines.slice(0, maxLines).join('\n').trim()
@@ -398,13 +560,9 @@ function formatConcise(text: string): string {
     let t = String(text || '').trim()
     if (!t) return 'Gracias por escribirnos. Podemos ayudarte con orientación general.'
 
-    // Normaliza y quita viñetas si el modelo metió alguna
     t = t.replace(/^[•\-]\s*/gm, '').replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
-
-    // Compacta a 2–4 líneas / ~340–360 chars (sin añadir preguntas)
     t = clampConcise(t, 4, 340)
 
-    // Emoji opcional (30%), máx 1, solo si no hay ya uno
     if (!/[^\w\s.,;:()¿?¡!]/.test(t) && Math.random() < 0.30) {
         const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '🧴', '💬', '🫶']
         t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`
@@ -412,12 +570,10 @@ function formatConcise(text: string): string {
     return t
 }
 
-// Inserta marca / web si viene en el prompt y no fue mencionada
 function maybeInjectBrand(text: string, businessPrompt?: string): string {
     const p = String(businessPrompt || '')
     const urlMatch = p.match(/(https?:\/\/[^\s]+|www\.[^\s]+)/i)
     const url = urlMatch ? urlMatch[0] : ''
-    // Marca: si detectamos "Leavid" explícito, priorizamos ese nombre
     const brand = /leavid/i.test(p) ? 'Leavid Skincare' : ''
 
     if (!brand && !url) return text
@@ -451,7 +607,6 @@ function personaLabel(s: AgentSpecialty) {
         default: return 'un asistente virtual de salud'
     }
 }
-
 
 function normalizeToE164(n: string) { return String(n || '').replace(/[^\d]/g, '') }
 
