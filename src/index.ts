@@ -136,6 +136,8 @@ app.get('/', (_req, res) => {
 app.use('/api/auth', authRoutes)
 app.use('/api/webhook', webhookRoutes)
 app.use('/api/whatsapp', whatsappRoutes)
+app.use('/api', registerRoutes)
+
 
 // 🔐 Rutas protegidas
 app.use('/api/products', productRoutes)
@@ -146,7 +148,7 @@ app.use('/api/templates', messageTemplateRoutes)
 app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
-app.use(registerRoutes)
+
 // 404 JSON final
 app.use((req, res) => {
     const url = req.originalUrl.split('?')[0]

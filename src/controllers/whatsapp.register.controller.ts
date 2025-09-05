@@ -1,14 +1,16 @@
+// src/controllers/whatsapp.register.controller.ts
 import { Request, Response } from 'express'
 import axios from 'axios'
 import prisma from '../lib/prisma'
 
 const FB_VERSION = process.env.FB_VERSION || 'v20.0'
+const SYSTEM_TOKEN = (process.env.WHATSAPP_TEMP_TOKEN || '').trim()
 
 function onlyDigits(s: string) {
     return String(s || '').replace(/\D+/g, '')
 }
 
-function metaErr(e: any) {
+function asMetaError(e: any) {
     const x = e?.response?.data?.error || e?.response?.data || e
     return {
         ok: false,
@@ -22,128 +24,143 @@ function metaErr(e: any) {
     }
 }
 
-/**
- * Busca el phone_number_id por display_phone_number dentro de la WABA
- * guardada para la empresa en tu DB.
- */
-async function findPhoneIdByDisplay(
-    empresaId: number,
-    accessToken: string,
-    displayPhoneNumber: string
-): Promise<{ phoneId: string | null; wabaId: string | null }> {
-    const acc = await prisma.whatsappAccount.findUnique({
-        where: { empresaId },
-        select: { wabaId: true },
-    })
-    const wabaId = acc?.wabaId || null
-    if (!wabaId) return { phoneId: null, wabaId: null }
+/** GET /api/whatsapp/waba/:wabaId/phones */
+export const listarTelefonosDeWaba = async (req: Request, res: Response) => {
+    try {
+        if (!SYSTEM_TOKEN) return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
 
+        const { wabaId } = req.params
+        if (!wabaId) return res.status(400).json({ ok: false, error: 'Falta wabaId' })
+
+        const { data } = await axios.get(
+            `https://graph.facebook.com/${FB_VERSION}/${wabaId}/phone_numbers`,
+            { headers: { Authorization: `Bearer ${SYSTEM_TOKEN}` } }
+        )
+
+        return res.json({ ok: true, data: data?.data || [] })
+    } catch (e: any) {
+        return res.status(400).json(asMetaError(e))
+    }
+}
+
+async function findPhoneIdInWaba(
+    wabaId: string,
+    displayPhoneNumber?: string
+): Promise<{ phoneId: string | null; phone?: any }> {
     const { data } = await axios.get(
         `https://graph.facebook.com/${FB_VERSION}/${wabaId}/phone_numbers`,
-        { params: { access_token: accessToken } }
+        { headers: { Authorization: `Bearer ${SYSTEM_TOKEN}` } }
     )
 
     const list: any[] = Array.isArray(data?.data) ? data.data : []
-    const wanted = onlyDigits(displayPhoneNumber)
-    const match = list.find((p) => onlyDigits(p?.display_phone_number) === wanted)
+    if (!list.length) return { phoneId: null }
 
-    return { phoneId: match?.id || null, wabaId }
+    if (!displayPhoneNumber) {
+        if (list.length === 1) return { phoneId: list[0].id, phone: list[0] }
+        return { phoneId: null }
+    }
+
+    const wanted = onlyDigits(displayPhoneNumber)
+    const match = list.find(p => onlyDigits(p?.display_phone_number) === wanted)
+    return { phoneId: match?.id || null, phone: match }
 }
 
-/**
- * POST /api/whatsapp/activar-numero
- * Body:
- *  - phoneNumberId?: string
- *  - displayPhoneNumber?: string
- *  - accessToken?: string  (si no llega, usa el guardado en DB)
- */
+/** POST /api/whatsapp/activar-numero */
 export const activarNumero = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+        if (!SYSTEM_TOKEN) return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
 
-        const { phoneNumberId: bodyPhoneId, displayPhoneNumber, accessToken: bodyToken } =
-            (req.body || {}) as { phoneNumberId?: string; displayPhoneNumber?: string; accessToken?: string }
-
-        // 1) Access token: usar el enviado o el persistido
-        let accessToken = bodyToken
-        if (!accessToken) {
-            const acc = await prisma.whatsappAccount.findUnique({
-                where: { empresaId },
-                select: { accessToken: true },
-            })
-            accessToken = acc?.accessToken || ''
+        const { wabaId, phoneNumberId: bodyPhoneId, displayPhoneNumber, pin } = (req.body || {}) as {
+            wabaId: string
+            phoneNumberId?: string
+            displayPhoneNumber?: string
+            pin?: string
         }
-        if (!accessToken) return res.status(400).json({ ok: false, error: 'Falta accessToken' })
 
-        // 2) Resolver phone_number_id si vino el número “bonito”
+        if (!wabaId) return res.status(400).json({ ok: false, error: 'Falta wabaId' })
+
         let phoneNumberId = (bodyPhoneId || '').trim()
-        let wabaId: string | null = null
+        let phone: any | undefined
 
         if (!phoneNumberId) {
-            const disp = (displayPhoneNumber || '').trim()
-            if (!disp) return res.status(400).json({ ok: false, error: 'Envía phoneNumberId o displayPhoneNumber' })
-            const r = await findPhoneIdByDisplay(empresaId, accessToken, disp)
+            const r = await findPhoneIdInWaba(wabaId, (displayPhoneNumber || '').trim())
             phoneNumberId = r.phoneId || ''
-            wabaId = r.wabaId
+            phone = r.phone
             if (!phoneNumberId) {
                 return res.status(404).json({
                     ok: false,
-                    error: `No se encontró phone_number_id para ${disp} en tu WABA`,
+                    error: displayPhoneNumber
+                        ? `No se encontró phone_number_id para ${displayPhoneNumber} en esta WABA`
+                        : 'Hay más de un número en la WABA. Debes indicar displayPhoneNumber o phoneNumberId',
                 })
             }
         }
 
-        // 3) Registrar
-        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/register`
-        const { data } = await axios.post(
-            url,
-            { messaging_product: 'whatsapp' },
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        )
+        const payload: Record<string, any> = { messaging_product: 'whatsapp' }
+        if (pin) payload.pin = String(pin)
 
-        // 4) Persistir phoneNumberId si descubrimos WABA
-        if (wabaId) {
-            await prisma.whatsappAccount.update({
-                where: { empresaId },
-                data: { phoneNumberId },
-            }).catch(() => null)
+        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/register`
+
+        try {
+            await axios.post(url, payload, { headers: { Authorization: `Bearer ${SYSTEM_TOKEN}` } })
+        } catch (e: any) {
+            const code = e?.response?.data?.error?.code
+            const msg = e?.response?.data?.error?.message || ''
+            if (code === 131000 || /already registered/i.test(msg)) {
+                // ya estaba registrado → OK
+            } else {
+                throw e
+            }
         }
 
-        return res.json({ ok: true, data })
+        await prisma.whatsappAccount.upsert({
+            where: { empresaId },
+            update: {
+                wabaId,
+                phoneNumberId,
+                displayPhoneNumber: phone?.display_phone_number || displayPhoneNumber || null,
+                updatedAt: new Date(),
+            },
+            create: {
+                empresaId,
+                wabaId,
+                phoneNumberId,
+                displayPhoneNumber: phone?.display_phone_number || displayPhoneNumber || null,
+                accessToken: '',
+            },
+        })
+
+        return res.json({
+            ok: true,
+            message: 'Número activado (o ya estaba activo).',
+            wabaId,
+            phoneNumberId,
+            displayPhoneNumber: phone?.display_phone_number || displayPhoneNumber || null,
+        })
     } catch (e: any) {
-        // Si ya está registrado, Meta suele devolver (#131000). Puedes tratarlo como success si quieres.
-        return res.status(400).json(metaErr(e))
+        return res.status(400).json(asMetaError(e))
     }
 }
 
-/**
- * GET /api/whatsapp/numero/:phoneNumberId/estado
- */
+/** GET /api/whatsapp/numero/:phoneNumberId/estado */
 export const estadoNumero = async (req: Request, res: Response) => {
     try {
-        const empresaId = (req as any).user?.empresaId
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
+        if (!SYSTEM_TOKEN) return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
 
         const phoneNumberId = req.params.phoneNumberId
         if (!phoneNumberId) return res.status(400).json({ ok: false, error: 'Falta phoneNumberId' })
 
-        const acc = await prisma.whatsappAccount.findUnique({
-            where: { empresaId },
-            select: { accessToken: true },
-        })
-        const token = acc?.accessToken
-        if (!token) return res.status(400).json({ ok: false, error: 'Falta accessToken para la empresa' })
-
         const { data } = await axios.get(`https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}`, {
             params: {
-                fields: 'id,display_phone_number,quality_rating,name_status,account_mode,verified_name',
-                access_token: token,
+                fields: 'id,display_phone_number,quality_rating,name_status,account_mode,verified_name,status',
+                access_token: SYSTEM_TOKEN,
             },
         })
 
         return res.json({ ok: true, data })
     } catch (e: any) {
-        return res.status(400).json(metaErr(e))
+        return res.status(400).json(asMetaError(e))
     }
 }

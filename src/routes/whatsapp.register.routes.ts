@@ -1,10 +1,12 @@
+// src/routes/whatsapp.register.routes.ts
 import { Router } from 'express'
-import { activarNumero, estadoNumero } from '../controllers/whatsapp.register.controller'
 import { verificarJWT } from '../middleware/auth.middleware'
+import { activarNumero, estadoNumero, listarTelefonosDeWaba } from '../controllers/whatsapp.register.controller'
 
 const router = Router()
 
-router.post('/api/whatsapp/activar-numero', verificarJWT, activarNumero)
-router.get('/api/whatsapp/numero/:phoneNumberId/estado', verificarJWT, estadoNumero)
+router.post('/whatsapp/activar-numero', verificarJWT, activarNumero)
+router.get('/whatsapp/numero/:phoneNumberId/estado', verificarJWT, estadoNumero)
+router.get('/whatsapp/waba/:wabaId/phones', verificarJWT, listarTelefonosDeWaba)
 
 export default router
