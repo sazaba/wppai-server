@@ -19,6 +19,7 @@ import productRoutes from './routes/product.routes'
 import mediaProxyRouter from './routes/mediaProxy.route'
 import ordersRouter from "./routes/orders.routes"
 import paymentsRouter from "./routes/payments.routes"
+import registerRoutes from './routes/whatsapp.register.routes'
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -145,7 +146,7 @@ app.use('/api/templates', messageTemplateRoutes)
 app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
-
+app.use(registerRoutes)
 // 404 JSON final
 app.use((req, res) => {
     const url = req.originalUrl.split('?')[0]
