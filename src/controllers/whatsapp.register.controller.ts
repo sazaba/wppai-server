@@ -104,14 +104,49 @@ export const activarNumero = async (req: Request, res: Response) => {
         const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/register`
 
         try {
-            await axios.post(url, payload, { headers: { Authorization: `Bearer ${SYSTEM_TOKEN}` } })
+            await axios.post(url, payload, {
+                headers: {
+                    Authorization: `Bearer ${SYSTEM_TOKEN}`,
+                    'Content-Type': 'application/json',
+                },
+            })
         } catch (e: any) {
-            const code = e?.response?.data?.error?.code
-            const msg = e?.response?.data?.error?.message || ''
+            // --- DEBUG MEJORADO ---
+            const metaErr = e?.response?.data?.error
+            const code = metaErr?.code
+            const msg = metaErr?.message || ''
+            const sub = metaErr?.error_subcode
+            const errData = metaErr?.error_data
+            const fbtrace = metaErr?.fbtrace_id
+            const type = metaErr?.type
+
+            // Si ya estaba registrado, lo tratamos como éxito
             if (code === 131000 || /already registered/i.test(msg)) {
-                // ya estaba registrado → OK
+                // noop
             } else {
-                throw e
+                // Log útil para servidor (no incluye token)
+                console.error('[WA REGISTER ERROR]', {
+                    url,
+                    payload,
+                    code,
+                    subcode: sub,
+                    type,
+                    message: msg,
+                    error_data: errData,
+                    fbtrace_id: fbtrace,
+                })
+
+                // Devolvemos TODO lo que pueda ayudar en el front
+                return res.status(400).json({
+                    ok: false,
+                    error: {
+                        message: msg || 'Meta error',
+                        code,
+                        error_subcode: sub,
+                        type,
+                        details: metaErr, // ← incluye error_data si viene
+                    },
+                })
             }
         }
 
@@ -143,6 +178,7 @@ export const activarNumero = async (req: Request, res: Response) => {
         return res.status(400).json(asMetaError(e))
     }
 }
+
 
 /** GET /api/whatsapp/numero/:phoneNumberId/estado */
 export const estadoNumero = async (req: Request, res: Response) => {
