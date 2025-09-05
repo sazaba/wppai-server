@@ -164,3 +164,84 @@ export const estadoNumero = async (req: Request, res: Response) => {
         return res.status(400).json(asMetaError(e))
     }
 }
+
+/** POST /api/whatsapp/numero/:phoneNumberId/two-step
+ *  Body: { pin: "123456" }
+ *  Configura/actualiza el PIN (two-step verification) del número.
+ */
+export const setTwoStepPin = async (req: Request, res: Response) => {
+    try {
+        if (!SYSTEM_TOKEN) return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
+
+        const phoneNumberId = (req.params?.phoneNumberId || '').trim()
+        const pin = (req.body?.pin || '').toString().trim()
+
+        if (!phoneNumberId) return res.status(400).json({ ok: false, error: 'Falta phoneNumberId' })
+        if (!/^\d{6}$/.test(pin)) return res.status(400).json({ ok: false, error: 'PIN inválido: debe ser de 6 dígitos' })
+
+        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/two_step_verification`
+        const payload = { pin }
+
+        const { data } = await axios.post(url, payload, {
+            headers: { Authorization: `Bearer ${SYSTEM_TOKEN}`, 'Content-Type': 'application/json' },
+        })
+
+        return res.json({ ok: true, data })
+    } catch (e: any) {
+        return res.status(400).json(asMetaError(e))
+    }
+}
+
+/** POST /api/whatsapp/numero/:phoneNumberId/request-code
+ *  Body: { code_method?: "SMS"|"VOICE", locale?: "en_US"|"es_ES"|... }
+ *  (Opcional) Pide código de verificación del número (proceso clásico).
+ */
+export const requestVerificationCode = async (req: Request, res: Response) => {
+    try {
+        if (!SYSTEM_TOKEN) return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
+
+        const phoneNumberId = (req.params?.phoneNumberId || '').trim()
+        if (!phoneNumberId) return res.status(400).json({ ok: false, error: 'Falta phoneNumberId' })
+
+        const code_method = (req.body?.code_method || 'SMS').toString().toUpperCase()
+        const locale = (req.body?.locale || 'en_US').toString()
+
+        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/request_code`
+        const payload = { code_method, locale }
+
+        const { data } = await axios.post(url, payload, {
+            headers: { Authorization: `Bearer ${SYSTEM_TOKEN}`, 'Content-Type': 'application/json' },
+        })
+
+        return res.json({ ok: true, data })
+    } catch (e: any) {
+        return res.status(400).json(asMetaError(e))
+    }
+}
+
+/** POST /api/whatsapp/numero/:phoneNumberId/verify-code
+ *  Body: { code: "123456" }
+ *  (Opcional) Verifica el código recibido en el paso anterior.
+ */
+export const verifyCode = async (req: Request, res: Response) => {
+    try {
+        if (!SYSTEM_TOKEN) return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
+
+        const phoneNumberId = (req.params?.phoneNumberId || '').trim()
+        const code = (req.body?.code || '').toString().trim()
+
+        if (!phoneNumberId) return res.status(400).json({ ok: false, error: 'Falta phoneNumberId' })
+        if (!/^\d{6}$/.test(code)) return res.status(400).json({ ok: false, error: 'Código inválido: debe ser de 6 dígitos' })
+
+        const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/verify_code`
+        const payload = { code }
+
+        const { data } = await axios.post(url, payload, {
+            headers: { Authorization: `Bearer ${SYSTEM_TOKEN}`, 'Content-Type': 'application/json' },
+        })
+
+        return res.json({ ok: true, data })
+    } catch (e: any) {
+        return res.status(400).json(asMetaError(e))
+    }
+}
