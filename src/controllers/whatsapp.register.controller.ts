@@ -66,18 +66,13 @@ async function findPhoneIdInWaba(
 }
 
 
-/** POST /api/whatsapp/activar-numero
- * Body: { wabaId: string, phoneNumberId?: string, displayPhoneNumber?: string, pin?: string }
- */
+// src/controllers/whatsapp.register.controller.ts
+
 export const activarNumero = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
-
-        const SYSTEM_TOKEN = (process.env.WHATSAPP_TEMP_TOKEN || '').trim()
-        if (!SYSTEM_TOKEN) {
-            return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
-        }
+        if (!SYSTEM_TOKEN) return res.status(500).json({ ok: false, error: 'WHATSAPP_TEMP_TOKEN no configurado' })
 
         const { wabaId, phoneNumberId: bodyPhoneId, displayPhoneNumber, pin } = (req.body || {}) as {
             wabaId: string
@@ -88,9 +83,18 @@ export const activarNumero = async (req: Request, res: Response) => {
 
         if (!wabaId) return res.status(400).json({ ok: false, error: 'Falta wabaId' })
 
-        // 1) Resolver phoneNumberId si no vino
+        // ⚠️ En este caso Meta exige PIN. Lo volvemos obligatorio.
+        const cleanPin = String(pin || '').trim()
+        if (!/^\d{6}$/.test(cleanPin)) {
+            return res.status(400).json({
+                ok: false,
+                error: 'Meta exige PIN de 6 dígitos para registrar este número. Ingresa el PIN correcto.',
+            })
+        }
+
         let phoneNumberId = (bodyPhoneId || '').trim()
         let phone: any | undefined
+
         if (!phoneNumberId) {
             const r = await findPhoneIdInWaba(wabaId, (displayPhoneNumber || '').trim())
             phoneNumberId = r.phoneId || ''
@@ -105,86 +109,75 @@ export const activarNumero = async (req: Request, res: Response) => {
             }
         }
 
-        // 2) Registrar en Meta (Cloud API). El PIN es opcional; si existe se usa.
         const url = `https://graph.facebook.com/${FB_VERSION}/${phoneNumberId}/register`
-        const payload: Record<string, any> = { messaging_product: 'whatsapp' }
-        if (pin) payload.pin = String(pin)
+        const payload = { messaging_product: 'whatsapp', pin: cleanPin }
 
         try {
             await axios.post(url, payload, {
                 headers: { Authorization: `Bearer ${SYSTEM_TOKEN}`, 'Content-Type': 'application/json' },
             })
         } catch (e: any) {
-            const metaErr = e?.response?.data?.error
-            const code = metaErr?.code
-            const msg = metaErr?.message || ''
-            // Si ya estaba registrado, lo tratamos como éxito idempotente
-            if (!(code === 131000 || /already registered/i.test(msg))) {
-                // Log enriquecido
-                console.error('[WA REGISTER ERROR]', {
-                    url, payload,
-                    code, subcode: metaErr?.error_subcode,
-                    type: metaErr?.type,
-                    message: msg,
-                    error_data: metaErr?.error_data,
-                    fbtrace_id: metaErr?.fbtrace_id,
+            const err = e?.response?.data?.error
+            const code = err?.code
+            const msg = err?.message || ''
+
+            // Mapear errores comunes con explicación clara
+            if (code === 100 && /pin is required/i.test(msg)) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        'Meta exige PIN para este número. Debes ingresar un PIN de 6 dígitos (el ya configurado previamente).',
                 })
-                return res.status(400).json({ ok: false, error: { message: msg || 'Meta error', details: metaErr } })
             }
-        }
+            if (code === 133005 || /two step verification pin mismatch/i.test(msg)) {
+                return res.status(400).json({
+                    ok: false,
+                    error:
+                        'PIN incorrecto. Este número ya tiene un PIN configurado anteriormente. Debes usar ese PIN exacto o solicitar el reset desde WhatsApp Manager / soporte de Meta.',
+                    details: err,
+                })
+            }
 
-        // 3) Persistencia segura en DB (evitar colisión de unique(phoneNumberId))
-        const existingByPhone = await prisma.whatsappAccount.findUnique({
-            where: { phoneNumberId },
-            select: { empresaId: true },
-        })
-
-        if (existingByPhone && existingByPhone.empresaId !== empresaId) {
-            return res.status(409).json({
+            console.error('[WA REGISTER ERROR]', {
+                url,
+                payload,
+                code: err?.code,
+                subcode: err?.error_subcode,
+                type: err?.type,
+                message: msg,
+                error_data: err?.error_data,
+                fbtrace_id: err?.fbtrace_id,
+            })
+            return res.status(400).json({
                 ok: false,
-                error: `Este phoneNumberId ya está conectado a otra empresa (${existingByPhone.empresaId}). Desconéctalo allí primero o usa otro número.`,
+                error: msg || 'Error de Meta al registrar el número',
+                details: err,
             })
         }
 
-        const display = phone?.display_phone_number || displayPhoneNumber || null
-
-        if (existingByPhone && existingByPhone.empresaId === empresaId) {
-            // update por phoneNumberId (clave única)
-            await prisma.whatsappAccount.update({
-                where: { phoneNumberId },
-                data: { wabaId, displayPhoneNumber: display, updatedAt: new Date() },
-            })
-        } else {
-            // Si no existe por phone, ver si ya hay fila por empresaId (p. ej. guardada en "vincular")
-            const existingByEmpresa = await prisma.whatsappAccount.findUnique({
-                where: { empresaId },
-                select: { empresaId: true },
-            })
-
-            if (existingByEmpresa) {
-                await prisma.whatsappAccount.update({
-                    where: { empresaId },
-                    data: { phoneNumberId, wabaId, displayPhoneNumber: display, updatedAt: new Date() },
-                })
-            } else {
-                await prisma.whatsappAccount.create({
-                    data: {
-                        empresaId,
-                        phoneNumberId,
-                        wabaId,
-                        displayPhoneNumber: display,
-                        accessToken: '', // aquí no lo necesitamos; se guarda en "vincular"
-                    },
-                })
-            }
-        }
+        await prisma.whatsappAccount.upsert({
+            where: { empresaId },
+            update: {
+                wabaId,
+                phoneNumberId,
+                displayPhoneNumber: phone?.display_phone_number || displayPhoneNumber || null,
+                updatedAt: new Date(),
+            },
+            create: {
+                empresaId,
+                wabaId,
+                phoneNumberId,
+                displayPhoneNumber: phone?.display_phone_number || displayPhoneNumber || null,
+                accessToken: '',
+            },
+        })
 
         return res.json({
             ok: true,
-            message: 'Número activado (o ya estaba activo).',
+            message: 'Número activado (registro exitoso).',
             wabaId,
             phoneNumberId,
-            displayPhoneNumber: display,
+            displayPhoneNumber: phone?.display_phone_number || displayPhoneNumber || null,
         })
     } catch (e: any) {
         return res.status(400).json(asMetaError(e))
