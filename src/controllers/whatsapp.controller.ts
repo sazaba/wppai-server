@@ -174,124 +174,49 @@ async function ensureFallbackTemplateInMeta(params: {
  * CONEXIÓN (flujo único)
  * ========================================================================== */
 
+// POST /api/whatsapp/vincular
 export const vincular = async (req: Request, res: Response) => {
     try {
-        const empresaId = (req as any).user?.empresaId;
-        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' });
+        const empresaId = (req as any).user?.empresaId
+        if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
-        const { accessToken, phoneNumberId, wabaId, businessId: bodyBusinessId, displayPhoneNumber } = req.body as {
-            accessToken: string;
-            phoneNumberId: string;
-            wabaId: string;
-            businessId?: string;
-            displayPhoneNumber?: string;
-        };
-
+        const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
         if (!accessToken || !phoneNumberId || !wabaId) {
-            return res.status(400).json({ ok: false, error: 'Faltan accessToken, phoneNumberId o wabaId' });
+            return res.status(400).json({ ok: false, error: 'Faltan accessToken, phoneNumberId o wabaId' })
         }
 
-        // 1) Validar permisos del token
+        // 1) Permisos del usuario
         const perms = await axios.get(`https://graph.facebook.com/${FB_VERSION}/me/permissions`, {
             params: { access_token: accessToken },
             headers: { 'Content-Type': 'application/json' },
-        });
+        })
         const granted: string[] = (perms.data?.data || [])
             .filter((p: any) => p.status === 'granted')
-            .map((p: any) => p.permission);
-        const need = ['business_management', 'whatsapp_business_management', 'whatsapp_business_messaging'];
-        const missing = need.filter((p) => !granted.includes(p));
-        if (missing.length) {
-            return res.status(403).json({ ok: false, error: `Faltan permisos: ${missing.join(', ')}` });
-        }
+            .map((p: any) => p.permission)
+        const need = ['business_management', 'whatsapp_business_management', 'whatsapp_business_messaging']
+        const missing = need.filter((p) => !granted.includes(p))
+        if (missing.length) return res.status(403).json({ ok: false, error: `Faltan permisos: ${missing.join(', ')}` })
 
-        // 2) Resolver owner del Business (dueño de la WABA)
-        const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
-        let businessId = (bodyBusinessId || '').trim();
-        if (!businessId) {
-            try {
-                const info = await axios.get(
-                    `https://graph.facebook.com/${FB_VERSION}/${wabaId}`,
-                    { params: { fields: 'owner_business_info' }, headers }
-                );
-                businessId = info.data?.owner_business_info?.id || '';
-            } catch (e: any) {
-                console.warn('[vincular] no se pudo leer owner_business_info:', e?.response?.data || e?.message);
-            }
-        }
-        if (!businessId) {
-            return res.status(400).json({ ok: false, error: 'No se pudo resolver el Business dueño de la WABA' });
-        }
-
-        // 3) Confirmar que el usuario pertenece y es ADMIN de ese Business
-        const meBiz = await axios.get(
-            `https://graph.facebook.com/${FB_VERSION}/me/businesses`,
-            { params: { fields: 'id,name,permitted_roles' }, headers }
-        );
-        const myBiz = (meBiz.data?.data || []).find((b: any) => String(b.id) === String(businessId));
-        if (!myBiz) {
-            return res.status(403).json({
-                ok: false,
-                error: `El usuario autenticado no pertenece al Business ${businessId} (dueño de la WABA). Pide a un ADMIN de ese Business que complete la conexión.`,
-            });
-        }
-        if (!(myBiz.permitted_roles || []).includes('ADMIN')) {
-            return res.status(403).json({
-                ok: false,
-                error: `El usuario no es ADMIN del Business ${businessId}. Debe ser ADMIN para suscribir la app.`,
-            });
-        }
-
-        // Helper: agregar app al Business y reintentar subscribed_apps
-        const APP_ID = (process.env.META_APP_ID || '').trim();
-        async function addAppAndResubscribe() {
-            if (!APP_ID) throw new Error('META_APP_ID no configurado en backend');
-            await axios.post(
-                `https://graph.facebook.com/${FB_VERSION}/${businessId}/apps`,
-                { app_id: APP_ID },
-                { headers }
-            );
-            await axios.post(
+        // 2) Suscribir app a la WABA
+        await axios
+            .post(
                 `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
                 {},
-                { headers }
-            );
-        }
+                { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+            )
+            .catch((e) => {
+                const msg = e?.response?.data?.error?.message || e?.message
+                throw new Error(`No pudimos suscribir tu WABA a la app. Detalle: ${msg}`)
+            })
 
-        // 4) Suscribir app a la WABA (con retry si (#200) Permissions)
-        try {
-            await axios.post(
-                `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
-                {},
-                { headers }
-            );
-        } catch (e: any) {
-            const err = e?.response?.data?.error;
-            const code = err?.code;
-            const msg = err?.message || '';
-            if (code === 200 || /Permissions error/i.test(msg)) {
-                try {
-                    await addAppAndResubscribe();
-                } catch (e2: any) {
-                    const why = e2?.response?.data?.error?.message || e2?.message || 'Permissions error';
-                    return res.status(403).json({
-                        ok: false,
-                        error: `No pudimos suscribir la WABA. Asegura que la APP esté añadida al Business y que el usuario sea ADMIN. Meta: ${why}`,
-                    });
-                }
-            } else {
-                return res.status(400).json({ ok: false, error: `No pudimos suscribir tu WABA a la app. Detalle: ${msg}` });
-            }
-        }
-
-        // 5) Guardar/actualizar credenciales
+        // 3) Guardar/actualizar credenciales
         await prisma.whatsappAccount.upsert({
             where: { empresaId },
             update: {
                 accessToken,
                 phoneNumberId,
                 wabaId,
-                businessId,
+                businessId: businessId || null,
                 displayPhoneNumber: displayPhoneNumber || null,
                 updatedAt: new Date(),
             },
@@ -300,17 +225,17 @@ export const vincular = async (req: Request, res: Response) => {
                 accessToken,
                 phoneNumberId,
                 wabaId,
-                businessId,
+                businessId: businessId || null,
                 displayPhoneNumber: displayPhoneNumber || null,
             },
-        });
+        })
 
-        return res.json({ ok: true });
+        return res.json({ ok: true })
     } catch (e: any) {
-        console.error('[vincular] error:', e?.response?.data || e?.message || e);
-        return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' });
+        console.error('[vincular] error:', e?.response?.data || e?.message || e)
+        return res.status(500).json({ ok: false, error: 'Error al guardar conexión de WhatsApp' })
     }
-};
+}
 
 /**
  * GET /api/whatsapp/estado
