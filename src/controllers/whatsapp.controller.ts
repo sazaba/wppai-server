@@ -175,17 +175,25 @@ async function ensureFallbackTemplateInMeta(params: {
  * ========================================================================== */
 
 // POST /api/whatsapp/vincular
+// POST /api/whatsapp/vincular
 export const vincular = async (req: Request, res: Response) => {
     try {
         const empresaId = (req as any).user?.empresaId
         if (!empresaId) return res.status(401).json({ ok: false, error: 'No autorizado' })
 
-        const { accessToken, phoneNumberId, wabaId, businessId, displayPhoneNumber } = req.body
+        const { accessToken, phoneNumberId, wabaId, businessId: bodyBusinessId, displayPhoneNumber } = req.body as {
+            accessToken: string
+            phoneNumberId: string
+            wabaId: string
+            businessId?: string
+            displayPhoneNumber?: string
+        }
+
         if (!accessToken || !phoneNumberId || !wabaId) {
             return res.status(400).json({ ok: false, error: 'Faltan accessToken, phoneNumberId o wabaId' })
         }
 
-        // 1) Permisos del usuario
+        // 1) Validar permisos del token
         const perms = await axios.get(`https://graph.facebook.com/${FB_VERSION}/me/permissions`, {
             params: { access_token: accessToken },
             headers: { 'Content-Type': 'application/json' },
@@ -197,26 +205,78 @@ export const vincular = async (req: Request, res: Response) => {
         const missing = need.filter((p) => !granted.includes(p))
         if (missing.length) return res.status(403).json({ ok: false, error: `Faltan permisos: ${missing.join(', ')}` })
 
-        // 2) Suscribir app a la WABA
-        await axios
-            .post(
+        // 2) Resolver businessId real (dueño de la WABA) si no vino
+        const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
+        let businessId = (bodyBusinessId || '').trim()
+        if (!businessId) {
+            try {
+                const info = await axios.get(
+                    `https://graph.facebook.com/${FB_VERSION}/${wabaId}`,
+                    { params: { fields: 'owner_business_info' }, headers }
+                )
+                businessId = info.data?.owner_business_info?.id || ''
+            } catch (e: any) {
+                console.warn('[vincular] no se pudo leer owner_business_info:', e?.response?.data || e?.message)
+            }
+        }
+        if (!businessId) {
+            return res.status(400).json({ ok: false, error: 'No se pudo resolver el Business dueño de la WABA' })
+        }
+
+        // Helper: agregar app al Business y reintentar subscribed_apps
+        const APP_ID = (process.env.META_APP_ID || '').trim()
+        async function addAppAndResubscribe() {
+            if (!APP_ID) throw new Error('META_APP_ID no configurado en backend')
+            // Agregar app al business
+            await axios.post(
+                `https://graph.facebook.com/${FB_VERSION}/${businessId}/apps`,
+                { app_id: APP_ID },
+                { headers }
+            )
+            // Reintentar suscribir
+            await axios.post(
                 `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
                 {},
-                { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+                { headers }
             )
-            .catch((e) => {
-                const msg = e?.response?.data?.error?.message || e?.message
-                throw new Error(`No pudimos suscribir tu WABA a la app. Detalle: ${msg}`)
-            })
+        }
 
-        // 3) Guardar/actualizar credenciales
+        // 3) Suscribir app a la WABA (con retry automático si (#200) Permissions)
+        try {
+            await axios.post(
+                `https://graph.facebook.com/${FB_VERSION}/${wabaId}/subscribed_apps`,
+                {},
+                { headers }
+            )
+        } catch (e: any) {
+            const err = e?.response?.data?.error
+            const code = err?.code
+            const msg = err?.message || ''
+            // Si es un permissions error, intentamos agregar la app al business y reintentar
+            if (code === 200 || /Permissions error/i.test(msg)) {
+                try {
+                    await addAppAndResubscribe()
+                } catch (e2: any) {
+                    const err2 = e2?.response?.data?.error
+                    const why = err2?.message || e2?.message || 'Permissions error'
+                    return res.status(403).json({
+                        ok: false,
+                        error: `No pudimos suscribir la WABA a la app. Verifica que el usuario sea ADMIN del Business ${businessId}. Meta: ${why}`,
+                    })
+                }
+            } else {
+                return res.status(400).json({ ok: false, error: `No pudimos suscribir tu WABA a la app. Detalle: ${msg}` })
+            }
+        }
+
+        // 4) Guardar/actualizar credenciales
         await prisma.whatsappAccount.upsert({
             where: { empresaId },
             update: {
                 accessToken,
                 phoneNumberId,
                 wabaId,
-                businessId: businessId || null,
+                businessId,
                 displayPhoneNumber: displayPhoneNumber || null,
                 updatedAt: new Date(),
             },
@@ -225,7 +285,7 @@ export const vincular = async (req: Request, res: Response) => {
                 accessToken,
                 phoneNumberId,
                 wabaId,
-                businessId: businessId || null,
+                businessId,
                 displayPhoneNumber: displayPhoneNumber || null,
             },
         })
