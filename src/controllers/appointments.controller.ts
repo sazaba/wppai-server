@@ -284,7 +284,7 @@ export async function deleteAppointment(req: Request, res: Response) {
     }
 }
 
-/* ===================== CONFIG (save + get) ===================== */
+/* ===================== CONFIG (GET + POST) ===================== */
 
 const timeZ = z.string().regex(/^\d{2}:\d{2}$/).nullable().optional();
 const dayZ = z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
@@ -318,28 +318,56 @@ const saveConfigDtoZ = z.object({
             })
         )
         .length(7, "Deben venir los 7 días"),
-    // Eliminado: provider
+    // provider: eliminado (opcional a futuro)
 });
 
+/** GET /api/appointments/config
+ *  👉 Responde PLANO: { config, hours, provider } para alinear con el front/lib */
 export async function getAppointmentConfig(req: Request, res: Response) {
     const empresaId = getEmpresaId(req);
+
     const [config, hours] = await Promise.all([
-        prisma.businessConfig.findUnique({ where: { empresaId } }),
+        prisma.businessConfig.findUnique({
+            where: { empresaId },
+            select: {
+                appointmentEnabled: true,
+                appointmentVertical: true,
+                appointmentTimezone: true,
+                appointmentBufferMin: true,
+                appointmentPolicies: true,
+                appointmentReminders: true,
+            },
+        }),
         prisma.appointmentHour.findMany({
             where: { empresaId },
             orderBy: { day: "asc" },
+            select: {
+                day: true,
+                isOpen: true,
+                start1: true,
+                end1: true,
+                start2: true,
+                end2: true,
+            },
         }),
     ]);
-    return res.json({ ok: true, data: { config, hours } });
+
+    // mantener null hasta que implementes provider principal
+    const provider = null;
+
+    // ✨ sin envoltorio { ok, data }, así lo espera el front
+    return res.json({ config, hours, provider });
 }
 
+/** POST /api/appointments/config
+ *  👉 Guarda config + hours. Responde { ok: true } */
 export async function saveAppointmentConfig(req: Request, res: Response) {
     try {
         const empresaId = getEmpresaId(req);
         const parsed = saveConfigDtoZ.parse(req.body);
         const { appointment, hours } = parsed;
 
-        const result = await prisma.$transaction(async (tx) => {
+        await prisma.$transaction(async (tx) => {
             // A) BusinessConfig
             await tx.businessConfig.upsert({
                 where: { empresaId },
@@ -351,6 +379,12 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentBufferMin: appointment.bufferMin,
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
+                    // crea mínimos para no romper constraints
+                    nombre: "",
+                    descripcion: "",
+                    servicios: "",
+                    faq: "",
+                    horarios: "",
                 },
                 update: {
                     appointmentEnabled: appointment.enabled,
@@ -386,23 +420,11 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     },
                 });
             }
-
-            const [configNow, hoursNow] = await Promise.all([
-                tx.businessConfig.findUnique({ where: { empresaId } }),
-                tx.appointmentHour.findMany({
-                    where: { empresaId },
-                    orderBy: { day: "asc" },
-                }),
-            ]);
-
-            return { config: configNow, hours: hoursNow };
         });
 
-        return res.json({ ok: true, data: result });
+        return res.json({ ok: true });
     } catch (err: any) {
         console.error("[saveAppointmentConfig] ❌", err);
-        return res
-            .status(400)
-            .json({ ok: false, error: err?.message || "bad_request" });
+        return res.status(400).json({ ok: false, error: err?.message || "bad_request" });
     }
 }
