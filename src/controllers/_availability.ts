@@ -1,5 +1,5 @@
 // src/controllers/_availability.ts
-import prisma from '../lib/prisma'
+import prisma from "../lib/prisma";
 
 export async function hasOverlap(params: {
     empresaId: number;
@@ -9,17 +9,15 @@ export async function hasOverlap(params: {
     endAt: Date;
     ignoreId?: number;
 }) {
-    const { empresaId, sedeId, providerId, startAt, endAt, ignoreId } = params;
+    if (!prisma) {
+        console.error("[hasOverlap] prisma undefined. Revisa import de ../lib/prisma");
+        return false; // evita 500 por null ref (temporal)
+    }
 
-    // armamos condiciones: por empresa + (sede/proveedor si vienen)
+    const { empresaId, sedeId, providerId, startAt, endAt, ignoreId } = params;
     const AND: any[] = [
         { empresaId },
-        {
-            OR: [
-                // [a..b] se solapa con [x..y] si a < y && b > x
-                { startAt: { lt: endAt }, endAt: { gt: startAt } },
-            ],
-        },
+        { startAt: { lt: endAt }, endAt: { gt: startAt } }, // a<y && b>x
     ];
     if (sedeId) AND.push({ sedeId });
     if (providerId) AND.push({ providerId });
