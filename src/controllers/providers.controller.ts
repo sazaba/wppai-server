@@ -1,8 +1,9 @@
 import { Request, Response } from "express";
 import prisma from '../lib/prisma'
+import { getEmpresaId } from "./_getEmpresaId";
 
 export async function listProviders(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
+    const empresaId = getEmpresaId(req);
     const data = await prisma.provider.findMany({
         where: { empresaId, activo: true },
         orderBy: { nombre: "asc" },
@@ -12,7 +13,7 @@ export async function listProviders(req: Request, res: Response) {
 }
 
 export async function createProvider(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
+    const empresaId = getEmpresaId(req);
     const { nombre, cargo, email, phone, colorHex } = req.body;
     if (!nombre) return res.status(400).json({ error: "nombre es requerido" });
 
@@ -23,7 +24,7 @@ export async function createProvider(req: Request, res: Response) {
 }
 
 export async function updateProvider(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
+    const empresaId = getEmpresaId(req);
     const id = Number(req.params.id);
     const { nombre, cargo, email, phone, colorHex, activo } = req.body;
 

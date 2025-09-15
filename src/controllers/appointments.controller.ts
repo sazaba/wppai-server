@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import prisma from '../lib/prisma'
 import { hasOverlap } from "./_availability";
+import { getEmpresaId } from "./_getEmpresaId";
 
 function parseDateParam(v?: string | string[]) {
     if (!v) return undefined;
@@ -11,7 +12,8 @@ function parseDateParam(v?: string | string[]) {
 
 // GET /api/appointments?from=&to=&sedeId=&serviceId=&providerId=
 export async function listAppointments(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
+
+    const empresaId = getEmpresaId(req);
     const { sedeId, serviceId, providerId } = req.query;
 
     const from = parseDateParam(req.query.from as any);
@@ -40,56 +42,62 @@ export async function listAppointments(req: Request, res: Response) {
 
 // POST /api/appointments
 export async function createAppointment(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
-    const {
-        sedeId, serviceId, providerId, conversationId,
-        source, status,
-        customerName, customerPhone, serviceName, notas,
-        startAt, endAt, timezone,
-    } = req.body;
+    try {
+        const empresaId = getEmpresaId(req); // ⬅️ ahora sí
+        const {
+            sedeId, serviceId, providerId, conversationId,
+            source, status,
+            customerName, customerPhone, serviceName, notas,
+            startAt, endAt, timezone,
+        } = req.body;
 
-    if (!customerName || !customerPhone || !serviceName || !startAt || !endAt) {
-        return res.status(400).json({ error: "Campos requeridos: customerName, customerPhone, serviceName, startAt, endAt" });
-    }
+        if (!customerName || !customerPhone || !serviceName || !startAt || !endAt) {
+            return res.status(400).json({ error: "Campos requeridos: customerName, customerPhone, serviceName, startAt, endAt" });
+        }
 
-    const start = new Date(startAt);
-    const end = new Date(endAt);
-    if (!(start < end)) return res.status(400).json({ error: "startAt debe ser menor que endAt" });
+        const start = new Date(startAt);
+        const end = new Date(endAt);
+        if (!(start < end)) return res.status(400).json({ error: "startAt debe ser menor que endAt" });
 
-    const overlap = await hasOverlap({
-        empresaId,
-        sedeId: sedeId ? Number(sedeId) : undefined,
-        providerId: providerId ? Number(providerId) : undefined,
-        startAt: start,
-        endAt: end,
-    });
-    if (overlap) return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
-
-    const appt = await prisma.appointment.create({
-        data: {
+        const overlap = await hasOverlap({
             empresaId,
-            sedeId: sedeId ? Number(sedeId) : null,
-            serviceId: serviceId ? Number(serviceId) : null,
-            providerId: providerId ? Number(providerId) : null,
-            conversationId: conversationId ? Number(conversationId) : null,
-            source: source ?? "client",
-            status: status ?? "pending",
-            customerName,
-            customerPhone,
-            serviceName,
-            notas: notas ?? null,
+            sedeId: sedeId ? Number(sedeId) : undefined,
+            providerId: providerId ? Number(providerId) : undefined,
             startAt: start,
             endAt: end,
-            timezone: timezone || "America/Bogota",
-        },
-    });
+        });
+        if (overlap) return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
 
-    res.status(201).json(appt);
+        const appt = await prisma.appointment.create({
+            data: {
+                empresaId,                                  // ⬅️ ya no es undefined
+                sedeId: sedeId ? Number(sedeId) : null,
+                serviceId: serviceId ? Number(serviceId) : null,
+                providerId: providerId ? Number(providerId) : null,
+                conversationId: conversationId ? Number(conversationId) : null,
+                source: source ?? "client",
+                status: status ?? "pending",
+                customerName,
+                customerPhone,
+                serviceName,
+                notas: notas ?? null,
+                startAt: start,
+                endAt: end,
+                timezone: timezone || "America/Bogota",
+            },
+        });
+
+        res.status(201).json(appt);
+    } catch (err: any) {
+        console.error("[createAppointment] ❌", err);
+        res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
+    }
 }
+
 
 // PUT /api/appointments/:id
 export async function updateAppointment(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
+    const empresaId = getEmpresaId(req);
     const id = Number(req.params.id);
     const patch = req.body;
 
@@ -141,7 +149,7 @@ export async function updateAppointment(req: Request, res: Response) {
 
 // PUT /api/appointments/:id/status
 export async function updateAppointmentStatus(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
+    const empresaId = getEmpresaId(req);
     const id = Number(req.params.id);
     const { status } = req.body as { status: any };
     if (!status) return res.status(400).json({ error: "status requerido" });
@@ -156,7 +164,7 @@ export async function updateAppointmentStatus(req: Request, res: Response) {
 
 // DELETE /api/appointments/:id
 export async function deleteAppointment(req: Request, res: Response) {
-    const empresaId = (req as any).empresaId as number;
+    const empresaId = getEmpresaId(req);
     const id = Number(req.params.id);
 
     const appt = await prisma.appointment.findUnique({ where: { id } });
