@@ -1,11 +1,11 @@
 // server/src/controllers/config.controller.ts
 import { Request, Response } from "express"
 import prisma from "../lib/prisma"
-// 👉 Importa tipos (solo para TypeScript) y el namespace Prisma para inputs
-import type { AiMode, AgentSpecialty, BusinessType, Prisma as PrismaTypes } from "@prisma/client"
-import { Prisma } from "@prisma/client" // <-- runtime para *inputs* (UncheckedCreate/UpdateInput)
+// 👉 Tipos (sólo TypeScript) y el namespace Prisma para inputs
+import type { AiMode, AgentSpecialty, BusinessType, AppointmentVertical } from "@prisma/client"
+import { Prisma } from "@prisma/client" // runtime: para *UncheckedCreate/UpdateInput*
 
-// Helpers básicos
+/* ---------------------- Helpers básicos ---------------------- */
 const s = (v: any, def = "") => (v === undefined || v === null ? def : String(v).trim())
 const b = (v: any, def = false) => (v === undefined || v === null ? def : Boolean(v))
 const nOrNull = (v: any) => {
@@ -18,7 +18,14 @@ const oneOf = <T extends string>(raw: any, allowed: readonly T[], def: T): T => 
     return (allowed as readonly string[]).includes(v) ? (v as T) : def
 }
 
-// ---- Mapeadores string -> *tipos* de Prisma (sin usar valores runtime)
+// JSON seguro (acepta objeto o string JSON; si falla, devuelve def)
+const parseJson = <T = any>(raw: any, def: T | null = null): T | null => {
+    if (raw === undefined || raw === null || raw === "") return def
+    if (typeof raw === "object") return raw as T
+    try { return JSON.parse(String(raw)) as T } catch { return def }
+}
+
+/* ---------------------- Mapeadores a enums ---------------------- */
 const toBusinessType = (v: "servicios" | "productos"): BusinessType =>
     (v === "productos" ? "productos" : "servicios") as BusinessType
 
@@ -32,7 +39,13 @@ const toAgentSpecialty = (
         ? v
         : "generico") as AgentSpecialty
 
-// === GET /api/config
+const toAppointmentVertical = (v: any): AppointmentVertical => {
+    const allowed: AppointmentVertical[] = ["none", "salud", "bienestar", "automotriz", "veterinaria", "fitness", "otros"]
+    const s = String(v ?? "").toLowerCase() as AppointmentVertical
+    return (allowed as readonly string[]).includes(s) ? (s as AppointmentVertical) : "none"
+}
+
+/* ---------------------- GET /api/config ---------------------- */
 export async function getConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
@@ -44,7 +57,7 @@ export async function getConfig(req: Request, res: Response) {
     }
 }
 
-// === PUT /api/config
+/* ---------------------- PUT /api/config ---------------------- */
 export async function upsertConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
 
@@ -71,7 +84,6 @@ export async function upsertConfig(req: Request, res: Response) {
     )
     const agentSpecialty = toAgentSpecialty(agentSpecialtyStr)
 
-    // Comparaciones con strings (runtime-safe)
     const agentPrompt = aiMode === "agente" ? (s(req.body?.agentPrompt) || null) : null
     const agentScope = aiMode === "agente" ? (s(req.body?.agentScope) || null) : null
     const agentDisclaimers = aiMode === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
@@ -116,13 +128,22 @@ export async function upsertConfig(req: Request, res: Response) {
     const facturaElectronicaInfo = s(req.body?.facturaElectronicaInfo)
     const soporteDevolucionesInfo = s(req.body?.soporteDevolucionesInfo)
 
+    // ====== Agenda / Citas (opcionales)
+    const appointmentEnabled = b(req.body?.appointmentEnabled, false)
+    const appointmentVertical = toAppointmentVertical(req.body?.appointmentVertical)
+    const appointmentTimezone = s(req.body?.appointmentTimezone || "America/Bogota") || "America/Bogota"
+    const appointmentBufferMin = Number(req.body?.appointmentBufferMin ?? 10) || 10
+    const appointmentPolicies = (req.body?.appointmentPolicies === null) ? null : (s(req.body?.appointmentPolicies) || null)
+    const appointmentReminders = b(req.body?.appointmentReminders, true)
+    // JSON: [{day:1,enabled:true,start:"08:00",end:"18:00"}, ...]
+    const appointmentWorkHours = parseJson(req.body?.appointmentWorkHours, null)
+
     // Validación mínima
     if (!nombre || !descripcion || !faq || !horarios) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
 
     try {
-        // Usa los tipos del *namespace* Prisma solo para inputs
         const data: Prisma.BusinessConfigUncheckedCreateInput = {
             empresaId,
             // base
@@ -179,12 +200,30 @@ export async function upsertConfig(req: Request, res: Response) {
             // post-venta
             facturaElectronicaInfo,
             soporteDevolucionesInfo,
+
+            // ===== agenda/citas
+            appointmentEnabled,
+            appointmentVertical,
+            appointmentTimezone,
+            appointmentBufferMin,
+            appointmentWorkHours: appointmentWorkHours as any,
+            appointmentPolicies,
+            appointmentReminders,
         }
 
         const toUpdate: Prisma.BusinessConfigUncheckedUpdateInput = { ...data }
         delete (toUpdate as any).empresaId
         if (envioCostoFijo === null) delete (toUpdate as any).envioCostoFijo
         if (envioGratisDesde === null) delete (toUpdate as any).envioGratisDesde
+
+        // evita sobrescribir si no vienen en body (opcional)
+        if (req.body?.appointmentEnabled === undefined) delete (toUpdate as any).appointmentEnabled
+        if (req.body?.appointmentVertical === undefined) delete (toUpdate as any).appointmentVertical
+        if (req.body?.appointmentTimezone === undefined) delete (toUpdate as any).appointmentTimezone
+        if (req.body?.appointmentBufferMin === undefined) delete (toUpdate as any).appointmentBufferMin
+        if (req.body?.appointmentWorkHours === undefined) delete (toUpdate as any).appointmentWorkHours
+        if (req.body?.appointmentPolicies === undefined) delete (toUpdate as any).appointmentPolicies
+        if (req.body?.appointmentReminders === undefined) delete (toUpdate as any).appointmentReminders
 
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
 
@@ -199,11 +238,8 @@ export async function upsertConfig(req: Request, res: Response) {
     }
 }
 
-/**
- * === PUT /api/config/agent
- * Guarda SOLO el modo/parametría del agente.
- */
-// === PUT /api/config/agent
+/* ---------------------- PUT /api/config/agent ---------------------- */
+/** Guarda SOLO el modo/perfil del agente (no toca agenda). */
 export async function upsertAgentConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
 
@@ -222,17 +258,11 @@ export async function upsertAgentConfig(req: Request, res: Response) {
     const agentDisclaimers = s(req.body?.agentDisclaimers) || null
 
     try {
-        // ⚠️ Campos obligatorios sin default en tu schema:
-        // descripcion, servicios, faq, horarios, disclaimers,
-        // enviosInfo, metodosPago, politicasDevolucion, politicasGarantia,
-        // promocionesInfo, canalesAtencion, extras
-        //
-        // Si el registro NO existe, los rellenamos con strings vacíos
-        // (válidos para TEXT) para no romper validaciones de Prisma.
+        // Si no existe el registro, creamos uno "mínimo" con strings vacíos para no romper validaciones.
         const createMinimos: Prisma.BusinessConfigUncheckedCreateInput = {
             empresaId,
-            // base
-            nombre: "",                    // tiene default("") en schema, pero lo enviamos igual
+            // base mínimas
+            nombre: "",
             descripcion: s(req.body?.descripcion) || "",
             servicios: s(req.body?.servicios) || "",
             faq: s(req.body?.faq) || "",
@@ -247,12 +277,11 @@ export async function upsertAgentConfig(req: Request, res: Response) {
             agentScope,
             agentDisclaimers,
 
-            // operación (mínimos requeridos)
+            // operación mínimas
             enviosInfo: s(req.body?.enviosInfo) || "",
             metodosPago: s(req.body?.metodosPago) || "",
             tiendaFisica: false,
             direccionTienda: "",
-
             politicasDevolucion: s(req.body?.politicasDevolucion) || "",
             politicasGarantia: s(req.body?.politicasGarantia) || "",
             promocionesInfo: s(req.body?.promocionesInfo) || "",
@@ -260,32 +289,31 @@ export async function upsertAgentConfig(req: Request, res: Response) {
             extras: s(req.body?.extras) || "",
             palabrasClaveNegocio: "",
 
-            // pagos (tienen defaults en schema; los enviamos igual por claridad)
+            // pagos/envíos (defaults)
             pagoLinkGenerico: "",
             pagoLinkProductoBase: "",
             pagoNotas: null,
-
             bancoNombre: "",
             bancoTitular: "",
             bancoTipoCuenta: "",
             bancoNumeroCuenta: "",
             bancoDocumento: "",
             transferenciaQRUrl: "",
-
-            // envíos (no son obligatorios)
             envioTipo: "",
             envioEntregaEstimado: "",
             envioCostoFijo: undefined as any,
             envioGratisDesde: undefined as any,
 
-            // post-venta (tienen default en schema)
+            // post-venta
             facturaElectronicaInfo: "",
             soporteDevolucionesInfo: "",
 
-            // escalamiento (tienen defaults en schema; los dejamos por compatibilidad)
+            // escalamiento
             escalarSiNoConfia: true,
             escalarPalabrasClave: "",
             escalarPorReintentos: 0,
+
+            // ⚠️ Agenda NO se toca desde este endpoint
         }
 
         const updateSoloAgente: Prisma.BusinessConfigUncheckedUpdateInput = {
@@ -294,8 +322,7 @@ export async function upsertAgentConfig(req: Request, res: Response) {
             agentPrompt,
             agentScope,
             agentDisclaimers,
-            // 👇 Si el front envía algunos de estos campos junto con el cambio del agente,
-            // aprovecha y actualízalos; si no vienen, no los toques.
+            // si vienen, actualiza algunos textos base también:
             ...(req.body?.descripcion !== undefined && { descripcion: s(req.body.descripcion) }),
             ...(req.body?.servicios !== undefined && { servicios: s(req.body.servicios) }),
             ...(req.body?.faq !== undefined && { faq: s(req.body.faq) }),
@@ -323,8 +350,7 @@ export async function upsertAgentConfig(req: Request, res: Response) {
     }
 }
 
-
-// === GET /api/config/all
+/* ---------------------- GET /api/config/all ---------------------- */
 export async function getAllConfigs(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     try {
@@ -339,7 +365,7 @@ export async function getAllConfigs(req: Request, res: Response) {
     }
 }
 
-// === DELETE /api/config/:id
+/* ---------------------- DELETE /api/config/:id ---------------------- */
 export async function deleteConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const id = Number(req.params.id)
@@ -356,7 +382,7 @@ export async function deleteConfig(req: Request, res: Response) {
     }
 }
 
-// === POST /api/config/reset?withCatalog=1
+/* ---------------------- POST /api/config/reset ---------------------- */
 export async function resetConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const withCatalog = ["1", "true", "yes"].includes(String(req.query.withCatalog || "").toLowerCase())
@@ -376,6 +402,5 @@ export async function resetConfig(req: Request, res: Response) {
     }
 }
 
-// 👇 pega esta línea justo después
+// Alias (compat)
 export const resetConfigDelete = resetConfig
-
