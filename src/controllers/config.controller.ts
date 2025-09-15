@@ -383,23 +383,35 @@ export async function deleteConfig(req: Request, res: Response) {
 /* ---------------------- POST /api/config/reset ---------------------- */
 export async function resetConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
-    const withCatalog = ["1", "true", "yes"].includes(String(req.query.withCatalog || "").toLowerCase())
+
+    // ya existente en tu código
+    const withCatalog = ["1", "true", "yes"].includes(
+        String(req.query.withCatalog || "").toLowerCase()
+    )
+
+    // opcional; por defecto borra horarios
+    const withAppointments =
+        !["0", "false", "no"].includes(String(req.query.withAppointments || "").toLowerCase())
 
     try {
         await prisma.$transaction(async (tx) => {
-            // 👇 NUEVO: limpia horarios de citas
-            await tx.appointmentHour.deleteMany({ where: { empresaId } }).catch(() => { })
+            // 🧹 Horarios de citas (si lo permites; por defecto sí)
+            if (withAppointments) {
+                await tx.appointmentHour.deleteMany({ where: { empresaId } }).catch(() => { })
+            }
 
-            // ya existente: borra la config del negocio
-            await tx.businessConfig.delete({ where: { empresaId } }).catch(() => { })
+            // 🧹 Config del negocio — usar deleteMany por si existe “basura” duplicada
+            await tx.businessConfig.deleteMany({ where: { empresaId } }).catch(() => { })
 
-            // opcional: catálogo
+            // 🧹 Catálogo (opcional)
             if (withCatalog) {
-                await tx.productImage.deleteMany({ where: { product: { empresaId } } })
-                await tx.product.deleteMany({ where: { empresaId } })
+                await tx.productImage.deleteMany({ where: { product: { empresaId } } }).catch(() => { })
+                await tx.product.deleteMany({ where: { empresaId } }).catch(() => { })
             }
         })
-        return res.json({ ok: true, withCatalog })
+
+        // contrato compatible (solo agrego withAppointments como info extra)
+        return res.json({ ok: true, withCatalog, withAppointments })
     } catch (error) {
         console.error("[resetConfig] error:", error)
         return res.status(500).json({ error: "No se pudo reiniciar la configuración" })
