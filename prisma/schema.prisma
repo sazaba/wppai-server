@@ -105,6 +105,16 @@ enum AppointmentVertical {
   otros
 }
 
+enum Weekday {
+  mon
+  tue
+  wed
+  thu
+  fri
+  sat
+  sun
+}
+
 /**
  * ========== Modelos base ==========
  */
@@ -140,14 +150,15 @@ model Empresa {
 
   orders Order[] // NUEVO: pedidos asociados
 
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
-  Message     Message[]
-  Product     Product[]
-  Sede        Sede[]
-  Service     Service[]
-  Provider    Provider[]
-  Appointment Appointment[]
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  Message         Message[]
+  Product         Product[]
+  Sede            Sede[]
+  Service         Service[]
+  Provider        Provider[]
+  Appointment     Appointment[]
+  AppointmentHour AppointmentHour[]
 
   @@map("empresa")
 }
@@ -519,4 +530,26 @@ model Appointment {
   @@index([empresaId, status, startAt])
   @@index([conversationId])
   @@map("appointment")
+}
+
+model AppointmentHour {
+  id        Int     @id @default(autoincrement())
+  empresaId Int
+  day       Weekday
+  isOpen    Boolean @default(false)
+
+  // Horas en formato "HH:MM" (24h)
+  start1 String? @db.VarChar(5)
+  end1   String? @db.VarChar(5)
+  start2 String? @db.VarChar(5)
+  end2   String? @db.VarChar(5)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@unique([empresaId, day])
+  @@index([empresaId, day])
+  @@map("appointmenthour")
 }
