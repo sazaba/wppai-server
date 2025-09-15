@@ -1,32 +1,28 @@
 // src/controllers/_availability.ts
 import prisma from "../lib/prisma";
 
-export async function hasOverlap(params: {
+type OverlapArgs = {
     empresaId: number;
-    sedeId?: number | null;
-    providerId?: number | null;
     startAt: Date;
     endAt: Date;
     ignoreId?: number;
-}) {
-    if (!prisma) {
-        console.error("[hasOverlap] prisma undefined. Revisa import de ../lib/prisma");
-        return false; // evita 500 por null ref (temporal)
-    }
+};
 
-    const { empresaId, sedeId, providerId, startAt, endAt, ignoreId } = params;
-    const AND: any[] = [
-        { empresaId },
-        { startAt: { lt: endAt }, endAt: { gt: startAt } }, // a<y && b>x
-    ];
-    if (sedeId) AND.push({ sedeId });
-    if (providerId) AND.push({ providerId });
+/**
+ * ¿Existe una cita que solape con [startAt, endAt)?
+ * Regla: (a.start < b.end) && (a.end > b.start)
+ */
+export async function hasOverlap(args: OverlapArgs): Promise<boolean> {
+    const { empresaId, startAt, endAt, ignoreId } = args;
 
     const conflict = await prisma.appointment.findFirst({
         where: {
-            AND,
+            empresaId,
             ...(ignoreId ? { NOT: { id: ignoreId } } : {}),
-            status: { not: "cancelled" },
+            AND: [
+                { startAt: { lt: endAt } }, // a.start < b.end
+                { endAt: { gt: startAt } } // a.end > b.start
+            ],
         },
         select: { id: true },
     });

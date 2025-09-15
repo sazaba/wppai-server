@@ -148,15 +148,12 @@ model Empresa {
   cuentaWhatsapp   WhatsappAccount?
   messageTemplates MessageTemplate[]
 
-  orders Order[] // NUEVO: pedidos asociados
+  orders Order[] // pedidos asociados
 
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
   Message         Message[]
   Product         Product[]
-  Sede            Sede[]
-  Service         Service[]
-  Provider        Provider[]
   Appointment     Appointment[]
   AppointmentHour AppointmentHour[]
 
@@ -219,7 +216,7 @@ model BusinessConfig {
   id           Int          @id @default(autoincrement())
   empresaId    Int          @unique
   nombre       String       @default("")
-  // 🔽 Hacemos opcionales los TEXT que antes eran requeridos
+  // 🔽 Campos de texto opcionales
   descripcion  String?      @db.Text
   servicios    String?      @db.Text
   faq          String?      @db.Text
@@ -442,68 +439,9 @@ model PaymentReceipt {
   @@map("paymentreceipt")
 }
 
-model Sede {
-  id        Int     @id @default(autoincrement())
-  empresaId Int
-  nombre    String
-  timezone  String  @default("America/Bogota")
-  direccion String  @default("")
-  activo    Boolean @default(true)
-
-  empresa      Empresa       @relation(fields: [empresaId], references: [id])
-  appointments Appointment[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([empresaId, activo])
-  @@map("sede")
-}
-
-model Service {
-  id          Int      @id @default(autoincrement())
-  empresaId   Int
-  nombre      String
-  duracionMin Int      @default(30)
-  precioDesde Decimal?
-  activo      Boolean  @default(true)
-
-  empresa      Empresa       @relation(fields: [empresaId], references: [id])
-  appointments Appointment[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([empresaId, activo, nombre])
-  @@map("service")
-}
-
-model Provider {
-  id        Int     @id @default(autoincrement())
-  empresaId Int
-  nombre    String
-  cargo     String  @default("")
-  email     String  @default("")
-  phone     String  @default("")
-  colorHex  String  @default("") // para UI
-  activo    Boolean @default(true)
-
-  empresa      Empresa       @relation(fields: [empresaId], references: [id])
-  appointments Appointment[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([empresaId, activo, nombre])
-  @@map("provider")
-}
-
 model Appointment {
   id             Int               @id @default(autoincrement())
   empresaId      Int
-  sedeId         Int?
-  serviceId      Int?
-  providerId     Int?
   conversationId Int?
   source         AppointmentSource @default(client)
   status         AppointmentStatus @default(pending)
@@ -513,14 +451,11 @@ model Appointment {
   serviceName   String
   notas         String? @db.Text
 
-  startAt  DateTime // <-- Faltaba en tu captura
+  startAt  DateTime
   endAt    DateTime
   timezone String   @default("America/Bogota")
 
   empresa      Empresa       @relation(fields: [empresaId], references: [id])
-  sede         Sede?         @relation(fields: [sedeId], references: [id])
-  service      Service?      @relation(fields: [serviceId], references: [id])
-  provider     Provider?     @relation(fields: [providerId], references: [id])
   conversation Conversation? @relation(fields: [conversationId], references: [id])
 
   createdAt DateTime @default(now())

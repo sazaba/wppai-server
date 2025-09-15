@@ -20,10 +20,7 @@ import mediaProxyRouter from './routes/mediaProxy.route'
 import ordersRouter from "./routes/orders.routes"
 import paymentsRouter from "./routes/payments.routes"
 import registerRoutes from './routes/whatsapp.register.routes'
-// Agenda (nuevas rutas)
-import sedesRoutes from './routes/sedes.routes'
-import servicesRoutes from './routes/services.routes'
-import providersRoutes from './routes/providers.routes'
+// Agenda 
 import appointmentsRoutes from './routes/appointments.routes'
 import appointmentHoursRoutes from './routes/appointmentHours.routes'
 
@@ -157,9 +154,7 @@ app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
 
 // 🗓️ Agenda (NUEVO)
-app.use('/api/sedes', sedesRoutes)
-app.use('/api/services', servicesRoutes)
-app.use('/api/providers', providersRoutes)
+
 app.use('/api/appointments', appointmentsRoutes)
 app.use('/api/appointment-hours', appointmentHoursRoutes)
 // 404 JSON final

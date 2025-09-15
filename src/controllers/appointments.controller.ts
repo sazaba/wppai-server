@@ -3,6 +3,7 @@ import { Request, Response } from "express";
 import prisma from "../lib/prisma";
 import { hasOverlap } from "./_availability";
 import { getEmpresaId } from "./_getEmpresaId";
+import { z } from "zod";
 
 /* ===================== Helpers ===================== */
 
@@ -35,8 +36,8 @@ function isInsideRanges(
     return inR1 || inR2;
 }
 
-/** Valida que (start,end) estén en un día abierto y dentro de los rangos HH:MM configurados.
- *  Si no hay registro de `AppointmentHour` para ese día, se asume permitido. */
+/** Valida que (start,end) estén dentro de la disponibilidad del día (si existe).
+ *  Si no hay AppointmentHour para ese día, se permite. */
 async function ensureWithinBusinessHours(opts: {
     empresaId: number;
     start: Date;
@@ -44,15 +45,14 @@ async function ensureWithinBusinessHours(opts: {
 }) {
     const { empresaId, start, end } = opts;
 
-    // Solo validamos si es la misma fecha de inicio y fin (misma día)
+    // Solo validamos si inicio y fin son el mismo día
     const sameDay =
         start.getFullYear() === end.getFullYear() &&
         start.getMonth() === end.getMonth() &&
         start.getDate() === end.getDate();
 
     if (!sameDay) {
-        // Si quieres prohibir citas que crucen medianoche, rechaza aquí.
-        // return { ok:false, code:400, msg:"La cita no puede cruzar de día" };
+        // Si quieres prohibir cruzar medianoche, devolver error aquí.
         return { ok: true };
     }
 
@@ -78,8 +78,7 @@ async function ensureWithinBusinessHours(opts: {
         return {
             ok: false,
             code: 409,
-            msg:
-                "Horario fuera de disponibilidad. Ajusta a los rangos permitidos del día.",
+            msg: "Horario fuera de disponibilidad. Ajusta a los rangos permitidos del día.",
         };
     }
 
@@ -87,19 +86,15 @@ async function ensureWithinBusinessHours(opts: {
 }
 
 /* ===================== List ===================== */
-// GET /api/appointments?from=&to=&sedeId=&serviceId=&providerId=
+// GET /api/appointments?from=&to=
 export async function listAppointments(req: Request, res: Response) {
     const empresaId = getEmpresaId(req);
-    const { sedeId, serviceId, providerId } = req.query;
 
     const from = parseDateParam(req.query.from as any);
     const to = parseDateParam(req.query.to as any);
 
     const AND: any[] = [{ empresaId }];
     if (from && to) AND.push({ startAt: { gte: from }, endAt: { lte: to } });
-    if (sedeId) AND.push({ sedeId: Number(sedeId) });
-    if (serviceId) AND.push({ serviceId: Number(serviceId) });
-    if (providerId) AND.push({ providerId: Number(providerId) });
 
     const data = await prisma.appointment.findMany({
         where: { AND },
@@ -107,9 +102,6 @@ export async function listAppointments(req: Request, res: Response) {
         select: {
             id: true,
             empresaId: true,
-            sedeId: true,
-            serviceId: true,
-            providerId: true,
             conversationId: true,
             source: true,
             status: true,
@@ -120,6 +112,8 @@ export async function listAppointments(req: Request, res: Response) {
             startAt: true,
             endAt: true,
             timezone: true,
+            createdAt: true,
+            updatedAt: true,
         },
     });
 
@@ -132,9 +126,6 @@ export async function createAppointment(req: Request, res: Response) {
     try {
         const empresaId = getEmpresaId(req);
         const {
-            sedeId,
-            serviceId,
-            providerId,
             conversationId,
             source,
             status,
@@ -157,31 +148,20 @@ export async function createAppointment(req: Request, res: Response) {
         const start = new Date(startAt);
         const end = new Date(endAt);
         if (!(start < end))
-            return res
-                .status(400)
-                .json({ error: "startAt debe ser menor que endAt" });
+            return res.status(400).json({ error: "startAt debe ser menor que endAt" });
 
-        // 1) Validar horario de atención (si hay configurado)
+        // 1) Horario de atención
         const wh = await ensureWithinBusinessHours({ empresaId, start, end });
         if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
-        // 2) Validar solapamiento
-        const overlap = await hasOverlap({
-            empresaId,
-            sedeId: sedeId ? Number(sedeId) : undefined,
-            providerId: providerId ? Number(providerId) : undefined,
-            startAt: start,
-            endAt: end,
-        });
+        // 2) Solapamiento
+        const overlap = await hasOverlap({ empresaId, startAt: start, endAt: end });
         if (overlap)
             return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
 
         const appt = await prisma.appointment.create({
             data: {
                 empresaId,
-                sedeId: sedeId ? Number(sedeId) : null,
-                serviceId: serviceId ? Number(serviceId) : null,
-                providerId: providerId ? Number(providerId) : null,
                 conversationId: conversationId ? Number(conversationId) : null,
                 source: (source as any) ?? "client",
                 status: (status as any) ?? "pending",
@@ -198,9 +178,7 @@ export async function createAppointment(req: Request, res: Response) {
         res.status(201).json(appt);
     } catch (err: any) {
         console.error("[createAppointment] ❌", err);
-        res
-            .status(err?.status || 500)
-            .json({ error: err?.message || "Error interno" });
+        res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
     }
 }
 
@@ -222,39 +200,29 @@ export async function updateAppointment(req: Request, res: Response) {
         if (patch.startAt) start = new Date(patch.startAt);
         if (patch.endAt) end = new Date(patch.endAt);
         if (!(start < end))
-            return res
-                .status(400)
-                .json({ error: "startAt debe ser menor que endAt" });
+            return res.status(400).json({ error: "startAt debe ser menor que endAt" });
 
-        const changedWindow =
-            patch.startAt || patch.endAt || patch.sedeId || patch.providerId;
+        const changedWindow = Boolean(patch.startAt || patch.endAt);
 
         if (changedWindow) {
-            // Validar horario de atención
+            // Horario de atención
             const wh = await ensureWithinBusinessHours({ empresaId, start, end });
             if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
-            // Validar solapamiento
+            // Solapamiento (ignorando la propia cita)
             const overlap = await hasOverlap({
                 empresaId,
-                sedeId: patch.sedeId ?? existing.sedeId ?? undefined,
-                providerId: patch.providerId ?? existing.providerId ?? undefined,
                 startAt: start,
                 endAt: end,
                 ignoreId: id,
             });
             if (overlap)
-                return res
-                    .status(409)
-                    .json({ error: "Existe otra cita en ese intervalo" });
+                return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
         }
 
         const appt = await prisma.appointment.update({
             where: { id },
             data: {
-                sedeId: patch.sedeId ?? existing.sedeId,
-                serviceId: patch.serviceId ?? existing.serviceId,
-                providerId: patch.providerId ?? existing.providerId,
                 conversationId: patch.conversationId ?? existing.conversationId,
                 source: (patch.source as any) ?? existing.source,
                 status: (patch.status as any) ?? existing.status,
@@ -271,9 +239,7 @@ export async function updateAppointment(req: Request, res: Response) {
         res.json(appt);
     } catch (err: any) {
         console.error("[updateAppointment] ❌", err);
-        res
-            .status(err?.status || 500)
-            .json({ error: err?.message || "Error interno" });
+        res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
     }
 }
 
@@ -295,9 +261,7 @@ export async function updateAppointmentStatus(req: Request, res: Response) {
         res.json(appt);
     } catch (err: any) {
         console.error("[updateAppointmentStatus] ❌", err);
-        res
-            .status(err?.status || 500)
-            .json({ error: err?.message || "Error interno" });
+        res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
     }
 }
 
@@ -316,48 +280,55 @@ export async function deleteAppointment(req: Request, res: Response) {
         res.json({ ok: true });
     } catch (err: any) {
         console.error("[deleteAppointment] ❌", err);
-        res
-            .status(err?.status || 500)
-            .json({ error: err?.message || "Error interno" });
+        res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
     }
 }
 
-// ===================== CONFIG (save + get) =====================
-import { z } from 'zod';
+/* ===================== CONFIG (save + get) ===================== */
 
 const timeZ = z.string().regex(/^\d{2}:\d{2}$/).nullable().optional();
-const dayZ = z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']);
+const dayZ = z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
 
 const saveConfigDtoZ = z.object({
     appointment: z.object({
         enabled: z.boolean(),
-        vertical: z.enum(['none', 'salud', 'bienestar', 'automotriz', 'veterinaria', 'fitness', 'otros']),
+        vertical: z.enum([
+            "none",
+            "salud",
+            "bienestar",
+            "automotriz",
+            "veterinaria",
+            "fitness",
+            "otros",
+        ]),
         timezone: z.string(),
         bufferMin: z.number().int().min(0).max(240),
         policies: z.string().nullable().optional(),
         reminders: z.boolean(),
     }),
-    hours: z.array(z.object({
-        day: dayZ,
-        isOpen: z.boolean(),
-        start1: timeZ, end1: timeZ, start2: timeZ, end2: timeZ,
-    })).length(7, 'Deben venir los 7 días'),
-    provider: z.object({
-        id: z.number().int().optional(),
-        nombre: z.string().min(1),
-        cargo: z.string().optional(),
-        email: z.string().optional(),
-        phone: z.string().optional(),
-        colorHex: z.string().optional(),
-        activo: z.boolean().optional(),
-    }).nullable().optional(),
+    hours: z
+        .array(
+            z.object({
+                day: dayZ,
+                isOpen: z.boolean(),
+                start1: timeZ,
+                end1: timeZ,
+                start2: timeZ,
+                end2: timeZ,
+            })
+        )
+        .length(7, "Deben venir los 7 días"),
+    // Eliminado: provider
 });
 
 export async function getAppointmentConfig(req: Request, res: Response) {
     const empresaId = getEmpresaId(req);
     const [config, hours] = await Promise.all([
         prisma.businessConfig.findUnique({ where: { empresaId } }),
-        prisma.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: 'asc' } }),
+        prisma.appointmentHour.findMany({
+            where: { empresaId },
+            orderBy: { day: "asc" },
+        }),
     ]);
     return res.json({ ok: true, data: { config, hours } });
 }
@@ -366,7 +337,7 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
     try {
         const empresaId = getEmpresaId(req);
         const parsed = saveConfigDtoZ.parse(req.body);
-        const { appointment, hours, provider } = parsed;
+        const { appointment, hours } = parsed;
 
         const result = await prisma.$transaction(async (tx) => {
             // A) BusinessConfig
@@ -416,48 +387,22 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                 });
             }
 
-            // C) Provider opcional (si quieres guardar “agente”)
-            let savedProvider: any = null;
-            if (provider) {
-                if (provider.id) {
-                    savedProvider = await tx.provider.update({
-                        where: { id: provider.id },
-                        data: {
-                            nombre: provider.nombre,
-                            cargo: provider.cargo ?? '',
-                            email: provider.email ?? '',
-                            phone: provider.phone ?? '',
-                            colorHex: provider.colorHex ?? '',
-                            activo: provider.activo ?? true,
-                            updatedAt: new Date(),
-                        },
-                    });
-                } else {
-                    savedProvider = await tx.provider.create({
-                        data: {
-                            empresaId,
-                            nombre: provider.nombre,
-                            cargo: provider.cargo ?? '',
-                            email: provider.email ?? '',
-                            phone: provider.phone ?? '',
-                            colorHex: provider.colorHex ?? '',
-                            activo: provider.activo ?? true,
-                        },
-                    });
-                }
-            }
-
             const [configNow, hoursNow] = await Promise.all([
                 tx.businessConfig.findUnique({ where: { empresaId } }),
-                tx.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: 'asc' } }),
+                tx.appointmentHour.findMany({
+                    where: { empresaId },
+                    orderBy: { day: "asc" },
+                }),
             ]);
 
-            return { config: configNow, hours: hoursNow, provider: savedProvider };
+            return { config: configNow, hours: hoursNow };
         });
 
         return res.json({ ok: true, data: result });
     } catch (err: any) {
-        console.error('[saveAppointmentConfig] ❌', err);
-        return res.status(400).json({ ok: false, error: err?.message || 'bad_request' });
+        console.error("[saveAppointmentConfig] ❌", err);
+        return res
+            .status(400)
+            .json({ ok: false, error: err?.message || "bad_request" });
     }
 }
