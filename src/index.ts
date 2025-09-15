@@ -20,6 +20,12 @@ import mediaProxyRouter from './routes/mediaProxy.route'
 import ordersRouter from "./routes/orders.routes"
 import paymentsRouter from "./routes/payments.routes"
 import registerRoutes from './routes/whatsapp.register.routes'
+// Agenda (nuevas rutas)
+import sedesRoutes from './routes/sedes.routes'
+import servicesRoutes from './routes/services.routes'
+import providersRoutes from './routes/providers.routes'
+import appointmentsRoutes from './routes/appointments.routes'
+
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -148,6 +154,12 @@ app.use('/api/templates', messageTemplateRoutes)
 app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
+
+// 🗓️ Agenda (NUEVO)
+app.use('/api/sedes', sedesRoutes)
+app.use('/api/services', servicesRoutes)
+app.use('/api/providers', providersRoutes)
+app.use('/api/appointments', appointmentsRoutes)
 
 // 404 JSON final
 app.use((req, res) => {

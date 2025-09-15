@@ -80,6 +80,31 @@ enum StorageProvider {
   cloudflare_image
 }
 
+enum AppointmentStatus {
+  pending
+  confirmed
+  rescheduled
+  cancelled
+  completed
+  no_show
+}
+
+enum AppointmentSource {
+  ai
+  agent
+  client
+}
+
+enum AppointmentVertical {
+  none
+  salud // odontología, estética, nutrición, etc.
+  bienestar // spa, peluquería, barbería
+  automotriz // taller, mantenimiento
+  veterinaria
+  fitness // gimnasios, entrenadores
+  otros
+}
+
 /**
  * ========== Modelos base ==========
  */
@@ -115,10 +140,14 @@ model Empresa {
 
   orders Order[] // NUEVO: pedidos asociados
 
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  Message   Message[]
-  Product   Product[]
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  Message     Message[]
+  Product     Product[]
+  Sede        Sede[]
+  Service     Service[]
+  Provider    Provider[]
+  Appointment Appointment[]
 
   @@map("empresa")
 }
@@ -169,7 +198,8 @@ model Conversation {
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
-  orders Order[] // pedidos creados desde esta conversación
+  orders      Order[] // pedidos creados desde esta conversación
+  Appointment Appointment[]
 
   @@map("conversation")
 }
@@ -234,6 +264,15 @@ model BusinessConfig {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // ===== Agenda / Citas
+  appointmentEnabled   Boolean             @default(false)
+  appointmentVertical  AppointmentVertical @default(none)
+  appointmentTimezone  String              @default("America/Bogota")
+  appointmentBufferMin Int                 @default(10)
+  appointmentWorkHours Json?
+  appointmentPolicies  String?             @db.Text
+  appointmentReminders Boolean             @default(true)
 
   Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 
@@ -390,4 +429,94 @@ model PaymentReceipt {
 
   @@index([orderId, isVerified])
   @@map("paymentreceipt")
+}
+
+model Sede {
+  id        Int     @id @default(autoincrement())
+  empresaId Int
+  nombre    String
+  timezone  String  @default("America/Bogota")
+  direccion String  @default("")
+  activo    Boolean @default(true)
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id])
+  appointments Appointment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([empresaId, activo])
+  @@map("sede")
+}
+
+model Service {
+  id          Int      @id @default(autoincrement())
+  empresaId   Int
+  nombre      String
+  duracionMin Int      @default(30)
+  precioDesde Decimal?
+  activo      Boolean  @default(true)
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id])
+  appointments Appointment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([empresaId, activo, nombre])
+  @@map("service")
+}
+
+model Provider {
+  id        Int     @id @default(autoincrement())
+  empresaId Int
+  nombre    String
+  cargo     String  @default("")
+  email     String  @default("")
+  phone     String  @default("")
+  colorHex  String  @default("") // para UI
+  activo    Boolean @default(true)
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id])
+  appointments Appointment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([empresaId, activo, nombre])
+  @@map("provider")
+}
+
+model Appointment {
+  id             Int               @id @default(autoincrement())
+  empresaId      Int
+  sedeId         Int?
+  serviceId      Int?
+  providerId     Int?
+  conversationId Int?
+  source         AppointmentSource @default(client)
+  status         AppointmentStatus @default(pending)
+
+  customerName  String
+  customerPhone String
+  serviceName   String
+  notas         String? @db.Text
+
+  startAt  DateTime // <-- Faltaba en tu captura
+  endAt    DateTime
+  timezone String   @default("America/Bogota")
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id])
+  sede         Sede?         @relation(fields: [sedeId], references: [id])
+  service      Service?      @relation(fields: [serviceId], references: [id])
+  provider     Provider?     @relation(fields: [providerId], references: [id])
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([empresaId, startAt, endAt])
+  @@index([empresaId, status, startAt])
+  @@index([conversationId])
+  @@map("appointment")
 }
