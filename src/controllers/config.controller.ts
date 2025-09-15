@@ -135,8 +135,7 @@ export async function upsertConfig(req: Request, res: Response) {
     const appointmentBufferMin = Number(req.body?.appointmentBufferMin ?? 10) || 10
     const appointmentPolicies = (req.body?.appointmentPolicies === null) ? null : (s(req.body?.appointmentPolicies) || null)
     const appointmentReminders = b(req.body?.appointmentReminders, true)
-    // JSON: [{day:1,enabled:true,start:"08:00",end:"18:00"}, ...]
-    const appointmentWorkHours = parseJson(req.body?.appointmentWorkHours, null)
+    // 🚫 Eliminado appointmentWorkHours (ya no existe en el modelo)
 
     // Validación mínima
     if (!nombre || !descripcion || !faq || !horarios) {
@@ -206,7 +205,6 @@ export async function upsertConfig(req: Request, res: Response) {
             appointmentVertical,
             appointmentTimezone,
             appointmentBufferMin,
-            appointmentWorkHours: appointmentWorkHours as any,
             appointmentPolicies,
             appointmentReminders,
         }
@@ -221,7 +219,6 @@ export async function upsertConfig(req: Request, res: Response) {
         if (req.body?.appointmentVertical === undefined) delete (toUpdate as any).appointmentVertical
         if (req.body?.appointmentTimezone === undefined) delete (toUpdate as any).appointmentTimezone
         if (req.body?.appointmentBufferMin === undefined) delete (toUpdate as any).appointmentBufferMin
-        if (req.body?.appointmentWorkHours === undefined) delete (toUpdate as any).appointmentWorkHours
         if (req.body?.appointmentPolicies === undefined) delete (toUpdate as any).appointmentPolicies
         if (req.body?.appointmentReminders === undefined) delete (toUpdate as any).appointmentReminders
 

@@ -209,6 +209,9 @@ model Conversation {
   orders      Order[] // pedidos creados desde esta conversación
   Appointment Appointment[]
 
+  // 🔎 Índices útiles para dashboard/IA
+  @@index([empresaId, estado, createdAt])
+  @@index([empresaId, phone])
   @@map("conversation")
 }
 
@@ -278,7 +281,7 @@ model BusinessConfig {
   appointmentVertical  AppointmentVertical @default(none)
   appointmentTimezone  String              @default("America/Bogota")
   appointmentBufferMin Int                 @default(10)
-  appointmentWorkHours Json?
+  // appointmentWorkHours Json?  // ❌ eliminado para evitar doble fuente
   appointmentPolicies  String?             @db.Text
   appointmentReminders Boolean             @default(true)
 
@@ -464,6 +467,7 @@ model Appointment {
   @@index([empresaId, startAt, endAt])
   @@index([empresaId, status, startAt])
   @@index([conversationId])
+  @@index([empresaId, customerPhone, startAt]) // 🔎 nuevo índice útil para búsquedas por cliente
   @@map("appointment")
 }
 
