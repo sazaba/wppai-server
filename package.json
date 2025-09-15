@@ -6,7 +6,9 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "tsx src/index.ts",
-    "start": "tsx src/index.ts"
+    "start": "tsx src/index.ts",
+    "migrate:dev": "dotenv -e .env -- prisma migrate dev",
+    "migrate:deploy": "dotenv -e .env.prod -- prisma migrate deploy"
   },
   "keywords": [],
   "author": "",
@@ -43,6 +45,7 @@
     "@types/multer": "^2.0.0",
     "@types/node": "^24.3.0",
     "@types/tmp": "^0.2.6",
+    "dotenv-cli": "^10.0.0",
     "prisma": "^6.11.1",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"
