@@ -380,13 +380,20 @@ export async function deleteConfig(req: Request, res: Response) {
 }
 
 /* ---------------------- POST /api/config/reset ---------------------- */
+/* ---------------------- POST /api/config/reset ---------------------- */
 export async function resetConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
     const withCatalog = ["1", "true", "yes"].includes(String(req.query.withCatalog || "").toLowerCase())
 
     try {
         await prisma.$transaction(async (tx) => {
+            // 👇 NUEVO: limpia horarios de citas
+            await tx.appointmentHour.deleteMany({ where: { empresaId } }).catch(() => { })
+
+            // ya existente: borra la config del negocio
             await tx.businessConfig.delete({ where: { empresaId } }).catch(() => { })
+
+            // opcional: catálogo
             if (withCatalog) {
                 await tx.productImage.deleteMany({ where: { product: { empresaId } } })
                 await tx.product.deleteMany({ where: { empresaId } })
