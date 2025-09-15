@@ -321,3 +321,143 @@ export async function deleteAppointment(req: Request, res: Response) {
             .json({ error: err?.message || "Error interno" });
     }
 }
+
+// ===================== CONFIG (save + get) =====================
+import { z } from 'zod';
+
+const timeZ = z.string().regex(/^\d{2}:\d{2}$/).nullable().optional();
+const dayZ = z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']);
+
+const saveConfigDtoZ = z.object({
+    appointment: z.object({
+        enabled: z.boolean(),
+        vertical: z.enum(['none', 'salud', 'bienestar', 'automotriz', 'veterinaria', 'fitness', 'otros']),
+        timezone: z.string(),
+        bufferMin: z.number().int().min(0).max(240),
+        policies: z.string().nullable().optional(),
+        reminders: z.boolean(),
+    }),
+    hours: z.array(z.object({
+        day: dayZ,
+        isOpen: z.boolean(),
+        start1: timeZ, end1: timeZ, start2: timeZ, end2: timeZ,
+    })).length(7, 'Deben venir los 7 días'),
+    provider: z.object({
+        id: z.number().int().optional(),
+        nombre: z.string().min(1),
+        cargo: z.string().optional(),
+        email: z.string().optional(),
+        phone: z.string().optional(),
+        colorHex: z.string().optional(),
+        activo: z.boolean().optional(),
+    }).nullable().optional(),
+});
+
+export async function getAppointmentConfig(req: Request, res: Response) {
+    const empresaId = getEmpresaId(req);
+    const [config, hours] = await Promise.all([
+        prisma.businessConfig.findUnique({ where: { empresaId } }),
+        prisma.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: 'asc' } }),
+    ]);
+    return res.json({ ok: true, data: { config, hours } });
+}
+
+export async function saveAppointmentConfig(req: Request, res: Response) {
+    try {
+        const empresaId = getEmpresaId(req);
+        const parsed = saveConfigDtoZ.parse(req.body);
+        const { appointment, hours, provider } = parsed;
+
+        const result = await prisma.$transaction(async (tx) => {
+            // A) BusinessConfig
+            await tx.businessConfig.upsert({
+                where: { empresaId },
+                create: {
+                    empresaId,
+                    appointmentEnabled: appointment.enabled,
+                    appointmentVertical: appointment.vertical as any,
+                    appointmentTimezone: appointment.timezone,
+                    appointmentBufferMin: appointment.bufferMin,
+                    appointmentPolicies: appointment.policies ?? null,
+                    appointmentReminders: appointment.reminders,
+                },
+                update: {
+                    appointmentEnabled: appointment.enabled,
+                    appointmentVertical: appointment.vertical as any,
+                    appointmentTimezone: appointment.timezone,
+                    appointmentBufferMin: appointment.bufferMin,
+                    appointmentPolicies: appointment.policies ?? null,
+                    appointmentReminders: appointment.reminders,
+                    updatedAt: new Date(),
+                },
+            });
+
+            // B) Horarios (upsert por día)
+            for (const h of hours) {
+                await tx.appointmentHour.upsert({
+                    where: { empresaId_day: { empresaId, day: h.day as any } },
+                    create: {
+                        empresaId,
+                        day: h.day as any,
+                        isOpen: h.isOpen,
+                        start1: h.start1 ?? null,
+                        end1: h.end1 ?? null,
+                        start2: h.start2 ?? null,
+                        end2: h.end2 ?? null,
+                    },
+                    update: {
+                        isOpen: h.isOpen,
+                        start1: h.start1 ?? null,
+                        end1: h.end1 ?? null,
+                        start2: h.start2 ?? null,
+                        end2: h.end2 ?? null,
+                        updatedAt: new Date(),
+                    },
+                });
+            }
+
+            // C) Provider opcional (si quieres guardar “agente”)
+            let savedProvider: any = null;
+            if (provider) {
+                if (provider.id) {
+                    savedProvider = await tx.provider.update({
+                        where: { id: provider.id },
+                        data: {
+                            nombre: provider.nombre,
+                            cargo: provider.cargo ?? '',
+                            email: provider.email ?? '',
+                            phone: provider.phone ?? '',
+                            colorHex: provider.colorHex ?? '',
+                            activo: provider.activo ?? true,
+                            updatedAt: new Date(),
+                        },
+                    });
+                } else {
+                    savedProvider = await tx.provider.create({
+                        data: {
+                            empresaId,
+                            nombre: provider.nombre,
+                            cargo: provider.cargo ?? '',
+                            email: provider.email ?? '',
+                            phone: provider.phone ?? '',
+                            colorHex: provider.colorHex ?? '',
+                            activo: provider.activo ?? true,
+                        },
+                    });
+                }
+            }
+
+            const [configNow, hoursNow] = await Promise.all([
+                tx.businessConfig.findUnique({ where: { empresaId } }),
+                tx.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: 'asc' } }),
+            ]);
+
+            return { config: configNow, hours: hoursNow, provider: savedProvider };
+        });
+
+        return res.json({ ok: true, data: result });
+    } catch (err: any) {
+        console.error('[saveAppointmentConfig] ❌', err);
+        return res.status(400).json({ ok: false, error: err?.message || 'bad_request' });
+    }
+}
