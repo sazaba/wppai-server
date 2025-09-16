@@ -10,6 +10,7 @@ import {
     // Config de agenda
     getAppointmentConfig,
     saveAppointmentConfig,
+    resetAppointments,
 } from "../controllers/appointments.controller";
 
 const router = Router();
@@ -30,5 +31,6 @@ router.post("/", createAppointment);
 router.put("/:id", updateAppointment);
 router.put("/:id/status", updateAppointmentStatus);
 router.delete("/:id", deleteAppointment);
+router.post("/reset", resetAppointments);
 
 export default router;

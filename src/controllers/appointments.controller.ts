@@ -4,9 +4,7 @@ import prisma from "../lib/prisma";
 import { hasOverlap } from "./_availability";
 import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
-import { AiMode } from "@prisma/client"
-
-
+import { AiMode } from "@prisma/client";
 
 /* ===================== Helpers ===================== */
 
@@ -18,8 +16,15 @@ function parseDateParam(v?: string | string[]) {
 }
 
 // map JS weekday (0=Sun..6=Sat) -> prisma Weekday enum ('sun'..'sat')
-const WEEK: Array<"sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat"> =
-    ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const WEEK: Array<"sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat"> = [
+    "sun",
+    "mon",
+    "tue",
+    "wed",
+    "thu",
+    "fri",
+    "sat",
+];
 
 const toMinutes = (hhmm?: string | null) => {
     if (!hhmm) return null;
@@ -439,3 +444,57 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
     }
 }
 
+/* ===================== RESET CONFIG (NUEVO) ===================== */
+/** POST /api/appointments/reset
+ *  👉 Borra todos los horarios y deja la configuración de citas en *defaults* (enabled=false, etc.)
+ *  No toca otros campos del negocio (nombre, descripcion, etc.).
+ */
+export async function resetAppointments(req: Request, res: Response) {
+    try {
+        const empresaId = getEmpresaId(req);
+
+        await prisma.$transaction(async (tx) => {
+            // 1) BORRAR HORARIOS
+            await tx.appointmentHour.deleteMany({ where: { empresaId } });
+
+            // 2) DEJAR CONFIG EN DEFAULTS (upsert por empresa)
+            await tx.businessConfig.upsert({
+                where: { empresaId },
+                create: {
+                    empresaId,
+                    // Defaults de agenda
+                    appointmentEnabled: false,
+                    appointmentVertical: "none" as any,
+                    appointmentTimezone: "America/Bogota",
+                    appointmentBufferMin: 10,
+                    appointmentPolicies: null,
+                    appointmentReminders: true,
+                    // mínimos para constraints
+                    nombre: "",
+                    descripcion: "",
+                    servicios: "",
+                    faq: "",
+                    horarios: "",
+                    // (Opcional) si quieres forzar un aiMode inicial aquí, puedes dejarlo en 'agente'
+                    // aiMode: AiMode.agente,
+                },
+                update: {
+                    appointmentEnabled: false,
+                    appointmentVertical: "none" as any,
+                    appointmentTimezone: "America/Bogota",
+                    appointmentBufferMin: 10,
+                    appointmentPolicies: null,
+                    appointmentReminders: true,
+                    updatedAt: new Date(),
+                    // (Opcional) idem comentario de arriba
+                    // aiMode: AiMode.agente,
+                },
+            });
+        });
+
+        return res.json({ ok: true });
+    } catch (e: any) {
+        console.error("[appointments.reset] error:", e);
+        return res.status(500).json({ error: "No se pudo reiniciar la agenda" });
+    }
+}
