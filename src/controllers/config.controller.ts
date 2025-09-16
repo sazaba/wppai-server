@@ -319,6 +319,8 @@ export async function upsertAgentConfig(req: Request, res: Response) {
             agentPrompt,
             agentScope,
             agentDisclaimers,
+            // 🔒 Exclusividad: si pasamos a agente, apagamos las citas
+            ...(aiMode === "agente" && { appointmentEnabled: false }),
             // si vienen, actualiza algunos textos base también:
             ...(req.body?.descripcion !== undefined && { descripcion: s(req.body.descripcion) }),
             ...(req.body?.servicios !== undefined && { servicios: s(req.body.servicios) }),

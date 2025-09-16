@@ -4,6 +4,9 @@ import prisma from "../lib/prisma";
 import { hasOverlap } from "./_availability";
 import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
+import { AiMode } from "@prisma/client"
+
+
 
 /* ===================== Helpers ===================== */
 
@@ -367,24 +370,29 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
         const parsed = saveConfigDtoZ.parse(req.body);
         const { appointment, hours } = parsed;
 
+        const forceEcommerce = appointment.enabled === true; // 🔒 exclusividad: si habilitas citas → aiMode = ecommerce
+
         await prisma.$transaction(async (tx) => {
             // A) BusinessConfig
             await tx.businessConfig.upsert({
                 where: { empresaId },
                 create: {
                     empresaId,
+                    // citas
                     appointmentEnabled: appointment.enabled,
                     appointmentVertical: appointment.vertical as any,
                     appointmentTimezone: appointment.timezone,
                     appointmentBufferMin: appointment.bufferMin,
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
-                    // crea mínimos para no romper constraints
+                    // mínimos para no romper constraints
                     nombre: "",
                     descripcion: "",
                     servicios: "",
                     faq: "",
                     horarios: "",
+                    // 🔒 Exclusividad: si citas está habilitado, el modo IA queda en ecommerce
+                    ...(forceEcommerce && { aiMode: AiMode.ecommerce }),
                 },
                 update: {
                     appointmentEnabled: appointment.enabled,
@@ -394,6 +402,8 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
                     updatedAt: new Date(),
+                    // 🔒 Exclusividad: si citas está habilitado, el modo IA queda en ecommerce
+                    ...(forceEcommerce && { aiMode: AiMode.ecommerce }),
                 },
             });
 
@@ -428,3 +438,4 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
         return res.status(400).json({ ok: false, error: err?.message || "bad_request" });
     }
 }
+
