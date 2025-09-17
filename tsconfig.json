@@ -1,16 +1,40 @@
+// {
+//     "compilerOptions": {
+//         "baseUrl": "./",
+//         "paths": {
+//             "*": [
+//                 "node_modules/*"
+//             ]
+//         },
+//         "target": "ES2020",
+//         "module": "CommonJS",
+//         "strict": true,
+//         "esModuleInterop": true,
+//         "moduleResolution": "node",
+//         "resolveJsonModule": true,
+//         "outDir": "dist",
+//         "rootDir": "src",
+//         "forceConsistentCasingInFileNames": true,
+//         "skipLibCheck": true,
+//         "types": [
+//             "node"
+//         ],
+//         "typeRoots": [
+//             "./node_modules/@types",
+//             "./src/types"
+//         ]
+//     },
+//     "include": [
+//         "src"
+//     ]
+// }
 {
     "compilerOptions": {
-        "baseUrl": "./",
-        "paths": {
-            "*": [
-                "node_modules/*"
-            ]
-        },
         "target": "ES2020",
         "module": "CommonJS",
+        "moduleResolution": "node",
         "strict": true,
         "esModuleInterop": true,
-        "moduleResolution": "node",
         "resolveJsonModule": true,
         "outDir": "dist",
         "rootDir": "src",
@@ -18,10 +42,6 @@
         "skipLibCheck": true,
         "types": [
             "node"
-        ],
-        "typeRoots": [
-            "./node_modules/@types",
-            "./src/types"
         ]
     },
     "include": [

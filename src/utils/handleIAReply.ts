@@ -2,19 +2,14 @@
 import prisma from '../lib/prisma'
 import { handleEcommerceIAReply, type IAReplyResult } from './handleIAReply.ecommerce'
 import { handleAgentReply } from './ai/strategies/agent.strategy'
+import { handleAppointmentsReply } from './ai/strategies/appointments.strategy'
 import { AiMode, AgentSpecialty, ConversationEstado } from '@prisma/client'
 
-/**
- * Orquestador: decide la estrategia según BusinessConfig.aiMode
- * - aiMode = ecommerce  -> delega a lógica existente (intacta)
- * - aiMode = agente     -> usa el agente personalizado (con specialty)
- */
 export const handleIAReply = async (
     chatId: number,
     mensajeArg: string,
     opts?: { toPhone?: string; autoSend?: boolean; phoneNumberId?: string }
 ): Promise<IAReplyResult | null> => {
-    // 1) Leer conversación
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
         select: { id: true, estado: true, empresaId: true, phone: true }
@@ -26,7 +21,6 @@ export const handleIAReply = async (
         return null
     }
 
-    // 2) Leer config mínima para decidir estrategia
     const config = await prisma.businessConfig.findFirst({
         where: { empresaId: conversacion.empresaId },
         orderBy: { updatedAt: 'desc' },
@@ -36,11 +30,25 @@ export const handleIAReply = async (
             agentSpecialty: true,
             agentPrompt: true,
             agentScope: true,
-            agentDisclaimers: true
+            agentDisclaimers: true,
+            appointmentEnabled: true,
+            appointmentVertical: true,
+            servicios: true,
         }
     })
 
     const mode = config?.aiMode ?? AiMode.ecommerce
+
+    // 👉 NUEVO: modo citas
+    if (mode === AiMode.appointments) {
+        return handleAppointmentsReply({
+            chatId,
+            empresaId: conversacion.empresaId,
+            mensajeArg,
+            toPhone: opts?.toPhone ?? conversacion.phone,
+            phoneNumberId: opts?.phoneNumberId
+        })
+    }
 
     if (mode === AiMode.agente) {
         return handleAgentReply({
@@ -58,6 +66,6 @@ export const handleIAReply = async (
         })
     }
 
-    // 3) Default/back-compat → e-commerce intacto
+    // Default/back-compat → e-commerce
     return handleEcommerceIAReply(chatId, mensajeArg, opts)
 }
