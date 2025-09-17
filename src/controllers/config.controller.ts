@@ -29,8 +29,9 @@ const parseJson = <T = any>(raw: any, def: T | null = null): T | null => {
 const toBusinessType = (v: "servicios" | "productos"): BusinessType =>
     (v === "productos" ? "productos" : "servicios") as BusinessType
 
-const toAiMode = (v: "ecommerce" | "agente"): AiMode =>
-    (v === "agente" ? "agente" : "ecommerce") as AiMode
+// ✅ ahora contempla 'appointments'
+const toAiMode = (v: "ecommerce" | "agente" | "appointments"): AiMode =>
+    (v === "agente" ? "agente" : v === "appointments" ? "appointments" : "ecommerce") as AiMode
 
 const toAgentSpecialty = (
     v: "generico" | "medico" | "dermatologia" | "nutricion" | "psicologia" | "odontologia"
@@ -64,7 +65,8 @@ export async function upsertConfig(req: Request, res: Response) {
     // Base
     const nombre = s(req.body?.nombre)
     const descripcion = s(req.body?.descripcion)
-    const servicios = s(req.body?.servicios)
+    // 👇 toma appointmentServices del form; si no viene, usa servicios
+    const servicios = s(req.body?.appointmentServices ?? req.body?.servicios)
     const faq = s(req.body?.faq)
     const horarios = s(req.body?.horarios)
 
@@ -74,8 +76,12 @@ export async function upsertConfig(req: Request, res: Response) {
     const disclaimers = s(req.body?.disclaimers)
 
     // IA / Agente
-    const aiModeStr = oneOf(req.body?.aiMode, ["ecommerce", "agente"] as const, "ecommerce")
-    const aiMode = toAiMode(aiModeStr)
+    // ✅ acepta 'appointments'
+    const aiModeStr = oneOf(req.body?.aiMode, ["ecommerce", "agente", "appointments"] as const, "ecommerce")
+    const aiModeFromBody: AiMode | undefined =
+        req.body?.aiMode !== undefined && req.body?.aiMode !== null && req.body?.aiMode !== ""
+            ? toAiMode(aiModeStr)
+            : undefined
 
     const agentSpecialtyStr = oneOf(
         req.body?.agentSpecialty,
@@ -84,9 +90,10 @@ export async function upsertConfig(req: Request, res: Response) {
     )
     const agentSpecialty = toAgentSpecialty(agentSpecialtyStr)
 
-    const agentPrompt = aiMode === "agente" ? (s(req.body?.agentPrompt) || null) : null
-    const agentScope = aiMode === "agente" ? (s(req.body?.agentScope) || null) : null
-    const agentDisclaimers = aiMode === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
+    // solo relevantes en modo agente
+    const agentPrompt = aiModeFromBody === "agente" ? (s(req.body?.agentPrompt) || null) : null
+    const agentScope = aiModeFromBody === "agente" ? (s(req.body?.agentScope) || null) : null
+    const agentDisclaimers = aiModeFromBody === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
 
     // Operación
     const enviosInfo = s(req.body?.enviosInfo)
@@ -135,12 +142,18 @@ export async function upsertConfig(req: Request, res: Response) {
     const appointmentBufferMin = Number(req.body?.appointmentBufferMin ?? 10) || 10
     const appointmentPolicies = (req.body?.appointmentPolicies === null) ? null : (s(req.body?.appointmentPolicies) || null)
     const appointmentReminders = b(req.body?.appointmentReminders, true)
-    // 🚫 Eliminado appointmentWorkHours (ya no existe en el modelo)
 
     // Validación mínima
     if (!nombre || !descripcion || !faq || !horarios) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
+
+    // ⚖️ Regla final para aiMode:
+    // - si el body trae aiMode -> usamos ese
+    // - si NO trae aiMode pero se habilita agenda -> 'appointments'
+    // - si nada de lo anterior -> no tocar aiMode (en update lo quitamos del payload)
+    const finalAiMode: AiMode | undefined =
+        aiModeFromBody ?? (appointmentEnabled ? "appointments" as AiMode : undefined)
 
     try {
         const data: Prisma.BusinessConfigUncheckedCreateInput = {
@@ -154,8 +167,8 @@ export async function upsertConfig(req: Request, res: Response) {
             businessType,
             disclaimers,
 
-            // IA
-            aiMode,
+            // IA (para CREATE necesitamos un valor seguro)
+            aiMode: finalAiMode ?? "ecommerce",
             agentSpecialty,
             agentPrompt,
             agentScope,
@@ -221,6 +234,9 @@ export async function upsertConfig(req: Request, res: Response) {
         if (req.body?.appointmentBufferMin === undefined) delete (toUpdate as any).appointmentBufferMin
         if (req.body?.appointmentPolicies === undefined) delete (toUpdate as any).appointmentPolicies
         if (req.body?.appointmentReminders === undefined) delete (toUpdate as any).appointmentReminders
+
+        // ⛔ clave: si NO debemos tocar aiMode en update, quítalo del payload
+        if (!finalAiMode) delete (toUpdate as any).aiMode
 
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
 
@@ -382,37 +398,26 @@ export async function deleteConfig(req: Request, res: Response) {
 }
 
 /* ---------------------- POST /api/config/reset ---------------------- */
-/* ---------------------- POST /api/config/reset ---------------------- */
 export async function resetConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId as number
 
-    // ya existente en tu código
-    const withCatalog = ["1", "true", "yes"].includes(
-        String(req.query.withCatalog || "").toLowerCase()
-    )
-
-    // opcional; por defecto borra horarios
+    const withCatalog = ["1", "true", "yes"].includes(String(req.query.withCatalog || "").toLowerCase())
     const withAppointments =
         !["0", "false", "no"].includes(String(req.query.withAppointments || "").toLowerCase())
 
     try {
         await prisma.$transaction(async (tx) => {
-            // 🧹 Horarios de citas (si lo permites; por defecto sí)
             if (withAppointments) {
                 await tx.appointmentHour.deleteMany({ where: { empresaId } }).catch(() => { })
             }
-
-            // 🧹 Config del negocio — usar deleteMany por si existe “basura” duplicada
             await tx.businessConfig.deleteMany({ where: { empresaId } }).catch(() => { })
 
-            // 🧹 Catálogo (opcional)
             if (withCatalog) {
                 await tx.productImage.deleteMany({ where: { product: { empresaId } } }).catch(() => { })
                 await tx.product.deleteMany({ where: { empresaId } }).catch(() => { })
             }
         })
 
-        // contrato compatible (solo agrego withAppointments como info extra)
         return res.json({ ok: true, withCatalog, withAppointments })
     } catch (error) {
         console.error("[resetConfig] error:", error)
