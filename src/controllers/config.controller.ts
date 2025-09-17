@@ -1,9 +1,9 @@
 // server/src/controllers/config.controller.ts
 import { Request, Response } from "express"
 import prisma from "../lib/prisma"
-// 👉 Tipos (sólo TypeScript) y el namespace Prisma para inputs
+// 👉 Tipos (solo TS) y Prisma para *UncheckedCreate/UpdateInput*
 import type { AiMode, AgentSpecialty, BusinessType, AppointmentVertical } from "@prisma/client"
-import { Prisma } from "@prisma/client" // runtime: para *UncheckedCreate/UpdateInput*
+import { Prisma } from "@prisma/client"
 
 /* ---------------------- Helpers básicos ---------------------- */
 const s = (v: any, def = "") => (v === undefined || v === null ? def : String(v).trim())
@@ -33,7 +33,7 @@ const oneOf = <T extends string>(raw: any, allowed: readonly T[], def: T): T => 
 const toBusinessType = (v: "servicios" | "productos"): BusinessType =>
     (v === "productos" ? "productos" : "servicios") as BusinessType
 
-// ✅ ahora contempla 'appointments'
+// ✅ contempla 'appointments'
 const toAiMode = (v: "ecommerce" | "agente" | "appointments"): AiMode =>
     (v === "agente" ? "agente" : v === "appointments" ? "appointments" : "ecommerce") as AiMode
 
@@ -69,7 +69,7 @@ export async function upsertConfig(req: Request, res: Response) {
     // Base
     const nombre = s(req.body?.nombre)
     const descripcion = s(req.body?.descripcion)
-    // 👇 toma appointmentServices del form; si no viene, usa servicios
+    // 👇 tomar del form de citas si viene; si no, usa servicios “general”
     const servicios = s(req.body?.appointmentServices ?? req.body?.servicios)
     const faq = s(req.body?.faq)
     const horarios = s(req.body?.horarios)
@@ -81,7 +81,7 @@ export async function upsertConfig(req: Request, res: Response) {
 
     // IA / Agente — acepta 'appointments'
     const aiModeStr = oneOf(req.body?.aiMode, ["ecommerce", "agente", "appointments"] as const, "ecommerce")
-    // Solo considerar que vino en el body si realmente vino (no undefined/null/"")
+    // considerar que vino en body solo si no es undefined/null/""
     const aiModeFromBody: AiMode | undefined =
         req.body?.aiMode !== undefined && req.body?.aiMode !== null && req.body?.aiMode !== ""
             ? toAiMode(aiModeStr)
@@ -94,7 +94,7 @@ export async function upsertConfig(req: Request, res: Response) {
     )
     const agentSpecialty = toAgentSpecialty(agentSpecialtyStr)
 
-    // Solo relevantes en modo agente explícito
+    // Solo relevantes si el body pidió explícitamente 'agente'
     const agentPrompt = aiModeFromBody === "agente" ? (s(req.body?.agentPrompt) || null) : null
     const agentScope = aiModeFromBody === "agente" ? (s(req.body?.agentScope) || null) : null
     const agentDisclaimers = aiModeFromBody === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
@@ -139,12 +139,13 @@ export async function upsertConfig(req: Request, res: Response) {
     const facturaElectronicaInfo = s(req.body?.facturaElectronicaInfo)
     const soporteDevolucionesInfo = s(req.body?.soporteDevolucionesInfo)
 
-    // ====== Agenda / Citas (opcionales)
+    // ====== Agenda / Citas
     const appointmentEnabled = b(req.body?.appointmentEnabled, false)
     const appointmentVertical = toAppointmentVertical(req.body?.appointmentVertical)
     const appointmentTimezone = s(req.body?.appointmentTimezone || "America/Bogota") || "America/Bogota"
     const appointmentBufferMin = Number(req.body?.appointmentBufferMin ?? 10) || 10
-    const appointmentPolicies = (req.body?.appointmentPolicies === null) ? null : (s(req.body?.appointmentPolicies) || null)
+    const appointmentPolicies =
+        req.body?.appointmentPolicies === null ? null : s(req.body?.appointmentPolicies) || null
     const appointmentReminders = b(req.body?.appointmentReminders, true)
 
     // Validación mínima
@@ -152,12 +153,16 @@ export async function upsertConfig(req: Request, res: Response) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
 
-    // ⚖️ Regla final para aiMode:
-    // - si el body trae aiMode -> usamos ese
-    // - si NO trae aiMode pero se habilita agenda -> 'appointments'
-    // - si nada de lo anterior -> no tocar aiMode (en update lo quitamos del payload)
+    // ✅ Prioridad para aiMode:
+    // 1) si el body pide 'agente' -> agente
+    // 2) si appointmentEnabled=true -> appointments
+    // 3) en otro caso, usar lo que vino en el body (o no tocar en update)
     const finalAiMode: AiMode | undefined =
-        aiModeFromBody ?? (appointmentEnabled ? ("appointments" as AiMode) : undefined)
+        aiModeFromBody === "agente"
+            ? "agente"
+            : appointmentEnabled
+                ? ("appointments" as AiMode)
+                : aiModeFromBody
 
     try {
         const data: Prisma.BusinessConfigUncheckedCreateInput = {
@@ -171,7 +176,7 @@ export async function upsertConfig(req: Request, res: Response) {
             businessType,
             disclaimers,
 
-            // IA (CREATE necesita un valor)
+            // IA (para CREATE necesitamos un valor)
             aiMode: finalAiMode ?? "ecommerce",
             agentSpecialty,
             agentPrompt,
@@ -231,7 +236,7 @@ export async function upsertConfig(req: Request, res: Response) {
         if (envioCostoFijo === null) delete (toUpdate as any).envioCostoFijo
         if (envioGratisDesde === null) delete (toUpdate as any).envioGratisDesde
 
-        // evita sobrescribir si no vienen en body (opcional)
+        // no sobrescribir campos de citas si no vinieron en body
         if (req.body?.appointmentEnabled === undefined) delete (toUpdate as any).appointmentEnabled
         if (req.body?.appointmentVertical === undefined) delete (toUpdate as any).appointmentVertical
         if (req.body?.appointmentTimezone === undefined) delete (toUpdate as any).appointmentTimezone
@@ -239,11 +244,10 @@ export async function upsertConfig(req: Request, res: Response) {
         if (req.body?.appointmentPolicies === undefined) delete (toUpdate as any).appointmentPolicies
         if (req.body?.appointmentReminders === undefined) delete (toUpdate as any).appointmentReminders
 
-        // ⛔ clave: si NO debemos tocar aiMode en update, quítalo del payload
+        // ⛔ clave: si NO debemos tocar aiMode en update, quitarlo del payload
         if (!finalAiMode) delete (toUpdate as any).aiMode
 
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
-
         const cfg = existente
             ? await prisma.businessConfig.update({ where: { empresaId }, data: toUpdate })
             : await prisma.businessConfig.create({ data })
@@ -275,7 +279,7 @@ export async function upsertAgentConfig(req: Request, res: Response) {
     const agentDisclaimers = s(req.body?.agentDisclaimers) || null
 
     try {
-        // Si no existe el registro, creamos uno "mínimo" con strings vacíos para no romper validaciones.
+        // Si no existe, crear registro mínimo para no romper validaciones.
         const createMinimos: Prisma.BusinessConfigUncheckedCreateInput = {
             empresaId,
             // base mínimas
