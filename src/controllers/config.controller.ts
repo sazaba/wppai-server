@@ -7,22 +7,26 @@ import { Prisma } from "@prisma/client" // runtime: para *UncheckedCreate/Update
 
 /* ---------------------- Helpers básicos ---------------------- */
 const s = (v: any, def = "") => (v === undefined || v === null ? def : String(v).trim())
-const b = (v: any, def = false) => (v === undefined || v === null ? def : Boolean(v))
+
+// boolean robusto: soporta "1/0", "true/false", "yes/no", "si/sí"
+const b = (v: any, def = false) => {
+    if (v === undefined || v === null || v === "") return def
+    if (typeof v === "boolean") return v
+    const st = String(v).trim().toLowerCase()
+    if (["1", "true", "yes", "si", "sí"].includes(st)) return true
+    if (["0", "false", "no"].includes(st)) return false
+    return Boolean(v)
+}
+
 const nOrNull = (v: any) => {
     if (v === undefined || v === null || v === "") return null
     const num = Number(v)
     return Number.isFinite(num) ? num : null
 }
+
 const oneOf = <T extends string>(raw: any, allowed: readonly T[], def: T): T => {
     const v = String(raw ?? "").toLowerCase() as T
     return (allowed as readonly string[]).includes(v) ? (v as T) : def
-}
-
-// JSON seguro (acepta objeto o string JSON; si falla, devuelve def)
-const parseJson = <T = any>(raw: any, def: T | null = null): T | null => {
-    if (raw === undefined || raw === null || raw === "") return def
-    if (typeof raw === "object") return raw as T
-    try { return JSON.parse(String(raw)) as T } catch { return def }
 }
 
 /* ---------------------- Mapeadores a enums ---------------------- */
@@ -42,8 +46,8 @@ const toAgentSpecialty = (
 
 const toAppointmentVertical = (v: any): AppointmentVertical => {
     const allowed: AppointmentVertical[] = ["none", "salud", "bienestar", "automotriz", "veterinaria", "fitness", "otros"]
-    const s = String(v ?? "").toLowerCase() as AppointmentVertical
-    return (allowed as readonly string[]).includes(s) ? (s as AppointmentVertical) : "none"
+    const st = String(v ?? "").toLowerCase() as AppointmentVertical
+    return (allowed as readonly string[]).includes(st) ? (st as AppointmentVertical) : "none"
 }
 
 /* ---------------------- GET /api/config ---------------------- */
@@ -75,9 +79,9 @@ export async function upsertConfig(req: Request, res: Response) {
 
     const disclaimers = s(req.body?.disclaimers)
 
-    // IA / Agente
-    // ✅ acepta 'appointments'
+    // IA / Agente — acepta 'appointments'
     const aiModeStr = oneOf(req.body?.aiMode, ["ecommerce", "agente", "appointments"] as const, "ecommerce")
+    // Solo considerar que vino en el body si realmente vino (no undefined/null/"")
     const aiModeFromBody: AiMode | undefined =
         req.body?.aiMode !== undefined && req.body?.aiMode !== null && req.body?.aiMode !== ""
             ? toAiMode(aiModeStr)
@@ -90,7 +94,7 @@ export async function upsertConfig(req: Request, res: Response) {
     )
     const agentSpecialty = toAgentSpecialty(agentSpecialtyStr)
 
-    // solo relevantes en modo agente
+    // Solo relevantes en modo agente explícito
     const agentPrompt = aiModeFromBody === "agente" ? (s(req.body?.agentPrompt) || null) : null
     const agentScope = aiModeFromBody === "agente" ? (s(req.body?.agentScope) || null) : null
     const agentDisclaimers = aiModeFromBody === "agente" ? (s(req.body?.agentDisclaimers) || null) : null
@@ -153,7 +157,7 @@ export async function upsertConfig(req: Request, res: Response) {
     // - si NO trae aiMode pero se habilita agenda -> 'appointments'
     // - si nada de lo anterior -> no tocar aiMode (en update lo quitamos del payload)
     const finalAiMode: AiMode | undefined =
-        aiModeFromBody ?? (appointmentEnabled ? "appointments" as AiMode : undefined)
+        aiModeFromBody ?? (appointmentEnabled ? ("appointments" as AiMode) : undefined)
 
     try {
         const data: Prisma.BusinessConfigUncheckedCreateInput = {
@@ -167,7 +171,7 @@ export async function upsertConfig(req: Request, res: Response) {
             businessType,
             disclaimers,
 
-            // IA (para CREATE necesitamos un valor seguro)
+            // IA (CREATE necesita un valor)
             aiMode: finalAiMode ?? "ecommerce",
             agentSpecialty,
             agentPrompt,
@@ -407,11 +411,15 @@ export async function resetConfig(req: Request, res: Response) {
 
     try {
         await prisma.$transaction(async (tx) => {
+            // 🧹 Horarios de citas (si lo permites; por defecto sí)
             if (withAppointments) {
                 await tx.appointmentHour.deleteMany({ where: { empresaId } }).catch(() => { })
             }
+
+            // 🧹 Config del negocio
             await tx.businessConfig.deleteMany({ where: { empresaId } }).catch(() => { })
 
+            // 🧹 Catálogo (opcional)
             if (withCatalog) {
                 await tx.productImage.deleteMany({ where: { product: { empresaId } } }).catch(() => { })
                 await tx.product.deleteMany({ where: { empresaId } }).catch(() => { })
