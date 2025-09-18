@@ -375,7 +375,10 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
         const parsed = saveConfigDtoZ.parse(req.body);
         const { appointment, hours } = parsed;
 
-        const forceEcommerce = appointment.enabled === true; // 🔒 exclusividad: si habilitas citas → aiMode = ecommerce
+        // ✅ Regla corregida:
+        // Si habilitas citas, forzar aiMode = "appointments".
+        // Si no, NO tocar aiMode (lo maneja el endpoint de agente).
+        const forceAppointments = appointment.enabled === true;
 
         await prisma.$transaction(async (tx) => {
             // A) BusinessConfig
@@ -396,8 +399,8 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // 🔒 Exclusividad: si citas está habilitado, el modo IA queda en ecommerce
-                    ...(forceEcommerce && { aiMode: AiMode.ecommerce }),
+                    // 👇 Solo si habilitas citas: aiMode = "appointments"
+                    ...(forceAppointments && { aiMode: AiMode.appointments }),
                 },
                 update: {
                     appointmentEnabled: appointment.enabled,
@@ -407,8 +410,9 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
                     updatedAt: new Date(),
-                    // 🔒 Exclusividad: si citas está habilitado, el modo IA queda en ecommerce
-                    ...(forceEcommerce && { aiMode: AiMode.ecommerce }),
+                    // 👇 Solo si habilitas citas: aiMode = "appointments"
+                    ...(forceAppointments && { aiMode: AiMode.appointments }),
+                    // ⚠️ Si enabled es false, NO tocamos aiMode
                 },
             });
 
@@ -447,8 +451,7 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
 /* ===================== RESET CONFIG (NUEVO) ===================== */
 /** POST /api/appointments/reset
  *  👉 Borra todos los horarios y deja la configuración de citas en *defaults* (enabled=false, etc.)
- *  No toca otros campos del negocio (nombre, descripcion, etc.).
- */
+ *  No toca otros campos del negocio (nombre, descripcion, etc.). */
 export async function resetAppointments(req: Request, res: Response) {
     try {
         const empresaId = getEmpresaId(req);
@@ -475,7 +478,7 @@ export async function resetAppointments(req: Request, res: Response) {
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // (Opcional) si quieres forzar un aiMode inicial aquí, puedes dejarlo en 'agente'
+                    // (Opcional) aiMode neutro inicial:
                     // aiMode: AiMode.agente,
                 },
                 update: {
@@ -486,7 +489,7 @@ export async function resetAppointments(req: Request, res: Response) {
                     appointmentPolicies: null,
                     appointmentReminders: true,
                     updatedAt: new Date(),
-                    // (Opcional) idem comentario de arriba
+                    // (Opcional) aiMode neutro:
                     // aiMode: AiMode.agente,
                 },
             });
