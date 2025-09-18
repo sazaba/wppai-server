@@ -69,7 +69,7 @@ export async function upsertConfig(req: Request, res: Response) {
     // Base
     const nombre = s(req.body?.nombre)
     const descripcion = s(req.body?.descripcion)
-    // 👇 tomar del form de citas si viene; si no, usa servicios “general”
+    // 👇 si el form de citas manda appointmentServices, úsalo como "servicios"
     const servicios = s(req.body?.appointmentServices ?? req.body?.servicios)
     const faq = s(req.body?.faq)
     const horarios = s(req.body?.horarios)
@@ -81,7 +81,7 @@ export async function upsertConfig(req: Request, res: Response) {
 
     // IA / Agente — acepta 'appointments'
     const aiModeStr = oneOf(req.body?.aiMode, ["ecommerce", "agente", "appointments"] as const, "ecommerce")
-    // considerar que vino en body solo si no es undefined/null/""
+    // Considerar aiMode del body solo si realmente vino
     const aiModeFromBody: AiMode | undefined =
         req.body?.aiMode !== undefined && req.body?.aiMode !== null && req.body?.aiMode !== ""
             ? toAiMode(aiModeStr)
@@ -145,13 +145,16 @@ export async function upsertConfig(req: Request, res: Response) {
     const appointmentTimezone = s(req.body?.appointmentTimezone || "America/Bogota") || "America/Bogota"
     const appointmentBufferMin = Number(req.body?.appointmentBufferMin ?? 10) || 10
     const appointmentPolicies =
-        req.body?.appointmentPolicies === null ? null : s(req.body?.appointmentPolicies) || null
+        req.body?.appointmentPolicies === null ? null : (s(req.body?.appointmentPolicies) || null)
     const appointmentReminders = b(req.body?.appointmentReminders, true)
 
     // Validación mínima
     if (!nombre || !descripcion || !faq || !horarios) {
         return res.status(400).json({ error: "Faltan campos requeridos." })
     }
+
+    // Logs de diagnóstico (bórralos luego)
+    console.log("[upsertConfig] body.aiMode:", req.body?.aiMode, "appointmentEnabled:", req.body?.appointmentEnabled)
 
     // ✅ Prioridad para aiMode:
     // 1) si el body pide 'agente' -> agente
@@ -163,6 +166,8 @@ export async function upsertConfig(req: Request, res: Response) {
             : appointmentEnabled
                 ? ("appointments" as AiMode)
                 : aiModeFromBody
+
+    console.log("[upsertConfig] finalAiMode:", finalAiMode)
 
     try {
         const data: Prisma.BusinessConfigUncheckedCreateInput = {
@@ -244,8 +249,17 @@ export async function upsertConfig(req: Request, res: Response) {
         if (req.body?.appointmentPolicies === undefined) delete (toUpdate as any).appointmentPolicies
         if (req.body?.appointmentReminders === undefined) delete (toUpdate as any).appointmentReminders
 
-        // ⛔ clave: si NO debemos tocar aiMode en update, quitarlo del payload
-        if (!finalAiMode) delete (toUpdate as any).aiMode
+        // 🔒 BLINDAJE AI MODE EN UPDATE:
+        // - Si appointmentEnabled=true -> forzar "appointments"
+        // - Si body pidió "agente" -> forzar "agente"
+        // - En cualquier otro caso y si NO vino aiMode en body, NO toques aiMode
+        if (appointmentEnabled) {
+            (toUpdate as any).aiMode = "appointments"
+        } else if (aiModeFromBody === "agente") {
+            (toUpdate as any).aiMode = "agente"
+        } else if (!aiModeFromBody) {
+            delete (toUpdate as any).aiMode
+        }
 
         const existente = await prisma.businessConfig.findUnique({ where: { empresaId } })
         const cfg = existente
