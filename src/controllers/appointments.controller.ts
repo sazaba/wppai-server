@@ -375,13 +375,11 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
         const parsed = saveConfigDtoZ.parse(req.body);
         const { appointment, hours } = parsed;
 
-        // ✅ Regla corregida:
-        // Si habilitas citas, forzar aiMode = "appointments".
-        // Si no, NO tocar aiMode (lo maneja el endpoint de agente).
         const forceAppointments = appointment.enabled === true;
 
         await prisma.$transaction(async (tx) => {
-            // A) BusinessConfig
+            const exists = await tx.businessConfig.findUnique({ where: { empresaId } });
+
             await tx.businessConfig.upsert({
                 where: { empresaId },
                 create: {
@@ -393,14 +391,14 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentBufferMin: appointment.bufferMin,
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
-                    // mínimos para no romper constraints
+                    // mínimos
                     nombre: "",
                     descripcion: "",
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // 👇 Solo si habilitas citas: aiMode = "appointments"
-                    ...(forceAppointments && { aiMode: AiMode.appointments }),
+                    // ✅ al CREAR: si enabled -> appointments, si no -> agente (evita default DB)
+                    aiMode: forceAppointments ? "appointments" : "agente",
                 },
                 update: {
                     appointmentEnabled: appointment.enabled,
@@ -410,13 +408,12 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
                     updatedAt: new Date(),
-                    // 👇 Solo si habilitas citas: aiMode = "appointments"
-                    ...(forceAppointments && { aiMode: AiMode.appointments }),
-                    // ⚠️ Si enabled es false, NO tocamos aiMode
+                    // ✅ en UPDATE: solo si enabled=true forzamos appointments; si false, NO tocamos aiMode
+                    ...(forceAppointments && { aiMode: "appointments" }),
                 },
             });
 
-            // B) Horarios (upsert por día)
+            // horarios
             for (const h of hours) {
                 await tx.appointmentHour.upsert({
                     where: { empresaId_day: { empresaId, day: h.day as any } },
