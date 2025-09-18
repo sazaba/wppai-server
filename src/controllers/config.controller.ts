@@ -58,6 +58,7 @@ export async function getConfig(req: Request, res: Response) {
 
 /* ---------------------- PUT /api/config ---------------------- */
 export async function upsertConfig(req: Request, res: Response) {
+    console.log("[config.upsert] body:", JSON.stringify(req.body));
     const empresaId = (req as any).user?.empresaId as number
 
     // Base

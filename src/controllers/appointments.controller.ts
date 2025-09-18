@@ -313,6 +313,7 @@ export async function getAppointmentConfig(req: Request, res: Response) {
 /** POST /api/appointments/config
  *  👉 Guarda config + hours. Responde { ok: true } */
 export async function saveAppointmentConfig(req: Request, res: Response) {
+    console.log("[appointments.config] body:", JSON.stringify(req.body));
     try {
         const empresaId = getEmpresaId(req);
         const parsed = saveConfigDtoZ.parse(req.body);
