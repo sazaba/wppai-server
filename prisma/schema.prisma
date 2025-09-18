@@ -241,7 +241,7 @@ model BusinessConfig {
   palabrasClaveNegocio String  @default("")
 
   // ===== Perfil de IA (personalizado)
-  aiMode           AiMode? // ecommerce | agente
+  aiMode           AiMode? // 
   agentSpecialty   AgentSpecialty @default(generico) // médico, dermatología, nutrición, etc.
   agentPrompt      String?        @db.Text // tono/instrucciones específicas del negocio
   agentScope       String?        @db.Text // qué atiende / qué no atiende

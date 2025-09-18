@@ -1,10 +1,9 @@
-// src/controllers/appointments.controller.ts
+// server/src/controllers/appointments.controller.ts
 import { Request, Response } from "express";
 import prisma from "../lib/prisma";
 import { hasOverlap } from "./_availability";
 import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
-import { AiMode } from "@prisma/client";
 
 /* ===================== Helpers ===================== */
 
@@ -59,10 +58,7 @@ async function ensureWithinBusinessHours(opts: {
         start.getMonth() === end.getMonth() &&
         start.getDate() === end.getDate();
 
-    if (!sameDay) {
-        // Si quieres prohibir cruzar medianoche, devolver error aquí.
-        return { ok: true };
-    }
+    if (!sameDay) return { ok: true };
 
     const jsDow = start.getDay(); // 0..6
     const day = WEEK[jsDow];
@@ -251,86 +247,36 @@ export async function updateAppointment(req: Request, res: Response) {
     }
 }
 
-/* ===================== Update Status ===================== */
-// PUT /api/appointments/:id/status
-export async function updateAppointmentStatus(req: Request, res: Response) {
-    try {
-        const empresaId = getEmpresaId(req);
-        const id = Number(req.params.id);
-        const { status } = req.body as { status: any };
-        if (!status) return res.status(400).json({ error: "status requerido" });
-
-        const appt = await prisma.appointment.update({
-            where: { id },
-            data: { status },
-        });
-        if (appt.empresaId !== empresaId)
-            return res.status(403).json({ error: "forbidden" });
-        res.json(appt);
-    } catch (err: any) {
-        console.error("[updateAppointmentStatus] ❌", err);
-        res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
-    }
-}
-
-/* ===================== Delete ===================== */
-// DELETE /api/appointments/:id
-export async function deleteAppointment(req: Request, res: Response) {
-    try {
-        const empresaId = getEmpresaId(req);
-        const id = Number(req.params.id);
-
-        const appt = await prisma.appointment.findUnique({ where: { id } });
-        if (!appt || appt.empresaId !== empresaId)
-            return res.status(404).json({ error: "No encontrado" });
-
-        await prisma.appointment.delete({ where: { id } });
-        res.json({ ok: true });
-    } catch (err: any) {
-        console.error("[deleteAppointment] ❌", err);
-        res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
-    }
-}
-
 /* ===================== CONFIG (GET + POST) ===================== */
 
 const timeZ = z.string().regex(/^\d{2}:\d{2}$/).nullable().optional();
 const dayZ = z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
 
+// 👇 Acepta aiMode opcional desde el front (solo "appointments" | "agente")
 const saveConfigDtoZ = z.object({
     appointment: z.object({
         enabled: z.boolean(),
-        vertical: z.enum([
-            "none",
-            "salud",
-            "bienestar",
-            "automotriz",
-            "veterinaria",
-            "fitness",
-            "otros",
-        ]),
+        vertical: z.enum(["none", "salud", "bienestar", "automotriz", "veterinaria", "fitness", "otros"]),
         timezone: z.string(),
         bufferMin: z.number().int().min(0).max(240),
         policies: z.string().nullable().optional(),
         reminders: z.boolean(),
+        aiMode: z.enum(["appointments", "agente"]).optional(),
     }),
-    hours: z
-        .array(
-            z.object({
-                day: dayZ,
-                isOpen: z.boolean(),
-                start1: timeZ,
-                end1: timeZ,
-                start2: timeZ,
-                end2: timeZ,
-            })
-        )
-        .length(7, "Deben venir los 7 días"),
-    // provider: eliminado (opcional a futuro)
+    hours: z.array(
+        z.object({
+            day: dayZ,
+            isOpen: z.boolean(),
+            start1: timeZ,
+            end1: timeZ,
+            start2: timeZ,
+            end2: timeZ,
+        })
+    ).length(7, "Deben venir los 7 días"),
 });
 
 /** GET /api/appointments/config
- *  👉 Responde PLANO: { config, hours, provider } para alinear con el front/lib */
+ *  👉 Responde PLANO: { config, hours, provider } */
 export async function getAppointmentConfig(req: Request, res: Response) {
     const empresaId = getEmpresaId(req);
 
@@ -360,10 +306,7 @@ export async function getAppointmentConfig(req: Request, res: Response) {
         }),
     ]);
 
-    // mantener null hasta que implementes provider principal
     const provider = null;
-
-    // ✨ sin envoltorio { ok, data }, así lo espera el front
     return res.json({ config, hours, provider });
 }
 
@@ -376,6 +319,7 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
         const { appointment, hours } = parsed;
 
         const forceAppointments = appointment.enabled === true;
+        const fromClient = appointment.aiMode; // "appointments" | "agente" | undefined
 
         await prisma.$transaction(async (tx) => {
             const exists = await tx.businessConfig.findUnique({ where: { empresaId } });
@@ -397,8 +341,8 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // ✅ al CREAR: si enabled -> appointments, si no -> agente (evita default DB)
-                    aiMode: forceAppointments ? "appointments" : "agente",
+                    // ✅ al CREAR: si enabled -> appointments; si no -> agente (evita defaults)
+                    aiMode: forceAppointments ? "appointments" : (fromClient ?? "agente"),
                 },
                 update: {
                     appointmentEnabled: appointment.enabled,
@@ -408,12 +352,15 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
                     updatedAt: new Date(),
-                    // ✅ en UPDATE: solo si enabled=true forzamos appointments; si false, NO tocamos aiMode
-                    ...(forceAppointments && { aiMode: "appointments" }),
+                    // ✅ en UPDATE: si enabled=true, forzamos appointments;
+                    // si enabled=false y viene fromClient (agente), lo respetamos; en otro caso no tocamos.
+                    ...(forceAppointments
+                        ? { aiMode: "appointments" }
+                        : fromClient ? { aiMode: fromClient } : {}),
                 },
             });
 
-            // horarios
+            // B) Horarios (upsert por día)
             for (const h of hours) {
                 await tx.appointmentHour.upsert({
                     where: { empresaId_day: { empresaId, day: h.day as any } },
@@ -445,10 +392,8 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
     }
 }
 
-/* ===================== RESET CONFIG (NUEVO) ===================== */
-/** POST /api/appointments/reset
- *  👉 Borra todos los horarios y deja la configuración de citas en *defaults* (enabled=false, etc.)
- *  No toca otros campos del negocio (nombre, descripcion, etc.). */
+/* ===================== RESET CONFIG ===================== */
+// POST /api/appointments/reset
 export async function resetAppointments(req: Request, res: Response) {
     try {
         const empresaId = getEmpresaId(req);
@@ -457,26 +402,24 @@ export async function resetAppointments(req: Request, res: Response) {
             // 1) BORRAR HORARIOS
             await tx.appointmentHour.deleteMany({ where: { empresaId } });
 
-            // 2) DEJAR CONFIG EN DEFAULTS (upsert por empresa)
+            // 2) DEFAULTS de agenda (no tocamos otros campos)
             await tx.businessConfig.upsert({
                 where: { empresaId },
                 create: {
                     empresaId,
-                    // Defaults de agenda
                     appointmentEnabled: false,
                     appointmentVertical: "none" as any,
                     appointmentTimezone: "America/Bogota",
                     appointmentBufferMin: 10,
                     appointmentPolicies: null,
                     appointmentReminders: true,
-                    // mínimos para constraints
                     nombre: "",
                     descripcion: "",
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // (Opcional) aiMode neutro inicial:
-                    // aiMode: AiMode.agente,
+                    // si quieres forzar modo neutro aquí:
+                    // aiMode: "agente",
                 },
                 update: {
                     appointmentEnabled: false,
@@ -486,8 +429,7 @@ export async function resetAppointments(req: Request, res: Response) {
                     appointmentPolicies: null,
                     appointmentReminders: true,
                     updatedAt: new Date(),
-                    // (Opcional) aiMode neutro:
-                    // aiMode: AiMode.agente,
+                    // aiMode: "agente",
                 },
             });
         });
