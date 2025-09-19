@@ -2,7 +2,8 @@
 import prisma from '../lib/prisma'
 import { handleEcommerceIAReply, type IAReplyResult } from './handleIAReply.ecommerce'
 import { handleAgentReply } from './ai/strategies/agent.strategy'
-import { handleAppointmentsReply } from './ai/strategies/appointments.strategy'
+// 👇 usar la misma convención que agent: handleAppointmentReply (singular)
+import { handleAppointmentReply } from './ai/strategies/appointments.strategy'
 import { AiMode, AgentSpecialty, ConversationEstado } from '@prisma/client'
 
 export const handleIAReply = async (
@@ -39,9 +40,9 @@ export const handleIAReply = async (
 
     const mode = config?.aiMode ?? AiMode.ecommerce
 
-    // 👉 NUEVO: modo citas
+    // 👉 Modo citas (solo conversación contextual; sin agendar aún)
     if (mode === AiMode.appointments) {
-        return handleAppointmentsReply({
+        return handleAppointmentReply({
             chatId,
             empresaId: conversacion.empresaId,
             mensajeArg,
@@ -50,6 +51,7 @@ export const handleIAReply = async (
         })
     }
 
+    // 👉 Modo agente (especialidades)
     if (mode === AiMode.agente) {
         return handleAgentReply({
             chatId,
@@ -66,6 +68,6 @@ export const handleIAReply = async (
         })
     }
 
-    // Default/back-compat → e-commerce
+    // 👉 Default/back-compat → e-commerce
     return handleEcommerceIAReply(chatId, mensajeArg, opts)
 }
