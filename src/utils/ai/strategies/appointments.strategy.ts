@@ -1,23 +1,559 @@
-// server/src/utils/ai/strategies/appointments.strategy.ts
+// src/modules/ai/appointment.strategy.ts
+import axios from 'axios'
 import prisma from '../../../lib/prisma'
+import type { Prisma } from '@prisma/client'
 import { openai } from '../../../lib/openai'
-import type { IAReplyResult } from '../../handleIAReply.ecommerce'
-import { ConversationEstado, MessageFrom } from '@prisma/client'
+import {
+    ConversationEstado,
+    MediaType,
+    MessageFrom,
+} from '@prisma/client'
 import * as Wam from '../../../services/whatsapp.service'
+import { transcribeAudioBuffer } from '../../../services/transcription.service'
+import type { IAReplyResult } from '../../handleIAReply.ecommerce'
 
+/* ================= Config imagen/texto ================= */
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                  // espera si llega imagen sin texto
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // adjunta imagen reciente si aplica
+const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // ventana de idempotencia
 
-/* ========== util: branding & formato breve (copias mínimas) ========== */
+/* ================= Respuesta breve ================= */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
 const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)
 const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
 
-function softTrim(s: string | null | undefined, max = 160) {
+/* ===== Idempotencia por inbound (sin DB) ===== */
+const processedInbound = new Map<number, number>() // messageId -> ts
+function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS) {
+    const now = Date.now()
+    const prev = processedInbound.get(messageId)
+    if (prev && (now - prev) <= windowMs) return true
+    processedInbound.set(messageId, now)
+    return false
+}
+
+/* ================= API principal ================= */
+export async function handleAppointmentReply(args: {
+    chatId: number
+    empresaId: number
+    mensajeArg?: string
+    toPhone?: string
+    phoneNumberId?: string
+}): Promise<IAReplyResult | null> {
+    const { chatId, empresaId, mensajeArg = '', toPhone, phoneNumberId } = args
+
+    // 1) Conversación base
+    const conversacion = await prisma.conversation.findUnique({
+        where: { id: chatId },
+        select: { id: true, estado: true, phone: true },
+    })
+    if (!conversacion) return null
+
+    // 2) Último mensaje del cliente
+    const last = await prisma.message.findFirst({
+        where: { conversationId: chatId, from: MessageFrom.client },
+        orderBy: { timestamp: 'desc' },
+        select: {
+            id: true,
+            mediaType: true,
+            mediaUrl: true,
+            caption: true,
+            isVoiceNote: true,
+            transcription: true,
+            contenido: true,
+            mimeType: true,
+            timestamp: true,
+        },
+    })
+
+    if (process.env.DEBUG_AI === '1') {
+        console.log('[APPOINTMENT] enter', {
+            chatId, empresaId,
+            lastId: last?.id, lastTs: last?.timestamp, lastType: last?.mediaType,
+            hasCaption: !!(last?.caption && String(last.caption).trim()),
+            hasContenido: !!(last?.contenido && String(last.contenido).trim()),
+            mensajeArgLen: (args.mensajeArg || '').length,
+        })
+    }
+
+    // Evitar doble respuesta por el mismo inbound
+    if (last?.id && seenInboundRecently(last.id)) {
+        if (process.env.DEBUG_AI === '1') console.log('[APPOINTMENT] Skip: inbound already processed', { lastId: last.id })
+        return null
+    }
+
+    // 3) Config de citas del negocio
+    const [bc, empresa] = await Promise.all([
+        prisma.businessConfig.findUnique({
+            where: { empresaId },
+            select: {
+                nombre: true,
+                appointmentVertical: true,
+                appointmentPolicies: true,
+                appointmentTimezone: true,
+                servicios: true, // texto libre (coma/enter); ajusta si tienes tabla separada
+            },
+        }),
+        prisma.empresa.findUnique({ where: { id: empresaId }, select: { nombre: true } }),
+    ])
+
+    // 4) Preparar texto priorizando transcripción (nota de voz)
+    let userText = (mensajeArg || '').trim()
+    if (!userText && last?.isVoiceNote) {
+        let transcript = (last.transcription || '').trim()
+        if (!transcript) {
+            try {
+                let audioBuf: Buffer | null = null
+                if (last.mediaUrl && /^https?:\/\//i.test(String(last.mediaUrl))) {
+                    const { data } = await axios.get(String(last.mediaUrl), { responseType: 'arraybuffer', timeout: 30000 })
+                    audioBuf = Buffer.from(data)
+                }
+                if (audioBuf) {
+                    const name =
+                        last.mimeType?.includes('mpeg') ? 'audio.mp3'
+                            : last.mimeType?.includes('wav') ? 'audio.wav'
+                                : last.mimeType?.includes('m4a') ? 'audio.m4a'
+                                    : last.mimeType?.includes('webm') ? 'audio.webm'
+                                        : 'audio.ogg'
+                    transcript = await transcribeAudioBuffer(audioBuf, name)
+                    if (transcript) {
+                        await prisma.message.update({ where: { id: last.id }, data: { transcription: transcript } })
+                    }
+                }
+            } catch (e) {
+                if (process.env.DEBUG_AI === '1') console.error('[APPOINTMENT] Transcription error:', (e as any)?.message || e)
+            }
+        }
+        if (transcript) userText = transcript
+    }
+
+    const isImage = last?.mediaType === MediaType.image && !!last?.mediaUrl
+    const imageUrl = isImage ? String(last?.mediaUrl) : null
+    const caption = String(last?.caption || '').trim()
+
+    // ====== Debounce por conversación ======
+    if (isImage) {
+        if (caption || userText) {
+            if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
+                if (process.env.DEBUG_AI === '1') console.log('[APPOINTMENT] Skip (debounce): image+caption same webhook')
+                return null
+            }
+            const comboText = (userText || caption || '').trim() || 'Hola'
+            const resp = await answerWithLLM_Appointment({
+                chatId,
+                empresaId,
+                negocio: empresa,
+                bc,
+                userText: comboText,
+                effectiveImageUrl: imageUrl,
+                lastIdToExcludeFromHistory: last?.id,
+                toPhone,
+                phoneNumberId,
+            })
+            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp)
+            return resp
+        } else {
+            if (process.env.DEBUG_AI === '1') console.log('[APPOINTMENT] Image-only: defer to upcoming text')
+            await sleep(IMAGE_WAIT_MS)
+            return null
+        }
+    } else {
+        if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
+            if (process.env.DEBUG_AI === '1') console.log('[APPOINTMENT] Skip (debounce): normal text flow')
+            return null
+        }
+    }
+
+    // 5) System prompt (vertical + servicios + políticas + tz)
+    const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
+    const vertical = humanVertical(bc?.appointmentVertical || 'servicios')
+    const nameLine = negocioName
+        ? `Asistente de ${vertical} de "${negocioName}".`
+        : `Asistente de ${vertical}.`
+
+    const servicios = parseServicios(bc?.servicios)
+    const serviciosLine = servicios.length
+        ? `Servicios autorizados: ${servicios.map(s => `• ${s}`).join('\n')}`
+        : `El negocio aún no publicó su catálogo completo de servicios. Si preguntan por algo no listado, ofrece ayuda para entender necesidades y comparte las opciones disponibles.`
+
+    const policies = (bc?.appointmentPolicies || '').trim()
+    const tz = (bc?.appointmentTimezone || '').trim()
+
+    const system = [
+        nameLine,
+        `Habla en primera persona (yo), tono profesional, cercano y claro. Responde en 2–5 líneas.`,
+        `Actúa dentro del ámbito de ${vertical}. No inventes información. Si preguntan fuera de alcance, indícalo y reconduce.`,
+        serviciosLine,
+        policies ? `Políticas relevantes: ${policies}` : '',
+        tz ? `Zona horaria del negocio: ${tz} (úsala solo como referencia de horarios; por ahora no confirmes reservas).` : '',
+        `AÚN NO agendas. Si piden reservar, ofrece orientar sobre disponibilidad y próximos pasos; evita confirmar citas por tu cuenta.`,
+    ].filter(Boolean).join('\n')
+
+    // 6) Historial
+    const history = await getRecentHistory(chatId, last?.id, 10)
+
+    // 7) Construcción de mensajes (adjunta imagen reciente si solo hay texto)
+    let effectiveImageUrl = imageUrl
+    if (!effectiveImageUrl && (userText || caption)) {
+        const recentImage = await prisma.message.findFirst({
+            where: {
+                conversationId: chatId,
+                from: MessageFrom.client,
+                mediaType: MediaType.image,
+                timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) },
+            },
+            orderBy: { timestamp: 'desc' },
+            select: { mediaUrl: true, caption: true },
+        })
+        if (recentImage?.mediaUrl) {
+            effectiveImageUrl = String(recentImage.mediaUrl)
+            if (!caption && recentImage.caption) {
+                userText = `${userText}\n\nNota de la imagen: ${recentImage.caption}`
+            }
+        }
+    }
+
+    const messages: Array<any> = [{ role: 'system', content: system }, ...history]
+    if (effectiveImageUrl) {
+        messages.push({
+            role: 'user',
+            content: [
+                { type: 'text', text: userText || caption || 'Hola' },
+                { type: 'image_url', image_url: { url: effectiveImageUrl } },
+            ],
+        })
+    } else {
+        messages.push({ role: 'user', content: userText || caption || 'Hola' })
+    }
+
+    budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
+
+    // 8) LLM
+    const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
+    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
+    let texto = ''
+    try {
+        texto = await runChatWithBudget({ model, messages, temperature, maxTokens: IA_MAX_TOKENS })
+    } catch (err: any) {
+        console.error('[APPOINTMENT] OpenAI error:', err?.response?.data || err?.message || err)
+        texto = 'Gracias por escribirnos. Puedo ayudarte con información sobre nuestros servicios y horarios.'
+    }
+
+    texto = closeNicely(texto)
+    texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
+    texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
+
+    // 9) Persistir + enviar
+    const saved = await persistBotReply({
+        conversationId: chatId,
+        empresaId,
+        texto,
+        nuevoEstado: ConversationEstado.respondido,
+        to: toPhone ?? conversacion.phone,
+        phoneNumberId,
+    })
+
+    if (!isImage && last?.timestamp) markActuallyReplied(chatId, last.timestamp)
+
+    return {
+        estado: ConversationEstado.respondido,
+        mensaje: saved.texto,
+        messageId: saved.messageId,
+        wamid: saved.wamid,
+        media: [],
+    }
+}
+
+/* ================= Variante para imagen con caption ================= */
+async function answerWithLLM_Appointment(opts: {
+    chatId: number
+    empresaId: number
+    negocio: { nombre?: string } | null
+    bc: any
+    userText: string
+    effectiveImageUrl?: string | null
+    lastIdToExcludeFromHistory?: number
+    toPhone?: string
+    phoneNumberId?: string
+}): Promise<IAReplyResult | null> {
+    const { chatId, empresaId, negocio, bc, userText, effectiveImageUrl, lastIdToExcludeFromHistory, toPhone, phoneNumberId } = opts
+
+    const negocioName = (bc?.nombre || negocio?.nombre || '').trim()
+    const vertical = humanVertical(bc?.appointmentVertical || 'servicios')
+    const nameLine = negocioName
+        ? `Asistente de ${vertical} de "${negocioName}".`
+        : `Asistente de ${vertical}.`
+
+    const servicios = parseServicios(bc?.servicios)
+    const serviciosLine = servicios.length
+        ? `Servicios autorizados: ${servicios.map(s => `• ${s}`).join('\n')}`
+        : `El negocio aún no publicó su catálogo completo de servicios. Si preguntan por algo no listado, ofrece ayuda para entender necesidades y comparte las opciones disponibles.`
+
+    const policies = (bc?.appointmentPolicies || '').trim()
+    const tz = (bc?.appointmentTimezone || '').trim()
+
+    const system = [
+        nameLine,
+        `Habla en primera persona (yo), tono profesional, cercano y claro. Responde en 2–5 líneas.`,
+        `Actúa dentro del ámbito de ${vertical}. No inventes información. Si preguntan fuera de alcance, indícalo y reconduce.`,
+        serviciosLine,
+        policies ? `Políticas relevantes: ${policies}` : '',
+        tz ? `Zona horaria del negocio: ${tz} (referencia; aún no agendas).` : '',
+        `AÚN NO agendas. Si piden reservar, ofrece orientar sobre disponibilidad y próximos pasos; evita confirmar citas por tu cuenta.`,
+    ].filter(Boolean).join('\n')
+
+    const history = await getRecentHistory(chatId, lastIdToExcludeFromHistory, 10)
+
+    const messages: Array<any> = [{ role: 'system', content: system }, ...history]
+    if (effectiveImageUrl) {
+        messages.push({
+            role: 'user',
+            content: [
+                { type: 'text', text: userText || 'Hola' },
+                { type: 'image_url', image_url: { url: effectiveImageUrl } },
+            ],
+        })
+    } else {
+        messages.push({ role: 'user', content: userText || 'Hola' })
+    }
+
+    budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
+
+    const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
+    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
+    let texto = ''
+    try {
+        texto = await runChatWithBudget({ model, messages, temperature, maxTokens: IA_MAX_TOKENS })
+    } catch (err: any) {
+        console.error('[APPOINTMENT] OpenAI error:', err?.response?.data || err?.message || err)
+        texto = 'Gracias por escribirnos. Puedo ayudarte con información sobre nuestros servicios y horarios.'
+    }
+
+    texto = closeNicely(texto)
+    texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
+    texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
+
+    const saved = await persistBotReply({
+        conversationId: chatId,
+        empresaId,
+        texto,
+        nuevoEstado: ConversationEstado.respondido,
+        to: toPhone,
+        phoneNumberId,
+    })
+
+    try {
+        if (lastIdToExcludeFromHistory) {
+            const ref = await prisma.message.findUnique({
+                where: { id: lastIdToExcludeFromHistory },
+                select: { timestamp: true },
+            })
+            if (ref?.timestamp) markActuallyReplied(chatId, ref.timestamp)
+        }
+    } catch { /* noop */ }
+
+    return {
+        estado: ConversationEstado.respondido,
+        mensaje: saved.texto,
+        messageId: saved.messageId,
+        wamid: saved.wamid,
+        media: [],
+    }
+}
+
+/* ================= Helpers compartidos ================= */
+
+function parseServicios(raw?: string | null): string[] {
+    const t = String(raw || '').trim()
+    if (!t) return []
+    // soporta coma, punto y coma y saltos de línea
+    return t
+        .split(/[\n;,]/g)
+        .map(s => s.replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 24) // seguridad
+}
+
+function humanVertical(v?: string | null) {
+    const s = String(v || '').toLowerCase().trim()
+    switch (s) {
+        case 'odontologia':
+        case 'odontológica':
+        case 'odontologica':
+            return 'odontología'
+        case 'estetica':
+        case 'clínica estética':
+            return 'clínica estética'
+        case 'veterinaria':
+            return 'veterinaria'
+        case 'salud':
+            return 'salud'
+        case 'fitness':
+            return 'fitness'
+        case 'bienestar':
+            return 'bienestar'
+        case 'automotriz':
+            return 'servicios automotrices'
+        default:
+            return s || 'servicios'
+    }
+}
+
+function sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// Historial compacto
+async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
+    const where: Prisma.MessageWhereInput = { conversationId }
+    if (excludeMessageId) where.id = { not: excludeMessageId }
+
+    const rows = await prisma.message.findMany({
+        where,
+        orderBy: { timestamp: 'desc' },
+        take,
+        select: { from: true, contenido: true },
+    })
+
+    return rows.reverse().map(r => {
+        const role = r.from === MessageFrom.client ? 'user' : 'assistant'
+        const content = softTrim(r.contenido || '', 220)
+        return { role, content }
+    })
+}
+
+async function runChatWithBudget(opts: {
+    model: string
+    messages: any[]
+    temperature: number
+    maxTokens: number
+}): Promise<string> {
+    const { model, messages, temperature } = opts
+    const firstMax = opts.maxTokens
+
+    if (process.env.DEBUG_AI === '1') {
+        console.log('[APPOINTMENT] model =', model)
+        console.log('[APPOINTMENT] OPENAI_API_KEY set =', !!process.env.OPENAI_API_KEY)
+        console.log('[APPOINTMENT] max_tokens try #1 =', firstMax)
+    }
+
+    try {
+        const resp1 = await openai.chat.completions.create({
+            model, messages, temperature, max_tokens: firstMax,
+        } as any)
+        return resp1?.choices?.[0]?.message?.content?.trim() || ''
+    } catch (err: any) {
+        const msg = String(err?.response?.data || err?.message || '')
+        if (process.env.DEBUG_AI === '1') console.error('[APPOINTMENT] first call error:', msg)
+
+        const affordable = parseAffordableTokens(msg)
+        const retryTokens =
+            (typeof affordable === 'number' && Number.isFinite(affordable))
+                ? Math.max(12, Math.min(affordable - 1, 48))
+                : 32
+
+        if (process.env.DEBUG_AI === '1') console.log('[APPOINTMENT] retry with max_tokens =', retryTokens)
+
+        const resp2 = await openai.chat.completions.create({
+            model, messages, temperature, max_tokens: retryTokens,
+        } as any)
+        return resp2?.choices?.[0]?.message?.content?.trim() || ''
+    }
+}
+
+function parseAffordableTokens(message: string): number | null {
+    const m =
+        message.match(/can\s+only\s+afford\s+(\d+)/i) ||
+        message.match(/only\s+(\d+)\s+tokens?/i) ||
+        message.match(/exceeded:\s*(\d+)\s*>\s*\d+/i)
+    if (m && m[1]) {
+        const n = Number(m[1])
+        return Number.isFinite(n) ? n : null
+    }
+    return null
+}
+
+// ===== prompt budgeting =====
+function softTrim(s: string | null | undefined, max = 140) {
     const t = (s || '').trim()
     if (!t) return ''
     return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, '') + '…'
 }
-function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
+function approxTokens(str: string) { return Math.ceil((str || '').length / 4) }
+
+function budgetMessages(messages: any[], budgetPromptTokens = 110) {
+    const sys = messages.find((m: any) => m.role === 'system')
+    const user = messages.find((m: any) => m.role === 'user')
+    if (!sys) return messages
+
+    const sysText = String(sys.content || '')
+    const userText = typeof user?.content === 'string'
+        ? user?.content
+        : Array.isArray(user?.content)
+            ? String(user?.content?.[0]?.text || '') : ''
+
+    let total = approxTokens(sysText) + approxTokens(userText)
+
+    for (const m of messages) {
+        if (m.role !== 'system' && m !== user) {
+            const t = typeof m.content === 'string'
+                ? m.content
+                : Array.isArray(m.content)
+                    ? String(m.content?.[0]?.text || '')
+                    : ''
+            total += approxTokens(t)
+        }
+    }
+
+    if (total <= budgetPromptTokens) return messages
+
+    const lines = sysText.split('\n').map(l => l.trim()).filter(Boolean)
+    const keep: string[] = []
+    for (const l of lines) {
+        if (/Asistente|Responde en|Actúa dentro del ámbito|Servicios autorizados|Políticas relevantes|Zona horaria/i.test(l)) {
+            keep.push(l)
+        }
+        if (keep.length >= 6) break
+    }
+    ; (sys as any).content = keep.join('\n') || lines.slice(0, 6).join('\n')
+
+    if (typeof user?.content === 'string') {
+        const ut = String(user.content)
+        user.content = ut.length > 200 ? ut.slice(0, 200) : ut
+    } else if (Array.isArray(user?.content)) {
+        const ut = String(user.content?.[0]?.text || '')
+        user.content[0].text = ut.length > 200 ? ut.slice(0, 200) : ut
+    }
+
+    let budget = budgetPromptTokens
+    const sizeOf = (c: any) => approxTokens(typeof c === 'string'
+        ? c
+        : Array.isArray(c) ? String(c?.[0]?.text || '') : '')
+
+    const sysTokens = approxTokens((sys as any).content || '')
+    budget -= sysTokens
+
+    const toTrim = messages.filter(m => m.role !== 'system' && m !== user)
+    for (const m of toTrim) {
+        const tks = sizeOf(m.content)
+        if (budget - tks <= 0) {
+            if (typeof m.content === 'string') {
+                m.content = softTrim(m.content, 120)
+            } else if (Array.isArray(m.content)) {
+                const txt = String(m.content?.[0]?.text || '')
+                m.content[0].text = softTrim(txt, 120)
+            }
+        } else {
+            budget -= tks
+        }
+    }
+
+    return messages
+}
+
+// ===== formatting / cierre =====
+function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS) {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return t
     const lines = t.split('\n').filter(Boolean)
@@ -33,7 +569,7 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
     t = t.replace(/^[•\-]\s*/gm, '').replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
     t = clampConcise(t, maxLines, maxChars)
     if (allowEmoji && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
-        const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '📆']
+        const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '💬']
         t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`
         t = clampConcise(t, maxLines, maxChars)
     }
@@ -48,46 +584,12 @@ function closeNicely(raw: string) {
     if (!t) return raw.trim()
     return `${t}…`
 }
-function maybeInjectBrand(text: string, businessPrompt?: string): string {
-    const p = String(businessPrompt || '')
-    const urlMatch = p.match(/(https?:\/\/[^\s]+|www\.[^\s]+)/i)
-    const url = urlMatch ? urlMatch[0] : ''
-    if (!url) return text
-    if (!endsWithPunctuation(text)) return text
-    const candidate = `${text}\nMás info: ${url}`.trim()
-    return clampConcise(candidate, IA_MAX_LINES, IA_MAX_CHARS)
-}
 
-/* ========== util: parse de servicios (desde BusinessConfig.servicios) ========== */
-function parseServiciosList(raw?: string | null): string[] {
-    const t = String(raw ?? '').trim()
-    if (!t) return []
-    // intenta JSON ["Corte","Color"] o string con comas/saltos de línea
-    try {
-        const j = JSON.parse(t)
-        if (Array.isArray(j)) return j.map(x => String(x || '').trim()).filter(Boolean)
-    } catch { /* noop */ }
-    return t
-        .split(/\r?\n|,/g)
-        .map(s => s.trim())
-        .filter(Boolean)
-}
-
-/* ========== util: historial & persistencia (copias mínimas) ========== */
-async function getRecentHistory(conversationId: number, take = 10) {
-    const rows = await prisma.message.findMany({
-        where: { conversationId },
-        orderBy: { timestamp: 'desc' },
-        take,
-        select: { from: true, contenido: true },
-    })
-    return rows.reverse().map(r => ({
-        role: r.from === MessageFrom.client ? 'user' : 'assistant',
-        content: softTrim(r.contenido || '', 220)
-    }))
-}
+/* ===== Persistencia & envío ===== */
 function normalizeToE164(n: string) { return String(n || '').replace(/[^\d]/g, '') }
-async function persistBotReply(opts: {
+async function persistBotReply({
+    conversationId, empresaId, texto, nuevoEstado, to, phoneNumberId,
+}: {
     conversationId: number
     empresaId: number
     texto: string
@@ -95,7 +597,6 @@ async function persistBotReply(opts: {
     to?: string
     phoneNumberId?: string
 }) {
-    const { conversationId, empresaId, texto, nuevoEstado, to, phoneNumberId } = opts
     const msg = await prisma.message.create({
         data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId },
     })
@@ -114,117 +615,17 @@ async function persistBotReply(opts: {
     return { messageId: msg.id, texto, wamid }
 }
 
-/* ========== Strategy principal ========== */
-export async function handleAppointmentsReply(args: {
-    chatId: number
-    empresaId: number
-    mensajeArg?: string
-    toPhone?: string
-    phoneNumberId?: string
-}): Promise<IAReplyResult | null> {
-    const { chatId, empresaId, mensajeArg = '', toPhone, phoneNumberId } = args
-
-    // 1) Config del negocio
-    const [bc, empresa] = await Promise.all([
-        prisma.businessConfig.findUnique({
-            where: { empresaId },
-            select: {
-                nombre: true,
-                appointmentVertical: true,   // <- usa este rol/vertical
-                servicios: true,             // <- origen de servicios permitidos
-                agentPrompt: true,           // para branding web/URL si lo tenías acá
-            }
-        }),
-        prisma.empresa.findUnique({ where: { id: empresaId }, select: { nombre: true } })
-    ])
-
-    if (!bc) {
-        const texto = 'No encuentro la configuración del negocio para agendar. Por favor intenta más tarde.'
-        const saved = await persistBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto,
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone,
-            phoneNumberId,
-        })
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        }
-    }
-
-
-    const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
-    const vertical = String(bc?.appointmentVertical ?? 'agenda')
-    const serviciosPermitidos = parseServiciosList(bc?.servicios)
-    const serviciosLinea = serviciosPermitidos.join(', ')
-
-    // 2) Prompt del sistema (habla de todo, pero SOLO agenda/propone de la lista)
-    const nameLine = negocioName
-        ? `Asistente de agenda (${vertical}) de "${negocioName}".`
-        : `Asistente de agenda (${vertical}).`
-
-    const reglas = [
-        nameLine,
-        'Responde breve (2–5 líneas), claro y empático.',
-        'Puedes hablar de dudas generales, precios, preparación, contraindicaciones, etc.',
-        '⚠️ Solo propón o agenda servicios que estén en la lista permitida (no inventes).',
-        serviciosPermitidos.length
-            ? `Servicios disponibles: ${serviciosLinea}. Si piden algo fuera, sugiere una alternativa de la lista.`
-            : 'Aún no hay servicios cargados; indica que pronto actualizaremos la agenda.',
-        'Evita párrafos largos y jerga complicada.',
-    ].filter(Boolean).join('\n')
-
-    // 3) Historial + mensaje del usuario
-    const history = await getRecentHistory(chatId, 10)
-    const messages: Array<any> = [
-        { role: 'system', content: reglas },
-        ...history,
-        { role: 'user', content: mensajeArg || 'Hola' },
-    ]
-
-    // 4) Llamada al LLM
-    const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini'
-    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35)
-    let texto = ''
-    try {
-        const resp = await openai.chat.completions.create({
-            model,
-            temperature,
-            max_tokens: IA_MAX_TOKENS,
-            messages
-        } as any)
-        texto = resp?.choices?.[0]?.message?.content?.trim() || ''
-    } catch (err: any) {
-        console.error('[APPOINTMENTS] OpenAI error:', err?.response?.data || err?.message || err)
-        texto = 'Gracias por escribirnos. Puedo ayudarte a revisar disponibilidad y opciones del servicio.'
-    }
-
-    // 5) Post-procesado conciso + branding web (si hay URL en prompt del negocio)
-    texto = closeNicely(texto)
-    texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
-    texto = maybeInjectBrand(texto, bc?.agentPrompt || '')
-
-
-    // 6) Guardar + enviar
-    const saved = await persistBotReply({
-        conversationId: chatId,
-        empresaId,
-        texto,
-        nuevoEstado: ConversationEstado.respondido,
-        to: toPhone,
-        phoneNumberId,
-    })
-
-    return {
-        estado: ConversationEstado.respondido,
-        mensaje: saved.texto,
-        messageId: saved.messageId,
-        wamid: saved.wamid,
-        media: [],
-    }
+/* ===== Idempotencia por conversación ===== */
+const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>()
+function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = REPLY_DEDUP_WINDOW_MS) {
+    const now = Date.now()
+    const prev = recentReplies.get(conversationId)
+    const clientMs = clientTs.getTime()
+    if (prev && prev.afterMs >= clientMs && (now - prev.repliedAtMs) <= windowMs) return true
+    recentReplies.set(conversationId, { afterMs: clientMs, repliedAtMs: now })
+    return false
+}
+function markActuallyReplied(conversationId: number, clientTs: Date) {
+    const now = Date.now()
+    recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now })
 }
