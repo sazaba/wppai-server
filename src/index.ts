@@ -23,6 +23,8 @@ import registerRoutes from './routes/whatsapp.register.routes'
 // Agenda 
 import appointmentsRoutes from './routes/appointments.routes'
 import appointmentHoursRoutes from './routes/appointmentHours.routes'
+import appointmentsConfigRoutes from "./routes/appointments.config.routes";
+
 
 
 // 📦 Cargar variables de entorno
@@ -154,7 +156,7 @@ app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
 
 // 🗓️ Agenda (NUEVO)
-
+app.use("/api/appointments/config", appointmentsConfigRoutes);
 app.use('/api/appointments', appointmentsRoutes)
 app.use('/api/appointment-hours', appointmentHoursRoutes)
 // 404 JSON final

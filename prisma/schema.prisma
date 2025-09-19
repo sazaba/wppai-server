@@ -104,6 +104,10 @@ enum AppointmentVertical {
   veterinaria
   fitness // gimnasios, entrenadores
   otros
+  odontologica // Clínica Odontológica
+  estetica // Clínica Estética
+  spa // Spa
+  custom
 }
 
 enum Weekday {
@@ -151,12 +155,13 @@ model Empresa {
 
   orders Order[] // pedidos asociados
 
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
-  Message         Message[]
-  Product         Product[]
-  Appointment     Appointment[]
-  AppointmentHour AppointmentHour[]
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  Message            Message[]
+  Product            Product[]
+  Appointment        Appointment[]
+  AppointmentHour    AppointmentHour[]
+  BusinessConfigAppt BusinessConfigAppt?
 
   @@map("empresa")
 }
@@ -492,4 +497,63 @@ model AppointmentHour {
   @@unique([empresaId, day])
   @@index([empresaId, day])
   @@map("appointmenthour")
+}
+
+model BusinessConfigAppt {
+  id        Int     @id @default(autoincrement())
+  empresaId Int     @unique
+  aiMode    AiMode? // 'appointments' recomendado cuando se habilite
+
+  // ===== Flags y parámetros base de agenda
+  appointmentEnabled        Boolean             @default(false)
+  appointmentVertical       AppointmentVertical @default(custom)
+  appointmentVerticalCustom String? // texto libre cuando vertical = custom
+  appointmentTimezone       String              @default("America/Bogota")
+  appointmentBufferMin      Int                 @default(10)
+  appointmentPolicies       String?             @db.Text
+  appointmentReminders      Boolean             @default(true)
+
+  // ===== Servicios
+  servicesText String? @db.Text // textarea libre (1 x línea / comas)
+  services     Json? // ["Limpieza", "Blanqueamiento", ...]
+
+  // ===== Logística / ubicación (opcional)
+  locationName        String?
+  locationAddress     String?
+  locationMapsUrl     String?
+  parkingInfo         String? @db.Text
+  virtualMeetingLink  String?
+  instructionsArrival String? @db.Text
+
+  // ===== Reglas operativas (opcional)
+  cancellationWindowHours Int?
+  noShowPolicy            String?  @db.Text
+  depositRequired         Boolean  @default(false)
+  depositAmount           Decimal? @db.Decimal(10, 2)
+  maxDailyAppointments    Int?
+  bookingWindowDays       Int?
+  blackoutDates           Json?
+  overlapStrategy         String? // "strict" | "flexible" (manejado en app)
+
+  // ===== Recordatorios / comunicaciones (opcional)
+  reminderSchedule       Json? // [{offsetHours:24, channel:"whatsapp"}, ...]
+  reminderTemplateId     String?
+  postBookingMessage     String? @db.Text
+  prepInstructionsPerSvc Json? // {"Limpieza dental":"Llegar 10 min antes", ...}
+
+  // ===== Knowledge Base (estructura + libre)
+  kbBusinessOverview String? @db.Text
+  kbFAQs             Json? // [{q:"", a:""}, ...]
+  kbServiceNotes     Json? // {"Servicio":"Notas..."}
+  kbEscalationRules  Json?
+  kbDisclaimers      String? @db.Text
+  kbMedia            Json? // links a PDFs/imagenes
+  kbFreeText         String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@map("businessconfig_appt")
 }
