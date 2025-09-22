@@ -381,11 +381,13 @@ export async function resetAppointments(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId;
     if (!empresaId) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
 
-    await prisma.businessConfigAppt.deleteMany({ where: { empresaId } });
+    await prisma.$transaction(async (tx) => {
+        await tx.businessConfigAppt.deleteMany({ where: { empresaId } });
+        await tx.appointmentHour.deleteMany({ where: { empresaId } });
+    });
 
-    return res.json({ ok: true, reset: true });
+    return res.json({ ok: true, reset: true, purgedHours: true });
 }
-
 /** ===== DELETE /config ===== */
 export async function deleteAppointmentConfig(req: Request, res: Response) {
     const empresaId = (req as any).user?.empresaId;
