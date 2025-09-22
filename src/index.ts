@@ -108,11 +108,19 @@ app.use(
         },
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        // 👇 añadimos el header custom para proteger POST/PATCH de citas
-        allowedHeaders: ['Content-Type', 'Authorization', 'x-appt-intent', 'x-estetica-intent'],
+        allowedHeaders: [
+            'Content-Type',
+            'Authorization',
+            'x-appt-intent',
+            'x-estetica-intent',
+            // 👇 añade estos dos
+            'cache-control',
+            'pragma',
+        ],
         exposedHeaders: ['Content-Length'],
-    }),
+    })
 )
+
 
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json({ type: 'application/json', limit: '5mb' }))
