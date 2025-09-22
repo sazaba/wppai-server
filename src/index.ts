@@ -21,7 +21,7 @@ import registerRoutes from './routes/whatsapp.register.routes'
 // Agenda 
 import appointmentsRoutes from './routes/appointments.routes'
 import appointmentHoursRoutes from './routes/appointmentHours.routes'
-import appointmentsConfigRoutes from "./routes/appointments.config.routes";
+import esteticaConfigRoutes from "./routes/estetica.config.routes";
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -143,7 +143,7 @@ app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
 
 // 🗓️ Agenda (NUEVO)
-app.use("/api/appointments/config", appointmentsConfigRoutes);
+app.use("/api/estetica/config", esteticaConfigRoutes);
 app.use('/api/appointments', appointmentsRoutes)
 app.use('/api/appointment-hours', appointmentHoursRoutes)
 

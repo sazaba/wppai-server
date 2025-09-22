@@ -12,7 +12,7 @@ type HourRow = {
     end2: string | null;
 };
 
-type SaveApptBody = {
+type SaveBody = {
     appointment: {
         enabled: boolean;
         vertical: "odontologica" | "estetica" | "spa" | "custom";
@@ -21,7 +21,7 @@ type SaveApptBody = {
         bufferMin: number;
         policies: string | null;
         reminders: boolean;
-        aiMode?: "appointments" | "agente" | "ecommerce";
+        aiMode?: "estetica" | "agente" | "ecommerce"; // 👈 por defecto será "estetica"
     };
     // Servicios
     servicesText?: string | null;
@@ -80,8 +80,8 @@ function normalizeServices(services?: string[] | null, servicesText?: string | n
     return servicesText.split(/\n|,/).map(s => s.trim()).filter(Boolean);
 }
 
-/** ===== GET /config ===== */
-export async function getAppointmentConfig(req: Request, res: Response) {
+/** ===== GET /api/estetica/config ===== */
+export async function getEsteticaConfig(req: Request, res: Response) {
     const empresaIdRaw = (req as any).user?.empresaId;
     const empresaId = Number(empresaIdRaw);
     if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
@@ -101,7 +101,7 @@ export async function getAppointmentConfig(req: Request, res: Response) {
                 bufferMin: 10,
                 policies: null,
                 reminders: true,
-                aiMode: "appointments",
+                aiMode: "estetica", // 👈 default
             },
             servicesText: "",
             services: [],
@@ -130,7 +130,7 @@ export async function getAppointmentConfig(req: Request, res: Response) {
             bufferMin: cfg.appointmentBufferMin,
             policies: cfg.appointmentPolicies ?? null,
             reminders: cfg.appointmentReminders,
-            aiMode: (cfg.aiMode as any) ?? "appointments",
+            aiMode: (cfg.aiMode as any) ?? "estetica",
         },
         servicesText: cfg.servicesText ?? "",
         services: (cfg.services as any) ?? [],
@@ -178,20 +178,23 @@ export async function getAppointmentConfig(req: Request, res: Response) {
     });
 }
 
-/** ===== POST /config (upsert completo) =====
- * Solo acepta requests desde el panel de Citas (x-appt-intent: citas)
+/** ===== POST /api/estetica/config (upsert completo) =====
+ * Requiere intent explícito: x-estetica-intent: estetica
+ * (Compat: también admite x-appt-intent: citas)
  */
-export async function saveAppointmentConfig(req: Request, res: Response) {
+export async function saveEsteticaConfig(req: Request, res: Response) {
     const empresaIdRaw = (req as any).user?.empresaId;
     const empresaId = Number(empresaIdRaw);
     if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
 
-    const apptIntent = String(req.header("x-appt-intent") || "").toLowerCase();
-    if (apptIntent !== "citas") {
-        return res.status(400).json({ ok: false, error: "APPT_INTENT_REQUIRED" });
+    const intentHeader = String(req.header("x-estetica-intent") || "").toLowerCase();
+    const legacyHeader = String(req.header("x-appt-intent") || "").toLowerCase();
+    const okIntent = intentHeader === "estetica" || legacyHeader === "citas";
+    if (!okIntent) {
+        return res.status(400).json({ ok: false, error: "ESTETICA_INTENT_REQUIRED" });
     }
 
-    const body = req.body as SaveApptBody;
+    const body = req.body as SaveBody;
     if (!body?.appointment) {
         return res.status(400).json({ ok: false, error: "APPOINTMENT_OBJECT_REQUIRED" });
     }
@@ -201,7 +204,7 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
     const verticalCustom = isCustom ? (body.appointment.verticalCustom?.trim() || null) : null;
 
     const dataConfig: any = {
-        aiMode: body.appointment.aiMode ?? "appointments",
+        aiMode: body.appointment.aiMode ?? "estetica", // 👈 por defecto estetica
 
         appointmentEnabled: body.appointment.enabled,
         appointmentVertical: body.appointment.vertical,
@@ -252,7 +255,6 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
         select: { id: true },
     });
 
-    // Si mandas hours en este endpoint, actualizamos; si no, no se tocan
     if (Array.isArray(body.hours) && body.hours.length) {
         for (const h of body.hours) {
             await prisma.appointmentHour.upsert({
@@ -280,20 +282,20 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
     return res.json({ ok: true });
 }
 
-/** ===== PATCH /config (update parcial) =====
- * Solo acepta requests desde el panel de Citas (x-appt-intent: citas)
- */
-export async function patchAppointmentConfig(req: Request, res: Response) {
+/** ===== PATCH /api/estetica/config (update parcial) ===== */
+export async function patchEsteticaConfig(req: Request, res: Response) {
     const empresaIdRaw = (req as any).user?.empresaId;
     const empresaId = Number(empresaIdRaw);
     if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
 
-    const apptIntent = String(req.header("x-appt-intent") || "").toLowerCase();
-    if (apptIntent !== "citas") {
-        return res.status(400).json({ ok: false, error: "APPT_INTENT_REQUIRED" });
+    const intentHeader = String(req.header("x-estetica-intent") || "").toLowerCase();
+    const legacyHeader = String(req.header("x-appt-intent") || "").toLowerCase();
+    const okIntent = intentHeader === "estetica" || legacyHeader === "citas";
+    if (!okIntent) {
+        return res.status(400).json({ ok: false, error: "ESTETICA_INTENT_REQUIRED" });
     }
 
-    const body = req.body as Partial<SaveApptBody>;
+    const body = req.body as Partial<SaveBody>;
 
     let servicesArray: string[] | undefined = undefined;
     if ("services" in body || "servicesText" in body) {
@@ -306,7 +308,7 @@ export async function patchAppointmentConfig(req: Request, res: Response) {
             : (body.appointment?.vertical ? null : undefined);
 
     const dataConfig: any = {
-        ...(body.appointment?.aiMode !== undefined && { aiMode: body.appointment.aiMode }),
+        ...(body.appointment?.aiMode !== undefined && { aiMode: body.appointment.aiMode }), // permite override
         ...(body.appointment?.enabled !== undefined && { appointmentEnabled: body.appointment.enabled }),
         ...(body.appointment?.vertical !== undefined && { appointmentVertical: body.appointment.vertical }),
         ...(verticalCustom !== undefined && { appointmentVerticalCustom: verticalCustom }),
@@ -361,6 +363,7 @@ export async function patchAppointmentConfig(req: Request, res: Response) {
             appointmentTimezone: "America/Bogota",
             appointmentBufferMin: 10,
             appointmentReminders: true,
+            aiMode: "estetica",
             ...dataConfig,
         },
         update: dataConfig,
@@ -394,10 +397,8 @@ export async function patchAppointmentConfig(req: Request, res: Response) {
     return res.json({ ok: true });
 }
 
-/** ===== POST /reset =====
- * Reinicia la config de appointments eliminando config + hours
- */
-export async function resetAppointments(req: Request, res: Response) {
+/** ===== POST /api/estetica/config/reset ===== */
+export async function resetEsteticaConfig(req: Request, res: Response) {
     const empresaIdRaw = (req as any).user?.empresaId;
     const empresaId = Number(empresaIdRaw);
     if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
@@ -410,8 +411,8 @@ export async function resetAppointments(req: Request, res: Response) {
     return res.json({ ok: true, reset: true, purgedHours: true });
 }
 
-/** ===== DELETE /config ===== */
-export async function deleteAppointmentConfig(req: Request, res: Response) {
+/** ===== DELETE /api/estetica/config ===== */
+export async function deleteEsteticaConfig(req: Request, res: Response) {
     const empresaIdRaw = (req as any).user?.empresaId;
     const empresaId = Number(empresaIdRaw);
     if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
