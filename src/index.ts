@@ -109,7 +109,7 @@ app.use(
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
         // 👇 añadimos el header custom para proteger POST/PATCH de citas
-        allowedHeaders: ['Content-Type', 'Authorization', 'x-appt-intent'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'x-appt-intent', 'x-estetica-intent'],
         exposedHeaders: ['Content-Length'],
     }),
 )
