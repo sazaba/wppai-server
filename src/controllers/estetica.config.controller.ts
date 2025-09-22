@@ -81,6 +81,7 @@ function normalizeServices(services?: string[] | null, servicesText?: string | n
 }
 
 /** ===== GET /api/estetica/config ===== */
+/** ===== GET /api/estetica/config ===== */
 export async function getEsteticaConfig(req: Request, res: Response) {
     const empresaIdRaw = (req as any).user?.empresaId;
     const empresaId = Number(empresaIdRaw);
@@ -91,8 +92,10 @@ export async function getEsteticaConfig(req: Request, res: Response) {
         prisma.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: "asc" } }),
     ]);
 
+    // 👉 si NO hay fila en businessconfig_appt:
     if (!cfg) {
         return res.json({
+            exists: false,                          // 👈 NUEVO
             appointment: {
                 enabled: false,
                 vertical: "custom",
@@ -101,7 +104,7 @@ export async function getEsteticaConfig(req: Request, res: Response) {
                 bufferMin: 10,
                 policies: null,
                 reminders: true,
-                aiMode: "estetica", // 👈 default
+                aiMode: "estetica",
             },
             servicesText: "",
             services: [],
@@ -121,7 +124,9 @@ export async function getEsteticaConfig(req: Request, res: Response) {
         });
     }
 
+    // 👉 si SÍ hay fila:
     return res.json({
+        exists: true,                             // 👈 NUEVO
         appointment: {
             enabled: cfg.appointmentEnabled,
             vertical: cfg.appointmentVertical,
