@@ -156,14 +156,14 @@ export async function upsertConfig(req: Request, res: Response) {
             aiModeFromBody === "agente"
                 ? "agente"
                 : appointmentEnabled
-                    ? "appointments"
+                    ? "estetica"
                     : aiModeFromBody ?? "agente"
 
         const wantsToSetAiModeOnUpdate: AiMode | undefined =
             aiModeFromBody === "agente"
                 ? "agente"
                 : appointmentEnabled
-                    ? "appointments"
+                    ? "estetica"
                     : aiModeFromBody /* puede ser 'ecommerce' si vino explícito */ || undefined
         // -------------------------------------------------------------------
 
