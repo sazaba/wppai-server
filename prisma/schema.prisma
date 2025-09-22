@@ -14,7 +14,7 @@ datasource db {
 enum AiMode {
   ecommerce
   agente
-  appointments
+  estetica
 }
 
 /// Especialidad del agente (expandible)
