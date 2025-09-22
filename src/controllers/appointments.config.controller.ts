@@ -82,8 +82,9 @@ function normalizeServices(services?: string[] | null, servicesText?: string | n
 
 /** ===== GET /config ===== */
 export async function getAppointmentConfig(req: Request, res: Response) {
-    const empresaId = (req as any).user?.empresaId;
-    if (!empresaId) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    const empresaIdRaw = (req as any).user?.empresaId;
+    const empresaId = Number(empresaIdRaw);
+    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
 
     const [cfg, hours] = await Promise.all([
         prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
@@ -177,12 +178,23 @@ export async function getAppointmentConfig(req: Request, res: Response) {
     });
 }
 
-/** ===== POST /config (upsert completo) ===== */
+/** ===== POST /config (upsert completo) =====
+ * Solo acepta requests desde el panel de Citas (x-appt-intent: citas)
+ */
 export async function saveAppointmentConfig(req: Request, res: Response) {
-    const empresaId = (req as any).user?.empresaId;
-    if (!empresaId) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    const empresaIdRaw = (req as any).user?.empresaId;
+    const empresaId = Number(empresaIdRaw);
+    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+
+    const apptIntent = String(req.header("x-appt-intent") || "").toLowerCase();
+    if (apptIntent !== "citas") {
+        return res.status(400).json({ ok: false, error: "APPT_INTENT_REQUIRED" });
+    }
 
     const body = req.body as SaveApptBody;
+    if (!body?.appointment) {
+        return res.status(400).json({ ok: false, error: "APPOINTMENT_OBJECT_REQUIRED" });
+    }
 
     const servicesArray = normalizeServices(body.services ?? null, body.servicesText ?? null);
     const isCustom = body.appointment.vertical === "custom";
@@ -268,10 +280,18 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
     return res.json({ ok: true });
 }
 
-/** ===== PATCH /config (update parcial) ===== */
+/** ===== PATCH /config (update parcial) =====
+ * Solo acepta requests desde el panel de Citas (x-appt-intent: citas)
+ */
 export async function patchAppointmentConfig(req: Request, res: Response) {
-    const empresaId = (req as any).user?.empresaId;
-    if (!empresaId) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    const empresaIdRaw = (req as any).user?.empresaId;
+    const empresaId = Number(empresaIdRaw);
+    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+
+    const apptIntent = String(req.header("x-appt-intent") || "").toLowerCase();
+    if (apptIntent !== "citas") {
+        return res.status(400).json({ ok: false, error: "APPT_INTENT_REQUIRED" });
+    }
 
     const body = req.body as Partial<SaveApptBody>;
 
@@ -307,12 +327,12 @@ export async function patchAppointmentConfig(req: Request, res: Response) {
 
         ...(body.rules?.cancellationWindowHours !== undefined && { cancellationWindowHours: body.rules.cancellationWindowHours }),
         ...(body.rules?.noShowPolicy !== undefined && { noShowPolicy: body.rules.noShowPolicy }),
-        ...(body.rules?.depositRequired !== undefined && { depositRequired: body.rules.depositRequired }),
-        ...(body.rules?.depositAmount !== undefined && { depositAmount: body.rules.depositAmount }),
-        ...(body.rules?.maxDailyAppointments !== undefined && { maxDailyAppointments: body.rules.maxDailyAppointments }),
-        ...(body.rules?.bookingWindowDays !== undefined && { bookingWindowDays: body.rules.bookingWindowDays }),
-        ...(body.rules?.blackoutDates !== undefined && { blackoutDates: body.rules.blackoutDates }),
-        ...(body.rules?.overlapStrategy !== undefined && { overlapStrategy: body.rules.overlapStrategy }),
+        ...(body.rules?.depositRequired !== undefined && { depositRequired: body.rules?.depositRequired }),
+        ...(body.rules?.depositAmount !== undefined && { depositAmount: body.rules?.depositAmount }),
+        ...(body.rules?.maxDailyAppointments !== undefined && { maxDailyAppointments: body.rules?.maxDailyAppointments }),
+        ...(body.rules?.bookingWindowDays !== undefined && { bookingWindowDays: body.rules?.bookingWindowDays }),
+        ...(body.rules?.blackoutDates !== undefined && { blackoutDates: body.rules?.blackoutDates }),
+        ...(body.rules?.overlapStrategy !== undefined && { overlapStrategy: body.rules?.overlapStrategy }),
 
         ...(body.reminders?.schedule !== undefined && { reminderSchedule: body.reminders.schedule }),
         ...(body.reminders?.templateId !== undefined && { reminderTemplateId: body.reminders.templateId }),
@@ -374,12 +394,13 @@ export async function patchAppointmentConfig(req: Request, res: Response) {
     return res.json({ ok: true });
 }
 
-/** ===== POST /reset (opcional) =====
- * Reinicia la config de appointments a valores por defecto (no toca horas)
+/** ===== POST /reset =====
+ * Reinicia la config de appointments eliminando config + hours
  */
 export async function resetAppointments(req: Request, res: Response) {
-    const empresaId = (req as any).user?.empresaId;
-    if (!empresaId) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    const empresaIdRaw = (req as any).user?.empresaId;
+    const empresaId = Number(empresaIdRaw);
+    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
 
     await prisma.$transaction(async (tx) => {
         await tx.businessConfigAppt.deleteMany({ where: { empresaId } });
@@ -388,10 +409,12 @@ export async function resetAppointments(req: Request, res: Response) {
 
     return res.json({ ok: true, reset: true, purgedHours: true });
 }
+
 /** ===== DELETE /config ===== */
 export async function deleteAppointmentConfig(req: Request, res: Response) {
-    const empresaId = (req as any).user?.empresaId;
-    if (!empresaId) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    const empresaIdRaw = (req as any).user?.empresaId;
+    const empresaId = Number(empresaIdRaw);
+    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
 
     const purgeHours =
         String(req.query.purgeHours || "").toLowerCase() === "true" ||

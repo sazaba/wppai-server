@@ -1,5 +1,3 @@
-
-// src/index.ts
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
@@ -25,8 +23,6 @@ import appointmentsRoutes from './routes/appointments.routes'
 import appointmentHoursRoutes from './routes/appointmentHours.routes'
 import appointmentsConfigRoutes from "./routes/appointments.config.routes";
 
-
-
 // 📦 Cargar variables de entorno
 dotenv.config()
 
@@ -34,13 +30,9 @@ dotenv.config()
 function sanitizePath(input?: string, fallback: string = '/socket.io') {
     if (!input) return fallback
     try {
-        // Si viene una URL completa (https://...), la rechazamos
-        // y usamos el fallback para evitar que algún lib intente registrarla como ruta.
         const u = new URL(input)
-        // si no lanza, entonces era URL
         return fallback
     } catch {
-        // no era URL; nos aseguramos que empiece por "/"
         return input.startsWith('/') ? input : `/${input}`
     }
 }
@@ -116,14 +108,10 @@ app.use(
         },
         credentials: true,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization'],
+        // 👇 añadimos el header custom para proteger POST/PATCH de citas
+        allowedHeaders: ['Content-Type', 'Authorization', 'x-appt-intent'],
         exposedHeaders: ['Content-Length'],
-
-
-
-
     }),
-
 )
 
 app.use(express.urlencoded({ extended: true }))
@@ -144,7 +132,6 @@ app.use('/api/webhook', webhookRoutes)
 app.use('/api/whatsapp', whatsappRoutes)
 app.use('/api', registerRoutes)
 
-
 // 🔐 Rutas protegidas
 app.use('/api/products', productRoutes)
 app.use('/api/config', configRoutes)
@@ -159,6 +146,7 @@ app.use("/api/payments", paymentsRouter)
 app.use("/api/appointments/config", appointmentsConfigRoutes);
 app.use('/api/appointments', appointmentsRoutes)
 app.use('/api/appointment-hours', appointmentHoursRoutes)
+
 // 404 JSON final
 app.use((req, res) => {
     const url = req.originalUrl.split('?')[0]
