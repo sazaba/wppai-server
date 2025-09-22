@@ -81,21 +81,108 @@ function normalizeServices(services?: string[] | null, servicesText?: string | n
 }
 
 /** ===== GET /api/estetica/config ===== */
-/** ===== GET /api/estetica/config ===== */
 export async function getEsteticaConfig(req: Request, res: Response) {
-    const empresaIdRaw = (req as any).user?.empresaId;
-    const empresaId = Number(empresaIdRaw);
-    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    const empresaIdRaw = (req as any).user?.empresaId
+    const empresaId = Number(empresaIdRaw)
+    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" })
 
-    const [cfg, hours] = await Promise.all([
-        prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
-        prisma.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: "asc" } }),
-    ]);
+    try {
+        const [cfg, hours] = await Promise.all([
+            prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
+            prisma.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: "asc" } }),
+        ])
 
-    // 👉 si NO hay fila en businessconfig_appt:
-    if (!cfg) {
+        if (!cfg) {
+            return res.json({
+                exists: false,
+                appointment: {
+                    enabled: false,
+                    vertical: "custom",
+                    verticalCustom: null,
+                    timezone: "America/Bogota",
+                    bufferMin: 10,
+                    policies: null,
+                    reminders: true,
+                    aiMode: "estetica",
+                },
+                servicesText: "",
+                services: [],
+                location: {},
+                rules: {},
+                reminders: { schedule: [], templateId: null, postBookingMessage: null },
+                prepInstructionsPerSvc: {},
+                kb: {},
+                hours: hours.map(h => ({
+                    day: h.day as any,
+                    isOpen: h.isOpen,
+                    start1: h.start1,
+                    end1: h.end1,
+                    start2: h.start2,
+                    end2: h.end2,
+                })),
+            })
+        }
+
         return res.json({
-            exists: false,                          // 👈 NUEVO
+            exists: true,
+            appointment: {
+                enabled: cfg.appointmentEnabled,
+                vertical: cfg.appointmentVertical,
+                verticalCustom: cfg.appointmentVerticalCustom ?? null,
+                timezone: cfg.appointmentTimezone,
+                bufferMin: cfg.appointmentBufferMin,
+                policies: cfg.appointmentPolicies ?? null,
+                reminders: cfg.appointmentReminders,
+                aiMode: (cfg.aiMode as any) ?? "estetica",
+            },
+            servicesText: cfg.servicesText ?? "",
+            services: (cfg.services as any) ?? [],
+            location: {
+                name: cfg.locationName ?? null,
+                address: cfg.locationAddress ?? null,
+                mapsUrl: cfg.locationMapsUrl ?? null,
+                parkingInfo: cfg.parkingInfo ?? null,
+                virtualLink: cfg.virtualMeetingLink ?? null,
+                instructionsArrival: cfg.instructionsArrival ?? null,
+            },
+            rules: {
+                cancellationWindowHours: cfg.cancellationWindowHours ?? null,
+                noShowPolicy: cfg.noShowPolicy ?? null,
+                depositRequired: cfg.depositRequired ?? false,
+                depositAmount: cfg.depositAmount ? Number(cfg.depositAmount) : null,
+                maxDailyAppointments: cfg.maxDailyAppointments ?? null,
+                bookingWindowDays: cfg.bookingWindowDays ?? null,
+                blackoutDates: (cfg.blackoutDates as any) ?? null,
+                overlapStrategy: cfg.overlapStrategy ?? null,
+            },
+            reminders: {
+                schedule: (cfg.reminderSchedule as any) ?? [],
+                templateId: cfg.reminderTemplateId ?? null,
+                postBookingMessage: cfg.postBookingMessage ?? null,
+            },
+            prepInstructionsPerSvc: (cfg.prepInstructionsPerSvc as any) ?? {},
+            kb: {
+                businessOverview: cfg.kbBusinessOverview ?? null,
+                faqs: (cfg.kbFAQs as any) ?? null,
+                serviceNotes: (cfg.kbServiceNotes as any) ?? null,
+                escalationRules: (cfg.kbEscalationRules as any) ?? null,
+                disclaimers: cfg.kbDisclaimers ?? null,
+                media: (cfg.kbMedia as any) ?? null,
+                freeText: cfg.kbFreeText ?? null,
+            },
+            hours: hours.map(h => ({
+                day: h.day as any,
+                isOpen: h.isOpen,
+                start1: h.start1,
+                end1: h.end1,
+                start2: h.start2,
+                end2: h.end2,
+            })),
+        })
+    } catch (err) {
+        console.error('[getEsteticaConfig] 500:', err)
+        return res.json({
+            exists: false,
             appointment: {
                 enabled: false,
                 vertical: "custom",
@@ -113,75 +200,12 @@ export async function getEsteticaConfig(req: Request, res: Response) {
             reminders: { schedule: [], templateId: null, postBookingMessage: null },
             prepInstructionsPerSvc: {},
             kb: {},
-            hours: hours.map(h => ({
-                day: h.day as Weekday,
-                isOpen: h.isOpen,
-                start1: h.start1,
-                end1: h.end1,
-                start2: h.start2,
-                end2: h.end2,
-            })),
-        });
+            hours: [],
+            error: "FALLBACK",
+        })
     }
-
-    // 👉 si SÍ hay fila:
-    return res.json({
-        exists: true,                             // 👈 NUEVO
-        appointment: {
-            enabled: cfg.appointmentEnabled,
-            vertical: cfg.appointmentVertical,
-            verticalCustom: cfg.appointmentVerticalCustom ?? null,
-            timezone: cfg.appointmentTimezone,
-            bufferMin: cfg.appointmentBufferMin,
-            policies: cfg.appointmentPolicies ?? null,
-            reminders: cfg.appointmentReminders,
-            aiMode: (cfg.aiMode as any) ?? "estetica",
-        },
-        servicesText: cfg.servicesText ?? "",
-        services: (cfg.services as any) ?? [],
-        location: {
-            name: cfg.locationName ?? null,
-            address: cfg.locationAddress ?? null,
-            mapsUrl: cfg.locationMapsUrl ?? null,
-            parkingInfo: cfg.parkingInfo ?? null,
-            virtualLink: cfg.virtualMeetingLink ?? null,
-            instructionsArrival: cfg.instructionsArrival ?? null,
-        },
-        rules: {
-            cancellationWindowHours: cfg.cancellationWindowHours ?? null,
-            noShowPolicy: cfg.noShowPolicy ?? null,
-            depositRequired: cfg.depositRequired ?? false,
-            depositAmount: cfg.depositAmount ? Number(cfg.depositAmount) : null,
-            maxDailyAppointments: cfg.maxDailyAppointments ?? null,
-            bookingWindowDays: cfg.bookingWindowDays ?? null,
-            blackoutDates: (cfg.blackoutDates as any) ?? null,
-            overlapStrategy: cfg.overlapStrategy ?? null,
-        },
-        reminders: {
-            schedule: (cfg.reminderSchedule as any) ?? [],
-            templateId: cfg.reminderTemplateId ?? null,
-            postBookingMessage: cfg.postBookingMessage ?? null,
-        },
-        prepInstructionsPerSvc: (cfg.prepInstructionsPerSvc as any) ?? {},
-        kb: {
-            businessOverview: cfg.kbBusinessOverview ?? null,
-            faqs: (cfg.kbFAQs as any) ?? null,
-            serviceNotes: (cfg.kbServiceNotes as any) ?? null,
-            escalationRules: (cfg.kbEscalationRules as any) ?? null,
-            disclaimers: cfg.kbDisclaimers ?? null,
-            media: (cfg.kbMedia as any) ?? null,
-            freeText: cfg.kbFreeText ?? null,
-        },
-        hours: hours.map(h => ({
-            day: h.day as Weekday,
-            isOpen: h.isOpen,
-            start1: h.start1,
-            end1: h.end1,
-            start2: h.start2,
-            end2: h.end2,
-        })),
-    });
 }
+
 
 /** ===== POST /api/estetica/config (upsert completo) =====
  * Requiere intent explícito: x-estetica-intent: estetica

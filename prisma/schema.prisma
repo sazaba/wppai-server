@@ -15,6 +15,7 @@ enum AiMode {
   ecommerce
   agente
   estetica
+  appts
 }
 
 /// Especialidad del agente (expandible)
