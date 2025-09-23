@@ -509,7 +509,7 @@ model AppointmentHour {
   @@map("appointmenthour")
 }
 
-/// Estetica Base de Datos
+/// Estetica Base de Datos//
 
 model BusinessConfigAppt {
   id        Int     @id @default(autoincrement())
