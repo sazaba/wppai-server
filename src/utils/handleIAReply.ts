@@ -2,7 +2,7 @@
 import prisma from '../lib/prisma'
 import { handleEcommerceIAReply, type IAReplyResult } from './handleIAReply.ecommerce'
 import { handleAgentReply } from './ai/strategies/agent.strategy'
-import { handleAppointmentReply } from './ai/strategies/appointments.strategy'
+import { handleEsteticaReply } from './ai/strategies/estetica.strategy'
 import {
     AiMode,
     AgentSpecialty,
@@ -105,7 +105,7 @@ export const handleIAReply = async (
 
     // 👉 Citas / Estética (usa la tabla businessconfig_appt)
     if (mode === AiMode.appts || mode === AiMode.estetica) {
-        return handleAppointmentReply({
+        return handleEsteticaReply({
             chatId,
             empresaId: conversacion.empresaId,
             mensajeArg,

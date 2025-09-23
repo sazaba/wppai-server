@@ -73,7 +73,7 @@ export type ApptConfigFromOrchestrator = {
 }
 
 /* ================= API principal ================= */
-export async function handleAppointmentReply(args: {
+export async function handleEsteticaReply(args: {
     chatId: number
     empresaId: number
     mensajeArg?: string
