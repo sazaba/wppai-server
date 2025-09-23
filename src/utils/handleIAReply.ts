@@ -41,7 +41,7 @@ export const handleIAReply = async (
     const mode = config?.aiMode ?? AiMode.ecommerce
 
     // 👉 Modo citas (solo conversación contextual; sin agendar aún)
-    if (mode === AiMode.appointments) {
+    if (mode === AiMode.estetica) {
         return handleAppointmentReply({
             chatId,
             empresaId: conversacion.empresaId,
