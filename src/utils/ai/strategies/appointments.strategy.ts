@@ -1,7 +1,8 @@
-// src/modules/ai/appointment.strategy.ts
+// server/src/utils/ai/strategies/appointments.strategy.ts
 import axios from 'axios'
 import prisma from '../../../lib/prisma'
 import type { Prisma } from '@prisma/client'
+import { AppointmentVertical } from '@prisma/client'
 import { openai } from '../../../lib/openai'
 import {
     ConversationEstado,
@@ -13,9 +14,9 @@ import { transcribeAudioBuffer } from '../../../services/transcription.service'
 import type { IAReplyResult } from '../../handleIAReply.ecommerce'
 
 /* ================= Config imagen/texto ================= */
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                  // espera si llega imagen sin texto
-const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // adjunta imagen reciente si aplica
-const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // ventana de idempotencia
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000)
+const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)
 
 /* ================= Respuesta breve ================= */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
@@ -24,13 +25,51 @@ const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
 
 /* ===== Idempotencia por inbound (sin DB) ===== */
-const processedInbound = new Map<number, number>() // messageId -> ts
+const processedInbound = new Map<number, number>()
 function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS) {
     const now = Date.now()
     const prev = processedInbound.get(messageId)
     if (prev && (now - prev) <= windowMs) return true
     processedInbound.set(messageId, now)
     return false
+}
+
+/* ================= Tipos locales ================= */
+type BcaConfig = {
+    appointmentEnabled?: boolean
+    appointmentVertical?: AppointmentVertical | null
+    appointmentVerticalCustom?: string | null
+    appointmentPolicies?: string | null
+    appointmentTimezone?: string | null
+    appointmentBufferMin?: number | null
+    appointmentReminders?: boolean | null
+    services?: unknown
+    servicesText?: string | null
+} | null
+
+type BcCompat = {
+    nombre?: string | null
+    appointmentVertical?: unknown
+    appointmentPolicies?: string | null
+    appointmentTimezone?: string | null
+    servicios?: string | null
+} | null
+
+// Para permitir que el orquestador pase apptConfig (opcional)
+export type ApptConfigFromOrchestrator = {
+    timezone: string
+    bufferMin: number
+    vertical: AppointmentVertical
+    verticalCustom: string | null
+    enabled: boolean
+    policies: string | null
+    reminders: boolean
+    services?: unknown
+    servicesText?: string
+    logistics?: Record<string, unknown>
+    rules?: Record<string, unknown>
+    remindersConfig?: Record<string, unknown>
+    kb?: Record<string, unknown>
 }
 
 /* ================= API principal ================= */
@@ -40,6 +79,7 @@ export async function handleAppointmentReply(args: {
     mensajeArg?: string
     toPhone?: string
     phoneNumberId?: string
+    apptConfig?: ApptConfigFromOrchestrator
 }): Promise<IAReplyResult | null> {
     const { chatId, empresaId, mensajeArg = '', toPhone, phoneNumberId } = args
 
@@ -83,8 +123,22 @@ export async function handleAppointmentReply(args: {
         return null
     }
 
-    // 3) Config de citas del negocio
-    const [bc, empresa] = await Promise.all([
+    // 3) Config del negocio (prioriza BCA, luego BC)
+    const [bca, bc, empresa] = await Promise.all([
+        prisma.businessConfigAppt.findUnique({
+            where: { empresaId },
+            select: {
+                appointmentEnabled: true,
+                appointmentVertical: true,
+                appointmentVerticalCustom: true,
+                appointmentPolicies: true,
+                appointmentTimezone: true,
+                appointmentBufferMin: true,
+                appointmentReminders: true,
+                services: true,
+                servicesText: true,
+            },
+        }) as Promise<BcaConfig>,
         prisma.businessConfig.findUnique({
             where: { empresaId },
             select: {
@@ -92,9 +146,9 @@ export async function handleAppointmentReply(args: {
                 appointmentVertical: true,
                 appointmentPolicies: true,
                 appointmentTimezone: true,
-                servicios: true, // texto libre (coma/enter); ajusta si tienes tabla separada
+                servicios: true,
             },
-        }),
+        }) as Promise<BcCompat>,
         prisma.empresa.findUnique({ where: { id: empresaId }, select: { nombre: true } }),
     ])
 
@@ -144,7 +198,8 @@ export async function handleAppointmentReply(args: {
                 chatId,
                 empresaId,
                 negocio: empresa,
-                bc,
+                bc,   // back-compat (nombre/catálogo largo)
+                bca,  // config especializada
                 userText: comboText,
                 effectiveImageUrl: imageUrl,
                 lastIdToExcludeFromHistory: last?.id,
@@ -165,20 +220,23 @@ export async function handleAppointmentReply(args: {
         }
     }
 
-    // 5) System prompt (vertical + servicios + políticas + tz)
+    // 5) System prompt (prioriza BCA, luego BC)
     const negocioName = (bc?.nombre || empresa?.nombre || '').trim()
-    const vertical = humanVertical(bc?.appointmentVertical || 'servicios')
+    const verticalVal =
+        (bca?.appointmentVertical ?? toApptVerticalOrNull(bc?.appointmentVertical)) ?? AppointmentVertical.custom
+    const vertical = humanVertical(verticalVal, bca?.appointmentVerticalCustom)
+
     const nameLine = negocioName
         ? `Asistente de ${vertical} de "${negocioName}".`
         : `Asistente de ${vertical}.`
 
-    const servicios = parseServicios(bc?.servicios)
+    const servicios = getServiciosFromConfigs(bca, bc)
     const serviciosLine = servicios.length
         ? `Servicios autorizados: ${servicios.map(s => `• ${s}`).join('\n')}`
         : `El negocio aún no publicó su catálogo completo de servicios. Si preguntan por algo no listado, ofrece ayuda para entender necesidades y comparte las opciones disponibles.`
 
-    const policies = (bc?.appointmentPolicies || '').trim()
-    const tz = (bc?.appointmentTimezone || '').trim()
+    const policies = (bca?.appointmentPolicies ?? bc?.appointmentPolicies ?? '').trim()
+    const tz = (bca?.appointmentTimezone ?? bc?.appointmentTimezone ?? '').trim()
 
     const system = [
         nameLine,
@@ -270,28 +328,36 @@ async function answerWithLLM_Appointment(opts: {
     chatId: number
     empresaId: number
     negocio: { nombre?: string } | null
-    bc: any
+    bc: BcCompat
+    bca?: BcaConfig
     userText: string
     effectiveImageUrl?: string | null
     lastIdToExcludeFromHistory?: number
     toPhone?: string
     phoneNumberId?: string
 }): Promise<IAReplyResult | null> {
-    const { chatId, empresaId, negocio, bc, userText, effectiveImageUrl, lastIdToExcludeFromHistory, toPhone, phoneNumberId } = opts
+    const {
+        chatId, empresaId, negocio, bc, bca, userText,
+        effectiveImageUrl, lastIdToExcludeFromHistory, toPhone, phoneNumberId
+    } = opts
 
     const negocioName = (bc?.nombre || negocio?.nombre || '').trim()
-    const vertical = humanVertical(bc?.appointmentVertical || 'servicios')
+
+    const verticalVal =
+        (bca?.appointmentVertical ?? toApptVerticalOrNull(bc?.appointmentVertical)) ?? AppointmentVertical.custom
+    const vertical = humanVertical(verticalVal, bca?.appointmentVerticalCustom)
+
     const nameLine = negocioName
         ? `Asistente de ${vertical} de "${negocioName}".`
         : `Asistente de ${vertical}.`
 
-    const servicios = parseServicios(bc?.servicios)
+    const servicios = getServiciosFromConfigs(bca, bc)
     const serviciosLine = servicios.length
         ? `Servicios autorizados: ${servicios.map(s => `• ${s}`).join('\n')}`
         : `El negocio aún no publicó su catálogo completo de servicios. Si preguntan por algo no listado, ofrece ayuda para entender necesidades y comparte las opciones disponibles.`
 
-    const policies = (bc?.appointmentPolicies || '').trim()
-    const tz = (bc?.appointmentTimezone || '').trim()
+    const policies = (bca?.appointmentPolicies ?? bc?.appointmentPolicies ?? '').trim()
+    const tz = (bca?.appointmentTimezone ?? bc?.appointmentTimezone ?? '').trim()
 
     const system = [
         nameLine,
@@ -364,25 +430,19 @@ async function answerWithLLM_Appointment(opts: {
 
 /* ================= Helpers compartidos ================= */
 
-function parseServicios(raw?: string | null): string[] {
-    const t = String(raw || '').trim()
-    if (!t) return []
-    // soporta coma, punto y coma y saltos de línea
-    return t
-        .split(/[\n;,]/g)
-        .map(s => s.replace(/\s+/g, ' ').trim())
-        .filter(Boolean)
-        .slice(0, 24) // seguridad
-}
-
-function humanVertical(v?: string | null) {
-    const s = String(v || '').toLowerCase().trim()
+// Resuelve el vertical usando enum/string con fallback
+function humanVertical(v?: string | AppointmentVertical | null, custom?: string | null) {
+    if (!v) return (custom && custom.trim()) || 'servicios'
+    const s = String(v).toLowerCase().trim()
     switch (s) {
-        case 'odontologia':
-        case 'odontológica':
         case 'odontologica':
+        case 'odontológica':
+        case 'odontologia':
+        case 'odontología':
             return 'odontología'
         case 'estetica':
+        case 'estética':
+        case 'clinica estetica':
         case 'clínica estética':
             return 'clínica estética'
         case 'veterinaria':
@@ -395,9 +455,61 @@ function humanVertical(v?: string | null) {
             return 'bienestar'
         case 'automotriz':
             return 'servicios automotrices'
+        case 'spa':
+            return 'spa'
+        case 'custom':
+            return (custom && custom.trim()) || 'servicios'
         default:
-            return s || 'servicios'
+            return s || (custom && custom.trim()) || 'servicios'
     }
+}
+
+// Convierte valores heredados de BC a enum si aplica (o null si no mapea)
+function toApptVerticalOrNull(v?: unknown): AppointmentVertical | null {
+    const s = String(v ?? '').toLowerCase().trim()
+    if (!s) return null
+    const map: Record<string, AppointmentVertical> = {
+        'none': AppointmentVertical.none,
+        'salud': AppointmentVertical.salud,
+        'bienestar': AppointmentVertical.bienestar,
+        'automotriz': AppointmentVertical.automotriz,
+        'veterinaria': AppointmentVertical.veterinaria,
+        'fitness': AppointmentVertical.fitness,
+        'otros': AppointmentVertical.otros,
+        'odontologica': AppointmentVertical.odontologica,
+        'estetica': AppointmentVertical.estetica,
+        'spa': AppointmentVertical.spa,
+        'custom': AppointmentVertical.custom,
+        // compat
+        'servicios': AppointmentVertical.custom,
+    }
+    return map[s] ?? null
+}
+
+// Fusiona servicios priorizando BCA (array/texto) y luego BC (texto)
+function getServiciosFromConfigs(bca?: BcaConfig, bc?: BcCompat): string[] {
+    if (bca && Array.isArray(bca?.services)) {
+        const arr = (bca.services as any[]).map(x => String(x ?? '').trim()).filter(Boolean)
+        if (arr.length) return arr.slice(0, 24)
+    }
+    const tBca = String(bca?.servicesText || '').trim()
+    if (tBca) {
+        const parsed = parseServicios(tBca)
+        if (parsed.length) return parsed
+    }
+    const tBc = String(bc?.servicios || '').trim()
+    if (tBc) return parseServicios(tBc)
+    return []
+}
+
+function parseServicios(raw?: string | null): string[] {
+    const t = String(raw || '').trim()
+    if (!t) return []
+    return t
+        .split(/[\n;,]/g)
+        .map(s => s.replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 24)
 }
 
 function sleep(ms: number) {
