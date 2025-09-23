@@ -14,16 +14,16 @@ import type { IAReplyResult } from '../../handleIAReply.ecommerce'
 
 /** Config imagen/texto */
 const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                 // 1s re-chequeo (no respondemos desde imagen sola)
-const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min adjuntar imagen reciente
+// ⚠️ Equilibrio: ventana corta para arrastrar imagen automáticamente
+const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)             // 60s
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // legacy (solo si hay referencia explícita)
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s ventana idempotencia in-memory
+const IMAGE_CARRY_LOCK_MIN = Number(process.env.IA_IMAGE_CARRY_LOCK_MIN ?? 10)      // 10 min bloqueo tras imagen indebida
 
-/** ===== Respuesta breve (soft clamp) =====
- *  - Limitamos por líneas (no por caracteres) para evitar cortes a media frase.
- *  - El modelo ya viene breve por IA_MAX_TOKENS.
- */
-const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)     // líneas duras
-const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)   // tope blando, no cortamos por chars
-const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)  // tokens del LLM (ligeramente más aire para cerrar frases)
+/** ===== Respuesta breve (soft clamp) ===== */
+const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
+const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)
+const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
 
 // ===== Idempotencia por inbound (sin DB) =====
@@ -41,6 +41,31 @@ export type AgentConfig = {
     prompt: string
     scope: string
     disclaimers: string
+}
+
+/** ===== Candado de arrastre de imágenes tras contenido sensible ===== */
+const imageCarryLock = new Map<number, number>() // conversationId -> expiresAtMs
+function lockImageCarry(conversationId: number, minutes = IMAGE_CARRY_LOCK_MIN) {
+    imageCarryLock.set(conversationId, Date.now() + minutes * 60_000)
+}
+function isImageCarryLocked(conversationId: number) {
+    const until = imageCarryLock.get(conversationId) || 0
+    if (Date.now() > until) { imageCarryLock.delete(conversationId); return false }
+    return true
+}
+function triggersSensitiveImageLock(texto: string): boolean {
+    const t = String(texto || '').toLowerCase()
+    return /im[aá]genes?\s+de\s+[áa]reas\s+[íi]ntimas/.test(t)
+        || /no\s+puedo.*(recibir|analizar).*(im[aá]gen|foto).*[íi]ntim/.test(t)
+}
+
+/** ===== Detección de referencia explícita a la imagen ===== */
+function mentionsImageExplicitly(t: string) {
+    const s = String(t || '').toLowerCase()
+    return /\b(foto|imagen|selfie|captura|screenshot)\b/.test(s)
+        || /(mira|revisa|checa|ve|verifica)\s+la\s+(foto|imagen)/.test(s)
+        || /(te\s+mand(e|é)|te\s+envi(e|é))\s+(la\s+)?(foto|imagen)/.test(s)
+        || /\b(de|en)\s+la\s+(foto|imagen)\b/.test(s)
 }
 
 export async function handleAgentReply(args: {
@@ -208,23 +233,46 @@ export async function handleAgentReply(args: {
     // 6) Historial reciente
     const history = await getRecentHistory(chatId, last?.id, 10)
 
-    // 7) Construcción de mensajes (adjunta imagen reciente si solo hay texto)
+    // 7) Construcción de mensajes (adjunta imagen reciente si solo hay texto) — Equilibrio
     let effectiveImageUrl = imageUrl
     if (!effectiveImageUrl && userText) {
-        const recentImage = await prisma.message.findFirst({
-            where: {
-                conversationId: chatId,
-                from: MessageFrom.client,
-                mediaType: MediaType.image,
-                timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) },
-            },
-            orderBy: { timestamp: 'desc' },
-            select: { mediaUrl: true, caption: true },
-        })
-        if (recentImage?.mediaUrl) {
-            effectiveImageUrl = String(recentImage.mediaUrl)
-            if (!caption && recentImage.caption) {
-                userText = `${userText}\n\nNota de la imagen: ${recentImage.caption}`
+        // ❗ si hay candado activo, no arrastrar imagen
+        if (!isImageCarryLocked(chatId)) {
+            // 7.1: primero intentamos ventana corta automática
+            const veryRecentImage = await prisma.message.findFirst({
+                where: {
+                    conversationId: chatId,
+                    from: MessageFrom.client,
+                    mediaType: MediaType.image,
+                    timestamp: { gte: new Date(Date.now() - IMAGE_CARRY_MS) },
+                },
+                orderBy: { timestamp: 'desc' },
+                select: { mediaUrl: true, caption: true, timestamp: true },
+            })
+
+            if (veryRecentImage?.mediaUrl) {
+                effectiveImageUrl = String(veryRecentImage.mediaUrl)
+                if (!caption && veryRecentImage.caption) {
+                    userText = `${userText}\n\nNota de la imagen: ${veryRecentImage.caption}`
+                }
+            } else if (mentionsImageExplicitly(userText)) {
+                // 7.2: si el texto menciona la foto, permitimos lookback más largo (legacy)
+                const referencedImage = await prisma.message.findFirst({
+                    where: {
+                        conversationId: chatId,
+                        from: MessageFrom.client,
+                        mediaType: MediaType.image,
+                        timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) },
+                    },
+                    orderBy: { timestamp: 'desc' },
+                    select: { mediaUrl: true, caption: true, timestamp: true },
+                })
+                if (referencedImage?.mediaUrl) {
+                    effectiveImageUrl = String(referencedImage.mediaUrl)
+                    if (!caption && referencedImage.caption) {
+                        userText = `${userText}\n\nNota de la imagen: ${referencedImage.caption}`
+                    }
+                }
             }
         }
     }
@@ -264,6 +312,13 @@ export async function handleAgentReply(args: {
     // 9) Post-formateo (solo líneas, sin branding)
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
+
+    // 👉 Si el texto implica rechazo por imagen íntima, activar candado
+    try {
+        if (triggersSensitiveImageLock(texto)) {
+            lockImageCarry(chatId, IMAGE_CARRY_LOCK_MIN)
+        }
+    } catch { /* noop */ }
 
     // 10) Persistir y responder
     const saved = await persistBotReply({
@@ -369,6 +424,13 @@ async function answerWithLLM(opts: {
     // Sin branding al final
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
+
+    // Candado si aplica
+    try {
+        if (triggersSensitiveImageLock(texto)) {
+            lockImageCarry(chatId, IMAGE_CARRY_LOCK_MIN)
+        }
+    } catch { /* noop */ }
 
     const saved = await persistBotReply({
         conversationId: chatId,
@@ -547,8 +609,6 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
 }
 
 // ===== formatting / misc =====
-
-// Soft clamp: SOLO líneas, no recortamos por caracteres para evitar “Te recom…”
 function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return t
@@ -565,13 +625,9 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
     let t = String(text || '').trim()
     if (!t) return 'Gracias por escribirnos. ¿Cómo puedo ayudarte?'
 
-    // Limpieza ligera
     t = t.replace(/^[•\-]\s*/gm, '').replace(/\s+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
-
-    // Recorte final SOLO por líneas
     t = clampConcise(t, maxLines, maxChars)
 
-    // 1 emoji opcional si el texto es “limpio”
     if (allowEmoji && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
         const EMOJIS = ['🙂', '💡', '👌', '✅', '✨', '🧴', '💬', '🫶']
         t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`
@@ -584,12 +640,10 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
 function endsWithPunctuation(t: string) {
     return /[.!?…]\s*$/.test((t || '').trim())
 }
-
 function closeNicely(raw: string): string {
     let t = (raw || '').trim()
     if (!t) return t
     if (endsWithPunctuation(t)) return t
-    // Quitar última palabra "a medias" y cerrar con puntos suspensivos
     t = t.replace(/\s+[^\s]*$/, '').trim()
     if (!t) return raw.trim()
     return `${t}…`
