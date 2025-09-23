@@ -261,14 +261,9 @@ export async function handleAgentReply(args: {
     // NUEVO: cerrar bonito si quedó cortado
     texto = closeNicely(texto)
 
-    // 9) Post-formateo + marca/web (solo líneas)
+    // 9) Post-formateo (solo líneas, sin branding)
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
-    const businessPrompt: string | undefined =
-        (agent?.prompt && agent.prompt.trim()) ||
-        (bc?.agentPrompt && bc.agentPrompt.trim()) ||
-        undefined
-    texto = maybeInjectBrand(texto, businessPrompt)
 
     // 10) Persistir y responder
     const saved = await persistBotReply({
@@ -371,13 +366,9 @@ async function answerWithLLM(opts: {
     // NUEVO: cerrar bonito si quedó cortado
     texto = closeNicely(texto)
 
+    // Sin branding al final
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
-    const businessPrompt: string | undefined =
-        (agent?.prompt && agent.prompt.trim()) ||
-        (bc?.agentPrompt && bc.agentPrompt.trim()) ||
-        undefined
-    texto = maybeInjectBrand(texto, businessPrompt)
 
     const saved = await persistBotReply({
         conversationId: chatId,
@@ -526,7 +517,7 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
         user.content = ut.length > 200 ? ut.slice(0, 200) : ut
     } else if (Array.isArray(user?.content)) {
         const ut = String(user.content?.[0]?.text || '')
-        user.content[0].text = ut.length > 200 ? ut.slice(0, 200) : ut
+        user.content[0].text = softTrim(ut, 200)
     }
 
     let budget = budgetPromptTokens
@@ -602,27 +593,6 @@ function closeNicely(raw: string): string {
     t = t.replace(/\s+[^\s]*$/, '').trim()
     if (!t) return raw.trim()
     return `${t}…`
-}
-
-function maybeInjectBrand(text: string, businessPrompt?: string): string {
-    const p = String(businessPrompt || '')
-    const urlMatch = p.match(/(https?:\/\/[^\s]+|www\.[^\s]+)/i)
-    const url = urlMatch ? urlMatch[0] : ''
-    const brand = /leavid/i.test(p) ? 'Leavid Skincare' : ''
-
-    if (!brand && !url) return text
-
-    // Solo inyecta si el texto terminó en puntuación (evita "corte abrupto" + marca)
-    if (!endsWithPunctuation(text)) return text
-
-    const low = text.toLowerCase()
-    const alreadyHas = (brand && low.includes(brand.toLowerCase())) || (url && low.includes(url.toLowerCase()))
-    if (alreadyHas) return text
-
-    const tail = `Más info: ${brand || ''}${brand && url ? ' – ' : ''}${url || ''}`.trim()
-    const candidate = `${text}\n${tail}`.trim()
-    // Revalidamos SOLO por líneas
-    return clampConcise(candidate, IA_MAX_LINES, IA_MAX_CHARS)
 }
 
 function humanSpecialty(s: AgentSpecialty) {
