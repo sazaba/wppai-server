@@ -12,13 +12,17 @@ import * as Wam from '../../../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../../../services/transcription.service'
 import type { IAReplyResult } from '../../handleIAReply.ecommerce'
 
-/** Config imagen/texto */
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                 // 1s re-chequeo (no respondemos desde imagen sola)
-// ⚠️ Equilibrio: ventana corta para arrastrar imagen automáticamente
-const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)             // 60s
-const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // legacy (solo si hay referencia explícita)
-const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s ventana idempotencia in-memory
-const IMAGE_CARRY_LOCK_MIN = Number(process.env.IA_IMAGE_CARRY_LOCK_MIN ?? 10)      // 10 min bloqueo tras imagen indebida
+/** ===== Config imagen/texto ===== */
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                  // 1s re-chequeo (no respondemos desde imagen sola)
+// Ventana corta para arrastrar imagen automáticamente
+const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)              // 60s
+// Ventana legacy (solo si el texto menciona explícitamente la imagen)
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min
+const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s idempotencia
+
+/** ===== Retraso humano simulado ===== */
+const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000)    // 3 min
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)    // 2 min
 
 /** ===== Respuesta breve (soft clamp) ===== */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
@@ -43,29 +47,78 @@ export type AgentConfig = {
     disclaimers: string
 }
 
-/** ===== Candado de arrastre de imágenes tras contenido sensible ===== */
-const imageCarryLock = new Map<number, number>() // conversationId -> expiresAtMs
-function lockImageCarry(conversationId: number, minutes = IMAGE_CARRY_LOCK_MIN) {
-    imageCarryLock.set(conversationId, Date.now() + minutes * 60_000)
-}
-function isImageCarryLocked(conversationId: number) {
-    const until = imageCarryLock.get(conversationId) || 0
-    if (Date.now() > until) { imageCarryLock.delete(conversationId); return false }
-    return true
-}
-function triggersSensitiveImageLock(texto: string): boolean {
-    const t = String(texto || '').toLowerCase()
-    return /im[aá]genes?\s+de\s+[áa]reas\s+[íi]ntimas/.test(t)
-        || /no\s+puedo.*(recibir|analizar).*(im[aá]gen|foto).*[íi]ntim/.test(t)
+/** ===== Utils ===== */
+function sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-/** ===== Detección de referencia explícita a la imagen ===== */
+async function computeReplyDelayMs(conversationId: number) {
+    const prevBot = await prisma.message.findFirst({
+        where: { conversationId, from: MessageFrom.bot },
+        select: { id: true },
+    })
+    return prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
+}
+
+/** Detección de referencia explícita a imagen en el texto */
 function mentionsImageExplicitly(t: string) {
     const s = String(t || '').toLowerCase()
     return /\b(foto|imagen|selfie|captura|screenshot)\b/.test(s)
         || /(mira|revisa|checa|ve|verifica)\s+la\s+(foto|imagen)/.test(s)
         || /(te\s+mand(e|é)|te\s+envi(e|é))\s+(la\s+)?(foto|imagen)/.test(s)
         || /\b(de|en)\s+la\s+(foto|imagen)\b/.test(s)
+}
+
+/** Selección de imagen contextual equilibrada */
+async function pickImageForContext(opts: {
+    conversationId: number
+    directUrl?: string | null
+    userText: string
+    caption: string
+}): Promise<{ url: string | null, noteToAppend: string }> {
+    const { conversationId, directUrl, userText, caption } = opts
+
+    // Si viene imagen en el último mensaje, úsala
+    if (directUrl) return { url: String(directUrl), noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : '' }
+
+    if (!userText) return { url: null, noteToAppend: '' }
+
+    // 1) Ventana corta automática (no requiere mención explícita)
+    const veryRecent = await prisma.message.findFirst({
+        where: {
+            conversationId,
+            from: MessageFrom.client,
+            mediaType: MediaType.image,
+            timestamp: { gte: new Date(Date.now() - IMAGE_CARRY_MS) },
+        },
+        orderBy: { timestamp: 'desc' },
+        select: { mediaUrl: true, caption: true },
+    })
+    if (veryRecent?.mediaUrl) {
+        const note = veryRecent.caption ? `\n\nNota de la imagen: ${veryRecent.caption}` : ''
+        return { url: String(veryRecent.mediaUrl), noteToAppend: note }
+    }
+
+    // 2) Si el texto la menciona explícitamente, permitimos lookback más largo
+    if (mentionsImageExplicitly(userText)) {
+        const referenced = await prisma.message.findFirst({
+            where: {
+                conversationId,
+                from: MessageFrom.client,
+                mediaType: MediaType.image,
+                timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) },
+            },
+            orderBy: { timestamp: 'desc' },
+            select: { mediaUrl: true, caption: true },
+        })
+        if (referenced?.mediaUrl) {
+            const note = referenced.caption ? `\n\nNota de la imagen: ${referenced.caption}` : ''
+            return { url: String(referenced.mediaUrl), noteToAppend: note }
+        }
+    }
+
+    // 3) Nada aplicable → no arrastrar imagen
+    return { url: null, noteToAppend: '' }
 }
 
 export async function handleAgentReply(args: {
@@ -185,7 +238,7 @@ export async function handleAgentReply(args: {
                 negocio: empresa,
                 bc,
                 userText: comboText,
-                effectiveImageUrl: imageUrl,
+                effectiveImageUrl: imageUrl, // imagen del mismo webhook
                 attachRecentIfTextOnly: false,
                 lastIdToExcludeFromHistory: last?.id,
                 toPhone,
@@ -233,47 +286,18 @@ export async function handleAgentReply(args: {
     // 6) Historial reciente
     const history = await getRecentHistory(chatId, last?.id, 10)
 
-    // 7) Construcción de mensajes (adjunta imagen reciente si solo hay texto) — Equilibrio
+    // 7) Construcción de mensajes (adjunta imagen solo si aplica)
     let effectiveImageUrl = imageUrl
     if (!effectiveImageUrl && userText) {
-        // ❗ si hay candado activo, no arrastrar imagen
-        if (!isImageCarryLocked(chatId)) {
-            // 7.1: primero intentamos ventana corta automática
-            const veryRecentImage = await prisma.message.findFirst({
-                where: {
-                    conversationId: chatId,
-                    from: MessageFrom.client,
-                    mediaType: MediaType.image,
-                    timestamp: { gte: new Date(Date.now() - IMAGE_CARRY_MS) },
-                },
-                orderBy: { timestamp: 'desc' },
-                select: { mediaUrl: true, caption: true, timestamp: true },
-            })
-
-            if (veryRecentImage?.mediaUrl) {
-                effectiveImageUrl = String(veryRecentImage.mediaUrl)
-                if (!caption && veryRecentImage.caption) {
-                    userText = `${userText}\n\nNota de la imagen: ${veryRecentImage.caption}`
-                }
-            } else if (mentionsImageExplicitly(userText)) {
-                // 7.2: si el texto menciona la foto, permitimos lookback más largo (legacy)
-                const referencedImage = await prisma.message.findFirst({
-                    where: {
-                        conversationId: chatId,
-                        from: MessageFrom.client,
-                        mediaType: MediaType.image,
-                        timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) },
-                    },
-                    orderBy: { timestamp: 'desc' },
-                    select: { mediaUrl: true, caption: true, timestamp: true },
-                })
-                if (referencedImage?.mediaUrl) {
-                    effectiveImageUrl = String(referencedImage.mediaUrl)
-                    if (!caption && referencedImage.caption) {
-                        userText = `${userText}\n\nNota de la imagen: ${referencedImage.caption}`
-                    }
-                }
-            }
+        const picked = await pickImageForContext({
+            conversationId: chatId,
+            directUrl: null,
+            userText,
+            caption,
+        })
+        effectiveImageUrl = picked.url
+        if (picked.noteToAppend) {
+            userText = `${userText}${picked.noteToAppend}`
         }
     }
 
@@ -306,19 +330,17 @@ export async function handleAgentReply(args: {
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
 
-    // NUEVO: cerrar bonito si quedó cortado
+    // Cerrar bonito si quedó cortado
     texto = closeNicely(texto)
 
     // 9) Post-formateo (solo líneas, sin branding)
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
 
-    // 👉 Si el texto implica rechazo por imagen íntima, activar candado
-    try {
-        if (triggersSensitiveImageLock(texto)) {
-            lockImageCarry(chatId, IMAGE_CARRY_LOCK_MIN)
-        }
-    } catch { /* noop */ }
+    // ⏳ Retraso humano simulado
+    const delayMs = await computeReplyDelayMs(chatId)
+    if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
+    await sleep(delayMs)
 
     // 10) Persistir y responder
     const saved = await persistBotReply({
@@ -343,8 +365,23 @@ export async function handleAgentReply(args: {
 
 /* ================= helpers ================= */
 
-function sleep(ms: number) {
-    return new Promise(resolve => setTimeout(resolve, ms))
+// Historial: últimos N mensajes en formato compacto
+async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
+    const where: Prisma.MessageWhereInput = { conversationId }
+    if (excludeMessageId) where.id = { not: excludeMessageId }
+
+    const rows = await prisma.message.findMany({
+        where,
+        orderBy: { timestamp: 'desc' },
+        take,
+        select: { from: true, contenido: true },
+    })
+
+    return rows.reverse().map(r => {
+        const role = r.from === MessageFrom.client ? 'user' : 'assistant'
+        const content = softTrim(r.contenido || '', 220)
+        return { role, content }
+    })
 }
 
 async function answerWithLLM(opts: {
@@ -418,19 +455,14 @@ async function answerWithLLM(opts: {
         texto = 'Gracias por escribirnos. Podemos ayudarte con orientación general sobre tu consulta.'
     }
 
-    // NUEVO: cerrar bonito si quedó cortado
     texto = closeNicely(texto)
-
-    // Sin branding al final
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
 
-    // Candado si aplica
-    try {
-        if (triggersSensitiveImageLock(texto)) {
-            lockImageCarry(chatId, IMAGE_CARRY_LOCK_MIN)
-        }
-    } catch { /* noop */ }
+    // ⏳ Retraso humano simulado
+    const delayMs = await computeReplyDelayMs(chatId)
+    if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
+    await sleep(delayMs)
 
     const saved = await persistBotReply({
         conversationId: chatId,
@@ -458,25 +490,6 @@ async function answerWithLLM(opts: {
         wamid: saved.wamid,
         media: [],
     }
-}
-
-// Historial: últimos N mensajes en formato compacto
-async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
-    const where: Prisma.MessageWhereInput = { conversationId }
-    if (excludeMessageId) where.id = { not: excludeMessageId }
-
-    const rows = await prisma.message.findMany({
-        where,
-        orderBy: { timestamp: 'desc' },
-        take,
-        select: { from: true, contenido: true },
-    })
-
-    return rows.reverse().map(r => {
-        const role = r.from === MessageFrom.client ? 'user' : 'assistant'
-        const content = softTrim(r.contenido || '', 220)
-        return { role, content }
-    })
 }
 
 async function runChatWithBudget(opts: {
@@ -636,7 +649,7 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
     return t
 }
 
-// === NUEVO: helpers para cerrar bonito ===
+// === helpers para cerrar bonito ===
 function endsWithPunctuation(t: string) {
     return /[.!?…]\s*$/.test((t || '').trim())
 }
