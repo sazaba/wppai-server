@@ -1,9 +1,10 @@
-// server/src/controllers/appointments.controller.ts
 import { Request, Response } from "express";
 import prisma from "../lib/prisma";
 import { hasOverlap } from "./_availability";
 import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
+// NEW
+import { addMinutes } from "date-fns";
 
 /* ===================== Helpers ===================== */
 
@@ -89,6 +90,94 @@ async function ensureWithinBusinessHours(opts: {
     return { ok: true };
 }
 
+/* ===================== NEW: Config runtime (Appt > Legacy) ===================== */
+async function loadApptRuntimeConfig(empresaId: number) {
+    const [cfgAppt, cfgLegacy] = await Promise.all([
+        prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
+        prisma.businessConfig.findUnique({
+            where: { empresaId },
+            select: {
+                appointmentEnabled: true,
+                appointmentTimezone: true,
+                appointmentBufferMin: true,
+                appointmentPolicies: true,
+                appointmentReminders: true,
+            },
+        }),
+    ]);
+
+    return {
+        appointmentEnabled:
+            (cfgAppt?.appointmentEnabled ?? cfgLegacy?.appointmentEnabled) ?? false,
+        timezone:
+            (cfgAppt?.appointmentTimezone ?? cfgLegacy?.appointmentTimezone) ||
+            "America/Bogota",
+        bufferMin:
+            (cfgAppt?.appointmentBufferMin ?? cfgLegacy?.appointmentBufferMin) ?? 10,
+
+        // Reglas nuevas (opcionales)
+        minNoticeH: cfgAppt?.appointmentMinNoticeHours ?? null,
+        maxAdvanceD: cfgAppt?.appointmentMaxAdvanceDays ?? null,
+        allowSameDay: cfgAppt?.allowSameDayBooking ?? false,
+
+        // Caches opcionales
+        locationName: cfgAppt?.locationName ?? null,
+        defaultServiceDurationMin: cfgAppt?.defaultServiceDurationMin ?? null,
+    };
+}
+
+/* ===================== NEW: Reglas de ventana, excepciones y overlap con buffer ===================== */
+
+function violatesNoticeAndWindow(
+    cfg: { minNoticeH: number | null; maxAdvanceD: number | null; allowSameDay: boolean },
+    startAt: Date
+) {
+    const now = new Date();
+    const sameDay = startAt.toDateString() === now.toDateString();
+    if (!cfg.allowSameDay && sameDay) return true;
+
+    const hoursDiff = (startAt.getTime() - now.getTime()) / 3_600_000;
+    if (cfg.minNoticeH != null && hoursDiff < cfg.minNoticeH) return true;
+
+    if (cfg.maxAdvanceD != null) {
+        const maxMs = cfg.maxAdvanceD * 24 * 3_600_000;
+        if (startAt.getTime() - now.getTime() > maxMs) return true;
+    }
+    return false;
+}
+
+async function isExceptionDay(empresaId: number, d: Date) {
+    const day = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const ex = await prisma.appointmentException.findFirst({
+        where: { empresaId, date: day },
+        select: { id: true },
+    });
+    return !!ex;
+}
+
+async function hasOverlapWithBuffer(opts: {
+    empresaId: number;
+    startAt: Date;
+    endAt: Date;
+    bufferMin: number;
+    ignoreId?: number;
+}) {
+    const { empresaId, startAt, endAt, bufferMin, ignoreId } = opts;
+    const startBuf = addMinutes(startAt, -bufferMin);
+    const endBuf = addMinutes(endAt, bufferMin);
+
+    const overlap = await prisma.appointment.findFirst({
+        where: {
+            empresaId,
+            ...(ignoreId ? { id: { not: ignoreId } } : {}),
+            status: { in: ["pending", "confirmed", "rescheduled"] },
+            OR: [{ startAt: { lt: endBuf }, endAt: { gt: startBuf } }],
+        },
+        select: { id: true },
+    });
+    return !!overlap;
+}
+
 /* ===================== List ===================== */
 // GET /api/appointments?from=&to=
 export async function listAppointments(req: Request, res: Response) {
@@ -140,6 +229,8 @@ export async function createAppointment(req: Request, res: Response) {
             startAt,
             endAt,
             timezone,
+            procedureId,        // opcional
+            serviceDurationMin, // opcional (cache)
         } = req.body;
 
         if (!customerName || !customerPhone || !serviceName || !startAt || !endAt) {
@@ -154,15 +245,50 @@ export async function createAppointment(req: Request, res: Response) {
         if (!(start < end))
             return res.status(400).json({ error: "startAt debe ser menor que endAt" });
 
-        // 1) Horario de atención
+        // === Config combinada (Appt > Legacy) ===
+        const cfg = await loadApptRuntimeConfig(empresaId);
+        if (!cfg.appointmentEnabled) {
+            return res
+                .status(403)
+                .json({ error: "La agenda está deshabilitada para esta empresa." });
+        }
+
+        // 1) Horario de atención (legacy) + excepción de agenda
         const wh = await ensureWithinBusinessHours({ empresaId, start, end });
         if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
-        // 2) Solapamiento
-        const overlap = await hasOverlap({ empresaId, startAt: start, endAt: end });
-        if (overlap)
-            return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
+        const dayExcept = await isExceptionDay(empresaId, start);
+        if (dayExcept)
+            return res.status(409).json({ error: "Día bloqueado por excepción." });
 
+        // 2) Reglas de ventana (minNotice / maxAdvance / same-day)
+        const violates = violatesNoticeAndWindow(
+            {
+                minNoticeH: cfg.minNoticeH,
+                maxAdvanceD: cfg.maxAdvanceD,
+                allowSameDay: cfg.allowSameDay,
+            },
+            start
+        );
+        if (violates) {
+            return res
+                .status(409)
+                .json({ error: "El horario solicitado no cumple con las reglas de reserva." });
+        }
+
+        // 3) Solapamiento con BUFFER desde config (mantiene tu lógica, solo la mejora)
+        const overlap = await hasOverlapWithBuffer({
+            empresaId,
+            startAt: start,
+            endAt: end,
+            bufferMin: cfg.bufferMin,
+        });
+        if (overlap)
+            return res
+                .status(409)
+                .json({ error: "Existe otra cita en ese intervalo (buffer aplicado)." });
+
+        // 4) Crear cita (con caches opcionales; no rompe tu modelo actual)
         const appt = await prisma.appointment.create({
             data: {
                 empresaId,
@@ -175,7 +301,15 @@ export async function createAppointment(req: Request, res: Response) {
                 notas: notas ?? null,
                 startAt: start,
                 endAt: end,
-                timezone: timezone || "America/Bogota",
+                timezone: timezone || cfg.timezone || "America/Bogota",
+                // nuevos opcionales
+                procedureId: procedureId ? Number(procedureId) : null,
+                customerDisplayName: customerName ?? null,
+                serviceDurationMin:
+                    serviceDurationMin ??
+                    cfg.defaultServiceDurationMin ??
+                    null,
+                locationNameCache: cfg.locationName ?? null,
             },
         });
 
@@ -208,16 +342,38 @@ export async function updateAppointment(req: Request, res: Response) {
 
         const changedWindow = Boolean(patch.startAt || patch.endAt);
 
+        // Cargar config para buffer/ventanas (no rompe si no existe Appt)
+        const cfg = await loadApptRuntimeConfig(empresaId);
+
         if (changedWindow) {
-            // Horario de atención
+            // Horario de atención (legacy) + excepción
             const wh = await ensureWithinBusinessHours({ empresaId, start, end });
             if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
-            // Solapamiento (ignorando la propia cita)
-            const overlap = await hasOverlap({
+            const dayExcept = await isExceptionDay(empresaId, start);
+            if (dayExcept)
+                return res.status(409).json({ error: "Día bloqueado por excepción." });
+
+            // Ventanas (minNotice/maxAdvance/same-day)
+            const violates = violatesNoticeAndWindow(
+                {
+                    minNoticeH: cfg.minNoticeH,
+                    maxAdvanceD: cfg.maxAdvanceD,
+                    allowSameDay: cfg.allowSameDay,
+                },
+                start
+            );
+            if (violates)
+                return res
+                    .status(409)
+                    .json({ error: "El horario solicitado no cumple con las reglas de reserva." });
+
+            // Solapamiento con BUFFER (ignorando la propia cita)
+            const overlap = await hasOverlapWithBuffer({
                 empresaId,
                 startAt: start,
                 endAt: end,
+                bufferMin: cfg.bufferMin,
                 ignoreId: id,
             });
             if (overlap)
@@ -237,6 +393,17 @@ export async function updateAppointment(req: Request, res: Response) {
                 startAt: start,
                 endAt: end,
                 timezone: patch.timezone ?? existing.timezone,
+                // opcionales nuevos (si los mandas desde UI)
+                procedureId:
+                    patch.procedureId !== undefined
+                        ? (patch.procedureId ? Number(patch.procedureId) : null)
+                        : existing.procedureId,
+                customerDisplayName:
+                    patch.customerDisplayName ?? existing.customerDisplayName,
+                serviceDurationMin:
+                    patch.serviceDurationMin ?? existing.serviceDurationMin,
+                locationNameCache:
+                    patch.locationNameCache ?? existing.locationNameCache,
             },
         });
 
@@ -248,31 +415,54 @@ export async function updateAppointment(req: Request, res: Response) {
 }
 
 /* ===================== CONFIG (GET + POST) ===================== */
+/** NOTA: se mantiene tu config LEGACY (BusinessConfig) para no romper front. */
 
+// ⏱️ "HH:MM"
 const timeZ = z.string().regex(/^\d{2}:\d{2}$/).nullable().optional();
 const dayZ = z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
 
-// 👇 Acepta aiMode opcional desde el front (solo "appointments" | "agente")
+// Inferir aiMode según vertical: estética => "estetica"; resto => "appts"
+function inferAiModeByVertical(vertical: string | undefined): "estetica" | "appts" {
+    if (vertical === "estetica") return "estetica";
+    return "appts";
+}
+
+// 👇 Acepta aiMode opcional desde el front (valores válidos del enum actual)
 const saveConfigDtoZ = z.object({
     appointment: z.object({
         enabled: z.boolean(),
-        vertical: z.enum(["none", "salud", "bienestar", "automotriz", "veterinaria", "fitness", "otros"]),
+        // Coincide con tu enum AppointmentVertical
+        vertical: z.enum([
+            "none",
+            "salud",
+            "bienestar",
+            "automotriz",
+            "veterinaria",
+            "fitness",
+            "otros",
+            "odontologica",
+            "estetica",
+            "spa",
+            "custom",
+        ]),
         timezone: z.string(),
         bufferMin: z.number().int().min(0).max(240),
         policies: z.string().nullable().optional(),
         reminders: z.boolean(),
-        aiMode: z.enum(["appointments", "agente"]).optional(),
+        aiMode: z.enum(["agente", "appts", "estetica"]).optional(),
     }),
-    hours: z.array(
-        z.object({
-            day: dayZ,
-            isOpen: z.boolean(),
-            start1: timeZ,
-            end1: timeZ,
-            start2: timeZ,
-            end2: timeZ,
-        })
-    ).length(7, "Deben venir los 7 días"),
+    hours: z
+        .array(
+            z.object({
+                day: dayZ,
+                isOpen: z.boolean(),
+                start1: timeZ,
+                end1: timeZ,
+                start2: timeZ,
+                end2: timeZ,
+            })
+        )
+        .length(7, "Deben venir los 7 días"),
 });
 
 /** GET /api/appointments/config
@@ -320,7 +510,8 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
         const { appointment, hours } = parsed;
 
         const forceAppointments = appointment.enabled === true;
-        const fromClient = appointment.aiMode; // "appointments" | "agente" | undefined
+        const fromClient = appointment.aiMode; // "agente" | "appts" | "estetica" | undefined
+        const inferredAiMode = inferAiModeByVertical(appointment.vertical);
 
         await prisma.$transaction(async (tx) => {
             const exists = await tx.businessConfig.findUnique({ where: { empresaId } });
@@ -342,8 +533,8 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // ✅ al CREAR: si enabled -> appointments; si no -> agente (evita defaults)
-                    aiMode: forceAppointments ? "appointments" : (fromClient ?? "agente"),
+                    // ✅ al CREAR: si enabled -> inferido por vertical; si no -> respeta fromClient o "agente"
+                    aiMode: forceAppointments ? inferredAiMode : (fromClient ?? "agente"),
                 },
                 update: {
                     appointmentEnabled: appointment.enabled,
@@ -353,11 +544,12 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
                     updatedAt: new Date(),
-                    // ✅ en UPDATE: si enabled=true, forzamos appointments;
-                    // si enabled=false y viene fromClient (agente), lo respetamos; en otro caso no tocamos.
+                    // ✅ en UPDATE: si enabled=true, forzamos el inferido; si enabled=false y viene fromClient, lo respetamos.
                     ...(forceAppointments
-                        ? { aiMode: "appointments" }
-                        : fromClient ? { aiMode: fromClient } : {}),
+                        ? { aiMode: inferredAiMode }
+                        : fromClient
+                            ? { aiMode: fromClient }
+                            : {}),
                 },
             });
 
@@ -419,8 +611,6 @@ export async function resetAppointments(req: Request, res: Response) {
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // si quieres forzar modo neutro aquí:
-                    // aiMode: "agente",
                 },
                 update: {
                     appointmentEnabled: false,
@@ -430,7 +620,6 @@ export async function resetAppointments(req: Request, res: Response) {
                     appointmentPolicies: null,
                     appointmentReminders: true,
                     updatedAt: new Date(),
-                    // aiMode: "agente",
                 },
             });
         });
@@ -440,4 +629,75 @@ export async function resetAppointments(req: Request, res: Response) {
         console.error("[appointments.reset] error:", e);
         return res.status(500).json({ error: "No se pudo reiniciar la agenda" });
     }
+}
+
+/* ===================== NUEVO: Reminder Rules + Tick ===================== */
+
+// GET /api/appointments/reminders
+export async function listReminderRules(req: Request, res: Response) {
+    const empresaId = getEmpresaId(req);
+    const data = await prisma.reminderRule.findMany({
+        where: { empresaId },
+        orderBy: { offsetHours: "asc" },
+    });
+    res.json(data);
+}
+
+// POST /api/appointments/reminders  (create/update)
+export async function upsertReminderRule(req: Request, res: Response) {
+    const empresaId = getEmpresaId(req);
+    const cfg = await prisma.businessConfigAppt.findUnique({ where: { empresaId } });
+    if (!cfg) return res.status(400).json({ error: "BusinessConfigAppt no encontrado" });
+
+    const dto = req.body;
+    const base = {
+        empresaId,
+        configApptId: cfg.id,
+        active: dto.active ?? true,
+        offsetHours: dto.offsetHours ?? 24,
+        messageTemplateId: Number(dto.messageTemplateId),
+        templateName: String(dto.templateName),
+        templateLang: dto.templateLang ?? "es",
+        templateParams: dto.templateParams ?? null,
+    };
+
+    const data = dto.id
+        ? await prisma.reminderRule.update({ where: { id: Number(dto.id) }, data: base })
+        : await prisma.reminderRule.create({ data: base });
+
+    res.json(data);
+}
+
+// POST /api/appointments/reminders/tick?window=5
+// Solo para pruebas: selecciona "debidos" y marca queued
+export async function triggerReminderTick(req: Request, res: Response) {
+    const windowMinutes = Number(req.query.window || 5);
+
+    const rows = await prisma.$queryRawUnsafe<any[]>(
+        `
+    SELECT a.id as appointmentId, rr.id as ruleId
+    FROM appointment a
+    JOIN reminder_rule rr ON rr.empresaId = a.empresaId AND rr.active = 1
+    LEFT JOIN appointment_reminder_log l
+      ON l.appointmentId = a.id AND l.reminderRuleId = rr.id
+    WHERE a.status IN ('confirmed')
+      AND l.id IS NULL
+      AND TIMESTAMPDIFF(MINUTE, NOW(), a.startAt) BETWEEN (rr.offsetHours*60) AND (rr.offsetHours*60 + ?)
+  `,
+        windowMinutes
+    );
+
+    // Aquí deberías invocar tu servicio real de WhatsApp + template.
+    // Simulación: marcamos en cola (queued)
+    for (const r of rows) {
+        await prisma.appointmentReminderLog.create({
+            data: {
+                appointmentId: r.appointmentId,
+                reminderRuleId: r.ruleId,
+                status: "queued",
+            },
+        });
+    }
+
+    res.json({ ok: true, count: rows.length, sample: rows.slice(0, 10) });
 }

@@ -1,461 +1,346 @@
-import type { Request, Response } from "express";
+// server/src/controllers/estetica.config.controller.ts
+import { Request, Response } from "express";
 import prisma from "../lib/prisma";
+import { Prisma, type Weekday, type StaffRole } from "@prisma/client";
+import { getEmpresaId } from "./_getEmpresaId";
 
-/** ===== Tipos auxiliares ===== */
-type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
-type HourRow = {
-    day: Weekday;
-    isOpen: boolean;
-    start1: string | null;
-    end1: string | null;
-    start2: string | null;
-    end2: string | null;
-};
-
-type SaveBody = {
-    appointment: {
-        enabled: boolean;
-        vertical: "odontologica" | "estetica" | "spa" | "custom";
-        verticalCustom?: string | null;
-        timezone: string;
-        bufferMin: number;
-        policies: string | null;
-        reminders: boolean;
-        aiMode?: "estetica" | "agente" | "ecommerce"; // 👈 por defecto será "estetica"
-    };
-    // Servicios
-    servicesText?: string | null;
-    services?: string[] | null;
-
-    // Logística
-    location?: {
-        name?: string | null;
-        address?: string | null;
-        mapsUrl?: string | null;
-        parkingInfo?: string | null;
-        virtualLink?: string | null;
-        instructionsArrival?: string | null;
-    };
-
-    // Reglas
-    rules?: {
-        cancellationWindowHours?: number | null;
-        noShowPolicy?: string | null;
-        depositRequired?: boolean | null;
-        depositAmount?: number | null;
-        maxDailyAppointments?: number | null;
-        bookingWindowDays?: number | null;
-        blackoutDates?: string[] | null;
-        overlapStrategy?: string | null;
-    };
-
-    // Recordatorios
-    reminders?: {
-        schedule?: Array<{ offsetHours: number; channel: string }> | null;
-        templateId?: string | null;
-        postBookingMessage?: string | null;
-    };
-
-    // Preparación por servicio
-    prepInstructionsPerSvc?: Record<string, string> | null;
-
-    // Knowledge Base
-    kb?: {
-        businessOverview?: string | null;
-        faqs?: Array<{ q: string; a: string }> | null;
-        serviceNotes?: Record<string, string> | null;
-        escalationRules?: any | null;
-        disclaimers?: string | null;
-        media?: any | null;
-        freeText?: string | null;
-    };
-
-    // Horario semanal (opcional)
-    hours?: HourRow[] | null;
-};
-
-function normalizeServices(services?: string[] | null, servicesText?: string | null) {
-    if (Array.isArray(services) && services.length) return services.filter(Boolean);
-    if (!servicesText) return [];
-    return servicesText.split(/\n|,/).map(s => s.trim()).filter(Boolean);
+/** ========= Helpers de tipado ========= */
+const WEEKDAY_VALUES: Weekday[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+function asWeekday(v: unknown): Weekday {
+    const s = String(v) as Weekday;
+    if (WEEKDAY_VALUES.includes(s)) return s;
+    throw new Error(`weekday inválido: ${v}`);
 }
 
-/** ===== GET /api/estetica/config ===== */
-export async function getEsteticaConfig(req: Request, res: Response) {
-    const empresaIdRaw = (req as any).user?.empresaId
-    const empresaId = Number(empresaIdRaw)
-    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" })
-
-    try {
-        const [cfg, hours] = await Promise.all([
-            prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
-            prisma.appointmentHour.findMany({ where: { empresaId }, orderBy: { day: "asc" } }),
-        ])
-
-        if (!cfg) {
-            return res.json({
-                exists: false,
-                appointment: {
-                    enabled: false,
-                    vertical: "custom",
-                    verticalCustom: null,
-                    timezone: "America/Bogota",
-                    bufferMin: 10,
-                    policies: null,
-                    reminders: true,
-                    aiMode: "estetica",
-                },
-                servicesText: "",
-                services: [],
-                location: {},
-                rules: {},
-                reminders: { schedule: [], templateId: null, postBookingMessage: null },
-                prepInstructionsPerSvc: {},
-                kb: {},
-                hours: hours.map(h => ({
-                    day: h.day as any,
-                    isOpen: h.isOpen,
-                    start1: h.start1,
-                    end1: h.end1,
-                    start2: h.start2,
-                    end2: h.end2,
-                })),
-            })
-        }
-
-        return res.json({
-            exists: true,
-            appointment: {
-                enabled: cfg.appointmentEnabled,
-                vertical: cfg.appointmentVertical,
-                verticalCustom: cfg.appointmentVerticalCustom ?? null,
-                timezone: cfg.appointmentTimezone,
-                bufferMin: cfg.appointmentBufferMin,
-                policies: cfg.appointmentPolicies ?? null,
-                reminders: cfg.appointmentReminders,
-                aiMode: (cfg.aiMode as any) ?? "estetica",
-            },
-            servicesText: cfg.servicesText ?? "",
-            services: (cfg.services as any) ?? [],
-            location: {
-                name: cfg.locationName ?? null,
-                address: cfg.locationAddress ?? null,
-                mapsUrl: cfg.locationMapsUrl ?? null,
-                parkingInfo: cfg.parkingInfo ?? null,
-                virtualLink: cfg.virtualMeetingLink ?? null,
-                instructionsArrival: cfg.instructionsArrival ?? null,
-            },
-            rules: {
-                cancellationWindowHours: cfg.cancellationWindowHours ?? null,
-                noShowPolicy: cfg.noShowPolicy ?? null,
-                depositRequired: cfg.depositRequired ?? false,
-                depositAmount: cfg.depositAmount ? Number(cfg.depositAmount) : null,
-                maxDailyAppointments: cfg.maxDailyAppointments ?? null,
-                bookingWindowDays: cfg.bookingWindowDays ?? null,
-                blackoutDates: (cfg.blackoutDates as any) ?? null,
-                overlapStrategy: cfg.overlapStrategy ?? null,
-            },
-            reminders: {
-                schedule: (cfg.reminderSchedule as any) ?? [],
-                templateId: cfg.reminderTemplateId ?? null,
-                postBookingMessage: cfg.postBookingMessage ?? null,
-            },
-            prepInstructionsPerSvc: (cfg.prepInstructionsPerSvc as any) ?? {},
-            kb: {
-                businessOverview: cfg.kbBusinessOverview ?? null,
-                faqs: (cfg.kbFAQs as any) ?? null,
-                serviceNotes: (cfg.kbServiceNotes as any) ?? null,
-                escalationRules: (cfg.kbEscalationRules as any) ?? null,
-                disclaimers: cfg.kbDisclaimers ?? null,
-                media: (cfg.kbMedia as any) ?? null,
-                freeText: cfg.kbFreeText ?? null,
-            },
-            hours: hours.map(h => ({
-                day: h.day as any,
-                isOpen: h.isOpen,
-                start1: h.start1,
-                end1: h.end1,
-                start2: h.start2,
-                end2: h.end2,
-            })),
-        })
-    } catch (err) {
-        console.error('[getEsteticaConfig] 500:', err)
-        return res.json({
-            exists: false,
-            appointment: {
-                enabled: false,
-                vertical: "custom",
-                verticalCustom: null,
-                timezone: "America/Bogota",
-                bufferMin: 10,
-                policies: null,
-                reminders: true,
-                aiMode: "estetica",
-            },
-            servicesText: "",
-            services: [],
-            location: {},
-            rules: {},
-            reminders: { schedule: [], templateId: null, postBookingMessage: null },
-            prepInstructionsPerSvc: {},
-            kb: {},
-            hours: [],
-            error: "FALLBACK",
-        })
-    }
+const STAFF_ROLES: StaffRole[] = ["profesional", "esteticista", "medico"];
+function asStaffRole(v: unknown): StaffRole {
+    const s = String(v) as StaffRole;
+    if (STAFF_ROLES.includes(s)) return s;
+    return "esteticista"; // valor por defecto
 }
 
+/** ========= BusinessConfigAppt ========= */
 
-/** ===== POST /api/estetica/config (upsert completo) =====
- * Requiere intent explícito: x-estetica-intent: estetica
- * (Compat: también admite x-appt-intent: citas)
- */
-export async function saveEsteticaConfig(req: Request, res: Response) {
-    const empresaIdRaw = (req as any).user?.empresaId;
-    const empresaId = Number(empresaIdRaw);
-    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+export async function getApptConfig(req: Request, res: Response) {
+    // 1) JWT → 2) params → 3) query
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
 
-    const intentHeader = String(req.header("x-estetica-intent") || "").toLowerCase();
-    const legacyHeader = String(req.header("x-appt-intent") || "").toLowerCase();
-    const okIntent = intentHeader === "estetica" || legacyHeader === "citas";
-    if (!okIntent) {
-        return res.status(400).json({ ok: false, error: "ESTETICA_INTENT_REQUIRED" });
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
     }
 
-    const body = req.body as SaveBody;
-    if (!body?.appointment) {
-        return res.status(400).json({ ok: false, error: "APPOINTMENT_OBJECT_REQUIRED" });
-    }
-
-    const servicesArray = normalizeServices(body.services ?? null, body.servicesText ?? null);
-    const isCustom = body.appointment.vertical === "custom";
-    const verticalCustom = isCustom ? (body.appointment.verticalCustom?.trim() || null) : null;
-
-    const dataConfig: any = {
-        aiMode: body.appointment.aiMode ?? "estetica", // 👈 por defecto estetica
-
-        appointmentEnabled: body.appointment.enabled,
-        appointmentVertical: body.appointment.vertical,
-        appointmentVerticalCustom: verticalCustom,
-        appointmentTimezone: body.appointment.timezone,
-        appointmentBufferMin: body.appointment.bufferMin,
-        appointmentPolicies: body.appointment.policies,
-        appointmentReminders: body.appointment.reminders,
-
-        servicesText: body.servicesText ?? null,
-        services: servicesArray.length ? servicesArray : [],
-
-        locationName: body.location?.name ?? undefined,
-        locationAddress: body.location?.address ?? undefined,
-        locationMapsUrl: body.location?.mapsUrl ?? undefined,
-        parkingInfo: body.location?.parkingInfo ?? undefined,
-        virtualMeetingLink: body.location?.virtualLink ?? undefined,
-        instructionsArrival: body.location?.instructionsArrival ?? undefined,
-
-        cancellationWindowHours: body.rules?.cancellationWindowHours ?? undefined,
-        noShowPolicy: body.rules?.noShowPolicy ?? undefined,
-        depositRequired: body.rules?.depositRequired ?? undefined,
-        depositAmount: body.rules?.depositAmount ?? undefined,
-        maxDailyAppointments: body.rules?.maxDailyAppointments ?? undefined,
-        bookingWindowDays: body.rules?.bookingWindowDays ?? undefined,
-        blackoutDates: body.rules?.blackoutDates ?? undefined,
-        overlapStrategy: body.rules?.overlapStrategy ?? undefined,
-
-        reminderSchedule: body.reminders?.schedule ?? undefined,
-        reminderTemplateId: body.reminders?.templateId ?? undefined,
-        postBookingMessage: body.reminders?.postBookingMessage ?? undefined,
-
-        prepInstructionsPerSvc: body.prepInstructionsPerSvc ?? undefined,
-
-        kbBusinessOverview: body.kb?.businessOverview ?? undefined,
-        kbFAQs: body.kb?.faqs ?? undefined,
-        kbServiceNotes: body.kb?.serviceNotes ?? undefined,
-        kbEscalationRules: body.kb?.escalationRules ?? undefined,
-        kbDisclaimers: body.kb?.disclaimers ?? undefined,
-        kbMedia: body.kb?.media ?? undefined,
-        kbFreeText: body.kb?.freeText ?? undefined,
-    };
-
-    await prisma.businessConfigAppt.upsert({
+    const data = await prisma.businessConfigAppt.findUnique({
         where: { empresaId },
-        create: { empresaId, ...dataConfig },
-        update: { ...dataConfig },
-        select: { id: true },
+        include: { EsteticaProcedure: true, ReminderRule: true },
     });
-
-    if (Array.isArray(body.hours) && body.hours.length) {
-        for (const h of body.hours) {
-            await prisma.appointmentHour.upsert({
-                where: { empresaId_day: { empresaId, day: h.day } },
-                create: {
-                    empresaId,
-                    day: h.day,
-                    isOpen: !!h.isOpen,
-                    start1: h.start1 ?? null,
-                    end1: h.end1 ?? null,
-                    start2: h.start2 ?? null,
-                    end2: h.end2 ?? null,
-                },
-                update: {
-                    isOpen: !!h.isOpen,
-                    start1: h.start1 ?? null,
-                    end1: h.end1 ?? null,
-                    start2: h.start2 ?? null,
-                    end2: h.end2 ?? null,
-                },
-            });
-        }
-    }
-
-    return res.json({ ok: true });
+    return res.json({ ok: true, data });
 }
 
-/** ===== PATCH /api/estetica/config (update parcial) ===== */
-export async function patchEsteticaConfig(req: Request, res: Response) {
-    const empresaIdRaw = (req as any).user?.empresaId;
-    const empresaId = Number(empresaIdRaw);
-    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+export async function upsertApptConfig(req: Request, res: Response) {
+    // 1) JWT → 2) params → 3) body
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
 
-    const intentHeader = String(req.header("x-estetica-intent") || "").toLowerCase();
-    const legacyHeader = String(req.header("x-appt-intent") || "").toLowerCase();
-    const okIntent = intentHeader === "estetica" || legacyHeader === "citas";
-    if (!okIntent) {
-        return res.status(400).json({ ok: false, error: "ESTETICA_INTENT_REQUIRED" });
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
     }
 
-    const body = req.body as Partial<SaveBody>;
+    // Los campos son opcionales; Prisma ignora undefined
+    const payload = {
+        aiMode: req.body.aiMode,
+        appointmentEnabled: req.body.appointmentEnabled as boolean | undefined,
+        appointmentVertical: req.body.appointmentVertical,
+        appointmentVerticalCustom: req.body.appointmentVerticalCustom ?? null,
+        appointmentTimezone: req.body.appointmentTimezone as string | undefined,
+        appointmentBufferMin: req.body.appointmentBufferMin as number | undefined,
+        appointmentPolicies: req.body.appointmentPolicies ?? null,
+        appointmentReminders: req.body.appointmentReminders as boolean | undefined,
 
-    let servicesArray: string[] | undefined = undefined;
-    if ("services" in body || "servicesText" in body) {
-        servicesArray = normalizeServices(body.services ?? null, body.servicesText ?? null);
-    }
+        appointmentMinNoticeHours: req.body.appointmentMinNoticeHours ?? null,
+        appointmentMaxAdvanceDays: req.body.appointmentMaxAdvanceDays ?? null,
+        allowSameDayBooking: req.body.allowSameDayBooking as boolean | undefined,
+        requireClientConfirmation: req.body.requireClientConfirmation as boolean | undefined,
+        cancellationAllowedHours: req.body.cancellationAllowedHours ?? null,
+        rescheduleAllowedHours: req.body.rescheduleAllowedHours ?? null,
+        defaultServiceDurationMin: req.body.defaultServiceDurationMin ?? null,
 
-    const isCustom = body.appointment?.vertical === "custom";
-    const verticalCustom =
-        isCustom ? (body.appointment?.verticalCustom?.trim() || null)
-            : (body.appointment?.vertical ? null : undefined);
+        servicesText: req.body.servicesText ?? null,
+        services: req.body.services ?? null,
 
-    const dataConfig: any = {
-        ...(body.appointment?.aiMode !== undefined && { aiMode: body.appointment.aiMode }), // permite override
-        ...(body.appointment?.enabled !== undefined && { appointmentEnabled: body.appointment.enabled }),
-        ...(body.appointment?.vertical !== undefined && { appointmentVertical: body.appointment.vertical }),
-        ...(verticalCustom !== undefined && { appointmentVerticalCustom: verticalCustom }),
-        ...(body.appointment?.timezone !== undefined && { appointmentTimezone: body.appointment.timezone }),
-        ...(body.appointment?.bufferMin !== undefined && { appointmentBufferMin: body.appointment.bufferMin }),
-        ...(body.appointment?.policies !== undefined && { appointmentPolicies: body.appointment.policies }),
-        ...(body.appointment?.reminders !== undefined && { appointmentReminders: body.appointment.reminders }),
+        locationName: req.body.locationName ?? null,
+        locationAddress: req.body.locationAddress ?? null,
+        locationMapsUrl: req.body.locationMapsUrl ?? null,
+        parkingInfo: req.body.parkingInfo ?? null,
+        virtualMeetingLink: req.body.virtualMeetingLink ?? null,
+        instructionsArrival: req.body.instructionsArrival ?? null,
 
-        ...(body.servicesText !== undefined && { servicesText: body.servicesText }),
-        ...(servicesArray !== undefined && { services: servicesArray }),
+        cancellationWindowHours: req.body.cancellationWindowHours ?? null,
+        noShowPolicy: req.body.noShowPolicy ?? null,
+        depositRequired: req.body.depositRequired as boolean | undefined,
+        depositAmount: req.body.depositAmount ?? null,
+        maxDailyAppointments: req.body.maxDailyAppointments ?? null,
+        bookingWindowDays: req.body.bookingWindowDays ?? null,
+        blackoutDates: req.body.blackoutDates ?? null,
+        overlapStrategy: req.body.overlapStrategy ?? null,
 
-        ...(body.location?.name !== undefined && { locationName: body.location.name }),
-        ...(body.location?.address !== undefined && { locationAddress: body.location.address }),
-        ...(body.location?.mapsUrl !== undefined && { locationMapsUrl: body.location.mapsUrl }),
-        ...(body.location?.parkingInfo !== undefined && { parkingInfo: body.location.parkingInfo }),
-        ...(body.location?.virtualLink !== undefined && { virtualMeetingLink: body.location.virtualLink }),
-        ...(body.location?.instructionsArrival !== undefined && { instructionsArrival: body.location.instructionsArrival }),
+        reminderSchedule: req.body.reminderSchedule ?? null,
+        reminderTemplateId: req.body.reminderTemplateId ?? null,
+        postBookingMessage: req.body.postBookingMessage ?? null,
+        prepInstructionsPerSvc: req.body.prepInstructionsPerSvc ?? null,
 
-        ...(body.rules?.cancellationWindowHours !== undefined && { cancellationWindowHours: body.rules.cancellationWindowHours }),
-        ...(body.rules?.noShowPolicy !== undefined && { noShowPolicy: body.rules.noShowPolicy }),
-        ...(body.rules?.depositRequired !== undefined && { depositRequired: body.rules?.depositRequired }),
-        ...(body.rules?.depositAmount !== undefined && { depositAmount: body.rules?.depositAmount }),
-        ...(body.rules?.maxDailyAppointments !== undefined && { maxDailyAppointments: body.rules?.maxDailyAppointments }),
-        ...(body.rules?.bookingWindowDays !== undefined && { bookingWindowDays: body.rules?.bookingWindowDays }),
-        ...(body.rules?.blackoutDates !== undefined && { blackoutDates: body.rules?.blackoutDates }),
-        ...(body.rules?.overlapStrategy !== undefined && { overlapStrategy: body.rules?.overlapStrategy }),
+        requireWhatsappOptIn: req.body.requireWhatsappOptIn as boolean | undefined,
+        allowSensitiveTopics: req.body.allowSensitiveTopics as boolean | undefined,
+        minClientAge: req.body.minClientAge ?? null,
 
-        ...(body.reminders?.schedule !== undefined && { reminderSchedule: body.reminders.schedule }),
-        ...(body.reminders?.templateId !== undefined && { reminderTemplateId: body.reminders.templateId }),
-        ...(body.reminders?.postBookingMessage !== undefined && { postBookingMessage: body.reminders.postBookingMessage }),
-
-        ...(body.prepInstructionsPerSvc !== undefined && { prepInstructionsPerSvc: body.prepInstructionsPerSvc }),
-
-        ...(body.kb?.businessOverview !== undefined && { kbBusinessOverview: body.kb.businessOverview }),
-        ...(body.kb?.faqs !== undefined && { kbFAQs: body.kb.faqs }),
-        ...(body.kb?.serviceNotes !== undefined && { kbServiceNotes: body.kb.serviceNotes }),
-        ...(body.kb?.escalationRules !== undefined && { kbEscalationRules: body.kb.escalationRules }),
-        ...(body.kb?.disclaimers !== undefined && { kbDisclaimers: body.kb.disclaimers }),
-        ...(body.kb?.media !== undefined && { kbMedia: body.kb.media }),
-        ...(body.kb?.freeText !== undefined && { kbFreeText: body.kb.freeText }),
+        kbBusinessOverview: req.body.kbBusinessOverview ?? null,
+        kbFAQs: req.body.kbFAQs ?? null,
+        kbServiceNotes: req.body.kbServiceNotes ?? null,
+        kbEscalationRules: req.body.kbEscalationRules ?? null,
+        kbDisclaimers: req.body.kbDisclaimers ?? null,
+        kbMedia: req.body.kbMedia ?? null,
+        kbFreeText: req.body.kbFreeText ?? null,
     };
 
-    if (!Object.keys(dataConfig).length && !body.hours) {
-        return res.json({ ok: true, noop: true });
-    }
-
-    await prisma.businessConfigAppt.upsert({
+    const data = await prisma.businessConfigAppt.upsert({
         where: { empresaId },
-        create: {
-            empresaId,
-            appointmentVertical: "custom",
-            appointmentTimezone: "America/Bogota",
-            appointmentBufferMin: 10,
-            appointmentReminders: true,
-            aiMode: "estetica",
-            ...dataConfig,
-        },
-        update: dataConfig,
-        select: { id: true },
+        update: payload,
+        create: { empresaId, ...payload },
     });
+    return res.json({ ok: true, data });
+}
 
-    if (Array.isArray(body.hours)) {
-        for (const h of body.hours) {
-            await prisma.appointmentHour.upsert({
-                where: { empresaId_day: { empresaId, day: h.day } },
-                create: {
-                    empresaId,
-                    day: h.day,
-                    isOpen: !!h.isOpen,
-                    start1: h.start1 ?? null,
-                    end1: h.end1 ?? null,
-                    start2: h.start2 ?? null,
-                    end2: h.end2 ?? null,
-                },
-                update: {
-                    isOpen: !!h.isOpen,
-                    start1: h.start1 ?? null,
-                    end1: h.end1 ?? null,
-                    start2: h.start2 ?? null,
-                    end2: h.end2 ?? null,
-                },
-            });
-        }
+/** ========= AppointmentHour ========= */
+
+export async function listHours(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
     }
 
-    return res.json({ ok: true });
+    const data = await prisma.appointmentHour.findMany({
+        where: { empresaId },
+        orderBy: { day: "asc" },
+    });
+    res.json({ ok: true, data });
 }
 
-/** ===== POST /api/estetica/config/reset ===== */
-export async function resetEsteticaConfig(req: Request, res: Response) {
-    const empresaIdRaw = (req as any).user?.empresaId;
-    const empresaId = Number(empresaIdRaw);
-    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+export async function upsertHours(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
 
-    await prisma.$transaction(async (tx) => {
-        await tx.businessConfigAppt.deleteMany({ where: { empresaId } });
-        await tx.appointmentHour.deleteMany({ where: { empresaId } });
+    const hours = Array.isArray(req.body.hours) ? req.body.hours : [];
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    // tipar y validar day como Weekday
+    const rows = hours.map((h: any) => ({
+        empresaId,
+        day: asWeekday(h.day),
+        isOpen: !!h.isOpen,
+        start1: h.start1 ?? null,
+        end1: h.end1 ?? null,
+        start2: h.start2 ?? null,
+        end2: h.end2 ?? null,
+    }));
+
+    await prisma.$transaction([
+        prisma.appointmentHour.deleteMany({ where: { empresaId } }),
+        prisma.appointmentHour.createMany({ data: rows }),
+    ]);
+
+    const data = await prisma.appointmentHour.findMany({
+        where: { empresaId },
+        orderBy: { day: "asc" },
     });
-
-    return res.json({ ok: true, reset: true, purgedHours: true });
+    res.json({ ok: true, data });
 }
 
-/** ===== DELETE /api/estetica/config ===== */
-export async function deleteEsteticaConfig(req: Request, res: Response) {
-    const empresaIdRaw = (req as any).user?.empresaId;
-    const empresaId = Number(empresaIdRaw);
-    if (!Number.isFinite(empresaId)) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+/** ========= EsteticaProcedure ========= */
 
-    const purgeHours =
-        String(req.query.purgeHours || "").toLowerCase() === "true" ||
-        req.query.purgeHours === "1";
+export async function listProcedures(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
 
-    await prisma.$transaction(async (tx) => {
-        await tx.businessConfigAppt.deleteMany({ where: { empresaId } });
-        if (purgeHours) {
-            await tx.appointmentHour.deleteMany({ where: { empresaId } });
-        }
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    const data = await prisma.esteticaProcedure.findMany({
+        where: { empresaId },
+        orderBy: { name: "asc" },
     });
+    res.json({ ok: true, data });
+}
 
-    return res.json({ ok: true, purgedHours: purgeHours });
+export async function upsertProcedure(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    const cfg = await prisma.businessConfigAppt.findUnique({ where: { empresaId } });
+    if (!cfg) return res.status(400).json({ ok: false, error: "BusinessConfigAppt no encontrado" });
+
+    const dto = req.body as {
+        id?: number;
+        name: string;
+        enabled?: boolean;
+        aliases?: unknown;
+        durationMin?: number | null;
+        requiresAssessment?: boolean;
+        priceMin?: string | number | null;
+        priceMax?: string | number | null;
+        depositRequired?: boolean;
+        depositAmount?: string | number | null;
+        prepInstructions?: string | null;
+        postCare?: string | null;
+        contraindications?: string | null;
+        notes?: string | null;
+        pageUrl?: string | null;
+        requiredStaffIds?: unknown;
+    };
+
+    const toDecimal = (v: unknown) =>
+        v === null || v === undefined || v === "" ? null : new Prisma.Decimal(v as any);
+
+    const createData: Prisma.EsteticaProcedureUncheckedCreateInput = {
+        empresaId,
+        configApptId: cfg.id,
+        name: dto.name,
+        enabled: dto.enabled ?? true,
+        aliases: (dto.aliases ?? null) as Prisma.InputJsonValue,
+        durationMin: dto.durationMin ?? null,
+        requiresAssessment: dto.requiresAssessment ?? false,
+        priceMin: toDecimal(dto.priceMin),
+        priceMax: toDecimal(dto.priceMax),
+        depositRequired: dto.depositRequired ?? false,
+        depositAmount: toDecimal(dto.depositAmount),
+        prepInstructions: dto.prepInstructions ?? null,
+        postCare: dto.postCare ?? null,
+        contraindications: dto.contraindications ?? null,
+        notes: dto.notes ?? null,
+        pageUrl: dto.pageUrl ?? null,
+        requiredStaffIds: (dto.requiredStaffIds ?? null) as Prisma.InputJsonValue,
+    };
+
+    const updateData: Prisma.EsteticaProcedureUncheckedUpdateInput = {
+        empresaId,
+        configApptId: cfg.id,
+        name: dto.name,
+        enabled: dto.enabled ?? true,
+        aliases: (dto.aliases ?? null) as Prisma.InputJsonValue,
+        durationMin: dto.durationMin ?? null,
+        requiresAssessment: dto.requiresAssessment ?? false,
+        priceMin: toDecimal(dto.priceMin) as any,
+        priceMax: toDecimal(dto.priceMax) as any,
+        depositRequired: dto.depositRequired ?? false,
+        depositAmount: toDecimal(dto.depositAmount) as any,
+        prepInstructions: dto.prepInstructions ?? null,
+        postCare: dto.postCare ?? null,
+        contraindications: dto.contraindications ?? null,
+        notes: dto.notes ?? null,
+        pageUrl: dto.pageUrl ?? null,
+        requiredStaffIds: (dto.requiredStaffIds ?? null) as Prisma.InputJsonValue,
+    };
+
+    const data = dto.id
+        ? await prisma.esteticaProcedure.update({ where: { id: Number(dto.id) }, data: updateData })
+        : await prisma.esteticaProcedure.create({ data: createData });
+
+    res.json({ ok: true, data });
+}
+
+/** ========= Staff (opcional) ========= */
+
+export async function listStaff(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    const data = await prisma.staff.findMany({ where: { empresaId }, orderBy: { name: "asc" } });
+    res.json({ ok: true, data });
+}
+
+export async function upsertStaff(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    const { id, name, role, active = true, availability } = req.body as {
+        id?: number;
+        name: string;
+        role?: string;
+        active?: boolean;
+        availability?: unknown;
+    };
+
+    const roleParsed: StaffRole = asStaffRole(role);
+    const availabilityJson = (availability ?? null) as Prisma.InputJsonValue;
+
+    const data = id
+        ? await prisma.staff.update({
+            where: { id: Number(id) },
+            data: { name, role: roleParsed, active, availability: availabilityJson },
+        })
+        : await prisma.staff.create({
+            data: { empresaId, name, role: roleParsed, active, availability: availabilityJson },
+        });
+
+    res.json({ ok: true, data });
+}
+
+/** ========= Excepciones (opcional) ========= */
+
+export async function listExceptions(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    const data = await prisma.appointmentException.findMany({
+        where: { empresaId },
+        orderBy: { date: "asc" },
+    });
+    res.json({ ok: true, data });
+}
+
+export async function upsertException(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    const { id, date, reason } = req.body as {
+        id?: number;
+        date: string | Date;
+        reason?: string | null;
+    };
+    const dateObj = new Date(date);
+
+    const data = id
+        ? await prisma.appointmentException.update({
+            where: { id: Number(id) },
+            data: { date: dateObj, reason: reason ?? null },
+        })
+        : await prisma.appointmentException.create({
+            data: { empresaId, date: dateObj, reason: reason ?? null },
+        });
+
+    res.json({ ok: true, data });
 }

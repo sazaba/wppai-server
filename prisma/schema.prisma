@@ -121,6 +121,13 @@ enum Weekday {
   sun
 }
 
+/// NUEVO: rol del staff (opcional)
+enum StaffRole {
+  profesional
+  esteticista
+  medico
+}
+
 /**
  * ========== Modelos base ==========
  */
@@ -156,15 +163,17 @@ model Empresa {
 
   orders Order[] // pedidos asociados
 
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-  Message            Message[]
-  Product            Product[]
-  Appointment        Appointment[]
-  AppointmentHour    AppointmentHour[]
-  BusinessConfigAppt BusinessConfigAppt?
-  EsteticaProcedure  EsteticaProcedure[]
-  ReminderRule       ReminderRule[]
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  Message              Message[]
+  Product              Product[]
+  Appointment          Appointment[]
+  AppointmentHour      AppointmentHour[]
+  BusinessConfigAppt   BusinessConfigAppt?
+  EsteticaProcedure    EsteticaProcedure[]
+  ReminderRule         ReminderRule[]
+  Staff                Staff[] // NUEVO
+  AppointmentException AppointmentException[] // NUEVO
 
   @@map("empresa")
 }
@@ -464,6 +473,11 @@ model Appointment {
   serviceName   String
   notas         String? @db.Text
 
+  // NUEVO: cache para render de mensajes/plantillas
+  customerDisplayName String? // preferencia para WhatsApp
+  serviceDurationMin  Int? // cache de duración
+  locationNameCache   String? // cache de nombre de sede
+
   startAt  DateTime
   endAt    DateTime
   timezone String   @default("America/Bogota")
@@ -483,7 +497,8 @@ model Appointment {
   @@index([empresaId, startAt, endAt])
   @@index([empresaId, status, startAt])
   @@index([conversationId])
-  @@index([empresaId, customerPhone, startAt]) // 🔎 nuevo índice útil para búsquedas por cliente
+  @@index([empresaId, customerPhone, startAt]) // 🔎 búsqueda por cliente
+  @@index([empresaId, status, startAt, customerPhone]) // NUEVO índice mixto útil
   @@map("appointment")
 }
 
@@ -525,6 +540,15 @@ model BusinessConfigAppt {
   appointmentPolicies       String?             @db.Text
   appointmentReminders      Boolean             @default(true)
 
+  // ===== NUEVO: reglas operativas claras para IA/booking
+  appointmentMinNoticeHours Int?
+  appointmentMaxAdvanceDays Int?
+  allowSameDayBooking       Boolean @default(false)
+  requireClientConfirmation Boolean @default(true)
+  cancellationAllowedHours  Int?
+  rescheduleAllowedHours    Int?
+  defaultServiceDurationMin Int?
+
   // ===== Servicios
   servicesText String? @db.Text // textarea libre (1 x línea / comas)
   services     Json? // ["Limpieza", "Blanqueamiento", ...] (legacy)
@@ -552,6 +576,11 @@ model BusinessConfigAppt {
   reminderTemplateId     String?
   postBookingMessage     String? @db.Text
   prepInstructionsPerSvc Json? // {"Limpieza facial":"Llegar 10 min antes", ...}
+
+  // ===== NUEVO: banderas de consentimiento/compliance
+  requireWhatsappOptIn Boolean @default(true)
+  allowSensitiveTopics Boolean @default(false)
+  minClientAge         Int?
 
   // ===== Knowledge Base (estructura + libre)
   kbBusinessOverview String? @db.Text
@@ -599,6 +628,9 @@ model EsteticaProcedure {
   contraindications String? @db.Text
   notes             String? @db.Text
   pageUrl           String?
+
+  // NUEVO: staff requerido (IDs válidos de Staff)
+  requiredStaffIds Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -660,4 +692,40 @@ model AppointmentReminderLog {
   @@index([appointmentId])
   @@index([reminderRuleId])
   @@map("appointment_reminder_log")
+}
+
+/**
+ * ========== NUEVO: Recursos y Excepciones ==========
+ */
+
+model Staff {
+  id           Int       @id @default(autoincrement())
+  empresaId    Int
+  name         String
+  role         StaffRole @default(esteticista)
+  active       Boolean   @default(true)
+  availability Json? // [{weekday:1,start:"09:00",end:"13:00"}]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId])
+  @@map("staff")
+}
+
+model AppointmentException {
+  id        Int      @id @default(autoincrement())
+  empresaId Int
+  date      DateTime // día completo (puedes extender a rango con start/end si quieres)
+  reason    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId, date])
+  @@map("appointment_exception")
 }

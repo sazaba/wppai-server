@@ -23,6 +23,7 @@ import appointmentsRoutes from './routes/appointments.routes'
 import appointmentHoursRoutes from './routes/appointmentHours.routes'
 import esteticaConfigRoutes from "./routes/estetica.config.routes";
 
+
 // 📦 Cargar variables de entorno
 dotenv.config()
 

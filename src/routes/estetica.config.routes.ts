@@ -1,27 +1,51 @@
-import { Router } from "express";
-import { verificarJWT } from "../middleware/auth.middleware";
+import { Router } from 'express'
+import { verificarJWT } from '../middleware/auth.middleware'
 import {
-    getEsteticaConfig,
-    saveEsteticaConfig,
-    patchEsteticaConfig,
-    deleteEsteticaConfig,
-    resetEsteticaConfig,
-} from "../controllers/estetica.config.controller";
+    getApptConfig,
+    upsertApptConfig,
+    listHours,
+    upsertHours,
+    listProcedures,
+    upsertProcedure,
+    listStaff,
+    upsertStaff,
+    listExceptions,
+    upsertException,
+} from '../controllers/estetica.config.controller'
 
-const router = Router();
-router.use(verificarJWT);
+const router = Router()
 
-// Log de entrada
-router.use((req, _res, next) => {
-    console.log("[estetica.config]", req.method, req.originalUrl);
-    next();
-});
+// 🔐 Aplica auth a todo el módulo
+router.use(verificarJWT)
 
-// 👇 cuelga de /api/estetica/config (ver index.ts)
-router.get("/", getEsteticaConfig);            // GET /api/estetica/config
-router.post("/", saveEsteticaConfig);          // POST /api/estetica/config (upsert)
-router.patch("/", patchEsteticaConfig);        // PATCH /api/estetica/config (parcial)
-router.delete("/", deleteEsteticaConfig);      // DELETE /api/estetica/config
-router.post("/reset", resetEsteticaConfig);    // POST /api/estetica/config/reset
+/** ========= BusinessConfigAppt ========= */
+// Obtener config completa (incluye procedimientos y reminder rules)
+router.get('/estetica/config/:empresaId', getApptConfig)
+// Crear/actualizar config
+router.post('/estetica/config/:empresaId', upsertApptConfig)
 
-export default router;
+/** ========= AppointmentHour ========= */
+// Listar horario semanal
+router.get('/estetica/hours/:empresaId', listHours)
+// Guardar horario semanal (sobrescribe por día)
+router.post('/estetica/hours/:empresaId', upsertHours)
+
+/** ========= EsteticaProcedure ========= */
+// Listar procedimientos
+router.get('/estetica/procedures/:empresaId', listProcedures)
+// Crear/actualizar procedimiento
+router.post('/estetica/procedures/:empresaId', upsertProcedure)
+
+/** ========= Staff (opcional) ========= */
+// Listar staff
+router.get('/estetica/staff/:empresaId', listStaff)
+// Crear/actualizar staff
+router.post('/estetica/staff/:empresaId', upsertStaff)
+
+/** ========= Excepciones (opcional) ========= */
+// Listar días de excepción
+router.get('/estetica/exceptions/:empresaId', listExceptions)
+// Crear/actualizar excepción
+router.post('/estetica/exceptions/:empresaId', upsertException)
+
+export default router
