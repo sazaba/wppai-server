@@ -13,6 +13,10 @@ import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy f
 // ⬇️ Cachear imágenes en Cloudflare Images
 import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsappMedia' // 👈 limpiamos foco al (re)abrir conv
 
+/** ===== Retraso humano simulado ===== */
+const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000) // 3 min
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000) // 2 min
+
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
     const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -33,7 +37,7 @@ export const verifyWebhook = (req: Request, res: Response) => {
 export const receiveWhatsappMessage = async (req: Request, res: Response) => {
     console.log('📩 Webhook recibido:', JSON.stringify(req.body, null, 2))
 
-    let responded = false // ⬅️ para evitar doble respuesta HTTP
+    let responded = false // para evitar doble respuesta HTTP
 
     try {
         const entry: any = req.body?.entry?.[0]
@@ -71,14 +75,14 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         // 🔁 IDEMPOTENCIA POR WA MESSAGE ID (evita duplicados al reintentar Meta)
         try {
             const already = await prisma.message.findFirst({
-                where: { externalId: String(msg.id) } // usamos externalId para inbound también
+                where: { externalId: String(msg.id) } // usamos externalId también para inbound
             })
             if (already) {
                 console.log('[DEDUP] inbound ya existente, externalId=', msg.id)
                 return res.status(200).json({ success: true, dedup: true })
             }
         } catch (e) {
-            console.warn('[DEDUP] consulta falló (continuo igual):', (e as any)?.message || e)
+            console.warn('[DEDUP] consulta falló (continuo):', (e as any)?.message || e)
         }
 
         // Empresa / cuenta
@@ -128,7 +132,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         let mediaUrlForFrontend: string | undefined
         let captionForDb: string | undefined
 
-        // ⚐ Flag para decidir si llamamos a IA en este webhook
+        // Flag para decidir si llamamos a IA en este webhook
         let skipIAForThisWebhook = false
 
         // 🔊 NOTA DE VOZ / AUDIO
@@ -157,7 +161,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = transcription || '[nota de voz]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
-            // 🛈 Para audio sí dejamos pasar a IA (tu lógica ya trata el caso sin transcripción)
+            // Para audio sí dejamos pasar a IA (tu lógica ya trata el caso sin transcripción)
         }
         // 🖼️ IMAGEN (➡️ cache a Cloudflare Images con fallback al proxy)
         else if (msg.type === 'image' && msg.image?.id) {
@@ -170,7 +174,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             // 1) Intentar cachear en Cloudflare Images
             try {
-                const accessToken = cuenta.accessToken // ya lo tienes en la cuenta
+                const accessToken = cuenta.accessToken
                 const { url } = await cacheWhatsappMediaToCloudflare({
                     waMediaId: inboundMediaId,
                     accessToken,
@@ -182,12 +186,12 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
             }
 
-            // ❗ Clave: si es imagen SIN caption ⇒ NO llamar IA en este webhook
+            // ❗ Si es imagen SIN caption ⇒ NO invocamos IA (esperamos el texto siguiente)
             if (!captionForDb) {
                 skipIAForThisWebhook = true
             }
         }
-        // 🎞️ VIDEO (se mantiene proxy firmado)
+        // 🎞️ VIDEO (proxy firmado)
         else if (msg.type === 'video' && msg.video?.id) {
             inboundMediaType = MediaType.video
             inboundMediaId = String(msg.video.id)
@@ -196,11 +200,10 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = captionForDb || '[video]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
-
-            // (opcional) si quieres el mismo comportamiento que imagen:
+            // (opcional) si quieres lo mismo que imagen:
             // if (!captionForDb) skipIAForThisWebhook = true
         }
-        // 📎 DOCUMENTO (se mantiene proxy firmado)
+        // 📎 DOCUMENTO (proxy firmado)
         else if (msg.type === 'document' && msg.document?.id) {
             inboundMediaType = MediaType.document
             inboundMediaId = String(msg.document.id)
@@ -210,12 +213,11 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = filename ? `[documento] ${filename}` : '[documento]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
-
             // (opcional) mismo criterio que imagen/video:
             // if (!captionForDb) skipIAForThisWebhook = true
         }
 
-        // Guardar ENTRANTE (🔁 ahora también persistimos mediaUrl si existe)
+        // Guardar ENTRANTE (ahora también persistimos mediaUrl si existe)
         const inboundData: any = {
             conversationId: conversation.id,
             empresaId,
@@ -224,10 +226,10 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             timestamp: ts,
             mediaType: inboundMediaType,
             mediaId: inboundMediaId,
-            mediaUrl: mediaUrlForFrontend, // 👈 CF o proxy
+            mediaUrl: mediaUrlForFrontend, // CF o proxy
             mimeType: inboundMime,
             transcription: transcription || undefined,
-            externalId: String(msg.id),      // ⬅️ IDEMPOTENCIA por WA message id
+            externalId: String(msg.id), // 🔁 idempotencia por WA message id
         }
         if (captionForDb) inboundData.caption = captionForDb
         if (process.env.FEATURE_ISVOICENOTE === '1') inboundData.isVoiceNote = Boolean(isVoiceNote)
@@ -285,9 +287,20 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             responded = true
         }
 
-        // ⚙️ Ejecutar IA y emitir resultado (en “background” tras el ACK)
+        // ⚙️ Ejecutar IA en background tras el ACK **respetando delay humano**
         ; (async () => {
             try {
+                // calcular delay: 3min si no hay bot previo en la conversación; 2min si ya hubo
+                const prevBot = await prisma.message.findFirst({
+                    where: { conversationId: conversation.id, from: MessageFrom.bot },
+                    select: { id: true },
+                })
+                const delayMs = prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
+                if (process.env.DEBUG_AI === '1') {
+                    console.log('[WEBHOOK] delay humano ms =', delayMs, 'prevBot?', !!prevBot)
+                }
+                await sleep(delayMs)
+
                 console.log('[IA] Llamando handleIAReply con:', {
                     conversationId: conversation.id,
                     empresaId,
@@ -423,7 +436,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             }
         })()
 
-        // ya respondimos antes; nada más que hacer aquí
+        // Ya respondimos antes; nada más que hacer aquí
         return
     } catch (error) {
         console.error('[receiveWhatsappMessage] Error:', error)
@@ -442,4 +455,8 @@ async function resolveConversationIdByWaId(_req: Request, waId: string): Promise
     } catch {
         return null
     }
+}
+
+function sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms))
 }
