@@ -13,22 +13,32 @@ import { transcribeAudioBuffer } from '../../../services/transcription.service'
 import type { IAReplyResult } from '../../handleIAReply.ecommerce'
 
 /** ===== Config imagen/texto ===== */
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                   // 1s re-chequeo (no respondemos desde imagen sola)
-// Ventana corta para arrastrar imagen automáticamente (sin mención explícita)
-const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)               // 60s
-// Ventana larga solo si el texto menciona explícitamente la imagen
-const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000)  // 5min
-const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)   // 120s idempotencia
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                  // 1s re-chequeo (no respondemos desde imagen sola)
+// Ventana corta para arrastrar imagen automáticamente
+const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)              // 60s
+// Ventana legacy (solo si el texto menciona explícitamente la imagen)
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5min
+const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)  // 120s idempotencia
 
-/** ===== Retraso humano simulado (NO se hace inside del handler) ===== */
-const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000)     // 3 min
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)     // 2 min
+/** ===== Retraso humano simulado ===== */
+const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000)    // 3 min
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)    // 2 min
 
 /** ===== Respuesta breve (soft clamp) ===== */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
 const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)
 const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
+
+// ===== Idempotencia por inbound (sin DB) =====
+const processedInbound = new Map<number, number>() // messageId -> timestamp ms
+function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
+    const now = Date.now()
+    const prev = processedInbound.get(messageId)
+    if (prev && (now - prev) <= windowMs) return true
+    processedInbound.set(messageId, now)
+    return false
+}
 
 export type AgentConfig = {
     specialty: AgentSpecialty
@@ -37,9 +47,10 @@ export type AgentConfig = {
     disclaimers: string
 }
 
-/* ================= utils ================= */
-
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
+/** ===== Utils ===== */
+function sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 async function computeReplyDelayMs(conversationId: number) {
     const prevBot = await prisma.message.findFirst({
@@ -47,19 +58,6 @@ async function computeReplyDelayMs(conversationId: number) {
         select: { id: true },
     })
     return prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
-}
-
-/** Idempotencia por inbound usando externalId (wamid) cuando exista */
-const processedInbound = new Map<string, number>() // key -> timestamp ms
-function inboundKey(empresaId: number, last?: { id?: number; externalId?: string | null }) {
-    return last?.externalId ? `w:${empresaId}:${last.externalId}` : `db:${empresaId}:${last?.id ?? 0}`
-}
-function seenInboundRecentlyKeyed(key: string, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
-    const now = Date.now()
-    const prev = processedInbound.get(key)
-    if (prev && (now - prev) <= windowMs) return true
-    processedInbound.set(key, now)
-    return false
 }
 
 /** Detección de referencia explícita a imagen en el texto */
@@ -71,29 +69,36 @@ function mentionsImageExplicitly(t: string) {
         || /\b(de|en)\s+la\s+(foto|imagen)\b/.test(s)
 }
 
-/** Selección de imagen contextual equilibrada */
+/** Selección de imagen contextual equilibrada (basada en timestamp del TEXTO, no en Date.now) */
 async function pickImageForContext(opts: {
     conversationId: number
     directUrl?: string | null
     userText: string
     caption: string
+    referenceTs: Date                // 👈 timestamp del último texto del cliente
 }): Promise<{ url: string | null, noteToAppend: string }> {
-    const { conversationId, directUrl, userText, caption } = opts
+    const { conversationId, directUrl, userText, caption, referenceTs } = opts
 
-    // Si viene imagen en el último mensaje, úsala
+    // Si viene imagen en el mismo inbound (directUrl), úsala
     if (directUrl) {
-        return { url: String(directUrl), noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : '' }
+        return {
+            url: String(directUrl),
+            noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : '',
+        }
     }
 
     if (!userText) return { url: null, noteToAppend: '' }
 
-    // 1) Ventana corta automática (no requiere mención explícita)
+    // 1) Ventana corta automática (no requiere mención explícita) — relativa al texto
     const veryRecent = await prisma.message.findFirst({
         where: {
             conversationId,
             from: MessageFrom.client,
             mediaType: MediaType.image,
-            timestamp: { gte: new Date(Date.now() - IMAGE_CARRY_MS) },
+            timestamp: {
+                gte: new Date(referenceTs.getTime() - IMAGE_CARRY_MS),
+                lte: referenceTs,
+            },
         },
         orderBy: { timestamp: 'desc' },
         select: { mediaUrl: true, caption: true },
@@ -103,14 +108,17 @@ async function pickImageForContext(opts: {
         return { url: String(veryRecent.mediaUrl), noteToAppend: note }
     }
 
-    // 2) Si el texto la menciona explícitamente, permitimos lookback más largo
+    // 2) Si el texto la menciona explícitamente, permitimos lookback más largo — relativo al texto
     if (mentionsImageExplicitly(userText)) {
         const referenced = await prisma.message.findFirst({
             where: {
                 conversationId,
                 from: MessageFrom.client,
                 mediaType: MediaType.image,
-                timestamp: { gte: new Date(Date.now() - IMAGE_LOOKBACK_MS) },
+                timestamp: {
+                    gte: new Date(referenceTs.getTime() - IMAGE_LOOKBACK_MS),
+                    lte: referenceTs,
+                },
             },
             orderBy: { timestamp: 'desc' },
             select: { mediaUrl: true, caption: true },
@@ -125,35 +133,6 @@ async function pickImageForContext(opts: {
     return { url: null, noteToAppend: '' }
 }
 
-/* ============================================================
-   Programa de ejecución: SCHEDULER + HANDLER
-   - Llama scheduleAgentReply(...) desde tu webhook (ACK inmediato)
-   - handleAgentReply NUNCA bloquea con sleeps largos
-============================================================ */
-
-/** Programa el envío con retraso humano, sin bloquear el webhook */
-export async function scheduleAgentReply(args: {
-    chatId: number
-    empresaId: number
-    mensajeArg?: string
-    toPhone?: string
-    phoneNumberId?: string
-    agent: AgentConfig
-}) {
-    try {
-        const delayMs = await computeReplyDelayMs(args.chatId) // 3min first, 2min next
-        if (process.env.DEBUG_AI === '1') console.log('[AGENT] scheduled in(ms)=', delayMs)
-        setTimeout(() => {
-            handleAgentReply(args).catch(err => console.error('[AGENT] async run error:', err))
-        }, delayMs)
-    } catch (e) {
-        console.error('[AGENT] schedule error:', e)
-        // Fallback: si no pudimos calcular delay, ejecuta inmediato
-        handleAgentReply(args).catch(err => console.error('[AGENT] fallback run error:', err))
-    }
-}
-
-/** Handler principal SIN sleeps de “delay humano” */
 export async function handleAgentReply(args: {
     chatId: number
     empresaId: number
@@ -176,7 +155,6 @@ export async function handleAgentReply(args: {
         orderBy: { timestamp: 'desc' },
         select: {
             id: true,
-            externalId: true,       // 👈 id de WhatsApp/META para idempotencia fuerte
             mediaType: true,
             mediaUrl: true,
             caption: true,
@@ -191,17 +169,16 @@ export async function handleAgentReply(args: {
     if (process.env.DEBUG_AI === '1') {
         console.log('[AGENT] handleAgentReply enter', {
             chatId, empresaId,
-            lastId: last?.id, lastW: last?.externalId, lastTs: last?.timestamp, lastType: last?.mediaType,
+            lastId: last?.id, lastTs: last?.timestamp, lastType: last?.mediaType,
             hasCaption: !!(last?.caption && String(last.caption).trim()),
             hasContenido: !!(last?.contenido && String(last.contenido).trim()),
             mensajeArgLen: (args.mensajeArg || '').length,
         })
     }
 
-    // 🔒 Guard: idempotencia inbound por clave combinada
-    const key = inboundKey(empresaId, last || undefined)
-    if (last && seenInboundRecentlyKeyed(key)) {
-        if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip: inbound already processed', { key })
+    // 🔒 Guard: si ya procesamos este inbound (last.id) recientemente, salir
+    if (last?.id && seenInboundRecently(last.id)) {
+        if (process.env.DEBUG_AI === '1') console.log('[AGENT] Skip: inbound already processed', { lastId: last.id })
         return null
     }
 
@@ -256,6 +233,7 @@ export async function handleAgentReply(args: {
     const isImage = last?.mediaType === MediaType.image && !!last?.mediaUrl
     const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
+    const referenceTs = last?.timestamp ?? new Date() // 👈 clave para el carry
 
     // ====== Debounce por conversación ======
     if (isImage) {
@@ -284,7 +262,6 @@ export async function handleAgentReply(args: {
             return resp
         } else {
             if (process.env.DEBUG_AI === '1') console.log('[AGENT] Image-only: defer to upcoming text')
-            // esperar brevemente por texto/caption que venga pegado
             await sleep(IMAGE_WAIT_MS)
             return null
         }
@@ -322,7 +299,7 @@ export async function handleAgentReply(args: {
     // 6) Historial reciente
     const history = await getRecentHistory(chatId, last?.id, 10)
 
-    // 7) Construcción de mensajes (adjunta imagen solo si aplica)
+    // 7) Construcción de mensajes (adjunta imagen solo si aplica, usando referenceTs)
     let effectiveImageUrl = imageUrl
     if (!effectiveImageUrl && userText) {
         const picked = await pickImageForContext({
@@ -330,9 +307,12 @@ export async function handleAgentReply(args: {
             directUrl: null,
             userText,
             caption,
+            referenceTs, // 👈 aquí está la corrección
         })
         effectiveImageUrl = picked.url
-        if (picked.noteToAppend) userText = `${userText}${picked.noteToAppend}`
+        if (picked.noteToAppend) {
+            userText = `${userText}${picked.noteToAppend}`
+        }
     }
 
     const messages: Array<any> = [{ role: 'system', content: system }, ...history]
@@ -370,6 +350,11 @@ export async function handleAgentReply(args: {
     // 9) Post-formateo (solo líneas, sin branding)
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
+
+    // ⏳ Retraso humano simulado (si lo usas en strategy)
+    const delayMs = await computeReplyDelayMs(chatId)
+    if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
+    await sleep(delayMs)
 
     // 10) Persistir y responder
     const saved = await persistBotReply({
@@ -488,6 +473,11 @@ async function answerWithLLM(opts: {
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
 
+    // ⏳ Retraso humano simulado (si lo usas en strategy)
+    const delayMs = await computeReplyDelayMs(chatId)
+    if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
+    await sleep(delayMs)
+
     const saved = await persistBotReply({
         conversationId: chatId,
         empresaId,
@@ -567,7 +557,7 @@ function parseAffordableTokens(message: string): number | null {
     return null
 }
 
-/* ===== prompt budgeting ===== */
+// ===== prompt budgeting =====
 function softTrim(s: string | null | undefined, max = 140) {
     const t = (s || '').trim()
     if (!t) return ''
@@ -645,7 +635,7 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     return messages
 }
 
-/* ===== formatting / misc ===== */
+// ===== formatting / misc =====
 function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return t
@@ -674,7 +664,9 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
 }
 
 // === helpers para cerrar bonito ===
-function endsWithPunctuation(t: string) { return /[.!?…]\s*$/.test((t || '').trim()) }
+function endsWithPunctuation(t: string) {
+    return /[.!?…]\s*$/.test((t || '').trim())
+}
 function closeNicely(raw: string): string {
     let t = (raw || '').trim()
     if (!t) return t
