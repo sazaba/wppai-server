@@ -132,25 +132,39 @@ export async function upsertHours(req: Request, res: Response) {
     }
 
     // Acepta body.hours o body.days
-    const incoming = Array.isArray(req.body.hours)
+    const incoming = Array.isArray(req.body?.hours)
         ? req.body.hours
-        : Array.isArray(req.body.days)
+        : Array.isArray(req.body?.days)
             ? req.body.days
             : [];
 
-    const rows = incoming.map((h: any) => ({
-        empresaId,
-        day: asWeekday(h.day),
-        isOpen: !!h.isOpen,
-        start1: h.start1 ?? null,
-        end1: h.end1 ?? null,
-        start2: h.start2 ?? null,
-        end2: h.end2 ?? null,
-    }));
+    // saneo
+    const toBool = (v: any) => v === true || v === 1 || v === "1" || v === "true";
+    const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const hhmmOrNull = (v: any) => {
+        if (v == null || v === "") return null;
+        const s = String(v).trim().slice(0, 5); // “HH:MM”
+        return HHMM.test(s) ? s : null;
+    };
+
+    const rows = incoming.map((h: any) => {
+        const open = toBool(h?.isOpen);
+        return {
+            empresaId,
+            day: asWeekday(h?.day),
+            isOpen: open,
+            start1: open ? hhmmOrNull(h?.start1) : null,
+            end1: open ? hhmmOrNull(h?.end1) : null,
+            start2: open ? hhmmOrNull(h?.start2) : null,
+            end2: open ? hhmmOrNull(h?.end2) : null,
+        };
+    });
 
     await prisma.$transaction([
         prisma.appointmentHour.deleteMany({ where: { empresaId } }),
-        rows.length ? prisma.appointmentHour.createMany({ data: rows }) : prisma.$executeRaw`SELECT 1`,
+        rows.length
+            ? prisma.appointmentHour.createMany({ data: rows })
+            : prisma.$executeRaw`SELECT 1`,
     ]);
 
     const data = await prisma.appointmentHour.findMany({
@@ -159,7 +173,6 @@ export async function upsertHours(req: Request, res: Response) {
     });
     res.json({ ok: true, data });
 }
-
 
 /** ========= EsteticaProcedure ========= */
 
