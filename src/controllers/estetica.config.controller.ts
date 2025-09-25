@@ -1,4 +1,3 @@
-// server/src/controllers/estetica.config.controller.ts
 import { Request, Response } from "express";
 import prisma from "../lib/prisma";
 import { Prisma, type Weekday, type StaffRole } from "@prisma/client";
@@ -16,13 +15,12 @@ const STAFF_ROLES: StaffRole[] = ["profesional", "esteticista", "medico"];
 function asStaffRole(v: unknown): StaffRole {
     const s = String(v) as StaffRole;
     if (STAFF_ROLES.includes(s)) return s;
-    return "esteticista"; // valor por defecto
+    return "esteticista";
 }
 
 /** ========= BusinessConfigAppt ========= */
 
 export async function getApptConfig(req: Request, res: Response) {
-    // 1) JWT → 2) params → 3) query
     const empresaId =
         getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
 
@@ -38,7 +36,6 @@ export async function getApptConfig(req: Request, res: Response) {
 }
 
 export async function upsertApptConfig(req: Request, res: Response) {
-    // 1) JWT → 2) params → 3) body
     const empresaId =
         getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
 
@@ -46,9 +43,8 @@ export async function upsertApptConfig(req: Request, res: Response) {
         return res.status(400).json({ ok: false, error: "empresaId requerido" });
     }
 
-    // Los campos son opcionales; Prisma ignora undefined
     const payload = {
-        aiMode: req.body.aiMode,
+        aiMode: (req.body.aiMode ?? "estetica") as "ecommerce" | "agente" | "estetica" | "appts",
         appointmentEnabled: req.body.appointmentEnabled as boolean | undefined,
         appointmentVertical: req.body.appointmentVertical,
         appointmentVerticalCustom: req.body.appointmentVerticalCustom ?? null,
@@ -136,7 +132,6 @@ export async function upsertHours(req: Request, res: Response) {
         return res.status(400).json({ ok: false, error: "empresaId requerido" });
     }
 
-    // tipar y validar day como Weekday
     const rows = hours.map((h: any) => ({
         empresaId,
         day: asWeekday(h.day),
@@ -194,10 +189,10 @@ export async function upsertProcedure(req: Request, res: Response) {
         aliases?: unknown;
         durationMin?: number | null;
         requiresAssessment?: boolean;
-        priceMin?: string | number | null;
-        priceMax?: string | number | null;
+        priceMin?: number | null;
+        priceMax?: number | null;
         depositRequired?: boolean;
-        depositAmount?: string | number | null;
+        depositAmount?: number | null;
         prepInstructions?: string | null;
         postCare?: string | null;
         contraindications?: string | null;
@@ -206,8 +201,17 @@ export async function upsertProcedure(req: Request, res: Response) {
         requiredStaffIds?: unknown;
     };
 
-    const toDecimal = (v: unknown) =>
-        v === null || v === undefined || v === "" ? null : new Prisma.Decimal(v as any);
+    const toDecimalNum = (v: unknown) => {
+        if (v === null || v === undefined || v === '') return null;
+        const n = typeof v === 'number' ? v : Number(v);
+        if (!Number.isFinite(n)) return null;
+        return new Prisma.Decimal(n);
+    };
+
+    const requiredStaffIdsJson =
+        Array.isArray(dto.requiredStaffIds)
+            ? (dto.requiredStaffIds as any[]).map(Number).filter(Number.isFinite)
+            : null;
 
     const createData: Prisma.EsteticaProcedureUncheckedCreateInput = {
         empresaId,
@@ -217,16 +221,16 @@ export async function upsertProcedure(req: Request, res: Response) {
         aliases: (dto.aliases ?? null) as Prisma.InputJsonValue,
         durationMin: dto.durationMin ?? null,
         requiresAssessment: dto.requiresAssessment ?? false,
-        priceMin: toDecimal(dto.priceMin),
-        priceMax: toDecimal(dto.priceMax),
+        priceMin: toDecimalNum(dto.priceMin),
+        priceMax: toDecimalNum(dto.priceMax),
         depositRequired: dto.depositRequired ?? false,
-        depositAmount: toDecimal(dto.depositAmount),
+        depositAmount: toDecimalNum(dto.depositAmount),
         prepInstructions: dto.prepInstructions ?? null,
         postCare: dto.postCare ?? null,
         contraindications: dto.contraindications ?? null,
         notes: dto.notes ?? null,
         pageUrl: dto.pageUrl ?? null,
-        requiredStaffIds: (dto.requiredStaffIds ?? null) as Prisma.InputJsonValue,
+        requiredStaffIds: (requiredStaffIdsJson ?? null) as Prisma.InputJsonValue,
     };
 
     const updateData: Prisma.EsteticaProcedureUncheckedUpdateInput = {
@@ -237,16 +241,16 @@ export async function upsertProcedure(req: Request, res: Response) {
         aliases: (dto.aliases ?? null) as Prisma.InputJsonValue,
         durationMin: dto.durationMin ?? null,
         requiresAssessment: dto.requiresAssessment ?? false,
-        priceMin: toDecimal(dto.priceMin) as any,
-        priceMax: toDecimal(dto.priceMax) as any,
+        priceMin: toDecimalNum(dto.priceMin) as any,
+        priceMax: toDecimalNum(dto.priceMax) as any,
         depositRequired: dto.depositRequired ?? false,
-        depositAmount: toDecimal(dto.depositAmount) as any,
+        depositAmount: toDecimalNum(dto.depositAmount) as any,
         prepInstructions: dto.prepInstructions ?? null,
         postCare: dto.postCare ?? null,
         contraindications: dto.contraindications ?? null,
         notes: dto.notes ?? null,
         pageUrl: dto.pageUrl ?? null,
-        requiredStaffIds: (dto.requiredStaffIds ?? null) as Prisma.InputJsonValue,
+        requiredStaffIds: (requiredStaffIdsJson ?? null) as Prisma.InputJsonValue,
     };
 
     const data = dto.id
@@ -256,7 +260,7 @@ export async function upsertProcedure(req: Request, res: Response) {
     res.json({ ok: true, data });
 }
 
-/** ========= Staff (opcional) ========= */
+/** ========= Staff ========= */
 
 export async function listStaff(req: Request, res: Response) {
     const empresaId =
@@ -301,7 +305,7 @@ export async function upsertStaff(req: Request, res: Response) {
     res.json({ ok: true, data });
 }
 
-/** ========= Excepciones (opcional) ========= */
+/** ========= Excepciones ========= */
 
 export async function listExceptions(req: Request, res: Response) {
     const empresaId =
