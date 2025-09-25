@@ -1,6 +1,5 @@
 import { Request, Response } from "express";
 import prisma from "../lib/prisma";
-import { hasOverlap } from "./_availability";
 import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
 import { addMinutes } from "date-fns";
@@ -13,18 +12,6 @@ function parseDateParam(v?: string | string[]) {
     const d = new Date(s);
     return Number.isNaN(+d) ? undefined : d;
 }
-
-// map JS weekday (0=Sun..6=Sat) -> prisma Weekday enum ('sun'..'sat')
-// (mantenido por compatibilidad aunque dejamos de usarlo en TZ)
-const WEEK: Array<"sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat"> = [
-    "sun",
-    "mon",
-    "tue",
-    "wed",
-    "thu",
-    "fri",
-    "sat",
-];
 
 const toMinutes = (hhmm?: string | null) => {
     if (!hhmm) return null;
@@ -44,11 +31,10 @@ function isInsideRanges(
     return inR1 || inR2;
 }
 
-/* ======== NUEVO: helpers de TZ (validación en la zona del negocio) ======== */
+/* ======== TZ helpers (validación en la zona del negocio) ======== */
 type WeekKey = "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat";
 
 function dayKeyInTZ(d: Date, tz: string): WeekKey {
-    // "Mon" -> "mon"
     const wd = new Intl.DateTimeFormat("en-US", {
         weekday: "short",
         timeZone: tz,
@@ -82,17 +68,29 @@ function sameCalendarDayInTZ(a: Date, b: Date, tz: string): boolean {
     return fmt.format(a) === fmt.format(b);
 }
 
-/** Valida que (start,end) estén dentro de la disponibilidad del día (si existe)
- *  usando la zona horaria del negocio. Si no hay AppointmentHour para ese día, se permite. */
+/** Regresa límites UTC del día local en tz (00:00–23:59:59.999). */
+function dayBoundsUTC(d: Date, tz: string) {
+    const ymd = new Intl.DateTimeFormat("en-CA", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).format(d); // "YYYY-MM-DD"
+    const [y, m, day] = ymd.split("-").map(Number);
+    const start = new Date(Date.UTC(y, (m as number) - 1, day, 0, 0, 0, 0));
+    const end = new Date(Date.UTC(y, (m as number) - 1, day, 23, 59, 59, 999));
+    return { start, end };
+}
+
+/** Valida que (start,end) estén dentro de la disponibilidad del día (si existe) en tz. */
 async function ensureWithinBusinessHours(opts: {
     empresaId: number;
     start: Date;
     end: Date;
-    timezone: string; // 👈 importante
+    timezone: string;
 }) {
     const { empresaId, start, end, timezone } = opts;
 
-    // Validamos “mismo día” según la TZ del negocio
     if (!sameCalendarDayInTZ(start, end, timezone)) return { ok: true };
 
     const day = dayKeyInTZ(start, timezone);
@@ -101,7 +99,7 @@ async function ensureWithinBusinessHours(opts: {
         where: { empresaId_day: { empresaId, day } },
     });
 
-    if (!row) return { ok: true }; // sin configuración => permitir
+    if (!row) return { ok: true };
     if (!row.isOpen) {
         return { ok: false, code: 409, msg: "El negocio está cerrado ese día." };
     }
@@ -153,6 +151,10 @@ async function loadApptRuntimeConfig(empresaId: number) {
         maxAdvanceD: cfgAppt?.appointmentMaxAdvanceDays ?? null,
         allowSameDay: cfgAppt?.allowSameDayBooking ?? false,
 
+        // ⬇️ NUEVO: reglas del formulario que pediste activar
+        bookingWindowDays: cfgAppt?.bookingWindowDays ?? null,
+        maxDailyAppointments: cfgAppt?.maxDailyAppointments ?? null,
+
         // Caches opcionales
         locationName: cfgAppt?.locationName ?? null,
         defaultServiceDurationMin: cfgAppt?.defaultServiceDurationMin ?? null,
@@ -162,7 +164,12 @@ async function loadApptRuntimeConfig(empresaId: number) {
 /* ===================== Reglas de ventana / excepciones / overlap ===================== */
 
 function violatesNoticeAndWindow(
-    cfg: { minNoticeH: number | null; maxAdvanceD: number | null; allowSameDay: boolean },
+    cfg: {
+        minNoticeH: number | null;
+        maxAdvanceD: number | null;
+        allowSameDay: boolean;
+        bookingWindowDays: number | null;
+    },
     startAt: Date
 ) {
     const now = new Date();
@@ -172,8 +179,16 @@ function violatesNoticeAndWindow(
     const hoursDiff = (startAt.getTime() - now.getTime()) / 3_600_000;
     if (cfg.minNoticeH != null && hoursDiff < cfg.minNoticeH) return true;
 
-    if (cfg.maxAdvanceD != null) {
-        const maxMs = cfg.maxAdvanceD * 24 * 3_600_000;
+    // Máximo avance por dos vías: maxAdvanceD (viejo) o bookingWindowDays (nuevo)
+    const maxD =
+        cfg.maxAdvanceD != null
+            ? cfg.maxAdvanceD
+            : cfg.bookingWindowDays != null
+                ? cfg.bookingWindowDays
+                : null;
+
+    if (maxD != null) {
+        const maxMs = maxD * 24 * 3_600_000;
         if (startAt.getTime() - now.getTime() > maxMs) return true;
     }
     return false;
@@ -209,6 +224,35 @@ async function hasOverlapWithBuffer(opts: {
         select: { id: true },
     });
     return !!overlap;
+}
+
+/** NUEVO: valida límite diario (maxDailyAppointments) en la TZ del negocio. */
+async function ensureDailyCap(opts: {
+    empresaId: number;
+    when: Date;
+    timezone: string;
+    cap: number | null | undefined;
+    ignoreId?: number;
+}) {
+    const { empresaId, when, timezone, cap, ignoreId } = opts;
+    if (!cap || cap <= 0) return { ok: true };
+
+    const { start, end } = dayBoundsUTC(when, timezone);
+
+    const count = await prisma.appointment.count({
+        where: {
+            empresaId,
+            startAt: { gte: start },
+            endAt: { lte: end },
+            status: { in: ["pending", "confirmed", "rescheduled"] },
+            ...(ignoreId ? { id: { not: ignoreId } } : {}),
+        },
+    });
+
+    if (count >= cap) {
+        return { ok: false, code: 409, msg: "Límite diario de citas alcanzado." };
+    }
+    return { ok: true };
 }
 
 /* ===================== List ===================== */
@@ -262,7 +306,7 @@ export async function createAppointment(req: Request, res: Response) {
             startAt,
             endAt,
             timezone,
-            procedureId,        // opcional
+            procedureId, // opcional
             serviceDurationMin, // opcional (cache)
         } = req.body;
 
@@ -291,7 +335,7 @@ export async function createAppointment(req: Request, res: Response) {
             empresaId,
             start,
             end,
-            timezone: cfg.timezone, // 👈 clave
+            timezone: cfg.timezone,
         });
         if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
@@ -299,12 +343,13 @@ export async function createAppointment(req: Request, res: Response) {
         if (dayExcept)
             return res.status(409).json({ error: "Día bloqueado por excepción." });
 
-        // 2) Reglas de ventana (minNotice / maxAdvance / same-day)
+        // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
         const violates = violatesNoticeAndWindow(
             {
                 minNoticeH: cfg.minNoticeH,
                 maxAdvanceD: cfg.maxAdvanceD,
                 allowSameDay: cfg.allowSameDay,
+                bookingWindowDays: cfg.bookingWindowDays,
             },
             start
         );
@@ -314,7 +359,16 @@ export async function createAppointment(req: Request, res: Response) {
                 .json({ error: "El horario solicitado no cumple con las reglas de reserva." });
         }
 
-        // 3) Solapamiento con BUFFER desde config
+        // 2b) NUEVO: límite de citas por día
+        const cap = await ensureDailyCap({
+            empresaId,
+            when: start,
+            timezone: cfg.timezone,
+            cap: cfg.maxDailyAppointments,
+        });
+        if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
+
+        // 3) Solapamiento con BUFFER
         const overlap = await hasOverlapWithBuffer({
             empresaId,
             startAt: start,
@@ -344,9 +398,7 @@ export async function createAppointment(req: Request, res: Response) {
                 procedureId: procedureId ? Number(procedureId) : null,
                 customerDisplayName: customerName ?? null,
                 serviceDurationMin:
-                    serviceDurationMin ??
-                    cfg.defaultServiceDurationMin ??
-                    null,
+                    serviceDurationMin ?? cfg.defaultServiceDurationMin ?? null,
                 locationNameCache: cfg.locationName ?? null,
             },
         });
@@ -380,7 +432,7 @@ export async function updateAppointment(req: Request, res: Response) {
 
         const changedWindow = Boolean(patch.startAt || patch.endAt);
 
-        // Cargar config para buffer/ventanas
+        // Config para buffer/ventanas/cap
         const cfg = await loadApptRuntimeConfig(empresaId);
 
         if (changedWindow) {
@@ -389,7 +441,7 @@ export async function updateAppointment(req: Request, res: Response) {
                 empresaId,
                 start,
                 end,
-                timezone: cfg.timezone, // 👈 clave también aquí
+                timezone: cfg.timezone,
             });
             if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
@@ -397,12 +449,13 @@ export async function updateAppointment(req: Request, res: Response) {
             if (dayExcept)
                 return res.status(409).json({ error: "Día bloqueado por excepción." });
 
-            // Ventanas (minNotice/maxAdvance/same-day)
+            // Ventanas (minNotice/maxAdvance/same-day/bookingWindowDays)
             const violates = violatesNoticeAndWindow(
                 {
                     minNoticeH: cfg.minNoticeH,
                     maxAdvanceD: cfg.maxAdvanceD,
                     allowSameDay: cfg.allowSameDay,
+                    bookingWindowDays: cfg.bookingWindowDays,
                 },
                 start
             );
@@ -410,6 +463,16 @@ export async function updateAppointment(req: Request, res: Response) {
                 return res
                     .status(409)
                     .json({ error: "El horario solicitado no cumple con las reglas de reserva." });
+
+            // Límite de citas por día (ignorando la propia)
+            const cap = await ensureDailyCap({
+                empresaId,
+                when: start,
+                timezone: cfg.timezone,
+                cap: cfg.maxDailyAppointments,
+                ignoreId: id,
+            });
+            if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
 
             // Solapamiento con BUFFER (ignorando la propia cita)
             const overlap = await hasOverlapWithBuffer({
@@ -439,7 +502,9 @@ export async function updateAppointment(req: Request, res: Response) {
                 // opcionales nuevos
                 procedureId:
                     patch.procedureId !== undefined
-                        ? (patch.procedureId ? Number(patch.procedureId) : null)
+                        ? patch.procedureId
+                            ? Number(patch.procedureId)
+                            : null
                         : existing.procedureId,
                 customerDisplayName:
                     patch.customerDisplayName ?? existing.customerDisplayName,
@@ -469,7 +534,6 @@ function inferAiModeByVertical(vertical: string | undefined): "estetica" | "appt
     return "appts";
 }
 
-// Acepta aiMode opcional desde el front
 const saveConfigDtoZ = z.object({
     appointment: z.object({
         enabled: z.boolean(),
