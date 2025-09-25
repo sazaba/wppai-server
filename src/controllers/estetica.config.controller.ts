@@ -127,12 +127,18 @@ export async function upsertHours(req: Request, res: Response) {
     const empresaId =
         getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
 
-    const hours = Array.isArray(req.body.hours) ? req.body.hours : [];
     if (!empresaId || Number.isNaN(empresaId)) {
         return res.status(400).json({ ok: false, error: "empresaId requerido" });
     }
 
-    const rows = hours.map((h: any) => ({
+    // Acepta body.hours o body.days
+    const incoming = Array.isArray(req.body.hours)
+        ? req.body.hours
+        : Array.isArray(req.body.days)
+            ? req.body.days
+            : [];
+
+    const rows = incoming.map((h: any) => ({
         empresaId,
         day: asWeekday(h.day),
         isOpen: !!h.isOpen,
@@ -144,7 +150,7 @@ export async function upsertHours(req: Request, res: Response) {
 
     await prisma.$transaction([
         prisma.appointmentHour.deleteMany({ where: { empresaId } }),
-        prisma.appointmentHour.createMany({ data: rows }),
+        rows.length ? prisma.appointmentHour.createMany({ data: rows }) : prisma.$executeRaw`SELECT 1`,
     ]);
 
     const data = await prisma.appointmentHour.findMany({
@@ -153,6 +159,7 @@ export async function upsertHours(req: Request, res: Response) {
     });
     res.json({ ok: true, data });
 }
+
 
 /** ========= EsteticaProcedure ========= */
 
