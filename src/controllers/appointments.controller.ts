@@ -3,7 +3,6 @@ import prisma from "../lib/prisma";
 import { hasOverlap } from "./_availability";
 import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
-// NEW
 import { addMinutes } from "date-fns";
 
 /* ===================== Helpers ===================== */
@@ -16,6 +15,7 @@ function parseDateParam(v?: string | string[]) {
 }
 
 // map JS weekday (0=Sun..6=Sat) -> prisma Weekday enum ('sun'..'sat')
+// (mantenido por compatibilidad aunque dejamos de usarlo en TZ)
 const WEEK: Array<"sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat"> = [
     "sun",
     "mon",
@@ -44,25 +44,58 @@ function isInsideRanges(
     return inR1 || inR2;
 }
 
-/** Valida que (start,end) estén dentro de la disponibilidad del día (si existe).
- *  Si no hay AppointmentHour para ese día, se permite. */
+/* ======== NUEVO: helpers de TZ (validación en la zona del negocio) ======== */
+type WeekKey = "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat";
+
+function dayKeyInTZ(d: Date, tz: string): WeekKey {
+    // "Mon" -> "mon"
+    const wd = new Intl.DateTimeFormat("en-US", {
+        weekday: "short",
+        timeZone: tz,
+    })
+        .format(d)
+        .toLowerCase()
+        .slice(0, 3) as WeekKey;
+    return wd;
+}
+
+function minutesInTZ(d: Date, tz: string): number {
+    const [hh, mm] = new Intl.DateTimeFormat("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+        timeZone: tz,
+    })
+        .format(d)
+        .split(":")
+        .map(Number);
+    return hh * 60 + mm;
+}
+
+function sameCalendarDayInTZ(a: Date, b: Date, tz: string): boolean {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    });
+    return fmt.format(a) === fmt.format(b);
+}
+
+/** Valida que (start,end) estén dentro de la disponibilidad del día (si existe)
+ *  usando la zona horaria del negocio. Si no hay AppointmentHour para ese día, se permite. */
 async function ensureWithinBusinessHours(opts: {
     empresaId: number;
     start: Date;
     end: Date;
+    timezone: string; // 👈 importante
 }) {
-    const { empresaId, start, end } = opts;
+    const { empresaId, start, end, timezone } = opts;
 
-    // Solo validamos si inicio y fin son el mismo día
-    const sameDay =
-        start.getFullYear() === end.getFullYear() &&
-        start.getMonth() === end.getMonth() &&
-        start.getDate() === end.getDate();
+    // Validamos “mismo día” según la TZ del negocio
+    if (!sameCalendarDayInTZ(start, end, timezone)) return { ok: true };
 
-    if (!sameDay) return { ok: true };
-
-    const jsDow = start.getDay(); // 0..6
-    const day = WEEK[jsDow];
+    const day = dayKeyInTZ(start, timezone);
 
     const row = await prisma.appointmentHour.findUnique({
         where: { empresaId_day: { empresaId, day } },
@@ -73,8 +106,8 @@ async function ensureWithinBusinessHours(opts: {
         return { ok: false, code: 409, msg: "El negocio está cerrado ese día." };
     }
 
-    const sMin = start.getHours() * 60 + start.getMinutes();
-    const eMin = end.getHours() * 60 + end.getMinutes();
+    const sMin = minutesInTZ(start, timezone);
+    const eMin = minutesInTZ(end, timezone);
 
     const r1 = { s: toMinutes(row.start1), e: toMinutes(row.end1) };
     const r2 = { s: toMinutes(row.start2), e: toMinutes(row.end2) };
@@ -90,7 +123,7 @@ async function ensureWithinBusinessHours(opts: {
     return { ok: true };
 }
 
-/* ===================== NEW: Config runtime (Appt > Legacy) ===================== */
+/* ===================== Config runtime (Appt > Legacy) ===================== */
 async function loadApptRuntimeConfig(empresaId: number) {
     const [cfgAppt, cfgLegacy] = await Promise.all([
         prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
@@ -126,7 +159,7 @@ async function loadApptRuntimeConfig(empresaId: number) {
     };
 }
 
-/* ===================== NEW: Reglas de ventana, excepciones y overlap con buffer ===================== */
+/* ===================== Reglas de ventana / excepciones / overlap ===================== */
 
 function violatesNoticeAndWindow(
     cfg: { minNoticeH: number | null; maxAdvanceD: number | null; allowSameDay: boolean },
@@ -253,8 +286,13 @@ export async function createAppointment(req: Request, res: Response) {
                 .json({ error: "La agenda está deshabilitada para esta empresa." });
         }
 
-        // 1) Horario de atención (legacy) + excepción de agenda
-        const wh = await ensureWithinBusinessHours({ empresaId, start, end });
+        // 1) Horario de atención (en TZ de negocio) + excepción
+        const wh = await ensureWithinBusinessHours({
+            empresaId,
+            start,
+            end,
+            timezone: cfg.timezone, // 👈 clave
+        });
         if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
         const dayExcept = await isExceptionDay(empresaId, start);
@@ -276,7 +314,7 @@ export async function createAppointment(req: Request, res: Response) {
                 .json({ error: "El horario solicitado no cumple con las reglas de reserva." });
         }
 
-        // 3) Solapamiento con BUFFER desde config (mantiene tu lógica, solo la mejora)
+        // 3) Solapamiento con BUFFER desde config
         const overlap = await hasOverlapWithBuffer({
             empresaId,
             startAt: start,
@@ -288,7 +326,7 @@ export async function createAppointment(req: Request, res: Response) {
                 .status(409)
                 .json({ error: "Existe otra cita en ese intervalo (buffer aplicado)." });
 
-        // 4) Crear cita (con caches opcionales; no rompe tu modelo actual)
+        // 4) Crear cita
         const appt = await prisma.appointment.create({
             data: {
                 empresaId,
@@ -342,12 +380,17 @@ export async function updateAppointment(req: Request, res: Response) {
 
         const changedWindow = Boolean(patch.startAt || patch.endAt);
 
-        // Cargar config para buffer/ventanas (no rompe si no existe Appt)
+        // Cargar config para buffer/ventanas
         const cfg = await loadApptRuntimeConfig(empresaId);
 
         if (changedWindow) {
-            // Horario de atención (legacy) + excepción
-            const wh = await ensureWithinBusinessHours({ empresaId, start, end });
+            // Horario de atención (en TZ) + excepción
+            const wh = await ensureWithinBusinessHours({
+                empresaId,
+                start,
+                end,
+                timezone: cfg.timezone, // 👈 clave también aquí
+            });
             if (!wh.ok) return res.status(wh.code!).json({ error: wh.msg });
 
             const dayExcept = await isExceptionDay(empresaId, start);
@@ -393,7 +436,7 @@ export async function updateAppointment(req: Request, res: Response) {
                 startAt: start,
                 endAt: end,
                 timezone: patch.timezone ?? existing.timezone,
-                // opcionales nuevos (si los mandas desde UI)
+                // opcionales nuevos
                 procedureId:
                     patch.procedureId !== undefined
                         ? (patch.procedureId ? Number(patch.procedureId) : null)
@@ -415,7 +458,6 @@ export async function updateAppointment(req: Request, res: Response) {
 }
 
 /* ===================== CONFIG (GET + POST) ===================== */
-/** NOTA: se mantiene tu config LEGACY (BusinessConfig) para no romper front. */
 
 // ⏱️ "HH:MM"
 const timeZ = z.string().regex(/^\d{2}:\d{2}$/).nullable().optional();
@@ -427,11 +469,10 @@ function inferAiModeByVertical(vertical: string | undefined): "estetica" | "appt
     return "appts";
 }
 
-// 👇 Acepta aiMode opcional desde el front (valores válidos del enum actual)
+// Acepta aiMode opcional desde el front
 const saveConfigDtoZ = z.object({
     appointment: z.object({
         enabled: z.boolean(),
-        // Coincide con tu enum AppointmentVertical
         vertical: z.enum([
             "none",
             "salud",
@@ -533,7 +574,7 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     servicios: "",
                     faq: "",
                     horarios: "",
-                    // ✅ al CREAR: si enabled -> inferido por vertical; si no -> respeta fromClient o "agente"
+                    // aiMode
                     aiMode: forceAppointments ? inferredAiMode : (fromClient ?? "agente"),
                 },
                 update: {
@@ -544,7 +585,6 @@ export async function saveAppointmentConfig(req: Request, res: Response) {
                     appointmentPolicies: appointment.policies ?? null,
                     appointmentReminders: appointment.reminders,
                     updatedAt: new Date(),
-                    // ✅ en UPDATE: si enabled=true, forzamos el inferido; si enabled=false y viene fromClient, lo respetamos.
                     ...(forceAppointments
                         ? { aiMode: inferredAiMode }
                         : fromClient
@@ -687,7 +727,6 @@ export async function triggerReminderTick(req: Request, res: Response) {
         windowMinutes
     );
 
-    // Aquí deberías invocar tu servicio real de WhatsApp + template.
     // Simulación: marcamos en cola (queued)
     for (const r of rows) {
         await prisma.appointmentReminderLog.create({
