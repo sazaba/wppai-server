@@ -3,8 +3,9 @@ import { verificarJWT } from '../middleware/auth.middleware'
 import {
     getApptConfig,
     upsertApptConfig,
-    listHours,
-    upsertHours,
+    // OJO: los de hours ya los manejas en /api/appointment-hours
+    // listHours,
+    // upsertHours,
     listProcedures,
     upsertProcedure,
     listStaff,
@@ -19,33 +20,34 @@ const router = Router()
 router.use(verificarJWT)
 
 /** ========= BusinessConfigAppt ========= */
-// Obtener config completa (incluye procedimientos y reminder rules)
-router.get('/estetica/config/:empresaId', getApptConfig)
-// Crear/actualizar config
-router.post('/estetica/config/:empresaId', upsertApptConfig)
+// GET /api/estetica/config
+router.get('/estetica/config', getApptConfig)
+// POST /api/estetica/config
+router.post('/estetica/config', upsertApptConfig)
 
 /** ========= AppointmentHour ========= */
-// Listar horario semanal
-router.get('/estetica/hours/:empresaId', listHours)
-// Guardar horario semanal (sobrescribe por día)
-router.post('/estetica/hours/:empresaId', upsertHours)
+/* ¡Ya tienes /api/appointment-hours funcionando! No dupliquemos paths aquí.
+   Si algún día quisieras traerlos a este router, serían:
+   router.get('/estetica/hours', listHours)
+   router.post('/estetica/hours', upsertHours)
+*/
 
 /** ========= EsteticaProcedure ========= */
-// Listar procedimientos
-router.get('/estetica/procedures/:empresaId', listProcedures)
-// Crear/actualizar procedimiento
-router.post('/estetica/procedures/:empresaId', upsertProcedure)
+// GET /api/estetica/procedures
+router.get('/estetica/procedures', listProcedures)
+// POST /api/estetica/procedure
+router.post('/estetica/procedure', upsertProcedure)
 
-/** ========= Staff (opcional) ========= */
-// Listar staff
-router.get('/estetica/staff/:empresaId', listStaff)
-// Crear/actualizar staff
-router.post('/estetica/staff/:empresaId', upsertStaff)
+/** ========= Staff ========= */
+// GET /api/estetica/staff
+router.get('/estetica/staff', listStaff)
+// POST /api/estetica/staff
+router.post('/estetica/staff', upsertStaff)
 
-/** ========= Excepciones (opcional) ========= */
-// Listar días de excepción
-router.get('/estetica/exceptions/:empresaId', listExceptions)
-// Crear/actualizar excepción
-router.post('/estetica/exceptions/:empresaId', upsertException)
+/** ========= Exceptions ========= */
+// GET /api/estetica/exceptions
+router.get('/estetica/exceptions', listExceptions)
+// POST /api/estetica/exception
+router.post('/estetica/exception', upsertException)
 
 export default router

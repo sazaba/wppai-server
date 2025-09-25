@@ -152,7 +152,7 @@ app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
 
 // 🗓️ Agenda (NUEVO)
-app.use("/api/estetica/config", esteticaConfigRoutes);
+app.use('/api', esteticaConfigRoutes);
 app.use('/api/appointments', appointmentsRoutes)
 app.use('/api/appointment-hours', appointmentHoursRoutes)
 
