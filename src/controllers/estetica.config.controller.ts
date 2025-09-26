@@ -417,3 +417,95 @@ export async function upsertException(req: Request, res: Response) {
 
     res.json({ ok: true, data });
 }
+
+// ================= PURGE TOTAL (empresa) =================
+
+/**
+ * DELETE /api/estetica/purge
+ * Borra TODO lo relativo a Estética para la empresa:
+ * - appointment_exception
+ * - staff
+ * - appointment_hour
+ * - estetica_procedure
+ * - reminder_rule (si existe el modelo)
+ * - business_config_appt
+ */
+export async function purgeAllEsteticaData(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    // Buscamos config para conocer el configApptId y limpiar children que dependan de él
+    const cfg = await prisma.businessConfigAppt.findUnique({
+        where: { empresaId },
+        select: { id: true },
+    });
+
+    // Ejecutamos en tx y devolvemos conteos por transparencia
+    const result = await prisma.$transaction(async (tx) => {
+        const deleted: Record<string, number> = {};
+
+        // 1) Hijos por empresaId directos
+        const delExceptions = await tx.appointmentException.deleteMany({ where: { empresaId } });
+        deleted.appointmentException = delExceptions.count;
+
+        const delStaff = await tx.staff.deleteMany({ where: { empresaId } });
+        deleted.staff = delStaff.count;
+
+        const delHours = await tx.appointmentHour.deleteMany({ where: { empresaId } });
+        deleted.appointmentHour = delHours.count;
+
+        // 2) Hijos ligados a configApptId + (por compat) empresaId
+        let delProceduresCount = 0;
+        if (cfg?.id) {
+            const delProcedures = await tx.esteticaProcedure.deleteMany({
+                where: {
+                    OR: [
+                        { empresaId },               // muchos modelos lo tienen
+                        { configApptId: cfg.id },    // y además FK directa a config
+                    ],
+                },
+            });
+            delProceduresCount = delProcedures.count;
+        } else {
+            const delProcedures = await tx.esteticaProcedure.deleteMany({ where: { empresaId } });
+            delProceduresCount = delProcedures.count;
+        }
+        deleted.esteticaProcedure = delProceduresCount;
+
+        // 3) ReminderRule (si existe el modelo en tu schema)
+        //    Intentamos por configApptId y por empresaId (según cómo lo tengas modelado).
+        try {
+            if ((tx as any).reminderRule) {
+                let delRR = { count: 0 };
+                if (cfg?.id) {
+                    delRR = await (tx as any).reminderRule.deleteMany({
+                        where: {
+                            OR: [{ configApptId: cfg.id }, { empresaId }],
+                        },
+                    });
+                } else {
+                    delRR = await (tx as any).reminderRule.deleteMany({ where: { empresaId } });
+                }
+                deleted.reminderRule = delRR.count;
+            }
+        } catch {
+            // Si no existe ReminderRule en tu schema, ignoramos silenciosamente
+        }
+
+        // 4) Finalmente, el padre
+        let delConfigCount = 0;
+        if (cfg?.id) {
+            const delCfg = await tx.businessConfigAppt.deleteMany({ where: { empresaId } });
+            delConfigCount = delCfg.count;
+        }
+        deleted.businessConfigAppt = delConfigCount;
+
+        return deleted;
+    });
+
+    return res.json({ ok: true, deleted: result });
+}

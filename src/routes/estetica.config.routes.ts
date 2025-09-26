@@ -12,6 +12,7 @@ import {
     upsertStaff,
     listExceptions,
     upsertException,
+    purgeAllEsteticaData,
 } from '../controllers/estetica.config.controller'
 
 const router = Router()
@@ -49,5 +50,7 @@ router.post('/estetica/staff', upsertStaff)
 router.get('/estetica/exceptions', listExceptions)
 // POST /api/estetica/exception
 router.post('/estetica/exception', upsertException)
+
+router.delete("/estetica/purge", purgeAllEsteticaData);
 
 export default router
