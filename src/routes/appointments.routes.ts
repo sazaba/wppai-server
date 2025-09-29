@@ -26,7 +26,8 @@ router.post("/reset", resetAppointments);
 router.get("/", listAppointments);
 router.post("/", createAppointment);
 router.put("/:id", updateAppointment);
-router.delete("/api/appointments/:id", deleteAppointment);
+router.delete("/:id", deleteAppointment);
+
 
 
 // ===== NUEVO: Reminder Rules (no rompe nada existente)
