@@ -27,12 +27,12 @@ export type IAReplyResult = {
 }
 
 /** ===== Config imagen/texto / tiempos ===== */
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)           // 1s
-const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)       // 60s: arrastrar imagen reciente
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                 // 1s
+const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)             // 60s: arrastrar imagen reciente
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5m si se menciona explícitamente
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)
-const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000) // 3m
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000) // 2m
+const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 0) // override a 0
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 0)   // override a 0
 
 /** ===== Respuesta concisa ===== */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
@@ -53,9 +53,9 @@ function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS
 /** ===== Helpers ===== */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-async function computeReplyDelayMs(conversationId: number) {
-    const prevBot = await prisma.message.findFirst({ where: { conversationId, from: MessageFrom.bot }, select: { id: true } })
-    return prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
+// ⚡️ Respuesta inmediata para este vertical
+async function computeReplyDelayMs(_conversationId: number) {
+    return 0
 }
 
 function mentionsImageExplicitly(t: string) {
@@ -268,9 +268,14 @@ export async function handleEsteticaReply(opts: {
                     transcript = await transcribeAudioBuffer(audioBuf, name)
                     if (transcript) await prisma.message.update({ where: { id: last.id }, data: { transcription: transcript } })
                 }
-            } catch {/* noop */ }
+            } catch { /* noop */ }
         }
         if (transcript) userText = transcript
+    }
+
+    // ⬇️ Fallback: si no hay texto por arg ni por audio, usa el texto del último mensaje del cliente
+    if (!userText && last?.contenido) {
+        userText = String(last.contenido || '').trim()
     }
 
     const isImage = last?.mediaType === MediaType.image && !!last?.mediaUrl
@@ -278,7 +283,7 @@ export async function handleEsteticaReply(opts: {
     const caption = String(last?.caption || '').trim()
     const referenceTs = last?.timestamp ?? new Date()
 
-    // Debounce por imagen
+    // Debounce por imagen / general
     if (isImage) {
         if (!(caption || userText)) { await sleep(IMAGE_WAIT_MS); return null }
         if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) return null
@@ -516,12 +521,24 @@ async function persistBotReply({
     let wamid: string | undefined
     if (to && String(to).trim()) {
         try {
+            // fallback para phoneNumberId
+            let phoneId = phoneNumberId
+            if (!phoneId) {
+                const acc = await prisma.whatsappAccount.findFirst({ where: { empresaId }, select: { phoneNumberId: true } })
+                phoneId = acc?.phoneNumberId
+            }
+
             const resp = await Wam.sendWhatsappMessage({
-                empresaId, to: normalizeToE164(to), body: texto, phoneNumberIdHint: phoneNumberId,
+                empresaId,
+                to: normalizeToE164(to),
+                body: texto,
+                phoneNumberIdHint: phoneId,
             })
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
             if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
-        } catch { /* noop */ }
+        } catch (e: any) {
+            console.warn('[WA] sendWhatsappMessage fallo:', e?.response?.data || e?.message || e)
+        }
     }
     return { messageId: msg.id, texto, wamid }
 }

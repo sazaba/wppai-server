@@ -1,4 +1,3 @@
-// server/src/utils/handleIAReply.ts
 import prisma from '../lib/prisma'
 import { handleEcommerceIAReply, type IAReplyResult } from './handleIAReply.ecommerce'
 import { handleAgentReply } from './ai/strategies/agent.strategy'
@@ -126,8 +125,8 @@ export const handleIAReply = async (
                     locationName: bca.locationName ?? undefined,
                     locationAddress: bca.locationAddress ?? undefined,
                     locationMapsUrl: bca.locationMapsUrl ?? undefined,
-                    parkingInfo: bca.parkingInfo ?? undefined,
                     virtualMeetingLink: bca.virtualMeetingLink ?? undefined,
+                    parkingInfo: bca.parkingInfo ?? undefined,
                     instructionsArrival: bca.instructionsArrival ?? undefined,
                 },
                 rules: {
