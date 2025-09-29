@@ -11,6 +11,7 @@ import {
     listReminderRules,
     upsertReminderRule,
     triggerReminderTick,
+    deleteAppointment,
 } from "../controllers/appointments.controller";
 
 const router = Router();
@@ -25,6 +26,8 @@ router.post("/reset", resetAppointments);
 router.get("/", listAppointments);
 router.post("/", createAppointment);
 router.put("/:id", updateAppointment);
+router.delete("/api/appointments/:id", deleteAppointment);
+
 
 // ===== NUEVO: Reminder Rules (no rompe nada existente)
 router.get("/reminders", listReminderRules);

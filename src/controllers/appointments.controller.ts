@@ -804,3 +804,22 @@ export async function triggerReminderTick(req: Request, res: Response) {
 
     res.json({ ok: true, count: rows.length, sample: rows.slice(0, 10) });
 }
+
+// DELETE /api/appointments/:id
+export async function deleteAppointment(req: Request, res: Response) {
+    try {
+        const empresaId = getEmpresaId(req);
+        const id = Number(req.params.id);
+
+        const existing = await prisma.appointment.findUnique({ where: { id } });
+        if (!existing || existing.empresaId !== empresaId) {
+            return res.status(404).json({ error: "Cita no encontrada" });
+        }
+
+        await prisma.appointment.delete({ where: { id } });
+        return res.json({ ok: true });
+    } catch (err: any) {
+        console.error("[deleteAppointment] ❌", err);
+        return res.status(500).json({ error: "No se pudo eliminar la cita" });
+    }
+}
