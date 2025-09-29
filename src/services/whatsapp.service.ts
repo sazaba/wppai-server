@@ -480,3 +480,28 @@ export async function sendVideoByLink(opts: {
 }) {
     return sendWhatsappMedia({ ...opts, type: 'video' })
 }
+
+/* ===================== Helper: plantilla por nombre ===================== */
+/**
+ * Azúcar sobre sendTemplate:
+ * - lang por defecto 'es'
+ * - variables opcionales para {{1}}, {{2}}, ...
+ */
+export async function sendTemplateByName(opts: {
+    empresaId: number
+    to: string
+    name: string               // nombre aprobado en Meta
+    lang?: string              // 'es', 'es_AR', 'en_US'...
+    variables?: string[]       // parámetros para {{1}}, {{2}}, ...
+    phoneNumberIdHint?: string
+}): Promise<OutboundResult> {
+    const { empresaId, to, name, lang = 'es', variables = [], phoneNumberIdHint } = opts
+    return sendTemplate({
+        empresaId,
+        to,
+        templateName: name,
+        templateLang: lang,
+        variables,
+        phoneNumberIdHint,
+    })
+}
