@@ -127,19 +127,45 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
 }
 
 /** Consulta de procedimientos (para RAG simple de servicios) */
-export async function retrieveProcedures(empresaId: number, query?: string) {
-    const where: any = { empresaId, enabled: true }
-    if (query) {
-        where.OR = [
-            { name: { contains: query, mode: 'insensitive' } },
-            { notes: { contains: query, mode: 'insensitive' } },
-            { contraindications: { contains: query, mode: 'insensitive' } },
-            { prepInstructions: { contains: query, mode: 'insensitive' } },
-            { postCare: { contains: query, mode: 'insensitive' } }
-        ]
+
+
+export async function retrieveProcedures(empresaId: number, rawQuery?: string) {
+    const q = (rawQuery || '').trim()
+
+    // 1) Sin query → top 10 activos
+    if (!q) {
+        return prisma.esteticaProcedure.findMany({
+            where: { empresaId, enabled: true },
+            orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
+            take: 10,
+            select: {
+                id: true,
+                name: true,
+                durationMin: true,
+                priceMin: true,
+                priceMax: true,
+                requiresAssessment: true,
+                prepInstructions: true,
+                contraindications: true,
+                postCare: true,
+                notes: true,
+            },
+        })
     }
-    return prisma.esteticaProcedure.findMany({
-        where,
+
+    // 2) Búsqueda compatible (sin "mode", sin "aliases" en el where)
+    const rows = await prisma.esteticaProcedure.findMany({
+        where: {
+            empresaId,
+            enabled: true,
+            OR: [
+                { name: { contains: q } },
+                { notes: { contains: q } },
+                { contraindications: { contains: q } },
+                { prepInstructions: { contains: q } },
+                { postCare: { contains: q } },
+            ],
+        },
         orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
         take: 10,
         select: {
@@ -152,10 +178,47 @@ export async function retrieveProcedures(empresaId: number, query?: string) {
             prepInstructions: true,
             contraindications: true,
             postCare: true,
-            notes: true
-        }
+            notes: true,
+        },
+    })
+
+    if (rows.length) return rows
+
+    // 3) Fallback: filtrar en memoria usando "aliases" si existe (cualquier tipo)
+    const all = await prisma.esteticaProcedure.findMany({
+        where: { empresaId, enabled: true },
+        take: 30,
+        orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
+        select: {
+            id: true,
+            name: true,
+            durationMin: true,
+            priceMin: true,
+            priceMax: true,
+            requiresAssessment: true,
+            prepInstructions: true,
+            contraindications: true,
+            postCare: true,
+            notes: true,
+            // no lo ponemos en el where para evitar error de tipado
+            // pero sí lo traemos como any si existe
+            // @ts-ignore - schema puede no tenerlo
+            aliases: true as any,
+        } as any,
+    })
+
+    const needle = q.toLowerCase()
+    return all.filter((p: any) => {
+        const aliases = Array.isArray(p.aliases)
+            ? p.aliases.join(', ')
+            : (typeof p.aliases === 'string' ? p.aliases : '')
+        const haystack = [
+            p.name, p.notes, p.contraindications, p.prepInstructions, p.postCare, aliases,
+        ].filter(Boolean).join(' • ').toLowerCase()
+        return haystack.includes(needle)
     })
 }
+
 
 const nrm = (s: string) =>
     String(s || '')

@@ -15,7 +15,7 @@ import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsa
 
 /** ===== Retraso humano simulado ===== */
 const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000) // 3 min
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000) // 2 min
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)  // 2 min
 
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
@@ -287,17 +287,29 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             responded = true
         }
 
-        // ⚙️ Ejecutar IA en background tras el ACK **respetando delay humano**
+        // ⚙️ Ejecutar IA en background tras el ACK **con delay dinámico**
         ; (async () => {
             try {
-                // calcular delay: 3min si no hay bot previo en la conversación; 2min si ya hubo
-                const prevBot = await prisma.message.findFirst({
-                    where: { conversationId: conversation.id, from: MessageFrom.bot },
-                    select: { id: true },
+                // === Delay humano (dinámico por modo) ===
+                // Si es Estética (o citas habilitadas), respondemos INMEDIATO
+                const bca = await prisma.businessConfigAppt.findUnique({
+                    where: { empresaId },
+                    select: { aiMode: true, appointmentEnabled: true },
                 })
-                const delayMs = prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
+                const isEstetica = (bca?.aiMode === 'estetica') || (bca?.appointmentEnabled === true)
+
+                let delayMs = 0
+                if (!isEstetica) {
+                    // Mantén el comportamiento anterior para otros verticales
+                    const prevBot = await prisma.message.findFirst({
+                        where: { conversationId: conversation.id, from: MessageFrom.bot },
+                        select: { id: true },
+                    })
+                    delayMs = prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
+                }
+
                 if (process.env.DEBUG_AI === '1') {
-                    console.log('[WEBHOOK] delay humano ms =', delayMs, 'prevBot?', !!prevBot)
+                    console.log('[WEBHOOK] delay humano ms =', delayMs, 'isEstetica?', isEstetica)
                 }
                 await sleep(delayMs)
 
