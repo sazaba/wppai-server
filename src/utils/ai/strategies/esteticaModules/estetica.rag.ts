@@ -118,7 +118,7 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
     }
 }
 
-/** ==== catálogo y matching (para respuestas sin inventar) ==== */
+/** ==== catálogo y matching ==== */
 const nrm = (s: string) =>
     String(s || '')
         .normalize('NFD')

@@ -1,4 +1,3 @@
-// server/src/utils/ai/strategies/esteticaModules/estetica.schedule.ts
 import prisma from '../../../../lib/prisma'
 import type { EsteticaCtx } from './estetica.rag'
 import { AppointmentStatus } from '@prisma/client'
@@ -265,18 +264,18 @@ function weekdayInTZ(d: Date, tz: string): number {
 }
 
 /**
- * Convierte (yyyy-mm-dd + hh:mm) en la TZ dada al instante UTC correcto.
+ * Convierte (YYYY-MM-DD + HH:mm) en la TZ dada al instante UTC correcto.
  * Ejemplo: "2025-09-30", "09:00", "America/Bogota" → Date con 2025-09-30 14:00 UTC.
  */
 function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const [y, m, d] = ymd.split('-').map(Number)
     const [h, mi] = hhmm.split(':').map(Number)
 
-    // Base "naive" en UTC
+    // Base en UTC "naive"
     const utcGuess = new Date(Date.UTC(y, m - 1, d, h, mi))
 
     // Qué hora ve esa TZ para ese instante
-    const fmt = new Intl.DateTimeFormat('en-US', {
+    const parts = new Intl.DateTimeFormat('en-US', {
         timeZone: tz,
         hour12: false,
         year: 'numeric',
@@ -284,17 +283,47 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
         day: '2-digit',
         hour: '2-digit',
         minute: '2-digit',
-    })
+    }).formatToParts(utcGuess)
 
-    const parts = fmt.formatToParts(utcGuess)
-    const gotH = Number(parts.find((p) => p.type === 'hour')?.value ?? '0')
-    const gotM = Number(parts.find((p) => p.type === 'minute')?.value ?? '0')
+    const gotH = Number(parts.find(p => p.type === 'hour')?.value ?? '0')
+    const gotM = Number(parts.find(p => p.type === 'minute')?.value ?? '0')
 
-    // Diferencia en minutos entre lo pedido y lo interpretado
+    // Diferencia en minutos entre lo pedido (h:mi) y lo observado en esa TZ
     const deltaMin = (h * 60 + mi) - (gotH * 60 + gotM)
 
-    // Ajustamos el UTC base para corregir la TZ
-    return new Date(utcGuess.getTime() - deltaMin * 60000)
+    // ✅ Ajuste correcto: sumamos el delta
+    return new Date(utcGuess.getTime() + deltaMin * 60000)
+}
+
+/** Próxima cita futura (pending|confirmed|rescheduled) para el teléfono dado. */
+export async function findNextUpcomingApptForPhone(
+    empresaId: number,
+    phoneE164: string
+) {
+    return prisma.appointment.findFirst({
+        where: {
+            empresaId,
+            customerPhone: phoneE164,
+            status: { in: ['pending', 'confirmed', 'rescheduled'] },
+            startAt: { gt: new Date() },
+        },
+        orderBy: { startAt: 'asc' },
+        select: { id: true, startAt: true, serviceName: true }
+    })
+}
+
+/** Cancela la próxima cita futura del teléfono (si existe). */
+export async function cancelNextUpcomingForPhone(
+    empresaId: number,
+    phoneE164: string
+) {
+    const appt = await findNextUpcomingApptForPhone(empresaId, phoneE164)
+    if (!appt) return null
+    await prisma.appointment.update({
+        where: { id: appt.id },
+        data: { status: 'cancelled' }
+    })
+    return appt
 }
 
 function startOfDayTZ(d: Date, tz: string): Date {

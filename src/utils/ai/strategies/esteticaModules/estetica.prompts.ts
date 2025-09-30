@@ -1,4 +1,3 @@
-// server/src/utils/ai/strategies/esteticaModules/estetica.prompts.ts
 import type { EsteticaCtx } from './estetica.rag'
 
 /**
@@ -14,7 +13,7 @@ export function buildSystemPrompt(ctx: EsteticaCtx): string {
 
     const addr = (ctx.logistics?.locationAddress ?? '').trim()
     const locName = (ctx.logistics?.locationName ?? '').trim()
-    const phone = (ctx.logistics?.locationMapsUrl ?? '').trim() // si quieres mostrar Maps; deja vacío si no
+    const phone = (ctx.logistics?.locationMapsUrl ?? '').trim()
     const arrival = (ctx.logistics?.instructionsArrival ?? '').trim()
     const parking = (ctx.logistics?.parkingInfo ?? '').trim()
 
@@ -65,9 +64,10 @@ export function fmtProposeSlots(
     return `Puedo ${verbo} tu cita en:\n${list}\n\nResponde con el número de la opción o indícame otra fecha/hora.`
 }
 
-/** Confirmación de cita */
+/** Confirmación de cita (incluye código corto) */
 export function fmtConfirmBooking(
     appt: {
+        id?: number
         startAt: Date
         endAt: Date
         serviceName?: string
@@ -94,9 +94,11 @@ export function fmtConfirmBooking(
                 .join(' — ')}`
             : ''
 
+    const code = appt?.id ? `\n🆔 Código: APT-${String(appt.id).padStart(4, '0')}` : ''
+
     return `✅ Cita confirmada${quien}${servicio}\n🗓️ ${f(
         appt.startAt
-    )}${loc}\nPor favor llega 10 minutos antes.`
+    )}${loc}${code}\nPor favor llega 10 minutos antes.`
 }
 
 /** Utilidad: formato de dinero COP sin decimales */

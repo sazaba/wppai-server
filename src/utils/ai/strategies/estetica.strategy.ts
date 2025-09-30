@@ -13,7 +13,7 @@ import {
 import { detectIntent, EsteticaIntent } from './esteticaModules/estetica.intents'
 import { buildSystemPrompt, fmtConfirmBooking, fmtProposeSlots } from './esteticaModules/estetica.prompts'
 import { loadApptContext, retrieveProcedures, type EsteticaCtx, confirmLatestPendingForPhone } from './esteticaModules/estetica.rag'
-import { findSlots, book, reschedule, cancel } from './esteticaModules/estetica.schedule'
+import { findSlots, book, reschedule, cancel, cancelNextUpcomingForPhone } from './esteticaModules/estetica.schedule'
 
 export type IAReplyResult = {
     estado: ConversationEstado
@@ -372,7 +372,7 @@ export async function handleEsteticaReply(opts: {
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
             if (!intent.appointmentId) {
-                const text = 'Para reagendar necesito el ID o la fecha de tu cita actual. ¿Puedes confirmarlo?'
+                const text = 'Para reagendar necesito el ID, el código APT-#### o la fecha de tu cita actual. ¿Me confirmas?'
                 const saved = await persistBotReply({
                     conversationId: chatId, empresaId, texto: text, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId,
                 })
@@ -433,25 +433,46 @@ export async function handleEsteticaReply(opts: {
             }
         }
 
-
-
         case EsteticaIntent.CANCEL: {
-            if (!intent.appointmentId) {
-                const text = 'Para cancelar necesito el ID o fecha aproximada de la cita. ¿Me ayudas con ese dato?'
-                const saved = await persistBotReply({
-                    conversationId: chatId, empresaId, texto: text, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId,
-                })
-                return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            const phone = (toPhone ?? conversacion.phone) || ''
+            // 1) ¿El usuario escribió un código APT-####?
+            const raw = (userText || caption || '').toUpperCase()
+            const m = raw.match(/APT[-\s]?(\d{1,8})/)
+            if (m) {
+                const apptId = Number(m[1])
+                try {
+                    const appt = await cancel({ empresaId, appointmentId: apptId })
+                    const fmt = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
+                    const when = appt?.startAt ? ` (${fmt(appt.startAt)})` : ''
+                    const windowTxt = ctx.rules?.cancellationWindowHours ? ` — ventana de ${ctx.rules.cancellationWindowHours}h` : ''
+                    const text = `Cita cancelada ✅${when}${windowTxt}`
+                    const saved = await persistBotReply({
+                        conversationId: chatId, empresaId, texto: text, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
+                    })
+                    return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+                } catch {
+                    // si falla, seguimos con las otras rutas
+                }
             }
-            const appt = await cancel({ empresaId, appointmentId: intent.appointmentId })
-            const fmt = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
-            const when = appt?.startAt ? ` (${fmt(appt.startAt)})` : ''
-            const windowTxt = ctx.rules?.cancellationWindowHours ? ` — ventana de ${ctx.rules.cancellationWindowHours}h` : ''
-            const text = `Cita cancelada ✅${when}${windowTxt}`
+
+            // 2) Si no dio código/ID: cancelar la PRÓXIMA futura del mismo número
+            if (phone) {
+                const appt = await cancelNextUpcomingForPhone(empresaId, phone)
+                const msg = appt
+                    ? `Cita cancelada ✅ (${new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(appt.startAt)})`
+                    : 'No encontré citas futuras para este número. Si quieres, dime la fecha aproximada o el código APT-####.'
+                const saved = await persistBotReply({
+                    conversationId: chatId, empresaId, texto: msg, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
+                })
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            }
+
+            // 3) Último recurso: pedir datos
+            const text = 'Para cancelar necesito el código APT-####, el ID o la fecha aproximada de la cita. ¿Me ayudas con ese dato?'
             const saved = await persistBotReply({
-                conversationId: chatId, empresaId, texto: text, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId: chatId, empresaId, texto: text, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId,
             })
-            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
         }
 
         case EsteticaIntent.GENERAL_QA:
