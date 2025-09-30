@@ -1,4 +1,3 @@
-// server/src/utils/ai/strategies/esteticaModules/estetica.rag.ts
 import prisma from '../../../../lib/prisma'
 import type { AppointmentVertical } from '@prisma/client'
 
@@ -34,10 +33,7 @@ export type EsteticaCtx = {
     buildKbContext: () => Promise<string>
 }
 
-/**
- * Carga el contexto de agenda desde el orquestador (preferente) o DB (fallback).
- * Mantiene shape estable para el strategy.
- */
+/** Carga contexto desde orquestador (si llega) o desde la BD */
 export async function loadApptContext(empresaId: number, fromOrchestrator?: any): Promise<EsteticaCtx> {
     if (fromOrchestrator) {
         return {
@@ -61,7 +57,7 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
                 allowSameDay: fromOrchestrator.allowSameDayBooking ?? fromOrchestrator.rules?.allowSameDay ?? false,
                 requireConfirmation: fromOrchestrator.requireClientConfirmation ?? fromOrchestrator.rules?.requireClientConfirmation ?? true,
                 defaultServiceDurationMin: fromOrchestrator.defaultServiceDurationMin ?? 60,
-                paymentNotes: fromOrchestrator.paymentNotes ?? null
+                paymentNotes: fromOrchestrator.paymentNotes ?? null,
             },
             buildKbContext: async () => {
                 const kb = fromOrchestrator.kb ?? {}
@@ -72,16 +68,14 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
                         : '',
                     kb.serviceNotes && `Notas de servicios:\n${JSON.stringify(kb.serviceNotes, null, 2)}`,
                     kb.disclaimers && `Avisos/Disclaimers:\n${kb.disclaimers}`,
-                    kb.freeText && `Notas libres:\n${kb.freeText}`
-                ]
-                    .filter(Boolean)
-                    .join('\n\n')
-            }
+                    kb.freeText && `Notas libres:\n${kb.freeText}`,
+                ].filter(Boolean).join('\n\n')
+            },
         }
     }
 
-    // Fallback a DB
     const bca = await prisma.businessConfigAppt.findUnique({ where: { empresaId } })
+
     return {
         empresaId,
         vertical: bca?.appointmentVertical ?? 'custom',
@@ -93,7 +87,7 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
             locationAddress: bca?.locationAddress ?? undefined,
             locationMapsUrl: bca?.locationMapsUrl ?? undefined,
             instructionsArrival: bca?.instructionsArrival ?? undefined,
-            parkingInfo: bca?.parkingInfo ?? undefined
+            parkingInfo: bca?.parkingInfo ?? undefined,
         },
         rules: {
             cancellationWindowHours: bca?.cancellationWindowHours ?? null,
@@ -109,7 +103,7 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
             allowSameDay: bca?.allowSameDayBooking ?? false,
             requireConfirmation: bca?.requireClientConfirmation ?? true,
             defaultServiceDurationMin: bca?.defaultServiceDurationMin ?? 60,
-            paymentNotes: null
+            paymentNotes: null,
         },
         buildKbContext: async () =>
             [
@@ -119,72 +113,12 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
                     : '',
                 bca?.kbServiceNotes && `Notas de servicios:\n${JSON.stringify(bca.kbServiceNotes, null, 2)}`,
                 bca?.kbDisclaimers && `Avisos/Disclaimers:\n${bca.kbDisclaimers}`,
-                bca?.kbFreeText && `Notas libres:\n${bca.kbFreeText}`
-            ]
-                .filter(Boolean)
-                .join('\n\n')
+                bca?.kbFreeText && `Notas libres:\n${bca.kbFreeText}`,
+            ].filter(Boolean).join('\n\n'),
     }
 }
 
-/** Consulta de procedimientos (para RAG simple de servicios) */
-
-
-/**
- * Busca procedimientos por palabras clave (MySQL friendly).
- * Si no hay match, cae a Top N recientes para que el LLM siempre tenga contexto.
- */
-export async function retrieveProcedures(empresaId: number, rawQuery?: string, topN = 6) {
-    const q0 = (rawQuery || '').trim()
-
-    // Si el usuario citó entre comillas, priorízalo; si no, limpia ruido común
-    const quoted = q0.match(/["“”](.+?)["“”]/)?.[1]
-    const q = (quoted || q0)
-        .replace(/[?¡!.,:;()]/g, ' ')
-        .replace(/\b(que|qué|cual|cuál|cuales|cuáles|de|del|la|el|los|las|un|una|unos|unas|y|o|u|para|con|sin|sobre|tratamiento|tratamientos|facial|faciales|precio|precios|duración|duracion|muestrame|muéstrame|mostrar|ofrecen|servicios)\b/gi, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-
-    // 1) Intento con query
-    let rows = q ? await prisma.esteticaProcedure.findMany({
-        where: {
-            empresaId,
-            enabled: true,
-            OR: [
-                { name: { contains: q } },
-                { notes: { contains: q } },
-                { contraindications: { contains: q } },
-                { prepInstructions: { contains: q } },
-                { postCare: { contains: q } },
-            ],
-        },
-        orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
-        take: topN,
-        select: {
-            id: true, name: true, durationMin: true, priceMin: true, priceMax: true,
-            requiresAssessment: true, prepInstructions: true, contraindications: true,
-            postCare: true, notes: true,
-        },
-    }) : []
-
-    // 2) Fallback a Top-N
-    if (!rows.length) {
-        rows = await prisma.esteticaProcedure.findMany({
-            where: { empresaId, enabled: true },
-            orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
-            take: topN,
-            select: {
-                id: true, name: true, durationMin: true, priceMin: true, priceMax: true,
-                requiresAssessment: true, prepInstructions: true, contraindications: true,
-                postCare: true, notes: true,
-            },
-        })
-    }
-
-    return rows
-}
-
-
-
+/** ==== catálogo y matching (para respuestas sin inventar) ==== */
 const nrm = (s: string) =>
     String(s || '')
         .normalize('NFD')
@@ -194,7 +128,67 @@ const nrm = (s: string) =>
         .replace(/\s+/g, ' ')
         .trim()
 
-/** Mapeo texto → procedimiento (id, nombre, duración, depósito) */
+export async function retrieveProcedures(empresaId: number, rawQuery?: string, topN = 6) {
+    const q0 = (rawQuery || '').trim()
+    const quoted = q0.match(/["“”](.+?)["“”]/)?.[1]
+    const q = (quoted || q0)
+        .replace(/[?¡!.,:;()]/g, ' ')
+        .replace(/\b(que|qué|cual|cuál|cuales|cuáles|de|del|la|el|los|las|un|una|unos|unas|y|o|u|para|con|sin|sobre|tratamiento|tratamientos|facial|faciales|precio|precios|duración|duracion|mostrar|servicios)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+    let rows = q
+        ? await prisma.esteticaProcedure.findMany({
+            where: {
+                empresaId,
+                enabled: true,
+                OR: [
+                    { name: { contains: q } },
+                    { notes: { contains: q } },
+                    { contraindications: { contains: q } },
+                    { prepInstructions: { contains: q } },
+                    { postCare: { contains: q } },
+                ],
+            },
+            orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
+            take: topN,
+            select: {
+                id: true,
+                name: true,
+                durationMin: true,
+                priceMin: true,
+                priceMax: true,
+                requiresAssessment: true,
+                prepInstructions: true,
+                contraindications: true,
+                postCare: true,
+                notes: true,
+            },
+        })
+        : []
+
+    if (!rows.length) {
+        rows = await prisma.esteticaProcedure.findMany({
+            where: { empresaId, enabled: true },
+            orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
+            take: topN,
+            select: {
+                id: true,
+                name: true,
+                durationMin: true,
+                priceMin: true,
+                priceMax: true,
+                requiresAssessment: true,
+                prepInstructions: true,
+                contraindications: true,
+                postCare: true,
+                notes: true,
+            },
+        })
+    }
+    return rows
+}
+
 export async function matchProcedureFromText(
     empresaId: number,
     text: string
@@ -204,12 +198,11 @@ export async function matchProcedureFromText(
 
     const rows = await prisma.esteticaProcedure.findMany({
         where: { empresaId, enabled: true },
-        select: { id: true, name: true, durationMin: true, aliases: true, depositRequired: true, depositAmount: true }
+        select: { id: true, name: true, durationMin: true, aliases: true, depositRequired: true, depositAmount: true },
     })
 
     let best: any = null
     let bestScore = 0
-
     for (const r of rows) {
         const nameScore = q.includes(nrm(r.name)) ? 1 : 0
         let aliasScore = 0
@@ -218,24 +211,22 @@ export async function matchProcedureFromText(
             if (typeof a === 'string' && q.includes(nrm(a))) aliasScore = Math.max(aliasScore, 0.8)
         }
         const score = Math.max(nameScore, aliasScore)
-        if (score > bestScore) { best = r; bestScore = score }
+        if (score > bestScore) {
+            best = r
+            bestScore = score
+        }
     }
-
     return bestScore >= 0.6
         ? { id: best.id, name: best.name, durationMin: best.durationMin, depositRequired: best.depositRequired, depositAmount: best.depositAmount }
         : null
 }
 
-/** Confirmar la última cita 'pending' por teléfono (útil para intent CONFIRM) */
 export async function confirmLatestPendingForPhone(empresaId: number, phoneE164: string) {
     const appt = await prisma.appointment.findFirst({
         where: { empresaId, customerPhone: phoneE164, status: 'pending' },
         orderBy: { startAt: 'desc' },
-        select: { id: true }
+        select: { id: true },
     })
     if (!appt) return null
-    return prisma.appointment.update({
-        where: { id: appt.id },
-        data: { status: 'confirmed' }
-    })
+    return prisma.appointment.update({ where: { id: appt.id }, data: { status: 'confirmed' } })
 }
