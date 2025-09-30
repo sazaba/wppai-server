@@ -2,107 +2,105 @@
 import type { EsteticaCtx } from './estetica.rag'
 
 /**
- * System prompt: personalidad + guardrails "full-agent" ACOTADO a la BD.
- * - No inventar servicios, precios, duraciones ni contraindicaciones.
- * - Si falta un dato, decirlo y sugerir valoración.
- * - Responder en 2–5 líneas, tono cálido y profesional; máx. 1 emoji.
+ * Prompt “full-agent” para estética:
+ * - Tono humano, cálido y profesional; 3–5 líneas; máx 1 emoji.
+ * - SOLO usa lo que esté en el catálogo/contexto (BD/orquestador). Si falta info, dilo y ofrece opciones.
+ * - Nunca inventes precios ni duraciones.
+ * - En agendamiento, propone 3–6 horarios y pide confirmar con el número.
  */
-export function buildSystemPrompt(ctx: EsteticaCtx) {
-    // Campos garantizados en tu ctx
-    const vertical = ctx.vertical && ctx.vertical !== 'custom' ? ctx.vertical : 'estética'
-    const addr = ctx.logistics?.locationAddress?.trim?.() ? ctx.logistics.locationAddress.trim() : ''
-    const locName = ctx.logistics?.locationName?.trim?.() ? ctx.logistics.locationName.trim() : ''
-    const tz = ctx.timezone || 'America/Bogota'
+export function buildSystemPrompt(ctx: EsteticaCtx): string {
+    const vertical =
+        ctx.vertical && ctx.vertical !== 'custom' ? String(ctx.vertical) : 'estética'
 
-    // Campos opcionales/no tipados en EsteticaCtx → leerlos con any para evitar errores TS
-    const anyCtx = ctx as any
-    const negocio = (anyCtx?.business?.name || '').toString().trim()
-    const web = (anyCtx?.business?.website || '').toString().trim()
-    const scope = (anyCtx?.business?.scope || '').toString().trim()
-    const disclaim = (anyCtx?.business?.disclaimers || '').toString().trim()
-    const phone = (anyCtx?.logistics?.phone || '').toString().trim()
-    const policies = (anyCtx?.policies || '').toString().trim()
-    const depositRequired: boolean = !!anyCtx?.rules?.depositRequired
-    const depositAmount = anyCtx?.rules?.depositAmount
+    const addr = (ctx.logistics?.locationAddress ?? '').trim()
+    const locName = (ctx.logistics?.locationName ?? '').trim()
+    const phone = (ctx.logistics?.locationMapsUrl ?? '').trim() // si quieres mostrar Maps; deja vacío si no
+    const arrival = (ctx.logistics?.instructionsArrival ?? '').trim()
+    const parking = (ctx.logistics?.parkingInfo ?? '').trim()
 
-    const depTxt = depositRequired
-        ? `Puede requerirse depósito${Number.isFinite(Number(depositAmount)) ? ` (${fmtMoney(depositAmount)})` : ''}.`
+    const depTxt = ctx.rules?.depositRequired
+        ? `Puede requerirse un depósito${ctx.rules?.depositAmount ? ` (${fmtMoney(ctx.rules.depositAmount)})` : ''
+        }.`
         : ''
 
     return [
-        negocio
-            ? `Asistente de orientación en ${vertical} de "${negocio}".`
-            : `Asistente de orientación en ${vertical}.`,
-        'Habla en primera persona (yo), tono cercano, profesional y claro.',
-        'Responde en 2–5 líneas. Usa como máximo 1 emoji cuando ayude al tono.',
-        'NUNCA inventes servicios, precios, duraciones ni contraindicaciones.',
-        'Para preguntas de catálogo usa EXCLUSIVAMENTE la información recuperada desde la base de datos (RAG).',
-        'Si un dato no está disponible, dilo con transparencia y sugiere agendar una valoración gratuita.',
-        'Evita párrafos largos; usa viñetas o numeración cuando mejore la claridad.',
-        scope ? `Ámbito: ${scope}` : '',
-        policies ? `Políticas relevantes: ${policies}` : '',
-        disclaim ? `Incluye cuando aplique: ${disclaim}` : '',
+        `Eres un asistente humano virtual especializado en ${vertical} para WhatsApp.`,
+        `Tu estilo es cercano, cálido y profesional. Responde en 3–5 líneas y usa a lo sumo 1 emoji.`,
+        `Usa únicamente información presente en el catálogo/contexto. Si no hay datos suficientes, comunícalo y ofrece alternativas (pedir más detalles o agendar una valoración gratuita si aplica).`,
+        `Nunca inventes precios ni duraciones: usa exactamente los valores del catálogo que te pase el sistema.`,
+        ctx.policies ? `Políticas: ${ctx.policies}` : '',
+        locName ? `Sede: ${locName}` : '',
         addr ? `Dirección: ${addr}` : '',
-        locName || phone ? `Contacto/Logística: ${[locName, phone].filter(Boolean).join(' — ')}` : '',
-        web ? `Sitio web: ${web}` : '',
+        phone ? `Mapa: ${phone}` : '',
+        arrival ? `Indicaciones de llegada: ${arrival}` : '',
+        parking ? `Parqueadero: ${parking}` : '',
         depTxt,
-        `Zona horaria de agenda: ${tz}.`,
-        'En agendamiento: propone entre 3 y 6 horarios válidos.'
-    ].filter(Boolean).join('\n')
+        `En agendamiento, propone entre 3 y 6 horarios válidos (zona horaria ${ctx.timezone}) y pide confirmar con el número de la opción.`,
+    ]
+        .filter(Boolean)
+        .join('\n')
 }
 
-/**
- * Ofertas de horarios (BOOK / RESCHEDULE).
- * ✔️ Conserva firma/semántica original.
- */
+/** Propuesta de horarios de agenda/reagenda */
 export function fmtProposeSlots(
     slots: Date[],
     ctx: EsteticaCtx,
     verbo: 'agendar' | 'reagendar' = 'agendar'
-) {
-    if (!slots?.length) {
-        return 'En este momento no veo cupos disponibles en la ventana actual. ¿Busco otras fechas? 🙂'
+): string {
+    if (!slots || slots.length === 0) {
+        return 'No veo cupos libres en esa franja. ¿Busco otras fechas u horarios?'
     }
-    const tz = ctx.timezone || 'America/Bogota'
     const f = (d: Date) =>
         new Intl.DateTimeFormat('es-CO', {
             dateStyle: 'full',
             timeStyle: 'short',
-            timeZone: tz,
+            timeZone: ctx.timezone,
         }).format(d)
 
-    const list = slots.slice(0, 6).map((s, i) => `${i + 1}. ${f(s)}`).join('\n')
-    return `Puedo ${verbo} tu cita. Estas opciones están libres:\n${list}\n\nResponde con el número que prefieras o indícame otra fecha/hora.`
+    const list = slots
+        .slice(0, 6)
+        .map((s, i) => `${i + 1}. ${f(s)}`)
+        .join('\n')
+
+    return `Puedo ${verbo} tu cita en:\n${list}\n\nResponde con el número de la opción o indícame otra fecha/hora.`
 }
 
-/**
- * Confirmación de cita.
- * ✔️ Mantiene la firma original (recibe endAt aunque no se use).
- */
+/** Confirmación de cita */
 export function fmtConfirmBooking(
-    appt: { startAt: Date; endAt: Date; serviceName?: string; customerName?: string },
+    appt: {
+        startAt: Date
+        endAt: Date
+        serviceName?: string
+        customerName?: string
+    },
     ctx: EsteticaCtx
-) {
-    const tz = ctx.timezone || 'America/Bogota'
-    const when = new Intl.DateTimeFormat('es-CO', {
-        dateStyle: 'full',
-        timeStyle: 'short',
-        timeZone: tz,
-    }).format(appt.startAt)
+): string {
+    const f = (d: Date) =>
+        new Intl.DateTimeFormat('es-CO', {
+            dateStyle: 'full',
+            timeStyle: 'short',
+            timeZone: ctx.timezone,
+        }).format(d)
 
     const quien = appt.customerName ? ` para ${appt.customerName}` : ''
     const servicio = appt.serviceName ? ` (${appt.serviceName})` : ''
-    const place = ctx.logistics?.locationName
-        ? `\nLugar: ${ctx.logistics.locationName}${ctx.logistics.locationAddress ? ` — ${ctx.logistics.locationAddress}` : ''}`
-        : ''
+    const loc =
+        ctx.logistics?.locationName || ctx.logistics?.locationAddress
+            ? `\n📍 Lugar: ${[
+                ctx.logistics?.locationName ?? '',
+                ctx.logistics?.locationAddress ?? '',
+            ]
+                .filter(Boolean)
+                .join(' — ')}`
+            : ''
 
-    return `Cita confirmada${quien}${servicio} ✅
-Fecha y hora: ${when}${place}
-¿Deseas que te envíe un recordatorio? 😊`
+    return `✅ Cita confirmada${quien}${servicio}\n🗓️ ${f(
+        appt.startAt
+    )}${loc}\nPor favor llega 10 minutos antes.`
 }
 
-/* ===== Utils ===== */
-function fmtMoney(v: unknown) {
+/** Utilidad: formato de dinero COP sin decimales */
+function fmtMoney(v: unknown): string {
     try {
         const n = Number(v)
         if (!Number.isFinite(n)) return ''
