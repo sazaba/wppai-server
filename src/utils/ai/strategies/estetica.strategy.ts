@@ -1,3 +1,4 @@
+// server/src/utils/ai/strategies/estetica.strategy.ts
 import axios from 'axios'
 import prisma from '../../../lib/prisma'
 import { openai } from '../../../lib/openai'
@@ -31,16 +32,17 @@ const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)
 const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000)
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)
-const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 0) // 0 = inmediato
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 0)   // 0 = inmediato
+// ⚡️ vertical estética: inmediato
+const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 0)
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 0)
 
 /** ===== Respuesta concisa ===== */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
 const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)
 const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)
-const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
+const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '1') === '1'
 
-/** ===== Idempotencia por inbound (memoria) ===== */
+/** ===== Idempotencia por inbound ===== */
 const processedInbound = new Map<number, number>()
 function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
     const now = Date.now()
@@ -52,11 +54,7 @@ function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS
 
 /** ===== Helpers ===== */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
-
-async function computeReplyDelayMs(_conversationId: number) {
-    // vertical Estética: respuesta inmediata
-    return 0
-}
+async function computeReplyDelayMs(_conversationId: number) { return 0 }
 
 function mentionsImageExplicitly(t: string) {
     const s = String(t || '').toLowerCase()
@@ -147,7 +145,8 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     let total = approxTokens(sysText) + approxTokens(userText)
     for (const m of messages) {
         if (m.role !== 'system' && m !== user) {
-            const t = typeof m.content === 'string' ? m.content
+            const t = typeof m.content === 'string'
+                ? m.content
                 : Array.isArray(m.content) ? String(m.content?.[0]?.text || '') : ''
             total += approxTokens(t)
         }
@@ -201,7 +200,7 @@ function closeNicely(raw: string): string {
     return t ? `${t}…` : raw.trim()
 }
 
-/** ===== Chat con retry en tokens ===== */
+/** ===== Chat con retry ===== */
 async function runChatWithBudget(opts: { model: string; messages: any[]; temperature: number; maxTokens: number }): Promise<string> {
     const { model, messages, temperature, maxTokens } = opts
     try {
@@ -214,6 +213,37 @@ async function runChatWithBudget(opts: { model: string; messages: any[]; tempera
         const r2 = await openai.chat.completions.create({ model, messages, temperature, max_tokens: retry } as any)
         return r2?.choices?.[0]?.message?.content?.trim() || ''
     }
+}
+
+/* ===== Extractor: cuántos servicios pidió el usuario (full agent pero acotado) ===== */
+function extractHowMany(text: string, fallback = 3, min = 1, max = 6): number {
+    const s = String(text || '').toLowerCase()
+    const map: Record<string, number> = {
+        'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5, 'seis': 6,
+        '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6
+    }
+    for (const [k, n] of Object.entries(map)) {
+        const re = new RegExp(`\\b${k}\\b`)
+        if (re.test(s)) return Math.max(min, Math.min(max, n))
+    }
+    const m = s.match(/\b(\d{1})\b/)
+    if (m) return Math.max(min, Math.min(max, Number(m[1])))
+    return fallback
+}
+
+/* ===== Render plano desde BD (sin LLM), tono amable + emojis) ===== */
+function renderProceduresPlain(procs: any[], n: number): string {
+    const items = procs.slice(0, n).map((p: any, i: number) => {
+        const dur = p.durationMin ? `${p.durationMin} minutos` : 'Duración variable'
+        const prec = p.priceMin
+            ? (p.priceMax && p.priceMax !== p.priceMin ? `$${p.priceMin} - $${p.priceMax}` : `$${p.priceMin}`)
+            : 'Consultar'
+        const req = p.requiresAssessment ? ' (requiere valoración previa)' : ''
+        return `${i + 1}. ${p.name}${req}\n   ⏱️ Duración: ${dur}\n   💵 Precio: ${prec}`
+    })
+    const head = `Con gusto, aquí tienes ${Math.min(n, procs.length)} opción${n > 1 ? 'es' : ''} del catálogo:\n`
+    const tail = `\n¿Quieres más detalles de alguno o agendamos valoración gratuita? 🙂`
+    return head + items.join('\n\n') + tail
 }
 
 /** ========================= ENTRY ========================= */
@@ -272,8 +302,6 @@ export async function handleEsteticaReply(opts: {
         }
         if (transcript) userText = transcript
     }
-
-    // Fallback: usa el texto del último inbound si no vino nada por arg/voz
     if (!userText && last?.contenido) userText = String(last.contenido || '').trim()
 
     const isImage = last?.mediaType === MediaType.image && !!last?.mediaUrl
@@ -294,40 +322,28 @@ export async function handleEsteticaReply(opts: {
 
     // 4) Ramas
     switch (intent.type) {
+        /** ======== FULL-AGENT ACOTADO A BD: LISTA DE SERVICIOS ======== */
         case EsteticaIntent.ASK_SERVICES: {
-            // Catálogo (query → si no hay match, Top-N)
-            let procs = await retrieveProcedures(empresaId, intent.query, 6)
-            if (!procs.length) procs = await retrieveProcedures(empresaId, '', 6)
+            // 1) Catálogo (query → si no hay match, Top-N)
+            let procs = await retrieveProcedures(empresaId, intent.query, 12)
+            if (!procs.length) procs = await retrieveProcedures(empresaId, '', 12)
 
-            const sys = buildSystemPrompt(ctx)
-
-            const history = await getRecentHistory(chatId, last?.id, 10)
-            const picked = await pickImageForContext({ conversationId: chatId, directUrl: imageUrl, userText, caption, referenceTs })
-            const messages: any[] = [{ role: 'system', content: sys }, ...history]
-
-            // servicesText es opcional en el ctx; para evitar errores de tipos lo leemos con any
-            const servicesText = (ctx as any)?.servicesText
-            const extraCatalogText = servicesText ? `\n\nCatálogo declarado:\n${String(servicesText)}` : ''
-
-            const userMsg = (intent.query || userText || caption || 'Servicios')
-            const ctxBlock = `\n\nContexto:\n${procsToContext(procs)}${extraCatalogText}`
-
-            if (picked.url) {
-                messages.push({
-                    role: 'user',
-                    content: [
-                        { type: 'text', text: `${userMsg}${ctxBlock}` },
-                        { type: 'image_url', image_url: { url: picked.url } }
-                    ]
+            if (!procs.length) {
+                const sorry =
+                    'Aún no tengo el catálogo cargado. ¿Te gustaría agendar una valoración gratuita para recomendarte opciones? 🙂'
+                const savedNone = await persistBotReply({
+                    conversationId: chatId, empresaId, texto: sorry,
+                    nuevoEstado: ConversationEstado.respondido,
+                    to: toPhone ?? conversacion.phone, phoneNumberId
                 })
-            } else {
-                messages.push({ role: 'user', content: `${userMsg}${ctxBlock}` })
+                return { estado: ConversationEstado.respondido, mensaje: savedNone.texto, messageId: savedNone.messageId, wamid: savedNone.wamid, media: [] }
             }
 
-            budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
-            const model = (process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini')
-            let texto = await runChatWithBudget({ model, messages, temperature: Number(process.env.IA_TEMPERATURE ?? 0.35), maxTokens: IA_MAX_TOKENS })
-            texto = formatConcise(closeNicely(texto), IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
+            // 2) Detectar cuántos pidió el usuario (1..6)
+            const howMany = extractHowMany(userText || intent.query || caption || '', 3, 1, 6)
+
+            // 3) Respuesta determinista desde BD (sin LLM)
+            const texto = renderProceduresPlain(procs, howMany)
 
             const delayMs = await computeReplyDelayMs(chatId); await sleep(delayMs)
             const saved = await persistBotReply({
@@ -476,6 +492,18 @@ export async function handleEsteticaReply(opts: {
                 })
             } else {
                 messages.push({ role: 'user', content: userText || caption || 'Hola' })
+            }
+
+            // (opcional) mete en USER contexto de catálogo resumido para anclar QA
+            let procs = await retrieveProcedures(empresaId, '', 6)
+            const servicesText = (ctx as any)?.servicesText
+            const extraCatalogText = servicesText ? `\n\nCatálogo declarado:\n${String(servicesText)}` : ''
+            const ctxBlock = procs.length ? `\n\nContexto:\n${procsToContext(procs)}${extraCatalogText}` : ''
+            if (typeof messages[messages.length - 1].content === 'string') {
+                messages[messages.length - 1].content += ctxBlock
+            } else {
+                const arr = messages[messages.length - 1].content
+                if (Array.isArray(arr) && arr[0]?.type === 'text') arr[0].text += ctxBlock
             }
 
             budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
