@@ -1,6 +1,6 @@
 import prisma from '../../../../lib/prisma'
 import type { EsteticaCtx } from './estetica.rag'
-import { AppointmentStatus } from '@prisma/client'
+import { AppointmentSource, AppointmentStatus } from '@prisma/client'
 
 const DAY_MAP: Record<number, 'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat'> = {
     0: 'sun', 1: 'mon', 2: 'tue', 3: 'wed', 4: 'thu', 5: 'fri', 6: 'sat',
@@ -151,13 +151,16 @@ export async function book(
         : null
     const needClientConfirm = !!ctx.rules?.requireConfirmation
     const needDeposit = !!proc?.depositRequired
-    const status: AppointmentStatus = needClientConfirm || needDeposit ? 'pending' : 'confirmed'
+    const status: AppointmentStatus = (needClientConfirm || needDeposit)
+        ? AppointmentStatus.pending
+        : AppointmentStatus.confirmed
+
 
     const appt = await prisma.appointment.create({
         data: {
             empresaId: args.empresaId,
             conversationId: args.conversationId,
-            source: 'ai',
+            source: AppointmentSource.ai,
             status,
             customerName: args.customerName ?? '',
             customerPhone: args.customerPhone,
