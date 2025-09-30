@@ -1,3 +1,4 @@
+// server/src/utils/ai/strategies/esteticaModules/estetica.schedule.ts
 import prisma from '../../../../lib/prisma'
 import type { EsteticaCtx } from './estetica.rag'
 import { AppointmentStatus } from '@prisma/client'
@@ -27,7 +28,13 @@ type FindSlotsArgs = {
  * - Cap diario y solape con citas existentes
  * - Zona horaria del negocio (¡sin 4:00 a. m.!)
  */
-export async function findSlots({ empresaId, ctx, hint, durationMin = 60, count = 8 }: FindSlotsArgs): Promise<Date[]> {
+export async function findSlots({
+    empresaId,
+    ctx,
+    hint,
+    durationMin = 60,
+    count = 8,
+}: FindSlotsArgs): Promise<Date[]> {
     const now = new Date()
     const from = hint ? new Date(hint) : now
     const maxDays = ctx.rules?.bookingWindowDays ?? 30
@@ -58,11 +65,31 @@ export async function findSlots({ empresaId, ctx, hint, durationMin = 60, count 
 
         for (const h of todays) {
             if (h.start1 && h.end1) {
-                await collectSlotsInRangeTZ(ymdKey, ctx.timezone, h.start1, h.end1, durationMin, out, count, empresaId, ctx)
+                await collectSlotsInRangeTZ(
+                    ymdKey,
+                    ctx.timezone,
+                    h.start1,
+                    h.end1,
+                    durationMin,
+                    out,
+                    count,
+                    empresaId,
+                    ctx
+                )
                 if (out.length >= count) break
             }
             if (h.start2 && h.end2) {
-                await collectSlotsInRangeTZ(ymdKey, ctx.timezone, h.start2, h.end2, durationMin, out, count, empresaId, ctx)
+                await collectSlotsInRangeTZ(
+                    ymdKey,
+                    ctx.timezone,
+                    h.start2,
+                    h.end2,
+                    durationMin,
+                    out,
+                    count,
+                    empresaId,
+                    ctx
+                )
                 if (out.length >= count) break
             }
         }
@@ -179,7 +206,10 @@ export async function book(
     return appt
 }
 
-export async function reschedule(args: { empresaId: number; appointmentId: number; newStartAt: Date }, ctx: EsteticaCtx) {
+export async function reschedule(
+    args: { empresaId: number; appointmentId: number; newStartAt: Date },
+    _ctx: EsteticaCtx
+) {
     const appt = await prisma.appointment.findUnique({ where: { id: args.appointmentId } })
     if (!appt) throw new Error('Cita no existe')
     const duration =
@@ -216,7 +246,6 @@ function weekdayInTZ(d: Date, tz: string): number {
     // 0..6 (Sun..Sat) en tz
     const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).formatToParts(d)
     const w = p.find((x) => x.type === 'weekday')?.value?.toLowerCase()
-    // Map rápido
     return { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 }[String(w).slice(0, 3) as 'sun'] ?? 0
 }
 
@@ -224,9 +253,7 @@ function weekdayInTZ(d: Date, tz: string): number {
 function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const [y, m, d] = ymd.split('-').map(Number)
     const [h, mi] = hhmm.split(':').map(Number)
-    // Empezamos en UTC “como si” fuera esa hora
     const guess = Date.UTC(y, (m || 1) - 1, d || 1, h || 0, mi || 0, 0)
-    // ¿Qué hora ve esa TZ para ese instante?
     const parts = new Intl.DateTimeFormat('en-US', {
         timeZone: tz,
         hourCycle: 'h23',
