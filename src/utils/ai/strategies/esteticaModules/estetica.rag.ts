@@ -129,32 +129,23 @@ export async function loadApptContext(empresaId: number, fromOrchestrator?: any)
 /** Consulta de procedimientos (para RAG simple de servicios) */
 
 
-export async function retrieveProcedures(empresaId: number, rawQuery?: string) {
-    const q = (rawQuery || '').trim()
+/**
+ * Busca procedimientos por palabras clave (MySQL friendly).
+ * Si no hay match, cae a Top N recientes para que el LLM siempre tenga contexto.
+ */
+export async function retrieveProcedures(empresaId: number, rawQuery?: string, topN = 6) {
+    const q0 = (rawQuery || '').trim()
 
-    // 1) Sin query → top 10 activos
-    if (!q) {
-        return prisma.esteticaProcedure.findMany({
-            where: { empresaId, enabled: true },
-            orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
-            take: 10,
-            select: {
-                id: true,
-                name: true,
-                durationMin: true,
-                priceMin: true,
-                priceMax: true,
-                requiresAssessment: true,
-                prepInstructions: true,
-                contraindications: true,
-                postCare: true,
-                notes: true,
-            },
-        })
-    }
+    // Si el usuario citó entre comillas, priorízalo; si no, limpia ruido común
+    const quoted = q0.match(/["“”](.+?)["“”]/)?.[1]
+    const q = (quoted || q0)
+        .replace(/[?¡!.,:;()]/g, ' ')
+        .replace(/\b(que|qué|cual|cuál|cuales|cuáles|de|del|la|el|los|las|un|una|unos|unas|y|o|u|para|con|sin|sobre|tratamiento|tratamientos|facial|faciales|precio|precios|duración|duracion|muestrame|muéstrame|mostrar|ofrecen|servicios)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
 
-    // 2) Búsqueda compatible (sin "mode", sin "aliases" en el where)
-    const rows = await prisma.esteticaProcedure.findMany({
+    // 1) Intento con query
+    let rows = q ? await prisma.esteticaProcedure.findMany({
         where: {
             empresaId,
             enabled: true,
@@ -167,57 +158,31 @@ export async function retrieveProcedures(empresaId: number, rawQuery?: string) {
             ],
         },
         orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
-        take: 10,
+        take: topN,
         select: {
-            id: true,
-            name: true,
-            durationMin: true,
-            priceMin: true,
-            priceMax: true,
-            requiresAssessment: true,
-            prepInstructions: true,
-            contraindications: true,
-            postCare: true,
-            notes: true,
+            id: true, name: true, durationMin: true, priceMin: true, priceMax: true,
+            requiresAssessment: true, prepInstructions: true, contraindications: true,
+            postCare: true, notes: true,
         },
-    })
+    }) : []
 
-    if (rows.length) return rows
+    // 2) Fallback a Top-N
+    if (!rows.length) {
+        rows = await prisma.esteticaProcedure.findMany({
+            where: { empresaId, enabled: true },
+            orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
+            take: topN,
+            select: {
+                id: true, name: true, durationMin: true, priceMin: true, priceMax: true,
+                requiresAssessment: true, prepInstructions: true, contraindications: true,
+                postCare: true, notes: true,
+            },
+        })
+    }
 
-    // 3) Fallback: filtrar en memoria usando "aliases" si existe (cualquier tipo)
-    const all = await prisma.esteticaProcedure.findMany({
-        where: { empresaId, enabled: true },
-        take: 30,
-        orderBy: [{ updatedAt: 'desc' }, { name: 'asc' }],
-        select: {
-            id: true,
-            name: true,
-            durationMin: true,
-            priceMin: true,
-            priceMax: true,
-            requiresAssessment: true,
-            prepInstructions: true,
-            contraindications: true,
-            postCare: true,
-            notes: true,
-            // no lo ponemos en el where para evitar error de tipado
-            // pero sí lo traemos como any si existe
-            // @ts-ignore - schema puede no tenerlo
-            aliases: true as any,
-        } as any,
-    })
-
-    const needle = q.toLowerCase()
-    return all.filter((p: any) => {
-        const aliases = Array.isArray(p.aliases)
-            ? p.aliases.join(', ')
-            : (typeof p.aliases === 'string' ? p.aliases : '')
-        const haystack = [
-            p.name, p.notes, p.contraindications, p.prepInstructions, p.postCare, aliases,
-        ].filter(Boolean).join(' • ').toLowerCase()
-        return haystack.includes(needle)
-    })
+    return rows
 }
+
 
 
 const nrm = (s: string) =>

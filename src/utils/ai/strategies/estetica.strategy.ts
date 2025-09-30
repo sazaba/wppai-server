@@ -2,13 +2,13 @@ import axios from 'axios'
 import prisma from '../../../lib/prisma'
 import { openai } from '../../../lib/openai'
 import * as Wam from '../../../services/whatsapp.service'
-import { sendTemplateByName as sendTpl } from '../../../services/whatsapp.service'  // 👈 helper de plantilla
+import { sendTemplateByName as sendTpl } from '../../../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../../../services/transcription.service'
 import {
     ConversationEstado,
     MediaType,
     MessageFrom,
-    AgentSpecialty, // solo para reutilizar helpers textuales
+    AgentSpecialty,
 } from '@prisma/client'
 
 import { detectIntent, EsteticaIntent } from './esteticaModules/estetica.intents'
@@ -16,7 +16,7 @@ import { buildSystemPrompt, fmtConfirmBooking, fmtProposeSlots } from './estetic
 import { loadApptContext, retrieveProcedures, type EsteticaCtx } from './esteticaModules/estetica.rag'
 import { findSlots, book, reschedule, cancel } from './esteticaModules/estetica.schedule'
 
-/** ===== Resultado (mismo tipo que e-commerce) ===== */
+/** ===== Resultado ===== */
 export type IAReplyResult = {
     estado: ConversationEstado
     mensaje?: string
@@ -27,12 +27,12 @@ export type IAReplyResult = {
 }
 
 /** ===== Config imagen/texto / tiempos ===== */
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)                 // 1s
-const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)             // 60s: arrastrar imagen reciente
-const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000) // 5m si se menciona explícitamente
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)
+const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000)
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)
-const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 0) // override a 0
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 0)   // override a 0
+const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 0) // 0 = inmediato
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 0)   // 0 = inmediato
 
 /** ===== Respuesta concisa ===== */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
@@ -40,8 +40,8 @@ const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000)
 const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100)
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? '0') === '1'
 
-/** ===== Idempotencia por inbound ===== */
-const processedInbound = new Map<number, number>() // messageId -> ts
+/** ===== Idempotencia por inbound (memoria) ===== */
+const processedInbound = new Map<number, number>()
 function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
     const now = Date.now()
     const prev = processedInbound.get(messageId)
@@ -53,8 +53,8 @@ function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS
 /** ===== Helpers ===== */
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-// ⚡️ Respuesta inmediata para este vertical
 async function computeReplyDelayMs(_conversationId: number) {
+    // vertical Estética: respuesta inmediata
     return 0
 }
 
@@ -273,17 +273,15 @@ export async function handleEsteticaReply(opts: {
         if (transcript) userText = transcript
     }
 
-    // ⬇️ Fallback: si no hay texto por arg ni por audio, usa el texto del último mensaje del cliente
-    if (!userText && last?.contenido) {
-        userText = String(last.contenido || '').trim()
-    }
+    // Fallback: usa el texto del último inbound si no vino nada por arg/voz
+    if (!userText && last?.contenido) userText = String(last.contenido || '').trim()
 
     const isImage = last?.mediaType === MediaType.image && !!last?.mediaUrl
     const imageUrl = isImage ? String(last?.mediaUrl) : null
     const caption = String(last?.caption || '').trim()
     const referenceTs = last?.timestamp ?? new Date()
 
-    // Debounce por imagen / general
+    // Debounce / idempotencia por conversación
     if (isImage) {
         if (!(caption || userText)) { await sleep(IMAGE_WAIT_MS); return null }
         if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) return null
@@ -291,26 +289,41 @@ export async function handleEsteticaReply(opts: {
         if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) return null
     }
 
-    // 3) Intent (con el texto final)
+    // 3) Intent
     const intent = await detectIntent(userText || caption || '', ctx)
 
     // 4) Ramas
     switch (intent.type) {
         case EsteticaIntent.ASK_SERVICES: {
-            const procs = await retrieveProcedures(empresaId, intent.query)
+            // Catálogo (query → si no hay match, Top-N)
+            let procs = await retrieveProcedures(empresaId, intent.query, 6)
+            if (!procs.length) procs = await retrieveProcedures(empresaId, '', 6)
+
             const sys = buildSystemPrompt(ctx)
 
-            // Historial compacto (como en agente)
             const history = await getRecentHistory(chatId, last?.id, 10)
             const picked = await pickImageForContext({ conversationId: chatId, directUrl: imageUrl, userText, caption, referenceTs })
             const messages: any[] = [{ role: 'system', content: sys }, ...history]
 
+            // servicesText es opcional en el ctx; para evitar errores de tipos lo leemos con any
+            const servicesText = (ctx as any)?.servicesText
+            const extraCatalogText = servicesText ? `\n\nCatálogo declarado:\n${String(servicesText)}` : ''
+
             const userMsg = (intent.query || userText || caption || 'Servicios')
+            const ctxBlock = `\n\nContexto:\n${procsToContext(procs)}${extraCatalogText}`
+
             if (picked.url) {
-                messages.push({ role: 'user', content: [{ type: 'text', text: `${userMsg}\n\nContexto:\n${procsToContext(procs)}${picked.noteToAppend}` }, { type: 'image_url', image_url: { url: picked.url } }] })
+                messages.push({
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: `${userMsg}${ctxBlock}` },
+                        { type: 'image_url', image_url: { url: picked.url } }
+                    ]
+                })
             } else {
-                messages.push({ role: 'user', content: `${userMsg}\n\nContexto:\n${procsToContext(procs)}` })
+                messages.push({ role: 'user', content: `${userMsg}${ctxBlock}` })
             }
+
             budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110))
             const model = (process.env.IA_TEXT_MODEL || process.env.IA_MODEL || 'gpt-4o-mini')
             let texto = await runChatWithBudget({ model, messages, temperature: Number(process.env.IA_TEMPERATURE ?? 0.35), maxTokens: IA_MAX_TOKENS })
@@ -356,7 +369,6 @@ export async function handleEsteticaReply(opts: {
 
             const txt = fmtConfirmBooking(appt, ctx)
 
-            // (Opcional) Plantilla de confirmación si está configurada: WA_TPL_APPT_CONFIRM="nombre:idioma"
             try {
                 const tp = (process.env.WA_TPL_APPT_CONFIRM || '').trim()
                 if (tp) {
@@ -433,7 +445,6 @@ export async function handleEsteticaReply(opts: {
                 })
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
-            // cancel( ) → 1 solo argumento (ver ajuste en schedule.ts)
             const appt = await cancel({ empresaId, appointmentId: intent.appointmentId })
             const fmt = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
             const when = appt?.startAt ? ` (${fmt(appt.startAt)})` : ''
@@ -451,7 +462,6 @@ export async function handleEsteticaReply(opts: {
         case EsteticaIntent.GENERAL_QA:
         default: {
             const sys = buildSystemPrompt(ctx)
-            // historial + imagen en contexto
             const history = await getRecentHistory(chatId, last?.id, 10)
             const picked = await pickImageForContext({ conversationId: chatId, directUrl: imageUrl, userText, caption, referenceTs })
 
@@ -500,7 +510,7 @@ async function getRecentHistory(conversationId: number, excludeMessageId?: numbe
     }))
 }
 
-/* ===== Persistencia y envío (misma firma que ecommerce/agent) ===== */
+/* ===== Persistencia y envío ===== */
 function normalizeToE164(n: string) { return String(n || '').replace(/[^\d]/g, '') }
 
 async function persistBotReply({
@@ -521,18 +531,13 @@ async function persistBotReply({
     let wamid: string | undefined
     if (to && String(to).trim()) {
         try {
-            // fallback para phoneNumberId
             let phoneId = phoneNumberId
             if (!phoneId) {
                 const acc = await prisma.whatsappAccount.findFirst({ where: { empresaId }, select: { phoneNumberId: true } })
                 phoneId = acc?.phoneNumberId
             }
-
             const resp = await Wam.sendWhatsappMessage({
-                empresaId,
-                to: normalizeToE164(to),
-                body: texto,
-                phoneNumberIdHint: phoneId,
+                empresaId, to: normalizeToE164(to), body: texto, phoneNumberIdHint: phoneId,
             })
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id
             if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } })
