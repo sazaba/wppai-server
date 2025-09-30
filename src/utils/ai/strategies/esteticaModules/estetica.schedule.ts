@@ -1,4 +1,3 @@
-// server/src/utils/ai/strategies/esteticaModules/estetica.schedule.ts
 import prisma from '../../../../lib/prisma'
 import type { EsteticaCtx } from './estetica.rag'
 import { AppointmentStatus } from '@prisma/client'
@@ -104,6 +103,7 @@ async function isSlotFree(empresaId: number, start: Date, durationMin: number) {
     const overlap = await prisma.appointment.count({
         where: {
             empresaId,
+            deletedAt: null,
             status: { notIn: ['cancelled', 'no_show'] },
             AND: [{ startAt: { lt: end } }, { endAt: { gt: start } }],
         },
@@ -119,6 +119,7 @@ async function isUnderDailyCap(empresaId: number, start: Date, ctx: EsteticaCtx)
     const count = await prisma.appointment.count({
         where: {
             empresaId,
+            deletedAt: null,
             status: { notIn: ['cancelled', 'no_show'] },
             startAt: { gte: s, lte: e },
         },
@@ -169,6 +170,7 @@ export async function book(
             endAt,
             timezone: args.timezone,
             procedureId: args.procedureId ?? null,
+            deletedAt: null,
         },
     })
     return appt
@@ -179,7 +181,7 @@ export async function reschedule(
     _ctx: EsteticaCtx
 ) {
     const appt = await prisma.appointment.findUnique({ where: { id: args.appointmentId } })
-    if (!appt) throw new Error('Cita no existe')
+    if (!appt || appt.deletedAt) throw new Error('Cita no existe')
     const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000))
     const free = await isSlotFree(args.empresaId, args.newStartAt, duration)
     if (!free) throw new Error('Nuevo horario ocupado')
@@ -190,9 +192,29 @@ export async function reschedule(
     return updated
 }
 
+/** SOFT DELETE de una cita (status+deletedAt) */
 export async function cancel(args: { empresaId: number; appointmentId: number }) {
-    const appt = await prisma.appointment.update({ where: { id: args.appointmentId }, data: { status: 'cancelled' } })
-    return appt
+    const appt = await prisma.appointment.findUnique({ where: { id: args.appointmentId } })
+    if (!appt || appt.empresaId !== args.empresaId || appt.deletedAt) throw new Error('Cita no existe')
+    const deleted = await prisma.appointment.update({
+        where: { id: args.appointmentId },
+        data: { status: 'cancelled', deletedAt: new Date() },
+    })
+    return deleted
+}
+
+/** SOFT DELETE de varias citas */
+export async function cancelMany(args: { empresaId: number; appointmentIds: number[] }) {
+    const items = await prisma.appointment.findMany({
+        where: { id: { in: args.appointmentIds }, empresaId: args.empresaId, deletedAt: null },
+        select: { id: true, startAt: true, serviceName: true, timezone: true }
+    })
+    if (!items.length) return []
+    await prisma.appointment.updateMany({
+        where: { id: { in: items.map(i => i.id) }, empresaId: args.empresaId, deletedAt: null },
+        data: { status: 'cancelled', deletedAt: new Date() }
+    })
+    return items
 }
 
 /** Helpers por teléfono */
@@ -201,6 +223,7 @@ export async function findNextUpcomingApptForPhone(empresaId: number, phoneE164:
         where: {
             empresaId,
             customerPhone: phoneE164,
+            deletedAt: null,
             status: { in: ['pending', 'confirmed', 'rescheduled'] },
             startAt: { gt: new Date() },
         },
@@ -208,12 +231,12 @@ export async function findNextUpcomingApptForPhone(empresaId: number, phoneE164:
         select: { id: true, startAt: true, serviceName: true },
     })
 }
-
 export async function listUpcomingApptsForPhone(empresaId: number, phoneE164: string) {
     return prisma.appointment.findMany({
         where: {
             empresaId,
             customerPhone: phoneE164,
+            deletedAt: null,
             status: { in: ['pending', 'confirmed', 'rescheduled'] },
             startAt: { gt: new Date() },
         },
@@ -223,7 +246,6 @@ export async function listUpcomingApptsForPhone(empresaId: number, phoneE164: st
 }
 
 /* ===== fechas (TZ) ===== */
-
 function addMinutes(d: Date, min: number) { return new Date(d.getTime() + min * 60000) }
 function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000) }
 

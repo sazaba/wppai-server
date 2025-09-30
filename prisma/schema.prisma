@@ -468,21 +468,18 @@ model Appointment {
   source         AppointmentSource @default(client)
   status         AppointmentStatus @default(pending)
 
-  customerName  String
-  customerPhone String
-  serviceName   String
-  notas         String? @db.Text
-
-  // NUEVO: cache para render de mensajes/plantillas
-  customerDisplayName String? // preferencia para WhatsApp
-  serviceDurationMin  Int? // cache de duración
-  locationNameCache   String? // cache de nombre de sede
+  customerName        String
+  customerPhone       String
+  serviceName         String
+  notas               String? @db.Text
+  customerDisplayName String?
+  serviceDurationMin  Int?
+  locationNameCache   String?
 
   startAt  DateTime
   endAt    DateTime
   timezone String   @default("America/Bogota")
 
-  // 🔗 (Opcional) relación con catálogo de procedimientos
   procedureId       Int?
   EsteticaProcedure EsteticaProcedure? @relation(name: "ProcedureToAppointments", fields: [procedureId], references: [id])
 
@@ -492,13 +489,17 @@ model Appointment {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// 👇 NUEVO: soft delete
+  deletedAt DateTime?
+
   AppointmentReminderLog AppointmentReminderLog[]
 
   @@index([empresaId, startAt, endAt])
   @@index([empresaId, status, startAt])
   @@index([conversationId])
-  @@index([empresaId, customerPhone, startAt]) // 🔎 búsqueda por cliente
-  @@index([empresaId, status, startAt, customerPhone]) // NUEVO índice mixto útil
+  @@index([empresaId, customerPhone, startAt])
+  @@index([empresaId, status, startAt, customerPhone])
+  @@index([deletedAt]) // 👈 recomendado para filtros
   @@map("appointment")
 }
 

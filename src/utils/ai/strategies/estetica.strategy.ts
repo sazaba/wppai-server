@@ -1,19 +1,15 @@
-// server/src/utils/ai/strategies/estetica.strategy.ts
 import axios from 'axios'
 import prisma from '../../../lib/prisma'
 import { openai } from '../../../lib/openai'
 import * as Wam from '../../../services/whatsapp.service'
 import { sendTemplateByName as sendTpl } from '../../../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../../../services/transcription.service'
-import { ConversationEstado, MediaType, MessageFrom } from '@prisma/client'
+import { ConversationEstado, MessageFrom } from '@prisma/client'
 
 import { detectIntent, EsteticaIntent } from './esteticaModules/estetica.intents'
 import { buildSystemPrompt, fmtConfirmBooking, fmtProposeSlots } from './esteticaModules/estetica.prompts'
 import { loadApptContext, retrieveProcedures, type EsteticaCtx, confirmLatestPendingForPhone } from './esteticaModules/estetica.rag'
-import {
-    findSlots, book, reschedule, cancel,
-    listUpcomingApptsForPhone,
-} from './esteticaModules/estetica.schedule'
+import { findSlots, book, reschedule, cancel, cancelMany, listUpcomingApptsForPhone } from './esteticaModules/estetica.schedule'
 
 export type IAReplyResult = {
     estado: ConversationEstado
@@ -24,7 +20,7 @@ export type IAReplyResult = {
     media?: Array<{ productId: number; imageUrl: string; wamid?: string }>
 }
 
-/* =================== Session Store (en memoria con TTL) =================== */
+/* =================== Session Store =================== */
 
 type ApptChoice = { id: number; startAt: Date; serviceName?: string | null }
 type PendingState =
@@ -34,9 +30,7 @@ type PendingState =
 
 const SESSION_TTL_MS = 15 * 60 * 1000
 const sessionMap = new Map<number, { expiresAt: number; data: PendingState }>()
-function putSession(convId: number, data: PendingState) {
-    sessionMap.set(convId, { expiresAt: Date.now() + SESSION_TTL_MS, data })
-}
+function putSession(convId: number, data: PendingState) { sessionMap.set(convId, { expiresAt: Date.now() + SESSION_TTL_MS, data }) }
 function getSession(convId: number): PendingState | null {
     const row = sessionMap.get(convId)
     if (!row) return null
@@ -45,11 +39,8 @@ function getSession(convId: number): PendingState | null {
 }
 function clearSession(convId: number) { sessionMap.delete(convId) }
 
-/* =================== Utilidades varias (dedup, formato, etc.) =================== */
+/* =================== Utilidades varias =================== */
 
-const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000)
-const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000)
-const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000)
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)
 
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5)
@@ -65,7 +56,6 @@ function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS
     processedInbound.set(messageId, now)
     return false
 }
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>()
 function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = REPLY_DEDUP_WINDOW_MS) {
@@ -85,7 +75,6 @@ function softTrim(s?: string | null, max = 160) {
     const t = (s || '').trim(); if (!t) return ''
     return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, '') + '…'
 }
-function approxTokens(str: string) { return Math.ceil((str || '').length / 4) }
 function clampConcise(text: string, maxLines = IA_MAX_LINES): string {
     let t = String(text || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!t) return t
@@ -156,22 +145,33 @@ async function persistBotReply({
     return { messageId: msg.id, texto, wamid }
 }
 
-function getOptionIndex(text: string): number | null {
-    const s = (text || '').toLowerCase()
-    const m = s.match(/\b(?:opci[oó]n|#|n[úu]mero|num\.?|no\.?)?\s*(\d{1,2})\b/)
-    if (!m) return null
-    const n = Number(m[1])
-    return Number.isFinite(n) ? n - 1 : null
+/* ======== NLU helpers (índices + nombre) ======== */
+function extractNumberListText(t: string): number[] {
+    const s = (t || '').toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/\b(opcion|opciones|numero|nro|num|no|#)\b/g, '')
+    const raw = s.match(/(\d{1,2})(?=(?:\D|$))/g)
+    if (!raw) return []
+    return raw.map(n => Number(n)).filter(n => Number.isFinite(n))
 }
-function looksLikeFullName(text: string): boolean {
-    const t = (text || '').trim()
+function sanitizeNameCandidate(t: string): string {
+    let s = (t || '').trim()
+    s = s.replace(/^\s*(la\s+)?opci[oó]n\s+\d+\s*/i, '')
+        .replace(/^\s*#\s*\d+\s*/i, '')
+        .replace(/\b(opci[oó]n|no\.?|num\.?|nro\.?)\s*\d+\b/gi, '')
+    s = s.replace(/\s*\b\d+\b\s*/g, ' ')
+    s = s.replace(/\s+/g, ' ').trim()
+    return s
+}
+function looksLikeFullNameStrict(text: string): boolean {
+    const t = sanitizeNameCandidate(text)
     if (t.length < 4) return false
+    if (/\d/.test(t)) return false
     const words = t.split(/\s+/)
     return words.length >= 2 && /^[a-zA-ZÀ-ÿ'´`-]+\s+[a-zA-ZÀ-ÿ'´`-]+/.test(t)
 }
 
 /* ========================= ENTRY ========================= */
-
 export async function handleEsteticaReply(opts: {
     chatId: number
     empresaId: number
@@ -226,78 +226,79 @@ export async function handleEsteticaReply(opts: {
     }
     if (!userText && last?.contenido) userText = String(last.contenido || '').trim()
 
-    // Si hay un estado pendiente y el usuario contesta con número o nombre, se atiende acá:
+    // Estado pendiente
     const pending = getSession(chatId)
     if (pending) {
-        // BOOK: espera selección de slot (1-6) y quizá nombre
+        // BOOK
         if (pending.kind === 'book') {
-            if (pending.needName && looksLikeFullName(userText)) {
-                await prisma.conversation.update({ where: { id: chatId }, data: { nombre: userText } })
-                // Quitamos el requisito de nombre y seguimos esperando la hora
+            const list = extractNumberListText(userText)
+            if (list.length >= 1) {
+                const idx = list[0] - 1
+                if (idx >= 0 && idx < pending.slots.length) {
+                    const chosen = pending.slots[idx]
+                    let nameToSave = conversacion.nombre ?? ''
+                    if ((!nameToSave || nameToSave.trim().length < 2) && looksLikeFullNameStrict(userText)) {
+                        nameToSave = sanitizeNameCandidate(userText)
+                        await prisma.conversation.update({ where: { id: chatId }, data: { nombre: nameToSave } })
+                    }
+                    const appt = await book({
+                        empresaId,
+                        conversationId: chatId,
+                        customerPhone: (toPhone ?? conversacion.phone) || '',
+                        customerName: nameToSave || undefined,
+                        serviceName: pending.serviceName,
+                        startAt: chosen,
+                        durationMin: pending.durationMin,
+                        timezone: ctx.timezone,
+                        procedureId: pending.procedureId,
+                    }, ctx)
+
+                    clearSession(chatId)
+                    const txt = fmtConfirmBooking(appt, ctx)
+
+                    try {
+                        const tp = (process.env.WA_TPL_APPT_CONFIRM || '').trim()
+                        if (tp) {
+                            const [tplName, tplLang = 'es'] = tp.split(':')
+                            const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
+                            const vars: string[] = [appt.customerName || 'cliente', appt.serviceName || 'cita', f(appt.startAt), ctx.logistics?.locationName || '']
+                            await sendTpl({ empresaId, to: (toPhone ?? conversacion.phone)!, name: tplName, lang: tplLang, variables: vars, phoneNumberIdHint: phoneNumberId })
+                        }
+                    } catch { }
+
+                    const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId })
+                    return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+                }
+            }
+
+            if (pending.needName && looksLikeFullNameStrict(userText)) {
+                const clean = sanitizeNameCandidate(userText)
+                await prisma.conversation.update({ where: { id: chatId }, data: { nombre: clean } })
                 putSession(chatId, { ...pending, needName: false })
                 const txt = 'Gracias. Ahora elige un horario con el número de la opción (1-6) para confirmar.'
                 const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId })
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
-
-            const idx = getOptionIndex(userText)
-            if (idx != null && idx >= 0 && idx < pending.slots.length) {
-                const chosen = pending.slots[idx]
-                const appt = await book({
-                    empresaId,
-                    conversationId: chatId,
-                    customerPhone: (toPhone ?? conversacion.phone) || '',
-                    customerName: conversacion.nombre ?? undefined,
-                    serviceName: pending.serviceName,
-                    startAt: chosen,
-                    durationMin: pending.durationMin,
-                    timezone: ctx.timezone,
-                    procedureId: pending.procedureId,
-                }, ctx)
-
-                clearSession(chatId)
-                const txt = fmtConfirmBooking(appt, ctx)
-
-                try {
-                    const tp = (process.env.WA_TPL_APPT_CONFIRM || '').trim()
-                    if (tp) {
-                        const [tplName, tplLang = 'es'] = tp.split(':')
-                        const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
-                        const vars: string[] = [appt.customerName || 'cliente', appt.serviceName || 'cita', f(appt.startAt), ctx.logistics?.locationName || '']
-                        await sendTpl({ empresaId, to: (toPhone ?? conversacion.phone)!, name: tplName, lang: tplLang, variables: vars, phoneNumberIdHint: phoneNumberId })
-                    }
-                } catch (e) { /* noop */ }
-
-                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId })
-                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
-            }
         }
 
-        // RESCHEDULE: si aún no eligió cuál cita, espera número; si ya eligió cita, espera número de horario
+        // RESCHEDULE
         if (pending.kind === 'reschedule') {
-            // Seleccionar cita
             if (pending.appts && !pending.selectedApptId) {
-                const idx = getOptionIndex(userText)
-                if (idx != null && idx >= 0 && pending.appts[idx]) {
+                const list = extractNumberListText(userText)
+                const idx = (list[0] ?? NaN) - 1
+                if (!Number.isNaN(idx) && idx >= 0 && pending.appts[idx]) {
                     const chosenAppt = pending.appts[idx]
-                    // Proponer horarios para esta cita
-                    const slots = pending.slots ?? await findSlots({
-                        empresaId,
-                        ctx,
-                        hint: null,
-                        durationMin: pending.durationMin,
-                        count: 6,
-                    })
+                    const slots = pending.slots ?? await findSlots({ empresaId, ctx, hint: null, durationMin: pending.durationMin, count: 6 })
                     putSession(chatId, { ...pending, selectedApptId: chosenAppt.id, slots })
                     const txt = fmtProposeSlots(slots, ctx, 'reagendar')
                     const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId })
                     return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
                 }
             }
-            // Seleccionar horario para la cita ya elegida
             if (pending.selectedApptId && pending.slots) {
-                const idx = getOptionIndex(userText)
-                if (idx != null && idx >= 0 && idx < pending.slots.length) {
+                const list = extractNumberListText(userText)
+                const idx = (list[0] ?? NaN) - 1
+                if (!Number.isNaN(idx) && idx >= 0 && idx < pending.slots.length) {
                     const newStart = pending.slots[idx]
                     const updated = await reschedule({ empresaId, appointmentId: pending.selectedApptId, newStartAt: newStart }, ctx)
                     clearSession(chatId)
@@ -308,18 +309,21 @@ export async function handleEsteticaReply(opts: {
             }
         }
 
-        // CANCEL: espera selección de cuál cita cancelar
+        // CANCEL en estado interactivo
         if (pending.kind === 'cancel' && pending.appts) {
-            const idx = getOptionIndex(userText)
-            if (idx != null && idx >= 0 && pending.appts[idx]) {
-                const apptId = pending.appts[idx].id
-                const appt = await cancel({ empresaId, appointmentId: apptId })
-                clearSession(chatId)
-                const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
-                const when = appt?.startAt ? ` (${f(appt.startAt)})` : ''
-                const txt = `Cita cancelada ✅${when}`
-                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId })
-                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            const list = extractNumberListText(userText)
+            if (list.length >= 1) {
+                const idxs = list.map(n => n - 1).filter(i => i >= 0 && pending.appts![i])
+                if (idxs.length) {
+                    const ids = idxs.map(i => pending.appts![i].id)
+                    const deleted = await cancelMany({ empresaId, appointmentIds: ids })
+                    clearSession(chatId)
+                    const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
+                    const lines = deleted.map(d => `• ${f(d.startAt)} — ${d.serviceName ?? 'servicio'}`).join('\n')
+                    const txt = `Citas canceladas ✅\n${lines}`
+                    const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId })
+                    return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+                }
             }
         }
     }
@@ -349,17 +353,8 @@ export async function handleEsteticaReply(opts: {
             const durationMin = intent.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60
             const serviceName = intent.serviceName ?? (intent.query ?? 'Evaluación/Consulta')
             const slots = await findSlots({ empresaId, ctx, hint: null, durationMin, count: 6 })
-
             const needName = !conversacion.nombre || conversacion.nombre.trim().length < 2
-            putSession(chatId, {
-                kind: 'book',
-                slots,
-                durationMin,
-                serviceName,
-                procedureId: intent.procedureId,
-                needName,
-            })
-
+            putSession(chatId, { kind: 'book', slots, durationMin, serviceName, procedureId: intent.procedureId, needName })
             const askName = needName ? `\n\nAntes de confirmar, ¿a nombre de quién agendamos? (Nombre y apellido)` : ''
             const txt = fmtProposeSlots(slots, ctx, 'agendar') + askName
             const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId })
@@ -385,7 +380,6 @@ export async function handleEsteticaReply(opts: {
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
 
-            // Varias citas → pedir selección
             const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
             const lines = appts.map((a, i) => `${i + 1}. ${f(a.startAt)} — ${a.serviceName ?? 'servicio'} (ID ${a.id})`).join('\n')
             putSession(chatId, { kind: 'reschedule', appts, durationMin })
@@ -401,11 +395,8 @@ export async function handleEsteticaReply(opts: {
                 const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId })
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
-
             const appt = await confirmLatestPendingForPhone(empresaId, phone)
-            const msg = appt
-                ? '¡Listo! Tu cita quedó confirmada ✅'
-                : 'No encontré una cita pendiente para ese número. Si quieres, te comparto horarios para agendar.'
+            const msg = appt ? '¡Listo! Tu cita quedó confirmada ✅' : 'No encontré una cita pendiente para ese número. Si quieres, te comparto horarios para agendar.'
             const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: msg, nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId })
             return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
         }
@@ -415,22 +406,63 @@ export async function handleEsteticaReply(opts: {
             const appts = await listUpcomingApptsForPhone(empresaId, phone)
             if (!appts.length) {
                 const text = 'No veo una cita futura asociada a este número. Si tienes el ID o fecha aproximada, compártemela y la cancelo por ti.'
-                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: text, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId })
+                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: text, nuevoEstado: conversacion.estado, to: phone, phoneNumberId })
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
+
+            if ((intent as any).cancelAll) {
+                const deleted = await cancelMany({ empresaId, appointmentIds: appts.map(a => a.id) })
+                clearSession(chatId)
+                const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
+                const lines = deleted.map(d => `• ${f(d.startAt)} — ${d.serviceName ?? 'servicio'}`).join('\n')
+                const txt = `Listo, cancelé todas tus citas ✅\n${lines}`
+                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: phone, phoneNumberId })
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            }
+
+            const numbers = (intent as any).numberList as number[] | undefined
+            if (numbers && numbers.length) {
+                const idxs = numbers.map(n => n - 1).filter(i => i >= 0 && i < appts.length)
+                if (idxs.length) {
+                    const ids = idxs.map(i => appts[i].id)
+                    const deleted = await cancelMany({ empresaId, appointmentIds: ids })
+                    clearSession(chatId)
+                    const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
+                    const lines = deleted.map(d => `• ${f(d.startAt)} — ${d.serviceName ?? 'servicio'}`).join('\n')
+                    const txt = `Citas canceladas ✅\n${lines}`
+                    const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: phone, phoneNumberId })
+                    return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+                }
+            }
+
             if (appts.length === 1) {
                 putSession(chatId, { kind: 'cancel', appts })
                 const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
                 const t = `Confirmo: ¿Quieres cancelar ${f(appts[0].startAt)} — ${appts[0].serviceName ?? 'servicio'}? Responde "sí confirmo" para proceder.`
-                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: t, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId })
+                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: t, nuevoEstado: conversacion.estado, to: phone, phoneNumberId })
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
+
             const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
             const lines = appts.map((a, i) => `${i + 1}. ${f(a.startAt)} — ${a.serviceName ?? 'servicio'} (ID ${a.id})`).join('\n')
             putSession(chatId, { kind: 'cancel', appts })
-            const txt = `Tienes varias citas:\n${lines}\n\nIndícame el número de la que deseas cancelar.`
-            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: conversacion.estado, to: toPhone ?? conversacion.phone, phoneNumberId })
+            const txt = `Tienes varias citas:\n${lines}\n\nIndícame el número de las que deseas cancelar (puedes decir "1 y 3" o "las dos").`
+            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: conversacion.estado, to: phone, phoneNumberId })
             return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+        }
+
+        case EsteticaIntent.LIST: {
+            const phone = (toPhone ?? conversacion.phone) || ''
+            const appts = await listUpcomingApptsForPhone(empresaId, phone)
+            if (!appts.length) {
+                const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: 'No tienes citas pendientes en este momento. ¿Buscamos horarios para agendar?', nuevoEstado: ConversationEstado.respondido, to: phone, phoneNumberId })
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            }
+            const f = (d: Date) => new Intl.DateTimeFormat('es-CO', { dateStyle: 'full', timeStyle: 'short', timeZone: ctx.timezone }).format(d)
+            const lines = appts.map((a, i) => `${i + 1}. ${f(a.startAt)} — ${a.serviceName ?? 'servicio'} (ID ${a.id})`).join('\n')
+            const txt = `Tienes estas citas agendadas:\n${lines}\n\nSi deseas cancelar o reagendar, dime el número (por ejemplo: "cancelar 2" o "reagendar 1").`
+            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: phone, phoneNumberId })
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
         }
 
         case EsteticaIntent.GENERAL_QA:
