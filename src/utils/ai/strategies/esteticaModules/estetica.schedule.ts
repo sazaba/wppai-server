@@ -1,3 +1,4 @@
+// server/src/utils/ai/strategies/esteticaModules/estetica.schedule.ts
 import prisma from '../../../../lib/prisma'
 import type { EsteticaCtx } from './estetica.rag'
 import { AppointmentStatus } from '@prisma/client'
@@ -241,6 +242,7 @@ function ymdInTZ(d: Date, tz: string): string {
     const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
     return f.format(d) // "YYYY-MM-DD"
 }
+
 function weekdayInTZ(d: Date, tz: string): number {
     // 0..6 (Sun..Sat) en tz
     const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).formatToParts(d)
@@ -249,18 +251,36 @@ function weekdayInTZ(d: Date, tz: string): number {
 }
 
 /**
- * Crea un Date cuyo instante UTC corresponde a (yyyy-mm-dd + hh:mm) en la TZ dada.
- * Implementación robusta sin cálculos manuales de offset.
+ * Convierte (yyyy-mm-dd + hh:mm) en la TZ dada al instante UTC correcto.
+ * Ejemplo: "2025-09-30", "09:00", "America/Bogota" → Date con 2025-09-30 14:00 UTC.
  */
 function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
-    // Construimos un string "local" (sin zona) y lo convertimos al instante correcto de la TZ
-    const isoLocal = `${ymd}T${hhmm}:00`
-    // 1) Creamos un Date a partir del string local (interpreta en TZ del host)
-    const localDate = new Date(isoLocal)
-    // 2) Lo “renderizamos” como texto en la TZ objetivo…
-    const asTargetTz = localDate.toLocaleString('en-US', { timeZone: tz })
-    // 3) …y volvemos a parsearlo como Date (host), lo que nos da el instante UTC correcto
-    return new Date(asTargetTz)
+    const [y, m, d] = ymd.split('-').map(Number)
+    const [h, mi] = hhmm.split(':').map(Number)
+
+    // Creamos primero el Date "naive" en UTC
+    const utcGuess = new Date(Date.UTC(y, m - 1, d, h, mi))
+
+    // Obtenemos qué hora sería en esa TZ
+    const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz,
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+    })
+
+    const parts = fmt.formatToParts(utcGuess)
+    const gotH = Number(parts.find((p) => p.type === 'hour')?.value ?? '0')
+    const gotM = Number(parts.find((p) => p.type === 'minute')?.value ?? '0')
+
+    // Diferencia en minutos entre lo pedido (h, mi) y lo interpretado (gotH, gotM)
+    const deltaMin = (h * 60 + mi) - (gotH * 60 + gotM)
+
+    // Ajustamos el UTC base para corregir la TZ
+    return new Date(utcGuess.getTime() - deltaMin * 60000)
 }
 
 function startOfDayTZ(d: Date, tz: string): Date {
