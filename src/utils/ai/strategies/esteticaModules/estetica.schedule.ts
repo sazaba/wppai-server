@@ -1,4 +1,3 @@
-// server/src/utils/ai/strategies/esteticaModules/estetica.schedule.ts
 import prisma from '../../../../lib/prisma'
 import type { EsteticaCtx } from './estetica.rag'
 import { AppointmentStatus } from '@prisma/client'
@@ -249,24 +248,19 @@ function weekdayInTZ(d: Date, tz: string): number {
     return { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 }[String(w).slice(0, 3) as 'sun'] ?? 0
 }
 
-/** Crea un Date que representa el *instante UTC* correspondiente a ese HH:mm de la TZ dada */
+/**
+ * Crea un Date cuyo instante UTC corresponde a (yyyy-mm-dd + hh:mm) en la TZ dada.
+ * Implementación robusta sin cálculos manuales de offset.
+ */
 function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
-    const [y, m, d] = ymd.split('-').map(Number)
-    const [h, mi] = hhmm.split(':').map(Number)
-    const guess = Date.UTC(y, (m || 1) - 1, d || 1, h || 0, mi || 0, 0)
-    const parts = new Intl.DateTimeFormat('en-US', {
-        timeZone: tz,
-        hourCycle: 'h23',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-    }).formatToParts(new Date(guess))
-    const gotH = Number(parts.find((p) => p.type === 'hour')?.value || 0)
-    const gotM = Number(parts.find((p) => p.type === 'minute')?.value || 0)
-    const deltaMin = (h * 60 + (mi || 0)) - (gotH * 60 + gotM)
-    return new Date(guess - deltaMin * 60000)
+    // Construimos un string "local" (sin zona) y lo convertimos al instante correcto de la TZ
+    const isoLocal = `${ymd}T${hhmm}:00`
+    // 1) Creamos un Date a partir del string local (interpreta en TZ del host)
+    const localDate = new Date(isoLocal)
+    // 2) Lo “renderizamos” como texto en la TZ objetivo…
+    const asTargetTz = localDate.toLocaleString('en-US', { timeZone: tz })
+    // 3) …y volvemos a parsearlo como Date (host), lo que nos da el instante UTC correcto
+    return new Date(asTargetTz)
 }
 
 function startOfDayTZ(d: Date, tz: string): Date {
