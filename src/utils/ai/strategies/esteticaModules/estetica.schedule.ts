@@ -49,7 +49,7 @@ export async function findSlots({
         const dateTz = addDays(from, dayOffset)
         const ymdKey = ymdInTZ(dateTz, ctx.timezone)
 
-        // minNotice / mismo día
+        // minNotice / mismo día (en TZ del negocio)
         const minNoticeH = ctx.rules?.minNoticeHours ?? 0
         const sameDay = ymdKey === ymdInTZ(now, ctx.timezone)
         if (!ctx.rules?.allowSameDay && sameDay && minNoticeH > 0) {
@@ -110,10 +110,21 @@ async function collectSlotsInRangeTZ(
 ) {
     let cursor = makeZonedDate(ymdKey, startHHmm, tz)
     const end = makeZonedDate(ymdKey, endHHmm, tz)
-    const step = (ctx.bufferMin ?? 10) + durationMin
+
+    // Paso: duración + buffer (sin saltos raros de día)
+    const step = durationMin + (ctx.bufferMin ?? 0)
 
     while (cursor.getTime() + durationMin * 60000 <= end.getTime()) {
-        if (await isSlotFree(empresaId, cursor, durationMin)) {
+        // Filtro amable adicional: no sugerir antes de 06:00 ni después de 22:00 hora local
+        const localHourStr = new Intl.DateTimeFormat('es-CO', {
+            hour: '2-digit',
+            hour12: false,
+            timeZone: tz,
+        }).format(cursor)
+        const localHour = parseInt(localHourStr, 10)
+        const inFriendlyRange = localHour >= 6 && localHour <= 22
+
+        if (inFriendlyRange && (await isSlotFree(empresaId, cursor, durationMin))) {
             if (await isUnderDailyCap(empresaId, cursor, ctx)) {
                 acc.push(new Date(cursor))
                 if (acc.length >= limit) break
@@ -178,7 +189,10 @@ export async function book(
     if (!free) throw new Error('Slot ocupado')
 
     const proc = args.procedureId
-        ? await prisma.esteticaProcedure.findUnique({ where: { id: args.procedureId }, select: { depositRequired: true } })
+        ? await prisma.esteticaProcedure.findUnique({
+            where: { id: args.procedureId },
+            select: { depositRequired: true },
+        })
         : null
     const needClientConfirm = !!ctx.rules?.requireConfirmation
     const needDeposit = !!proc?.depositRequired
@@ -213,7 +227,8 @@ export async function reschedule(
     const appt = await prisma.appointment.findUnique({ where: { id: args.appointmentId } })
     if (!appt) throw new Error('Cita no existe')
     const duration =
-        appt.serviceDurationMin ?? Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000))
+        appt.serviceDurationMin ??
+        Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000))
     const free = await isSlotFree(args.empresaId, args.newStartAt, duration)
     if (!free) throw new Error('Nuevo horario ocupado')
     const updated = await prisma.appointment.update({
@@ -242,7 +257,6 @@ function ymdInTZ(d: Date, tz: string): string {
     const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
     return f.format(d) // "YYYY-MM-DD"
 }
-
 function weekdayInTZ(d: Date, tz: string): number {
     // 0..6 (Sun..Sat) en tz
     const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).formatToParts(d)
@@ -258,10 +272,10 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const [y, m, d] = ymd.split('-').map(Number)
     const [h, mi] = hhmm.split(':').map(Number)
 
-    // Creamos primero el Date "naive" en UTC
+    // Base "naive" en UTC
     const utcGuess = new Date(Date.UTC(y, m - 1, d, h, mi))
 
-    // Obtenemos qué hora sería en esa TZ
+    // Qué hora ve esa TZ para ese instante
     const fmt = new Intl.DateTimeFormat('en-US', {
         timeZone: tz,
         hour12: false,
@@ -276,7 +290,7 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const gotH = Number(parts.find((p) => p.type === 'hour')?.value ?? '0')
     const gotM = Number(parts.find((p) => p.type === 'minute')?.value ?? '0')
 
-    // Diferencia en minutos entre lo pedido (h, mi) y lo interpretado (gotH, gotM)
+    // Diferencia en minutos entre lo pedido y lo interpretado
     const deltaMin = (h * 60 + mi) - (gotH * 60 + gotM)
 
     // Ajustamos el UTC base para corregir la TZ
