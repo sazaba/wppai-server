@@ -1,15 +1,10 @@
+// server/src/utils/ai/strategies/esteticaModules/estetica.schedule.ts
 import prisma from '../../../../lib/prisma'
 import type { EsteticaCtx } from './estetica.rag'
 import { AppointmentStatus } from '@prisma/client'
 
 const DAY_MAP: Record<number, 'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat'> = {
-    0: 'sun',
-    1: 'mon',
-    2: 'tue',
-    3: 'wed',
-    4: 'thu',
-    5: 'fri',
-    6: 'sat',
+    0: 'sun', 1: 'mon', 2: 'tue', 3: 'wed', 4: 'thu', 5: 'fri', 6: 'sat',
 }
 
 type FindSlotsArgs = {
@@ -21,19 +16,10 @@ type FindSlotsArgs = {
 }
 
 /**
- * Genera próximos slots válidos respetando:
- * - AppointmentHour (isOpen, tramos 1/2)
- * - AppointmentException / blackoutDates
- * - Cap diario y solape con citas existentes
- * - Zona horaria del negocio (¡sin 4:00 a. m.!)
+ * Slots válidos por TZ del negocio. Respeta AppointmentHour, Exceptions,
+ * cap diario y solapes. Evita sugerir <06:00 o >22:00 hora local.
  */
-export async function findSlots({
-    empresaId,
-    ctx,
-    hint,
-    durationMin = 60,
-    count = 8,
-}: FindSlotsArgs): Promise<Date[]> {
+export async function findSlots({ empresaId, ctx, hint, durationMin = 60, count = 8 }: FindSlotsArgs): Promise<Date[]> {
     const now = new Date()
     const from = hint ? new Date(hint) : now
     const maxDays = ctx.rules?.bookingWindowDays ?? 30
@@ -59,36 +45,16 @@ export async function findSlots({
         if (isBlackout(ymdKey, ctx) || isExceptionDay(ymdKey, exceptions, ctx.timezone)) continue
 
         const weekday = DAY_MAP[weekdayInTZ(dateTz, ctx.timezone)]
-        const todays = hours.filter((h) => h.day === weekday && h.isOpen)
+        const todays = hours.filter(h => h.day === weekday && h.isOpen)
         if (!todays.length) continue
 
         for (const h of todays) {
             if (h.start1 && h.end1) {
-                await collectSlotsInRangeTZ(
-                    ymdKey,
-                    ctx.timezone,
-                    h.start1,
-                    h.end1,
-                    durationMin,
-                    out,
-                    count,
-                    empresaId,
-                    ctx
-                )
+                await collectSlotsInRangeTZ(ymdKey, ctx.timezone, h.start1, h.end1, durationMin, out, count, empresaId, ctx)
                 if (out.length >= count) break
             }
             if (h.start2 && h.end2) {
-                await collectSlotsInRangeTZ(
-                    ymdKey,
-                    ctx.timezone,
-                    h.start2,
-                    h.end2,
-                    durationMin,
-                    out,
-                    count,
-                    empresaId,
-                    ctx
-                )
+                await collectSlotsInRangeTZ(ymdKey, ctx.timezone, h.start2, h.end2, durationMin, out, count, empresaId, ctx)
                 if (out.length >= count) break
             }
         }
@@ -109,18 +75,10 @@ async function collectSlotsInRangeTZ(
 ) {
     let cursor = makeZonedDate(ymdKey, startHHmm, tz)
     const end = makeZonedDate(ymdKey, endHHmm, tz)
-
-    // Paso: duración + buffer (sin saltos raros de día)
     const step = durationMin + (ctx.bufferMin ?? 0)
 
     while (cursor.getTime() + durationMin * 60000 <= end.getTime()) {
-        // Filtro amable adicional: no sugerir antes de 06:00 ni después de 22:00 hora local
-        const localHourStr = new Intl.DateTimeFormat('es-CO', {
-            hour: '2-digit',
-            hour12: false,
-            timeZone: tz,
-        }).format(cursor)
-        const localHour = parseInt(localHourStr, 10)
+        const localHour = parseInt(new Intl.DateTimeFormat('es-CO', { hour: '2-digit', hour12: false, timeZone: tz }).format(cursor), 10)
         const inFriendlyRange = localHour >= 6 && localHour <= 22
 
         if (inFriendlyRange && (await isSlotFree(empresaId, cursor, durationMin))) {
@@ -135,10 +93,10 @@ async function collectSlotsInRangeTZ(
 
 function isBlackout(ymdKey: string, ctx: EsteticaCtx) {
     const list = ctx.rules?.blackoutDates ?? []
-    return Array.isArray(list) && list.some((d) => d === ymdKey)
+    return Array.isArray(list) && list.some(d => d === ymdKey)
 }
 function isExceptionDay(ymdKey: string, exceptions: { date: Date }[], tz: string) {
-    return exceptions.some((e) => ymdInTZ(e.date, tz) === ymdKey)
+    return exceptions.some(e => ymdInTZ(e.date, tz) === ymdKey)
 }
 
 async function isSlotFree(empresaId: number, start: Date, durationMin: number) {
@@ -188,10 +146,7 @@ export async function book(
     if (!free) throw new Error('Slot ocupado')
 
     const proc = args.procedureId
-        ? await prisma.esteticaProcedure.findUnique({
-            where: { id: args.procedureId },
-            select: { depositRequired: true },
-        })
+        ? await prisma.esteticaProcedure.findUnique({ where: { id: args.procedureId }, select: { depositRequired: true } })
         : null
     const needClientConfirm = !!ctx.rules?.requireConfirmation
     const needDeposit = !!proc?.depositRequired
@@ -225,9 +180,7 @@ export async function reschedule(
 ) {
     const appt = await prisma.appointment.findUnique({ where: { id: args.appointmentId } })
     if (!appt) throw new Error('Cita no existe')
-    const duration =
-        appt.serviceDurationMin ??
-        Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000))
+    const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000))
     const free = await isSlotFree(args.empresaId, args.newStartAt, duration)
     if (!free) throw new Error('Nuevo horario ocupado')
     const updated = await prisma.appointment.update({
@@ -242,64 +195,8 @@ export async function cancel(args: { empresaId: number; appointmentId: number })
     return appt
 }
 
-/* ===== utilidades de fecha con zona horaria (sin libs externas) ===== */
-
-function addMinutes(d: Date, min: number) {
-    return new Date(d.getTime() + min * 60000)
-}
-function addDays(d: Date, days: number) {
-    return new Date(d.getTime() + days * 86400000)
-}
-
-/** yyyy-mm-dd calculado en la TZ dada */
-function ymdInTZ(d: Date, tz: string): string {
-    const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
-    return f.format(d) // "YYYY-MM-DD"
-}
-function weekdayInTZ(d: Date, tz: string): number {
-    // 0..6 (Sun..Sat) en tz
-    const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).formatToParts(d)
-    const w = p.find((x) => x.type === 'weekday')?.value?.toLowerCase()
-    return { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 }[String(w).slice(0, 3) as 'sun'] ?? 0
-}
-
-/**
- * Convierte (YYYY-MM-DD + HH:mm) en la TZ dada al instante UTC correcto.
- * Ejemplo: "2025-09-30", "09:00", "America/Bogota" → Date con 2025-09-30 14:00 UTC.
- */
-function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
-    const [y, m, d] = ymd.split('-').map(Number)
-    const [h, mi] = hhmm.split(':').map(Number)
-
-    // Base en UTC "naive"
-    const utcGuess = new Date(Date.UTC(y, m - 1, d, h, mi))
-
-    // Qué hora ve esa TZ para ese instante
-    const parts = new Intl.DateTimeFormat('en-US', {
-        timeZone: tz,
-        hour12: false,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-    }).formatToParts(utcGuess)
-
-    const gotH = Number(parts.find(p => p.type === 'hour')?.value ?? '0')
-    const gotM = Number(parts.find(p => p.type === 'minute')?.value ?? '0')
-
-    // Diferencia en minutos entre lo pedido (h:mi) y lo observado en esa TZ
-    const deltaMin = (h * 60 + mi) - (gotH * 60 + gotM)
-
-    // ✅ Ajuste correcto: sumamos el delta
-    return new Date(utcGuess.getTime() + deltaMin * 60000)
-}
-
-/** Próxima cita futura (pending|confirmed|rescheduled) para el teléfono dado. */
-export async function findNextUpcomingApptForPhone(
-    empresaId: number,
-    phoneE164: string
-) {
+/** Helpers por teléfono */
+export async function findNextUpcomingApptForPhone(empresaId: number, phoneE164: string) {
     return prisma.appointment.findFirst({
         where: {
             empresaId,
@@ -308,29 +205,53 @@ export async function findNextUpcomingApptForPhone(
             startAt: { gt: new Date() },
         },
         orderBy: { startAt: 'asc' },
-        select: { id: true, startAt: true, serviceName: true }
+        select: { id: true, startAt: true, serviceName: true },
     })
 }
 
-/** Cancela la próxima cita futura del teléfono (si existe). */
-export async function cancelNextUpcomingForPhone(
-    empresaId: number,
-    phoneE164: string
-) {
-    const appt = await findNextUpcomingApptForPhone(empresaId, phoneE164)
-    if (!appt) return null
-    await prisma.appointment.update({
-        where: { id: appt.id },
-        data: { status: 'cancelled' }
+export async function listUpcomingApptsForPhone(empresaId: number, phoneE164: string) {
+    return prisma.appointment.findMany({
+        where: {
+            empresaId,
+            customerPhone: phoneE164,
+            status: { in: ['pending', 'confirmed', 'rescheduled'] },
+            startAt: { gt: new Date() },
+        },
+        orderBy: { startAt: 'asc' },
+        select: { id: true, startAt: true, serviceName: true },
     })
-    return appt
 }
 
-function startOfDayTZ(d: Date, tz: string): Date {
-    const ymd = ymdInTZ(d, tz)
-    return makeZonedDate(ymd, '00:00', tz)
+/* ===== fechas (TZ) ===== */
+
+function addMinutes(d: Date, min: number) { return new Date(d.getTime() + min * 60000) }
+function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000) }
+
+function ymdInTZ(d: Date, tz: string): string {
+    const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' })
+    return f.format(d)
 }
-function endOfDayTZ(d: Date, tz: string): Date {
-    const ymd = ymdInTZ(d, tz)
-    return makeZonedDate(ymd, '23:59', tz)
+function weekdayInTZ(d: Date, tz: string): number {
+    const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).formatToParts(d)
+    const w = p.find(x => x.type === 'weekday')?.value?.toLowerCase()
+    return ({ sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 } as any)[String(w).slice(0, 3)] ?? 0
 }
+
+/** Convierte (YYYY-MM-DD + HH:mm) en instante UTC de esa TZ */
+function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
+    const [y, m, d] = ymd.split('-').map(Number)
+    const [h, mi] = hhmm.split(':').map(Number)
+    const utcGuess = new Date(Date.UTC(y, m - 1, d, h, mi))
+
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    }).formatToParts(utcGuess)
+
+    const gotH = Number(parts.find(p => p.type === 'hour')?.value ?? '0')
+    const gotM = Number(parts.find(p => p.type === 'minute')?.value ?? '0')
+    const deltaMin = (h * 60 + mi) - (gotH * 60 + gotM)
+    return new Date(utcGuess.getTime() + deltaMin * 60000)
+}
+
+function startOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), '00:00', tz) }
+function endOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), '23:59', tz) }
