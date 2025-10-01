@@ -280,8 +280,12 @@ function isBlackout(ymdKey: string, ctx: EsteticaCtx) {
     const list = ctx.rules?.blackoutDates ?? [];
     return Array.isArray(list) && list.some((d) => d === ymdKey);
 }
-function addMinutes(d: Date, min: number) { return new Date(d.getTime() + min * 60000); }
-function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000); }
+function addMinutes(d: Date, min: number) {
+    return new Date(d.getTime() + min * 60000);
+}
+function addDays(d: Date, days: number) {
+    return new Date(d.getTime() + days * 86400000);
+}
 
 function ymdInTZ(d: Date, tz: string): string {
     const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -334,6 +338,7 @@ async function safeFetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
     }
 }
 
+/* ========= Ventanas del día (con logs de diagnóstico) ========= */
 function getOpenWindowsForDay({
     tz,
     ymd,
@@ -348,12 +353,19 @@ function getOpenWindowsForDay({
     const ex = exceptions.find((e) => ymdInTZ(e.date, tz) === ymd);
 
     if (ex) {
-        if (ex.isOpen === false) return [];
+        if (ex.isOpen === false) {
+            console.debug("[schedule.windows] exception CLOSE", { ymd, tz });
+            return [];
+        }
         const exPairs: [string | null, string | null][] = [
             [ex.start1, ex.end1],
             [ex.start2, ex.end2],
         ];
-        const exWindows = exPairs.filter(([s, e]) => !!s && !!e).map(([s, e]) => ({ start: s as string, end: e as string }));
+        const exWindows = exPairs
+            .filter(([s, e]) => !!s && !!e)
+            .map(([s, e]) => ({ start: s as string, end: e as string }));
+
+        console.debug("[schedule.windows] exception OVERRIDE", { ymd, tz, count: exWindows.length, ex });
         if (exWindows.length) return exWindows;
     }
 
@@ -364,9 +376,12 @@ function getOpenWindowsForDay({
         .flatMap((h) => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
         .filter(([s, e]) => !!s && !!e);
 
-    return pairs.map(([s, e]) => ({ start: s as string, end: e as string }));
+    const win = pairs.map(([s, e]) => ({ start: s as string, end: e as string }));
+    console.debug("[schedule.windows] hours", { ymd, tz, weekday, windows: win });
+    return win;
 }
 
+/* ==== Recolección de slots por ventana (con logs de descartes) ==== */
 async function collectSlotsInRangeTZ(
     ymdKey: string,
     tz: string,
@@ -383,6 +398,12 @@ async function collectSlotsInRangeTZ(
     const end = makeZonedDate(ymdKey, endHHmm, tz);
     const step = 15;
 
+    let foundBefore = acc.length;
+    let dropFriendly = 0;
+    let dropEarliest = 0;
+    let dropBusy = 0;
+    let dropCap = 0;
+
     while (cursor.getTime() + durationMin * 60000 <= end.getTime()) {
         const localHour = parseInt(
             new Intl.DateTimeFormat("es-CO", { hour: "2-digit", hour12: false, timeZone: tz }).format(cursor),
@@ -393,16 +414,44 @@ async function collectSlotsInRangeTZ(
         const slotEnd = addMinutes(cursor, durationMin);
         const afterEarliest = slotEnd >= earliest;
 
-        if (inFriendlyRange && afterEarliest && (await isSlotFree(empresaId, cursor, durationMin, ctx))) {
-            if (await isUnderDailyCap(empresaId, cursor, ctx)) {
-                acc.push(new Date(cursor));
-                if (acc.length >= limit) break;
-            }
+        if (!inFriendlyRange) {
+            dropFriendly++;
+            cursor = addMinutes(cursor, step);
+            continue;
         }
+        if (!afterEarliest) {
+            dropEarliest++;
+            cursor = addMinutes(cursor, step);
+            continue;
+        }
+
+        if (!(await isSlotFree(empresaId, cursor, durationMin, ctx))) {
+            dropBusy++;
+            cursor = addMinutes(cursor, step);
+            continue;
+        }
+        if (!(await isUnderDailyCap(empresaId, cursor, ctx))) {
+            dropCap++;
+            cursor = addMinutes(cursor, step);
+            continue;
+        }
+
+        acc.push(new Date(cursor));
+        if (acc.length >= limit) break;
         cursor = addMinutes(cursor, step);
     }
+
+    const foundNow = acc.length - foundBefore;
+    console.debug("[schedule.collect]", {
+        ymd: ymdKey,
+        tz,
+        win: `${startHHmm}-${endHHmm}`,
+        foundInWindow: foundNow,
+        drops: { friendly: dropFriendly, earliest: dropEarliest, busy: dropBusy, cap: dropCap },
+    });
 }
 
+/* ==================== Chequeos de ocupación / límites ==================== */
 async function isSlotFree(empresaId: number, start: Date, durationMin: number, ctx?: EsteticaCtx) {
     const buffer = ctx?.bufferMin ?? 0;
     const startWithBuffer = addMinutes(start, -buffer);
@@ -435,5 +484,9 @@ async function isUnderDailyCap(empresaId: number, start: Date, ctx: EsteticaCtx)
     return count < cap;
 }
 
-function startOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
-function endOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz); }
+function startOfDayTZ(d: Date, tz: string): Date {
+    return makeZonedDate(ymdInTZ(d, tz), "00:00", tz);
+}
+function endOfDayTZ(d: Date, tz: string): Date {
+    return makeZonedDate(ymdInTZ(d, tz), "23:59", tz);
+}
