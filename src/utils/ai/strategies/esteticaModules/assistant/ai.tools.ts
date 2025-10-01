@@ -1,3 +1,4 @@
+// utils/ai/strategies/esteticaModules/assistant/ai.tools.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../estetica.rag";
 import {
@@ -10,14 +11,35 @@ import {
 } from "../estetica.schedule";
 
 /* -------------------------------------------
-   Helpers
+   Pequeños helpers de fechas (TZ)
 ------------------------------------------- */
+function ymdInTZ(d: Date, tz: string): string {
+    const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+    return f.format(d);
+}
+function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
+    const [y, m, d] = ymd.split("-").map(Number);
+    const [h, mi] = hhmm.split(":").map(Number);
+    const guess = new Date(Date.UTC(y, m - 1, d, h, mi));
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz, hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+    }).formatToParts(guess);
+    const gotH = Number(parts.find(p => p.type === "hour")?.value ?? "0");
+    const gotM = Number(parts.find(p => p.type === "minute")?.value ?? "0");
+    const deltaMin = (h * 60 + mi) - (gotH * 60 + gotM);
+    return new Date(guess.getTime() + deltaMin * 60000);
+}
+function startOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
+function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000); }
+function startOfTomorrowTZ(tz: string): Date { return startOfDayTZ(addDays(new Date(), 1), tz); }
 
 function normalizeToE164(n: string) {
     return String(n || "").replace(/[^\d]/g, "");
 }
 
-/** Busca un servicio por id o por nombre (contains, case-insensitive de forma portable) */
+/* -------------------------------------------
+   Resolución robusta de servicio
+------------------------------------------- */
 async function resolveService(
     empresaId: number,
     q: { serviceId?: number; name?: string }
@@ -29,19 +51,28 @@ async function resolveService(
         });
         return row ?? null;
     }
-    if (q.name) {
-        // Evitamos mode:"insensitive" por compatibilidad con todos los motores
+    if (q.name && q.name.trim()) {
         const name = q.name.trim();
-        const row = await prisma.esteticaProcedure.findFirst({
-            where: {
-                empresaId,
-                enabled: true,
-                // contains simple; para mejorar matching, podrías guardar un campo "searchTerms"
-                name: { contains: name },
-            },
+
+        // 1) Intento con mode: 'insensitive' (algunos proveedores no lo soportan; casteamos a any)
+        const row1 = await prisma.esteticaProcedure.findFirst({
+            where: { empresaId, enabled: true, name: { contains: name, mode: "insensitive" } as any },
             select: { id: true, name: true, durationMin: true },
         });
-        return row ?? null;
+        if (row1) return row1;
+
+        // 2) Fallback: traigo algunos y comparo en memoria (case/acentos)
+        const few = await prisma.esteticaProcedure.findMany({
+            where: { empresaId, enabled: true },
+            select: { id: true, name: true, durationMin: true },
+            take: 25,
+        });
+        const norm = (s: string) => s
+            .toLowerCase()
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        const target = norm(name);
+        const found = few.find(p => norm(p.name).includes(target));
+        return found ?? null;
     }
     return null;
 }
@@ -49,56 +80,52 @@ async function resolveService(
 /* -------------------------------------------
    Tool specs (lo que “ve” el modelo)
 ------------------------------------------- */
-
 export const toolSpecs = [
     {
         type: "function",
         function: {
-            name: "listProcedures",
-            description:
-                "Devuelve el catálogo (activo) de servicios/procedimientos disponibles en la clínica, para mostrarlos al usuario.",
+            name: "listServices",
+            description: "Obtiene el catálogo activo de procedimientos de la clínica.",
             parameters: {
                 type: "object",
                 properties: {
-                    limit: { type: "number", description: "Máximo de items (default 6)" },
+                    limit: { type: "number", description: "Cantidad máxima (default 6)" }
                 },
-                required: [],
-            },
-        },
+                required: []
+            }
+        }
     },
     {
         type: "function",
         function: {
             name: "listUpcomingApptsForPhone",
-            description:
-                "Lista próximas citas de un número de teléfono (para mostrar, reagendar o cancelar).",
+            description: "Lista próximas citas de un número de teléfono (para mostrar, reagendar o cancelar).",
             parameters: {
                 type: "object",
                 properties: {
                     phone: { type: "string", description: "Número en formato E.164 o local" },
-                    limit: { type: "number", description: "Máximo de citas a devolver (default 5)" },
+                    limit: { type: "number", description: "Máximo de citas a devolver (default 5)" }
                 },
-                required: ["phone"],
-            },
-        },
+                required: ["phone"]
+            }
+        }
     },
     {
         type: "function",
         function: {
             name: "findSlots",
-            description:
-                "Busca horarios disponibles. Si hay servicio, usa su duración; si no, usa la duración por defecto del negocio. Siempre ofrece desde mañana en adelante.",
+            description: "Busca horarios disponibles. Si hay servicio, usa su duración; si no, usa la duración por defecto del negocio. Nunca ofrece el mismo día.",
             parameters: {
                 type: "object",
                 properties: {
                     serviceId: { type: "number", description: "ID del servicio (si se conoce)" },
                     serviceName: { type: "string", description: "Nombre aproximado del servicio" },
-                    fromISO: { type: "string", description: "Inicio sugerido del rango (ISO). Si no se envía, será mañana." },
-                    max: { type: "number", description: "Máximo de opciones a mostrar (default 6)" },
+                    fromISO: { type: "string", description: "Inicio sugerido del rango (ISO). Si no viene, se usa mañana 00:00 en TZ del negocio." },
+                    max: { type: "number", description: "Máximo de opciones a mostrar (default 6)" }
                 },
-                required: [],
-            },
-        },
+                required: []
+            }
+        }
     },
     {
         type: "function",
@@ -114,12 +141,11 @@ export const toolSpecs = [
                     phone: { type: "string" },
                     fullName: { type: "string" },
                     notes: { type: "string" },
-                    durationMin: { type: "number", description: "Duración en minutos (opcional)" },
-                    conversationId: { type: "number", description: "ID de la conversación para enlazar la cita" },
+                    durationMin: { type: "number", description: "Duración en minutos (opcional)" }
                 },
-                required: ["startISO", "phone", "fullName", "conversationId"],
-            },
-        },
+                required: ["startISO", "phone", "fullName"]
+            }
+        }
     },
     {
         type: "function",
@@ -130,11 +156,11 @@ export const toolSpecs = [
                 type: "object",
                 properties: {
                     appointmentId: { type: "number" },
-                    newStartISO: { type: "string" },
+                    newStartISO: { type: "string" }
                 },
-                required: ["appointmentId", "newStartISO"],
-            },
-        },
+                required: ["appointmentId", "newStartISO"]
+            }
+        }
     },
     {
         type: "function",
@@ -144,11 +170,11 @@ export const toolSpecs = [
             parameters: {
                 type: "object",
                 properties: {
-                    appointmentId: { type: "number" },
+                    appointmentId: { type: "number" }
                 },
-                required: ["appointmentId"],
-            },
-        },
+                required: ["appointmentId"]
+            }
+        }
     },
     {
         type: "function",
@@ -158,32 +184,30 @@ export const toolSpecs = [
             parameters: {
                 type: "object",
                 properties: {
-                    appointmentIds: { type: "array", items: { type: "number" } },
+                    appointmentIds: { type: "array", items: { type: "number" } }
                 },
-                required: ["appointmentIds"],
-            },
-        },
-    },
+                required: ["appointmentIds"]
+            }
+        }
+    }
 ] as const;
 
 /* -------------------------------------------
-   Handlers (conectan las tools al backend real)
+   Handlers (conectan tools ↔ backend)
+   Nota: pasamos también session (conversationId)
 ------------------------------------------- */
-
-export const toolHandlers = (ctx: EsteticaCtx) => ({
-    /** Catálogo desde la BD para que el modelo NO invente */
-    async listProcedures(args: any) {
+export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: number }) => ({
+    async listServices(args: any) {
         const limit = Number(args?.limit ?? 6);
-        const rows = await prisma.esteticaProcedure.findMany({
+        const items = await prisma.esteticaProcedure.findMany({
             where: { empresaId: ctx.empresaId, enabled: true },
             select: { id: true, name: true, durationMin: true, priceMin: true, priceMax: true, requiresAssessment: true },
-            orderBy: { name: "asc" },
-            take: Math.min(Math.max(limit, 1), 20),
+            take: limit,
+            orderBy: { name: "asc" }
         });
-        return { ok: true, items: rows };
+        return { ok: true, items };
     },
 
-    /** Próximas citas por teléfono */
     async listUpcomingApptsForPhone(args: any) {
         const { phone, limit = 5 } = args;
         const phoneE164 = normalizeToE164(phone || "");
@@ -191,41 +215,30 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
         return { ok: true, items: items.slice(0, limit) };
     },
 
-    /** Encuentra slots → desde MAÑANA */
     async findSlots(args: any) {
         const { serviceId, serviceName, fromISO, max = 6 } = args;
 
-        // 1) Resolver servicio para duración
+        // 1) Resolver servicio (para durationMin)
         const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
         const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
-        // 2) Hint: si no viene, mañana desde ahora
-        const hintBase = fromISO ? new Date(fromISO) : new Date(Date.now() + 24 * 60 * 60 * 1000);
+        // 2) Si no llega pista temporal, arrancamos desde mañana 00:00 (TZ negocio)
+        const hint = fromISO ? new Date(fromISO) : startOfTomorrowTZ(ctx.timezone);
 
-        // 3) Call core
+        // 3) Buscar
         const dates = await findSlotsCore({
             empresaId: ctx.empresaId,
             ctx,
-            hint: hintBase,
+            hint,
             durationMin,
             count: max,
         });
 
-        return { ok: true, slots: dates.map(d => d.toISOString()), durationMin, service: svc?.name ?? null };
+        return { ok: true, slots: dates.map(d => d.toISOString()), durationMin, serviceName: svc?.name ?? serviceName ?? null };
     },
 
-    /** Agendar */
     async book(args: any) {
-        const {
-            serviceId,
-            serviceName,
-            startISO,
-            phone,
-            fullName,
-            notes,
-            durationMin: durationMinArg,
-            conversationId,
-        } = args;
+        const { serviceId, serviceName, startISO, phone, fullName, notes, durationMin: durationMinArg } = args;
 
         const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
         if (!svc) {
@@ -238,11 +251,12 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
         }
 
         const durationMin = durationMinArg ?? svc.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+        const conversationId = Number(session?.conversationId ?? 0); // inyección desde el agente
 
         const appt = await bookCore(
             {
                 empresaId: ctx.empresaId,
-                conversationId: Number(conversationId),
+                conversationId,
                 customerPhone: normalizeToE164(phone),
                 customerName: fullName,
                 serviceName: svc.name,
@@ -257,50 +271,25 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
 
         return {
             ok: true,
-            data: {
-                id: appt.id,
-                startAt: appt.startAt.toISOString(),
-                status: appt.status,
-                serviceName: svc.name,
-            },
+            data: { id: appt.id, startAt: appt.startAt.toISOString(), status: appt.status, serviceName: appt.serviceName ?? svc.name }
         };
     },
 
-    /** Reagendar */
     async reschedule(args: any) {
         const updated = await rescheduleCore(
             { empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId), newStartAt: new Date(args.newStartISO) },
             ctx
         );
-        return {
-            ok: true,
-            data: {
-                id: updated.id,
-                startAt: updated.startAt.toISOString(),
-                status: updated.status,
-            },
-        };
+        return { ok: true, data: { id: updated.id, startAt: updated.startAt.toISOString(), status: updated.status } };
     },
 
-    /** Cancelar una cita */
     async cancel(args: any) {
         const deleted = await cancelCore({ empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId) });
-        return {
-            ok: true,
-            data: {
-                id: deleted.id,
-                startAt: deleted.startAt.toISOString(),
-                status: deleted.status,
-            },
-        };
+        return { ok: true, data: { id: deleted.id, startAt: deleted.startAt.toISOString(), status: deleted.status } };
     },
 
-    /** Cancelar varias citas */
     async cancelMany(args: any) {
         const rows = await cancelManyCore({ empresaId: ctx.empresaId, appointmentIds: (args.appointmentIds || []).map(Number) });
-        return {
-            ok: true,
-            data: rows.map(r => ({ id: r.id, startAt: r.startAt.toISOString(), serviceName: r.serviceName || null })),
-        };
+        return { ok: true, data: rows.map(r => ({ id: r.id, startAt: r.startAt.toISOString(), serviceName: r.serviceName || null })) };
     },
 });

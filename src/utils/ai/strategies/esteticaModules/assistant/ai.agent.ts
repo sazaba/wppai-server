@@ -1,19 +1,18 @@
 // utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
 import { openai } from "../../../../../lib/openai";
 import type { EsteticaCtx } from "../estetica.rag";
-import { toolSpecs, toolHandlers } from "./ai.tools";
+import { toolSpecs, toolHandlers } from "../assistant/ai.tools";
 import { systemPrompt } from "./ai.prompts";
 
 const MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.35);
 
-// Primera llamada no acepta role "tool"
+// Primer turno (no se usa role "tool")
 export type ChatTurn = { role: "user" | "assistant"; content: string };
 
-// Para la segunda vuelta sí mandamos "tool"
+// Para segunda vuelta sí enviamos mensajes "tool"
 type ToolMsg = { role: "tool"; content: string; tool_call_id: string };
 
-// Mensaje assistant con tool_calls
 type AssistantMsg = {
     role: "assistant";
     content?: string | null;
@@ -24,53 +23,10 @@ type AssistantMsg = {
     }>;
 };
 
-/* --- formatter corto + emoji (igual que tu core) --- */
-const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5);
-const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000);
-const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? "1") === "1";
-
-function clampConcise(text: string, maxLines = IA_MAX_LINES): string {
-    let t = String(text || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    if (!t) return t;
-    const lines = t.split("\n").filter(Boolean);
-    if (lines.length > maxLines) {
-        t = lines.slice(0, maxLines).join("\n").trim();
-        if (!/[.!?…]$/.test(t)) t += "…";
-    }
-    return t;
-}
-function closeNicely(raw: string) {
-    let t = (raw || "").trim();
-    if (!t) return t;
-    if (/[.!?…]\s*$/.test(t)) return t;
-    t = t.replace(/\s+[^\s]*$/, "").trim();
-    return t ? `${t}…` : raw.trim();
-}
-function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_CHARS, allowEmoji = IA_ALLOW_EMOJI) {
-    let t = String(text || "").trim();
-    if (!t) return "Gracias por escribirnos. ¿Cómo puedo ayudarte?";
-    t = t.replace(/^[•\-]\s*/gm, "").replace(/\s+\n/g, "\n").replace(/\n{2,}/g, "\n").trim();
-    t = t.length > maxChars ? t.slice(0, maxChars - 1) + "…" : t;
-    t = clampConcise(t, maxLines);
-    if (allowEmoji && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
-        const EMOJIS = ["🙂", "💡", "👌", "✅", "✨", "💬", "🫶"];
-        t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`;
-        t = clampConcise(t, maxLines);
-    }
-    return t;
-}
-const finalize = (s: string) => formatConcise(closeNicely(s));
-
-/**
- * Orquesta la conversación con política TOOLS-FIRST.
- * - 1ª pasada: que el modelo decida qué tools llamar
- * - Ejecutamos handlers
- * - 2ª pasada: redacta respuesta final
- */
 export async function runEsteticaAgent(
-    ctx: EsteticaCtx,
+    ctx: EsteticaCtx & { __conversationId?: number }, // permitimos inyectar convId
     turns: ChatTurn[],
-    _extras?: { phone?: string }
+    extras?: { phone?: string; conversationId?: number }
 ): Promise<string> {
     const sys = systemPrompt(ctx);
 
@@ -78,7 +34,7 @@ export async function runEsteticaAgent(
         (t): t is ChatTurn => t && (t.role === "user" || t.role === "assistant")
     );
 
-    // -------- 1) Planificación / decisión de tool-calls --------
+    // 1) Planificación + tool calls
     const result = await openai.chat.completions.create({
         model: MODEL,
         temperature: TEMPERATURE,
@@ -89,24 +45,19 @@ export async function runEsteticaAgent(
 
     const msg = (result.choices?.[0]?.message || {}) as AssistantMsg;
 
-    // -------- 2) Si hay tool calls, ejecuta y hace follow-up --------
+    // 2) Si hay tool calls → ejecutar y hacer follow-up
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-        const handlers = toolHandlers(ctx);
+        const handlers = toolHandlers(ctx, { conversationId: extras?.conversationId ?? ctx.__conversationId });
         const toolMsgs: ToolMsg[] = [];
 
         for (const call of msg.tool_calls) {
             const toolName = call.function.name as keyof ReturnType<typeof toolHandlers>;
             let args: any = {};
-            try {
-                args = call.function.arguments ? JSON.parse(call.function.arguments) : {};
-            } catch {
-                args = {};
-            }
+            try { args = call.function.arguments ? JSON.parse(call.function.arguments) : {}; } catch { args = {}; }
 
             let toolResponse: unknown;
             try {
-                // Índice dinámico controlado
-                toolResponse = await handlers[toolName](args);
+                toolResponse = await (handlers as any)[toolName](args);
             } catch (e: any) {
                 toolResponse = { ok: false, error: e?.message || "TOOL_ERROR" };
             }
@@ -118,27 +69,23 @@ export async function runEsteticaAgent(
             });
         }
 
-        // Segunda vuelta: redactar respuesta final con resultados de tools
+        // 3) Segunda vuelta con resultados de tools (el prompt ya obliga a NO inventar horas)
         const follow = await openai.chat.completions.create({
             model: MODEL,
             temperature: TEMPERATURE,
             messages: [
                 { role: "system", content: sys },
                 ...cleanTurns,
-                msg as any, // assistant con tool_calls
-                ...toolMsgs, // respuestas de las tools
+                msg as any,
+                ...toolMsgs,
             ] as any,
         } as any);
 
-        const out =
-            follow.choices?.[0]?.message?.content?.trim() ||
-            "¿Quieres que te muestre horarios o prefieres más información?";
-        return finalize(out);
+        const out = follow.choices?.[0]?.message?.content?.trim();
+        return out || "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
     }
 
-    // -------- 3) No hubo tools → respuesta directa --------
-    const direct =
-        (msg.content || "").trim() ||
-        "¿Quieres que te muestre horarios o prefieres más información?";
-    return finalize(direct);
+    // 4) Sin tools → respuesta directa
+    const direct = (msg.content || "").trim();
+    return direct || "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
 }
