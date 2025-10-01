@@ -104,7 +104,7 @@ async function isSlotFree(empresaId: number, start: Date, durationMin: number) {
         where: {
             empresaId,
             deletedAt: null,
-            status: { notIn: ['cancelled', 'no_show'] },
+            status: { notIn: [AppointmentStatus.cancelled, AppointmentStatus.no_show] }, // ✅ enum
             AND: [{ startAt: { lt: end } }, { endAt: { gt: start } }],
         },
     })
@@ -120,7 +120,7 @@ async function isUnderDailyCap(empresaId: number, start: Date, ctx: EsteticaCtx)
         where: {
             empresaId,
             deletedAt: null,
-            status: { notIn: ['cancelled', 'no_show'] },
+            status: { notIn: [AppointmentStatus.cancelled, AppointmentStatus.no_show] }, // ✅ enum
             startAt: { gte: s, lte: e },
         },
     })
@@ -155,7 +155,6 @@ export async function book(
         ? AppointmentStatus.pending
         : AppointmentStatus.confirmed
 
-
     const appt = await prisma.appointment.create({
         data: {
             empresaId: args.empresaId,
@@ -185,12 +184,20 @@ export async function reschedule(
 ) {
     const appt = await prisma.appointment.findUnique({ where: { id: args.appointmentId } })
     if (!appt || appt.deletedAt) throw new Error('Cita no existe')
-    const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000))
+
+    const duration = appt.serviceDurationMin
+        ?? Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000))
+
     const free = await isSlotFree(args.empresaId, args.newStartAt, duration)
     if (!free) throw new Error('Nuevo horario ocupado')
+
     const updated = await prisma.appointment.update({
         where: { id: appt.id },
-        data: { startAt: args.newStartAt, endAt: addMinutes(args.newStartAt, duration), status: 'rescheduled' },
+        data: {
+            startAt: args.newStartAt,
+            endAt: addMinutes(args.newStartAt, duration),
+            status: AppointmentStatus.rescheduled, // ✅ tipado fuerte
+        },
     })
     return updated
 }
@@ -201,7 +208,7 @@ export async function cancel(args: { empresaId: number; appointmentId: number })
     if (!appt || appt.empresaId !== args.empresaId || appt.deletedAt) throw new Error('Cita no existe')
     const deleted = await prisma.appointment.update({
         where: { id: args.appointmentId },
-        data: { status: 'cancelled', deletedAt: new Date() },
+        data: { status: AppointmentStatus.cancelled, deletedAt: new Date() }, // ✅ enum
     })
     return deleted
 }
@@ -215,7 +222,7 @@ export async function cancelMany(args: { empresaId: number; appointmentIds: numb
     if (!items.length) return []
     await prisma.appointment.updateMany({
         where: { id: { in: items.map(i => i.id) }, empresaId: args.empresaId, deletedAt: null },
-        data: { status: 'cancelled', deletedAt: new Date() }
+        data: { status: AppointmentStatus.cancelled, deletedAt: new Date() } // ✅ enum
     })
     return items
 }
@@ -227,7 +234,7 @@ export async function findNextUpcomingApptForPhone(empresaId: number, phoneE164:
             empresaId,
             customerPhone: phoneE164,
             deletedAt: null,
-            status: { in: ['pending', 'confirmed', 'rescheduled'] },
+            status: { in: [AppointmentStatus.pending, AppointmentStatus.confirmed, AppointmentStatus.rescheduled] },
             startAt: { gt: new Date() },
         },
         orderBy: { startAt: 'asc' },
@@ -240,7 +247,7 @@ export async function listUpcomingApptsForPhone(empresaId: number, phoneE164: st
             empresaId,
             customerPhone: phoneE164,
             deletedAt: null,
-            status: { in: ['pending', 'confirmed', 'rescheduled'] },
+            status: { in: [AppointmentStatus.pending, AppointmentStatus.confirmed, AppointmentStatus.rescheduled] },
             startAt: { gt: new Date() },
         },
         orderBy: { startAt: 'asc' },

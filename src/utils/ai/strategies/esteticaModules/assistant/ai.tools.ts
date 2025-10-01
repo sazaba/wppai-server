@@ -2,204 +2,292 @@
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../estetica.rag";
 import {
-    findSlots, book, reschedule, cancel, cancelMany,
-    listUpcomingApptsForPhone
+    findSlots as findSlotsCore,
+    book as bookCore,
+    reschedule as rescheduleCore,
+    cancel as cancelCore,
+    cancelMany as cancelManyCore,
+    listUpcomingApptsForPhone as listUpcomingCore,
 } from "../estetica.schedule";
-import { confirmLatestPendingForPhone } from "../estetica.rag";
-import { AppointmentStatus } from "@prisma/client";
 
-// ==================== Tipos estandarizados ====================
-// Respuesta estándar para que el orquestador pueda resumir sin romper.
-export type ToolResp<T> = { ok: true; data: T } | { ok: false; error: string };
+/* -------------------------------------------
+   Helpers
+------------------------------------------- */
 
-// Tipos de entrada para el orquestador
-export type ToolInput =
-    | { name: "find_slots"; args: { empresaId: number; durationMin?: number; count?: number; hintISO?: string | null; ctx: EsteticaCtx; serviceName?: string; procedureId?: number } }
-    | { name: "book_appt"; args: { empresaId: number; conversationId: number; phone: string; name?: string; serviceName?: string; procedureId?: number; startISO: string; durationMin?: number; timezone: string; notes?: string; ctx: EsteticaCtx } }
-    | { name: "reschedule_appt"; args: { empresaId: number; apptId: number; newStartISO: string; ctx: EsteticaCtx } }
-    | { name: "cancel_appt"; args: { empresaId: number; apptId: number } }
-    | { name: "cancel_many"; args: { empresaId: number; apptIds: number[] } }
-    | { name: "list_upcoming"; args: { empresaId: number; phone: string } }
-    | { name: "confirm_latest_pending"; args: { empresaId: number; phone: string } };
-
-export type ToolName = "find_slots" | "book_appt" | "reschedule_appt" | "cancel_appt" | "cancel_many" | "list_upcoming" | "confirm_latest_pending";
-
-// ==================== Helpers de matching ====================
-const nrm = (s: string) =>
-    String(s || "")
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .toLowerCase()
-        .replace(/[^\w\s]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-
-async function getEnabledProcedures(empresaId: number) {
-    const rows = await prisma.esteticaProcedure.findMany({
-        where: { empresaId, enabled: true },
-        select: { id: true, name: true, durationMin: true, aliases: true }
-    });
-    return rows.map(r => ({
-        id: r.id,
-        name: r.name,
-        durationMin: r.durationMin ?? undefined,
-        aliases: Array.isArray(r.aliases) ? (r.aliases as any[]).filter(x => typeof x === "string") as string[] : []
-    }));
+function normalizeToE164(n: string) {
+    return String(n || "").replace(/[^\d]/g, "");
 }
 
-function matchProcedureByNameOrAlias(list: Awaited<ReturnType<typeof getEnabledProcedures>>, q?: string) {
-    if (!q) return null;
-    const text = nrm(q);
-    if (!text) return null;
-
-    let best: { id: number; name: string; durationMin?: number } | null = null;
-    let bestScore = 0;
-
-    for (const p of list) {
-        const nameScore = text.includes(nrm(p.name)) ? 1 : 0;
-        let aliasScore = 0;
-        for (const a of p.aliases) {
-            if (text.includes(nrm(a))) aliasScore = Math.max(aliasScore, 0.8);
-        }
-        const score = Math.max(nameScore, aliasScore);
-        if (score > bestScore) {
-            bestScore = score;
-            best = { id: p.id, name: p.name, durationMin: p.durationMin };
-        }
+/**
+ * Resuelve un servicio verificando que exista en la BD.
+ * - Si llega serviceId, busca por id.
+ * - Si llega name, hace contains (case-insensitive cuando el proveedor lo soporta).
+ * Devuelve: { id, name, durationMin } o null.
+ */
+async function resolveService(
+    empresaId: number,
+    q: { serviceId?: number; name?: string }
+): Promise<{ id: number; name: string; durationMin: number | null } | null> {
+    if (q.serviceId) {
+        const row = await prisma.esteticaProcedure.findFirst({
+            where: { id: q.serviceId, empresaId, enabled: true },
+            select: { id: true, name: true, durationMin: true },
+        });
+        return row ?? null;
     }
-    return bestScore >= 0.6 ? best : null;
+    if (q.name) {
+        // NOTA: algunos proveedores (p.ej. SQLite) no soportan `mode: 'insensitive'` en el cliente de Prisma.
+        // Para evitar el error de tipado, no usamos `mode`; hacemos un contains estándar.
+        const row = await prisma.esteticaProcedure.findFirst({
+            where: {
+                empresaId,
+                enabled: true,
+                name: { contains: q.name }, // <- sin `mode` para compatibilidad total
+            },
+            select: { id: true, name: true, durationMin: true },
+        });
+        return row ?? null;
+    }
+    return null;
 }
 
-// ==================== Toolset (acceso real a DB) ====================
-export const Toolset = {
-    /** Encuentra horarios. Si viene procedureId o serviceName válido, usa su duration; si no, usa durationMin/ctx. */
-    async find_slots(a: ToolInput & { name: "find_slots" }): Promise<ToolResp<{ slots: string[]; durationMin: number }>> {
-        const { empresaId, ctx } = a.args;
-        let { durationMin, count = 6, hintISO = null, serviceName, procedureId } = a.args;
+/* -------------------------------------------
+   Tool specs (lo que “ve” el modelo)
+------------------------------------------- */
 
-        // Si llega un procedimiento, intenta aplicar su duración por defecto
-        if (!durationMin && (procedureId || serviceName)) {
-            const procs = await getEnabledProcedures(empresaId);
-            let proc = null;
-            if (procedureId) proc = procs.find(p => p.id === procedureId) || null;
-            if (!proc && serviceName) proc = matchProcedureByNameOrAlias(procs, serviceName);
-            if (proc?.durationMin) durationMin = proc.durationMin;
-        }
-        durationMin = durationMin || ctx.rules?.defaultServiceDurationMin || 60;
-
-        const hint = hintISO ? new Date(hintISO) : null;
-        const dates = await findSlots({ empresaId, ctx, hint, durationMin, count });
-        return { ok: true, data: { slots: dates.map(d => d.toISOString()), durationMin } };
-    },
-
-    /** Agenda SOLO si el servicio existe y está habilitado en BD. Si no existe, devuelve error con alternativas. */
-    async book_appt(a: ToolInput & { name: "book_appt" }): Promise<ToolResp<{ id: number; startAt: string; status: AppointmentStatus }>> {
-        const { empresaId, conversationId, phone, name, serviceName, procedureId, startISO, timezone, notes, ctx } = a.args;
-        let { durationMin } = a.args;
-
-        const procs = await getEnabledProcedures(empresaId);
-
-        // Resolver procedimiento
-        let proc = null as null | { id: number; name: string; durationMin?: number };
-        if (procedureId) proc = procs.find(p => p.id === procedureId) || null;
-        if (!proc && serviceName) proc = matchProcedureByNameOrAlias(procs, serviceName);
-
-        if (!proc) {
-            // No existe en catálogo → NO agendar. Sugerimos opciones.
-            const suggestions = procs.slice(0, 5).map(p => p.name);
-            return {
-                ok: false,
-                error: `Servicio no disponible para agendar. Opciones habilitadas: ${suggestions.join(", ")}. También puedo agendar una valoración.`
-            };
-        }
-
-        durationMin = durationMin || proc.durationMin || ctx.rules?.defaultServiceDurationMin || 60;
-
-        const appt = await book({
-            empresaId,
-            conversationId,
-            customerPhone: phone,
-            customerName: name || undefined,
-            serviceName: proc.name,
-            startAt: new Date(startISO),
-            durationMin,
-            timezone,
-            procedureId: proc.id,
-            notes
-        }, ctx);
-
-        return { ok: true, data: { id: appt.id, startAt: appt.startAt.toISOString(), status: appt.status as AppointmentStatus } };
-    },
-
-    async reschedule_appt(a: ToolInput & { name: "reschedule_appt" }): Promise<ToolResp<{ id: number; startAt: string; status: AppointmentStatus }>> {
-        const { empresaId, apptId, newStartISO, ctx } = a.args;
-        const upd = await reschedule({ empresaId, appointmentId: apptId, newStartAt: new Date(newStartISO) }, ctx);
-        return { ok: true, data: { id: upd.id, startAt: upd.startAt.toISOString(), status: upd.status as AppointmentStatus } };
-    },
-
-    async cancel_appt(a: ToolInput & { name: "cancel_appt" }): Promise<ToolResp<{ id: number; startAt: string; status: AppointmentStatus }>> {
-        const { empresaId, apptId } = a.args;
-        const upd = await cancel({ empresaId, appointmentId: apptId });
-        return { ok: true, data: { id: upd.id, startAt: upd.startAt.toISOString(), status: upd.status as AppointmentStatus } };
-    },
-
-    async cancel_many(a: ToolInput & { name: "cancel_many" }): Promise<ToolResp<{ items: { id: number; startAt: string; serviceName: string | null }[] }>> {
-        const { empresaId, apptIds } = a.args;
-        const rows = await cancelMany({ empresaId, appointmentIds: apptIds });
-        return { ok: true, data: { items: rows.map(r => ({ id: r.id, startAt: r.startAt.toISOString(), serviceName: r.serviceName || null })) } };
-    },
-
-    async list_upcoming(a: ToolInput & { name: "list_upcoming" }): Promise<ToolResp<{ items: { id: number; startAt: string; serviceName: string | null }[] }>> {
-        const { empresaId, phone } = a.args;
-        const list = await listUpcomingApptsForPhone(empresaId, phone);
-        return { ok: true, data: { items: list.map(x => ({ id: x.id, startAt: x.startAt.toISOString(), serviceName: x.serviceName || null })) } };
-    },
-
-    async confirm_latest_pending(a: ToolInput & { name: "confirm_latest_pending" }): Promise<ToolResp<{ id: number; startAt: string; status: AppointmentStatus } | null>> {
-        const { empresaId, phone } = a.args;
-        const appt = await confirmLatestPendingForPhone(empresaId, phone);
-        if (!appt) return { ok: true, data: null };
-        return { ok: true, data: { id: appt.id, startAt: appt.startAt.toISOString(), status: appt.status as AppointmentStatus } };
-    }
-};
-
-export function listToolSignatures() {
-    // Lo que el LLM ve: descripción y shape esperado. (No incluir 'ctx' para no confundir al modelo.)
-    return [
-        {
-            name: "find_slots",
-            description: "Obtiene horarios disponibles (devuelve ISO strings). Úsalo ANTES de ofrecer horas.",
-            schema: "{ empresaId:number, durationMin?:number, count?:number, hintISO?:string|null, serviceName?:string, procedureId?:number }"
+export const toolSpecs = [
+    {
+        type: "function",
+        function: {
+            name: "listUpcomingApptsForPhone",
+            description:
+                "Lista próximas citas de un número de teléfono (para mostrar, reagendar o cancelar).",
+            parameters: {
+                type: "object",
+                properties: {
+                    phone: { type: "string", description: "Número en formato E.164 o local" },
+                    limit: {
+                        type: "number",
+                        description: "Máximo de citas a devolver (default 5)",
+                    },
+                },
+                required: ["phone"],
+            },
         },
-        {
-            name: "book_appt",
-            description: "Crea la cita SOLO si el servicio existe en BD. Si no existe, regresará error con sugerencias.",
-            schema: "{ empresaId:number, conversationId:number, phone:string, name?:string, serviceName?:string, procedureId?:number, startISO:string, durationMin?:number, timezone:string, notes?:string }"
+    },
+    {
+        type: "function",
+        function: {
+            name: "findSlots",
+            description:
+                "Busca horarios disponibles. Si hay servicio, usa su duración; si no, usa la duración por defecto del negocio.",
+            parameters: {
+                type: "object",
+                properties: {
+                    serviceId: { type: "number", description: "ID del servicio (si se conoce)" },
+                    serviceName: { type: "string", description: "Nombre aproximado del servicio" },
+                    fromISO: { type: "string", description: "Inicio sugerido del rango (ISO)" },
+                    max: { type: "number", description: "Máximo de opciones a mostrar (default 6)" },
+                },
+                required: [],
+            },
         },
-        {
-            name: "reschedule_appt",
-            description: "Cambia fecha/hora de una cita existente por ID.",
-            schema: "{ empresaId:number, apptId:number, newStartISO:string }"
+    },
+    {
+        type: "function",
+        function: {
+            name: "book",
+            description:
+                "Crea una cita (solo si el servicio existe en BD). Valida conflictos y reglas.",
+            parameters: {
+                type: "object",
+                properties: {
+                    serviceId: { type: "number" },
+                    serviceName: { type: "string" },
+                    startISO: { type: "string", description: "Fecha/hora inicio en ISO" },
+                    phone: { type: "string" },
+                    fullName: { type: "string" },
+                    notes: { type: "string" },
+                    durationMin: { type: "number", description: "Duración en minutos (opcional)" },
+                    conversationId: {
+                        type: "number",
+                        description: "ID de la conversación para enlazar la cita",
+                    },
+                },
+                required: ["startISO", "phone", "fullName", "conversationId"],
+            },
         },
-        {
-            name: "cancel_appt",
-            description: "Cancela (soft delete) una cita por ID.",
-            schema: "{ empresaId:number, apptId:number }"
+    },
+    {
+        type: "function",
+        function: {
+            name: "reschedule",
+            description: "Mueve una cita existente a un nuevo horario.",
+            parameters: {
+                type: "object",
+                properties: {
+                    appointmentId: { type: "number" },
+                    newStartISO: { type: "string" },
+                },
+                required: ["appointmentId", "newStartISO"],
+            },
         },
-        {
-            name: "cancel_many",
+    },
+    {
+        type: "function",
+        function: {
+            name: "cancel",
+            description: "Cancela una cita específica.",
+            parameters: {
+                type: "object",
+                properties: {
+                    appointmentId: { type: "number" },
+                },
+                required: ["appointmentId"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "cancelMany",
             description: "Cancela varias citas por ID.",
-            schema: "{ empresaId:number, apptIds:number[] }"
+            parameters: {
+                type: "object",
+                properties: {
+                    appointmentIds: { type: "array", items: { type: "number" } },
+                },
+                required: ["appointmentIds"],
+            },
         },
-        {
-            name: "list_upcoming",
-            description: "Lista próximas citas por teléfono (del cliente actual).",
-            schema: "{ empresaId:number, phone:string }"
-        },
-        {
-            name: "confirm_latest_pending",
-            description: "Confirma la cita pendiente más reciente de ese teléfono.",
-            schema: "{ empresaId:number, phone:string }"
+    },
+] as const;
+
+/* -------------------------------------------
+   Handlers (conectan las tools al backend real)
+------------------------------------------- */
+
+export const toolHandlers = (ctx: EsteticaCtx) => ({
+    /** Lista próximas citas por teléfono (adapta a tu firma real) */
+    async listUpcomingApptsForPhone(args: any) {
+        const { phone, limit = 5 } = args;
+        const phoneE164 = normalizeToE164(phone || "");
+        const items = await listUpcomingCore(ctx.empresaId, phoneE164);
+        return { ok: true, items: items.slice(0, limit) };
+    },
+
+    /** Encuentra slots usando la firma de findSlots({ empresaId, ctx, hint, durationMin, count }) */
+    async findSlots(args: any) {
+        const { serviceId, serviceName, fromISO, max = 6 } = args;
+
+        // 1) Resolver servicio para obtener durationMin (si existe)
+        const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
+        const durationMin =
+            svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+
+        // 2) Calcular hint
+        const hint = fromISO ? new Date(fromISO) : null;
+
+        // 3) Llamar a la función core
+        const dates = await findSlotsCore({
+            empresaId: ctx.empresaId,
+            ctx,
+            hint,
+            durationMin,
+            count: max,
+        });
+
+        return { ok: true, slots: dates.map((d) => d.toISOString()), durationMin };
+    },
+
+    /** Agenda adaptando a bookCore(args, ctx) */
+    async book(args: any) {
+        const {
+            serviceId,
+            serviceName,
+            startISO,
+            phone,
+            fullName,
+            notes,
+            durationMin: durationMinArg,
+            conversationId,
+        } = args;
+
+        const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
+        // Si no existe en catálogo → NO agendar. Sugerir alternativas.
+        if (!svc) {
+            const suggestions = await prisma.esteticaProcedure.findMany({
+                where: { empresaId: ctx.empresaId, enabled: true },
+                select: { id: true, name: true, durationMin: true },
+                take: 6,
+            });
+            return { ok: false, reason: "SERVICE_NOT_FOUND", suggestions };
         }
-    ];
-}
+
+        const durationMin =
+            durationMinArg ?? svc.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+
+        const appt = await bookCore(
+            {
+                empresaId: ctx.empresaId,
+                conversationId: Number(conversationId),
+                customerPhone: normalizeToE164(phone),
+                customerName: fullName,
+                serviceName: svc.name,
+                startAt: new Date(startISO),
+                durationMin,
+                timezone: ctx.timezone,
+                procedureId: svc.id,
+                notes: notes || undefined,
+            },
+            ctx
+        );
+
+        return {
+            ok: true,
+            data: {
+                id: appt.id,
+                startAt: appt.startAt.toISOString(),
+                status: appt.status,
+            },
+        };
+    },
+
+    /** Reagendar usando rescheduleCore({ empresaId, appointmentId, newStartAt }) */
+    async reschedule(args: any) {
+        const updated = await rescheduleCore(
+            { empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId), newStartAt: new Date(args.newStartISO) },
+            ctx
+        );
+        return {
+            ok: true,
+            data: {
+                id: updated.id,
+                startAt: updated.startAt.toISOString(),
+                status: updated.status,
+            },
+        };
+    },
+
+    /** Cancelar una cita */
+    async cancel(args: any) {
+        const deleted = await cancelCore({ empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId) });
+        return {
+            ok: true,
+            data: {
+                id: deleted.id,
+                startAt: deleted.startAt.toISOString(),
+                status: deleted.status,
+            },
+        };
+    },
+
+    /** Cancelar varias citas */
+    async cancelMany(args: any) {
+        const rows = await cancelManyCore({ empresaId: ctx.empresaId, appointmentIds: (args.appointmentIds || []).map(Number) });
+        return {
+            ok: true,
+            data: rows.map((r) => ({ id: r.id, startAt: r.startAt.toISOString(), serviceName: r.serviceName || null })),
+        };
+    },
+});
