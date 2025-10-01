@@ -3,6 +3,8 @@ import prisma from "../../../../lib/prisma";
 import type { EsteticaCtx } from "./estetica.rag";
 import { AppointmentSource, AppointmentStatus } from "@prisma/client";
 
+export const ESTETICA_SCHEDULE_VERSION = "estetica-schedule@2025-10-01-a";
+
 /* ==================== Constantes / Tipos ==================== */
 const DAY_MAP: Record<number, "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat"> = {
     0: "sun",
@@ -65,6 +67,18 @@ export async function findSlots({
         safeFetchExceptions(empresaId),
     ]);
 
+    console.debug("[schedule.findSlots] in", {
+        v: ESTETICA_SCHEDULE_VERSION,
+        empresaId,
+        tz: ctx.timezone,
+        hint,
+        durationMin,
+        count,
+        rules: ctx.rules,
+        hours: hours.length,
+        exceptions: rawExceptions.length,
+    });
+
     const out: Date[] = [];
     let cursor = new Date(from);
 
@@ -82,12 +96,7 @@ export async function findSlots({
             continue;
         }
 
-        const windows = getOpenWindowsForDay({
-            tz: ctx.timezone,
-            ymd,
-            hours,
-            exceptions: rawExceptions,
-        });
+        const windows = getOpenWindowsForDay({ tz: ctx.timezone, ymd, hours, exceptions: rawExceptions });
 
         for (const w of windows) {
             await collectSlotsInRangeTZ(
@@ -108,6 +117,7 @@ export async function findSlots({
         cursor = addDays(cursor, 1);
     }
 
+    console.debug("[schedule.findSlots] out", { v: ESTETICA_SCHEDULE_VERSION, found: out.length });
     return out;
 }
 
@@ -266,18 +276,12 @@ export async function listUpcomingApptsForPhone(empresaId: number, phoneE164: st
 }
 
 /* ==================== Helpers ==================== */
-
 function isBlackout(ymdKey: string, ctx: EsteticaCtx) {
     const list = ctx.rules?.blackoutDates ?? [];
     return Array.isArray(list) && list.some((d) => d === ymdKey);
 }
-
-function addMinutes(d: Date, min: number) {
-    return new Date(d.getTime() + min * 60000);
-}
-function addDays(d: Date, days: number) {
-    return new Date(d.getTime() + days * 86400000);
-}
+function addMinutes(d: Date, min: number) { return new Date(d.getTime() + min * 60000); }
+function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000); }
 
 function ymdInTZ(d: Date, tz: string): string {
     const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -288,7 +292,6 @@ function weekdayInTZ(d: Date, tz: string): number {
     const w = p.find((x) => x.type === "weekday")?.value?.toLowerCase();
     return ({ sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 } as any)[String(w).slice(0, 3)] ?? 0;
 }
-
 function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const [y, m, d] = ymd.split("-").map(Number);
     const [h, mi] = hhmm.split(":").map(Number);
@@ -313,11 +316,7 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
 /** ✅ Sin SELECT de campos inexistentes: mapea de forma segura */
 async function safeFetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
     try {
-        // No usamos 'select' para evitar errores de tipado si el esquema no tiene columnas nuevas
-        const rows = (await prisma.appointmentException.findMany({
-            where: { empresaId },
-        } as any)) as any[];
-
+        const rows = (await prisma.appointmentException.findMany({ where: { empresaId } } as any)) as any[];
         return rows.map((r: any) => ({
             date: r.date,
             isOpen: r?.isOpen ?? null,
@@ -327,19 +326,11 @@ async function safeFetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
             end2: r?.end2 ?? null,
         }));
     } catch {
-        // Esquema muy antiguo: solo fecha
         const rows = (await prisma.appointmentException.findMany({
             where: { empresaId },
             select: { date: true },
         } as any)) as any[];
-        return rows.map((r: any) => ({
-            date: r.date,
-            isOpen: null,
-            start1: null,
-            end1: null,
-            start2: null,
-            end2: null,
-        }));
+        return rows.map((r: any) => ({ date: r.date, isOpen: null, start1: null, end1: null, start2: null, end2: null }));
     }
 }
 
@@ -362,10 +353,7 @@ function getOpenWindowsForDay({
             [ex.start1, ex.end1],
             [ex.start2, ex.end2],
         ];
-        const exWindows = exPairs
-            .filter(([s, e]) => !!s && !!e)
-            .map(([s, e]) => ({ start: s as string, end: e as string }));
-
+        const exWindows = exPairs.filter(([s, e]) => !!s && !!e).map(([s, e]) => ({ start: s as string, end: e as string }));
         if (exWindows.length) return exWindows;
     }
 
@@ -447,9 +435,5 @@ async function isUnderDailyCap(empresaId: number, start: Date, ctx: EsteticaCtx)
     return count < cap;
 }
 
-function startOfDayTZ(d: Date, tz: string): Date {
-    return makeZonedDate(ymdInTZ(d, tz), "00:00", tz);
-}
-function endOfDayTZ(d: Date, tz: string): Date {
-    return makeZonedDate(ymdInTZ(d, tz), "23:59", tz);
-}
+function startOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
+function endOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz); }
