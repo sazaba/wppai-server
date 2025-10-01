@@ -1,63 +1,175 @@
-import { openai } from '../../../../../lib/openai'
-import prisma from '../../../../../lib/prisma'
-import type { EsteticaCtx } from '../estetica.rag'
-import { buildPlannerPrompt, buildFinalizerPrompt } from './ai.prompts'
-import { execTool, type ToolCall, type ToolResult } from './ai.tools'
+// utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
+import { openai } from "../../../../../lib/openai";
+import prisma from "../../../../../lib/prisma";
+import type { EsteticaCtx } from "../estetica.rag";
+import { buildAssistantSystem, ASSISTANT_BEHAVIOR_RULES } from "./ai.prompts";
+import { Toolset, listToolSignatures, ToolName, ToolResp } from "./ai.tools";
 
-type Plan = { calls: ToolCall[]; say?: string }
-function safeParsePlan(raw: string): Plan {
-    try {
-        const obj = JSON.parse(raw)
-        const calls = Array.isArray(obj?.calls) ? obj.calls : []
-        const say = typeof obj?.say === 'string' ? obj.say : ''
-        return { calls, say }
-    } catch { return { calls: [], say: '' } }
+const MODEL = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini";
+const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.3);
+
+// -------- utilidades locales --------
+type RoleMsg = { role: "system" | "user" | "assistant"; content: string };
+
+function soft(s?: string | null, max = 320) {
+    const t = (s || "").trim();
+    if (!t) return "";
+    return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
 }
 
-export async function runAssistantOrchestrated(input: {
-    empresaId: number
-    conversationId: number
-    userText: string
-    ctx: EsteticaCtx
-}) {
-    const { empresaId, conversationId, userText, ctx } = input
+function isJustGreeting(text: string) {
+    const t = text.toLowerCase().trim();
+    return /^(hola|buen[oa]s|hey|qué tal|buen día|buenas tardes|buenas noches)[!. ]*$/i.test(t);
+}
 
-    const conv = await prisma.conversation.findUnique({ where: { id: conversationId }, select: { phone: true, nombre: true } })
-    const phone = (conv?.phone || '').replace(/[^\d]/g, '')
-    const kb = await ctx.buildKbContext()
+/** Hace una llamada con intención de JSON estricto y devuelve el objeto parseado o {} */
+async function planJSON(messages: RoleMsg[], maxTokens = 220): Promise<any> {
+    const r = await openai.chat.completions.create({
+        model: MODEL,
+        temperature: TEMPERATURE,
+        messages,
+        // En SDKs antiguos no existe tipado: usar `as any` evita error TS.
+        response_format: { type: "json_object" } as any,
+        max_tokens: maxTokens
+    } as any);
+    const content = r?.choices?.[0]?.message?.content || "{}";
+    try { return JSON.parse(content); } catch { return {}; }
+}
 
-    // 1) Planner: decide llamadas
-    const planner = await openai.chat.completions.create({
-        model: process.env.IA_TEXT_MODEL || 'gpt-4o-mini',
-        temperature: 0.2,
-        response_format: { type: 'json_object' } as any,
-        messages: [
-            { role: 'system', content: buildPlannerPrompt(ctx, kb) },
-            { role: 'user', content: `Cliente: ${conv?.nombre ?? ''} (${phone})` },
-            { role: 'user', content: `Mensaje: ${userText}` },
-        ],
-    } as any)
+/** Formatea tool result para pasar al LLM de cierre sin exponer PII ni objetos enormes */
+function summarizeToolResult(name: string, result: ToolResp<any>): string {
+    if (!result) return `${name}: (sin respuesta)`;
+    if ("ok" in result && !result.ok) return `${name}: ERROR: ${String(result.error || "desconocido")}`;
+    const data = (result as any).data;
+    try {
+        return `${name}: ${JSON.stringify(data, (_, v) => (v instanceof Date ? v.toISOString() : v))}`;
+    } catch {
+        return `${name}: (ok)`;
+    }
+}
 
-    const plan = safeParsePlan(planner.choices?.[0]?.message?.content || '{}')
+// ————— Orquestador: planifica → ejecuta tools → redacta respuesta final —————
+export async function runAssistantOrchestrated(args: {
+    empresaId: number;
+    conversationId: number;
+    userText: string;
+    ctx: EsteticaCtx;
+}): Promise<{ texto: string }> {
+    const { empresaId, conversationId, userText, ctx } = args;
 
-    // 2) Ejecutar herramientas (si las hay)
-    const execResults: ToolResult[] = []
-    for (const call of plan.calls) {
-        const r = await execTool({ empresaId, conversationId, phone, ctx }, call as ToolCall)
-        execResults.push(r)
+    // 1) Historia breve, sin ruido
+    const last = await prisma.message.findMany({
+        where: { conversationId },
+        orderBy: { timestamp: "desc" },
+        take: 8,
+        select: { from: true, contenido: true }
+    });
+    const chatHistory: RoleMsg[] = last.reverse().map(m => ({
+        role: m.from === "client" ? "user" : "assistant",
+        content: soft(m.contenido, 300)
+    }));
+
+    // 2) “Anti-saludo”: si el mensaje es solo “hola”, evita párrafos y pregunta directo
+    if (isJustGreeting(userText)) {
+        // CTA ultra breve para llevarlo a acción
+        return { texto: "¡Hola! ¿Agendamos, consultamos servicios o revisamos tus citas? Responde: *1 Agendar* · *2 Servicios* · *3 Mis citas*." };
     }
 
-    // 3) Finalizer: redactar respuesta final con resultados
-    const finalizer = await openai.chat.completions.create({
-        model: process.env.IA_TEXT_MODEL || 'gpt-4o-mini',
-        temperature: 0.35,
-        messages: [
-            { role: 'system', content: buildFinalizerPrompt(ctx) },
-            { role: 'user', content: `Resultados: ${JSON.stringify(execResults)}` },
-            ...(plan.say ? [{ role: 'user', content: `Borrador del planner: ${plan.say}` } as const] : []),
-        ],
-    } as any)
+    // 3) Construimos contexto + catálogo de herramientas
+    const system = buildAssistantSystem(ctx);
+    const toolSigs = listToolSignatures();
+    const toolsPreamble =
+        [
+            "Herramientas disponibles (usa solo si hace falta y nunca inventes resultados):",
+            ...toolSigs.map(t => `- ${t.name}: ${t.description}  args: ${t.schema}`),
+            "Cuando uses una herramienta, primero planea y devuelve un JSON válido.",
+            ...ASSISTANT_BEHAVIOR_RULES
+        ].join("\n");
 
-    const texto = finalizer.choices?.[0]?.message?.content?.trim() || plan.say || 'Gracias, ¿en qué más puedo ayudarte?'
-    return { texto, execResults }
+    // 4) Paso de 'plan': el modelo decide si usa herramienta o contesta directo
+    const planningObj = await planJSON(
+        [
+            { role: "system", content: system },
+            { role: "system", content: toolsPreamble },
+            ...chatHistory,
+            { role: "user", content: userText },
+            {
+                role: "system",
+                content:
+                    "Piensa en 1 línea: ¿necesitas usar una herramienta? Devuelve SOLO un JSON válido con {action:'tool'|'talk', tool?:string, args?:object, reply?:string}. " +
+                    "Elige tool exacto entre: " + toolSigs.map(t => t.name).join(", ") + "."
+            }
+        ],
+        220
+    );
+
+    let action: "tool" | "talk" = (planningObj.action === "tool" ? "tool" : "talk");
+    let tool: ToolName | undefined = planningObj.tool as ToolName | undefined;
+    let argsAny: any = planningObj.args || {};
+    let replyFallback: string = planningObj.reply || "";
+
+    // 5) Ejecutamos herramienta si aplica
+    let toolResult: ToolResp<any> | null = null;
+    if (action === "tool" && tool && (Toolset as any)[tool]) {
+        // Defaults críticos para evitar errores si el LLM olvida parámetros
+        argsAny = { ...(argsAny || {}) };
+        if (tool === "find_slots") {
+            argsAny.empresaId ??= empresaId;
+            argsAny.count ??= 6;
+            argsAny.ctx ??= ctx;
+        }
+        if (tool === "book_appt") {
+            argsAny.empresaId ??= empresaId;
+            argsAny.conversationId ??= conversationId;
+            argsAny.ctx ??= ctx;
+        }
+        if (tool === "reschedule_appt") {
+            argsAny.empresaId ??= empresaId;
+            argsAny.ctx ??= ctx;
+        }
+        if (tool === "list_upcoming" || tool === "confirm_latest_pending" || tool === "cancel_appt" || tool === "cancel_many") {
+            argsAny.empresaId ??= empresaId;
+        }
+
+        try {
+            toolResult = await (Toolset as any)[tool]({ name: tool, args: argsAny });
+        } catch (e: any) {
+            // Error duro de ejecución -> respondemos breve y segura
+            const err = String(e?.message || e || "Error al ejecutar la acción");
+            return { texto: `Lo siento, falló la acción (${err}). ¿Quieres que lo intente con otro horario o lo haga manualmente?` };
+        }
+    }
+
+    // 6) Redacción FINAL corta (1–4 líneas) con el resultado (o fallback)
+    //    Forzamos concisión y CTA claro.
+    const final = await openai.chat.completions.create({
+        model: MODEL,
+        temperature: TEMPERATURE,
+        messages: [
+            { role: "system", content: system },
+            {
+                role: "system",
+                content:
+                    "Redacta la respuesta FINAL en 1–4 líneas, sin prosa de saludo, directa y clara. Ofrece el siguiente paso en una oración. " +
+                    "Evita repetir contexto, no inventes datos. Si hay horarios, preséntalos con números (1–6) y pide el número de la opción."
+            },
+            ...(tool && toolResult
+                ? [{ role: "system", content: `Resultado de herramienta (${tool}):\n${summarizeToolResult(tool, toolResult)}` } as RoleMsg]
+                : [{ role: "system", content: "No se usó herramienta. Responde útil y concreta." } as RoleMsg]),
+            { role: "user", content: userText }
+        ],
+        max_tokens: 180
+    } as any);
+
+    let texto = (final.choices?.[0]?.message?.content || "").trim();
+
+    // 7) Si el modelo se queda mudo, usa el fallback del 'plan'
+    if (!texto) {
+        texto = (replyFallback || "¿Te ayudo a ver horarios, conocer servicios o revisar tus citas?").trim();
+    }
+
+    // 8) Micro-anti-saludo: borra encabezados tipo “¡Hola!” si el modelo los coló
+    texto = texto.replace(/^(hola|buen[oa]s|hey)[^a-zA-Záéíóúñ]*[,:\-–—]?\s*/i, "");
+
+    return { texto };
 }
