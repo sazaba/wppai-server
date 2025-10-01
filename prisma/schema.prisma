@@ -500,6 +500,7 @@ model Appointment {
   @@index([empresaId, customerPhone, startAt])
   @@index([empresaId, status, startAt, customerPhone])
   @@index([deletedAt]) // 👈 recomendado para filtros
+  @@index([empresaId, deletedAt, startAt])
   @@map("appointment")
 }
 
@@ -719,13 +720,19 @@ model Staff {
 model AppointmentException {
   id        Int      @id @default(autoincrement())
   empresaId Int
-  date      DateTime // día completo (puedes extender a rango con start/end si quieres)
+  date      DateTime
   reason    String?
+
+  // NUEVO (opcionales)
+  isOpen Boolean? @default(true)
+  start1 String?  @db.VarChar(5) // "09:00"
+  end1   String?  @db.VarChar(5)
+  start2 String?  @db.VarChar(5)
+  end2   String?  @db.VarChar(5)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 
   @@index([empresaId, date])
   @@map("appointment_exception")

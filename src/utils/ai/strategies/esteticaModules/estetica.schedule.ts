@@ -31,22 +31,16 @@ type HourRow = {
     end2: string | null;
 };
 
-/** Hacemos opcionales estos campos porque en tu DB pueden no existir aún */
 type ExceptionRow = {
     date: Date;
-    isOpen?: boolean | null;
-    start1?: string | null;
-    end1?: string | null;
-    start2?: string | null;
-    end2?: string | null;
+    isOpen: boolean | null;
+    start1: string | null;
+    end1: string | null;
+    start2: string | null;
+    end2: string | null;
 };
 
 /* ==================== API principal ==================== */
-/**
- * Genera slots válidos por TZ del negocio.
- * Respeta AppointmentHours, Exceptions (override), minNotice, buffer, maxAdvance,
- * cap diario y solapes con citas existentes. No ofrece fuera de 6–22h locales.
- */
 export async function findSlots({
     empresaId,
     ctx,
@@ -56,12 +50,10 @@ export async function findSlots({
 }: FindSlotsArgs): Promise<Date[]> {
     const now = new Date();
 
-    // Ventana de búsqueda (usa bookingWindowDays o maxAdvanceDays)
     const bookingWindowDays = ctx.rules?.bookingWindowDays ?? ctx.rules?.maxAdvanceDays ?? 30;
     const from = hint ? new Date(hint) : now;
     const to = addDays(from, bookingWindowDays);
 
-    // Earliest permitido por reglas: minNotice + buffer
     const minNoticeH = ctx.rules?.minNoticeHours ?? 0;
     const earliest = addMinutes(now, minNoticeH * 60 + (ctx.bufferMin ?? 0));
 
@@ -70,23 +62,8 @@ export async function findSlots({
             where: { empresaId, isOpen: true },
             select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
         }),
-        // Consulta segura: si tu tabla solo tiene "date", esto compila siempre.
-        prisma.appointmentException.findMany({
-            where: { empresaId },
-            select: { date: true }, // <-- si agregas columnas en el futuro, amplía este select
-        }),
+        safeFetchExceptions(empresaId),
     ]);
-
-    // Normalizamos a nuestros tipos locales
-    const hoursNorm: HourRow[] = hours.map((h) => ({
-        day: h.day as HourRow["day"],
-        isOpen: h.isOpen,
-        start1: h.start1,
-        end1: h.end1,
-        start2: h.start2,
-        end2: h.end2,
-    }));
-    const exceptionsNorm: ExceptionRow[] = rawExceptions.map((e) => ({ date: e.date }));
 
     const out: Date[] = [];
     let cursor = new Date(from);
@@ -94,28 +71,24 @@ export async function findSlots({
     while (cursor < to && out.length < count) {
         const ymd = ymdInTZ(cursor, ctx.timezone);
 
-        // Same-day: si NO se permite, saltar el día actual completo
         const isSameDay = ymd === ymdInTZ(now, ctx.timezone);
-        if (isSameDay && !ctx.rules?.allowSameDay) {
+        if (isSameDay && !(ctx.rules?.allowSameDay ?? false)) {
             cursor = addDays(cursor, 1);
             continue;
         }
 
-        // Blackout de reglas
         if (isBlackout(ymd, ctx)) {
             cursor = addDays(cursor, 1);
             continue;
         }
 
-        // Ventanas para el día (exceptions override)
         const windows = getOpenWindowsForDay({
             tz: ctx.timezone,
             ymd,
-            hours: hoursNorm,
-            exceptions: exceptionsNorm,
+            hours,
+            exceptions: rawExceptions,
         });
 
-        // Generar slots dentro de cada ventana
         for (const w of windows) {
             await collectSlotsInRangeTZ(
                 ymd,
@@ -138,9 +111,7 @@ export async function findSlots({
     return out;
 }
 
-/**
- * Crea una cita. Usa transacción, previene solapes (con buffer) y duplicados exactos.
- */
+/* ==================== Mutaciones ==================== */
 export async function book(
     args: {
         empresaId: number;
@@ -159,11 +130,9 @@ export async function book(
     const endAt = addMinutes(args.startAt, args.durationMin);
 
     return prisma.$transaction(async (tx) => {
-        // Revalidar solape con buffer
         const free = await isSlotFree(args.empresaId, args.startAt, args.durationMin, ctx);
         if (!free) throw new Error("CONFLICT_SLOT");
 
-        // Duplicado exacto por phone+startAt
         const dup = await tx.appointment.findFirst({
             where: {
                 empresaId: args.empresaId,
@@ -176,7 +145,6 @@ export async function book(
         });
         if (dup) throw new Error("DUPLICATE_APPOINTMENT");
 
-        // Confirmación / depósito
         const proc = args.procedureId
             ? await tx.esteticaProcedure.findUnique({
                 where: { id: args.procedureId },
@@ -185,7 +153,6 @@ export async function book(
             : null;
 
         const needClientConfirm = !!ctx.rules?.requireConfirmation;
-
         const needDeposit = !!proc?.depositRequired;
         const status: AppointmentStatus =
             needClientConfirm || needDeposit ? AppointmentStatus.pending : AppointmentStatus.confirmed;
@@ -215,9 +182,6 @@ export async function book(
     });
 }
 
-/**
- * Reagenda una cita (con transacción y revalidación de solape).
- */
 export async function reschedule(
     args: { empresaId: number; appointmentId: number; newStartAt: Date },
     ctx: EsteticaCtx
@@ -248,7 +212,6 @@ export async function reschedule(
     });
 }
 
-/** SOFT DELETE de una cita (status+deletedAt) */
 export async function cancel(args: { empresaId: number; appointmentId: number }) {
     const appt = await prisma.appointment.findUnique({ where: { id: args.appointmentId } });
     if (!appt || appt.empresaId !== args.empresaId || appt.deletedAt) throw new Error("Cita no existe");
@@ -260,7 +223,6 @@ export async function cancel(args: { empresaId: number; appointmentId: number })
     return deleted;
 }
 
-/** SOFT DELETE de varias citas */
 export async function cancelMany(args: { empresaId: number; appointmentIds: number[] }) {
     const items = await prisma.appointment.findMany({
         where: { id: { in: args.appointmentIds }, empresaId: args.empresaId, deletedAt: null },
@@ -274,7 +236,7 @@ export async function cancelMany(args: { empresaId: number; appointmentIds: numb
     return items;
 }
 
-/** Próxima cita por teléfono (activa) */
+/** Próxima / listado por teléfono */
 export async function findNextUpcomingApptForPhone(empresaId: number, phoneE164: string) {
     return prisma.appointment.findFirst({
         where: {
@@ -289,7 +251,6 @@ export async function findNextUpcomingApptForPhone(empresaId: number, phoneE164:
     });
 }
 
-/** Lista próximas citas por teléfono (activas) */
 export async function listUpcomingApptsForPhone(empresaId: number, phoneE164: string) {
     return prisma.appointment.findMany({
         where: {
@@ -304,7 +265,7 @@ export async function listUpcomingApptsForPhone(empresaId: number, phoneE164: st
     });
 }
 
-/* ==================== Helpers (TZ, fechas, windows) ==================== */
+/* ==================== Helpers ==================== */
 
 function isBlackout(ymdKey: string, ctx: EsteticaCtx) {
     const list = ctx.rules?.blackoutDates ?? [];
@@ -328,7 +289,6 @@ function weekdayInTZ(d: Date, tz: string): number {
     return ({ sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 } as any)[String(w).slice(0, 3)] ?? 0;
 }
 
-/** Convierte (YYYY-MM-DD + HH:mm) en instante UTC de esa TZ */
 function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const [y, m, d] = ymd.split("-").map(Number);
     const [h, mi] = hhmm.split(":").map(Number);
@@ -350,6 +310,39 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     return new Date(utcGuess.getTime() + deltaMin * 60000);
 }
 
+/** ✅ Sin SELECT de campos inexistentes: mapea de forma segura */
+async function safeFetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
+    try {
+        // No usamos 'select' para evitar errores de tipado si el esquema no tiene columnas nuevas
+        const rows = (await prisma.appointmentException.findMany({
+            where: { empresaId },
+        } as any)) as any[];
+
+        return rows.map((r: any) => ({
+            date: r.date,
+            isOpen: r?.isOpen ?? null,
+            start1: r?.start1 ?? null,
+            end1: r?.end1 ?? null,
+            start2: r?.start2 ?? null,
+            end2: r?.end2 ?? null,
+        }));
+    } catch {
+        // Esquema muy antiguo: solo fecha
+        const rows = (await prisma.appointmentException.findMany({
+            where: { empresaId },
+            select: { date: true },
+        } as any)) as any[];
+        return rows.map((r: any) => ({
+            date: r.date,
+            isOpen: null,
+            start1: null,
+            end1: null,
+            start2: null,
+            end2: null,
+        }));
+    }
+}
+
 function getOpenWindowsForDay({
     tz,
     ymd,
@@ -361,29 +354,21 @@ function getOpenWindowsForDay({
     hours: HourRow[];
     exceptions: ExceptionRow[];
 }): Array<{ start: string; end: string }> {
-    // ¿Hay excepción para el día?
     const ex = exceptions.find((e) => ymdInTZ(e.date, tz) === ymd);
 
-    // Si tu esquema solo tiene "date", tratamos la excepción como "cerrado todo el día"
-    if (ex && ex.isOpen === undefined && ex.start1 === undefined) {
-        return [];
-    }
-
-    // Excepción avanzada (con campos)
     if (ex) {
         if (ex.isOpen === false) return [];
-        const exPairs: [string | null | undefined, string | null | undefined][] = [
+        const exPairs: [string | null, string | null][] = [
             [ex.start1, ex.end1],
             [ex.start2, ex.end2],
         ];
         const exWindows = exPairs
             .filter(([s, e]) => !!s && !!e)
             .map(([s, e]) => ({ start: s as string, end: e as string }));
-        if (exWindows.length) return exWindows; // usar horas de excepción si existen
-        // si hay excepción pero sin horas → caer al horario semanal
+
+        if (exWindows.length) return exWindows;
     }
 
-    // Horario semanal (fallback)
     const weekday = DAY_MAP[weekdayInTZ(makeZonedDate(ymd, "00:00", tz), tz)];
     const todays = hours.filter((h) => h.day === weekday && h.isOpen);
 
@@ -408,17 +393,15 @@ async function collectSlotsInRangeTZ(
 ) {
     let cursor = makeZonedDate(ymdKey, startHHmm, tz);
     const end = makeZonedDate(ymdKey, endHHmm, tz);
-    const step = 15; // 15m de granularidad
+    const step = 15;
 
     while (cursor.getTime() + durationMin * 60000 <= end.getTime()) {
-        // Friendly range 6–22h
         const localHour = parseInt(
             new Intl.DateTimeFormat("es-CO", { hour: "2-digit", hour12: false, timeZone: tz }).format(cursor),
             10
         );
         const inFriendlyRange = localHour >= 6 && localHour <= 22;
 
-        // Earliest (minNotice + buffer) aplicado al final del slot
         const slotEnd = addMinutes(cursor, durationMin);
         const afterEarliest = slotEnd >= earliest;
 
@@ -432,7 +415,6 @@ async function collectSlotsInRangeTZ(
     }
 }
 
-/** Verifica solapes con buffer */
 async function isSlotFree(empresaId: number, start: Date, durationMin: number, ctx?: EsteticaCtx) {
     const buffer = ctx?.bufferMin ?? 0;
     const startWithBuffer = addMinutes(start, -buffer);
