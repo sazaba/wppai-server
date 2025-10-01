@@ -1,4 +1,3 @@
-// utils/ai/strategies/esteticaModules/assistant/ai.tools.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../estetica.rag";
 import {
@@ -18,80 +17,27 @@ function normalizeToE164(n: string) {
     return String(n || "").replace(/[^\d]/g, "");
 }
 
-/** YYYY-MM-DD en la TZ del negocio */
-function ymdInTZ(d: Date, tz: string): string {
-    const f = new Intl.DateTimeFormat("en-CA", {
-        timeZone: tz,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-    });
-    return f.format(d);
-}
-
-/** Construye Date UTC para YYYY-MM-DD HH:mm en TZ dada */
-function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
-    const [y, m, d] = ymd.split("-").map(Number);
-    const [h, mi] = hhmm.split(":").map(Number);
-    const utcGuess = new Date(Date.UTC(y, m - 1, d, h, mi));
-    const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone: tz,
-        hour12: false,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-    }).formatToParts(utcGuess);
-    const gotH = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
-    const gotM = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
-    const deltaMin = h * 60 + mi - (gotH * 60 + gotM);
-    return new Date(utcGuess.getTime() + deltaMin * 60000);
-}
-
-/** Inicio de mañana (00:01) en TZ del negocio */
-function startOfTomorrowTZ(tz: string): Date {
-    const now = new Date();
-    // suma 1 día en TZ de negocio
-    const ymdTomorrow = ((): string => {
-        const parts = new Intl.DateTimeFormat("en-CA", {
-            timeZone: tz,
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-        })
-            .formatToParts(new Date(now.getTime() + 24 * 3600 * 1000))
-            .reduce((acc: any, p) => ((acc[p.type] = p.value), acc), {});
-        return `${parts.year}-${parts.month}-${parts.day}`;
-    })();
-    // 00:01 para evitar borde de medianoche
-    return makeZonedDate(ymdTomorrow, "00:01", tz);
-}
-
-/**
- * Resuelve un servicio verificando que exista en la BD.
- * Devuelve: { id, name, durationMin } o null.
- *
- * ⚠️ Si tu schema usa `enabled` en vez de `isActive`, cambia el where.
- */
+/** Busca un servicio por id o por nombre (contains, case-insensitive de forma portable) */
 async function resolveService(
     empresaId: number,
     q: { serviceId?: number; name?: string }
 ): Promise<{ id: number; name: string; durationMin: number | null } | null> {
     if (q.serviceId) {
         const row = await prisma.esteticaProcedure.findFirst({
-            where: { id: q.serviceId, empresaId, enabled: true }, // <- cámbialo a enabled: true si tu schema lo usa
+            where: { id: q.serviceId, empresaId, enabled: true },
             select: { id: true, name: true, durationMin: true },
         });
         return row ?? null;
     }
     if (q.name) {
+        // Evitamos mode:"insensitive" por compatibilidad con todos los motores
+        const name = q.name.trim();
         const row = await prisma.esteticaProcedure.findFirst({
             where: {
                 empresaId,
-                enabled: true, // <- cámbialo a enabled: true si aplica
-                // sin `mode: 'insensitive'` para evitar error de tipado
-                name: { contains: q.name },
+                enabled: true,
+                // contains simple; para mejorar matching, podrías guardar un campo "searchTerms"
+                name: { contains: name },
             },
             select: { id: true, name: true, durationMin: true },
         });
@@ -108,6 +54,21 @@ export const toolSpecs = [
     {
         type: "function",
         function: {
+            name: "listProcedures",
+            description:
+                "Devuelve el catálogo (activo) de servicios/procedimientos disponibles en la clínica, para mostrarlos al usuario.",
+            parameters: {
+                type: "object",
+                properties: {
+                    limit: { type: "number", description: "Máximo de items (default 6)" },
+                },
+                required: [],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
             name: "listUpcomingApptsForPhone",
             description:
                 "Lista próximas citas de un número de teléfono (para mostrar, reagendar o cancelar).",
@@ -115,10 +76,7 @@ export const toolSpecs = [
                 type: "object",
                 properties: {
                     phone: { type: "string", description: "Número en formato E.164 o local" },
-                    limit: {
-                        type: "number",
-                        description: "Máximo de citas a devolver (default 5)",
-                    },
+                    limit: { type: "number", description: "Máximo de citas a devolver (default 5)" },
                 },
                 required: ["phone"],
             },
@@ -129,14 +87,14 @@ export const toolSpecs = [
         function: {
             name: "findSlots",
             description:
-                "Busca horarios disponibles desde MAÑANA en adelante. Si hay servicio, usa su duración; si no, usa la duración por defecto del negocio.",
+                "Busca horarios disponibles. Si hay servicio, usa su duración; si no, usa la duración por defecto del negocio. Siempre ofrece desde mañana en adelante.",
             parameters: {
                 type: "object",
                 properties: {
                     serviceId: { type: "number", description: "ID del servicio (si se conoce)" },
                     serviceName: { type: "string", description: "Nombre aproximado del servicio" },
-                    fromISO: { type: "string", description: "Inicio sugerido del rango (ISO)" },
-                    max: { type: "number", description: "Máximo de opciones a mostrar (default 8)" },
+                    fromISO: { type: "string", description: "Inicio sugerido del rango (ISO). Si no se envía, será mañana." },
+                    max: { type: "number", description: "Máximo de opciones a mostrar (default 6)" },
                 },
                 required: [],
             },
@@ -146,8 +104,7 @@ export const toolSpecs = [
         type: "function",
         function: {
             name: "book",
-            description:
-                "Crea una cita (solo si el servicio existe en BD). Valida conflictos y reglas.",
+            description: "Crea una cita (solo si el servicio existe en BD). Valida conflictos y reglas.",
             parameters: {
                 type: "object",
                 properties: {
@@ -158,10 +115,7 @@ export const toolSpecs = [
                     fullName: { type: "string" },
                     notes: { type: "string" },
                     durationMin: { type: "number", description: "Duración en minutos (opcional)" },
-                    conversationId: {
-                        type: "number",
-                        description: "ID de la conversación para enlazar la cita",
-                    },
+                    conversationId: { type: "number", description: "ID de la conversación para enlazar la cita" },
                 },
                 required: ["startISO", "phone", "fullName", "conversationId"],
             },
@@ -217,7 +171,19 @@ export const toolSpecs = [
 ------------------------------------------- */
 
 export const toolHandlers = (ctx: EsteticaCtx) => ({
-    /** Lista próximas citas por teléfono */
+    /** Catálogo desde la BD para que el modelo NO invente */
+    async listProcedures(args: any) {
+        const limit = Number(args?.limit ?? 6);
+        const rows = await prisma.esteticaProcedure.findMany({
+            where: { empresaId: ctx.empresaId, enabled: true },
+            select: { id: true, name: true, durationMin: true, priceMin: true, priceMax: true, requiresAssessment: true },
+            orderBy: { name: "asc" },
+            take: Math.min(Math.max(limit, 1), 20),
+        });
+        return { ok: true, items: rows };
+    },
+
+    /** Próximas citas por teléfono */
     async listUpcomingApptsForPhone(args: any) {
         const { phone, limit = 5 } = args;
         const phoneE164 = normalizeToE164(phone || "");
@@ -225,42 +191,30 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
         return { ok: true, items: items.slice(0, limit) };
     },
 
-    /**
-     * Encuentra slots usando la firma:
-     * findSlotsCore({ empresaId, ctx, hint, durationMin, count })
-     * - hint: desde mañana 00:01 (en TZ) o fromISO si es posterior; nunca hoy.
-     */
+    /** Encuentra slots → desde MAÑANA */
     async findSlots(args: any) {
-        const { serviceId, serviceName, fromISO, max = 8 } = args;
+        const { serviceId, serviceName, fromISO, max = 6 } = args;
 
-        // 1) Resolver servicio para obtener durationMin (si existe)
+        // 1) Resolver servicio para duración
         const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
         const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
-        // 2) Forzar que el hint sea >= mañana 00:01 en la TZ del negocio
-        const minHint = startOfTomorrowTZ(ctx.timezone);
-        const from = fromISO ? new Date(fromISO) : null;
-        const hint = from && from > minHint ? from : minHint;
+        // 2) Hint: si no viene, mañana desde ahora
+        const hintBase = fromISO ? new Date(fromISO) : new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-        // 3) Llamar a la función core (ella ya respeta blackout, caps, etc.)
+        // 3) Call core
         const dates = await findSlotsCore({
             empresaId: ctx.empresaId,
             ctx,
-            hint,
+            hint: hintBase,
             durationMin,
-            count: Math.max(6, Number(max) || 8), // varias horas y varios días
+            count: max,
         });
 
-        return {
-            ok: true,
-            slots: dates.map((d) => d.toISOString()),
-            durationMin,
-            serviceId: svc?.id ?? null,
-            serviceName: svc?.name ?? null,
-        };
+        return { ok: true, slots: dates.map(d => d.toISOString()), durationMin, service: svc?.name ?? null };
     },
 
-    /** Agenda adaptando a bookCore(args, ctx) */
+    /** Agendar */
     async book(args: any) {
         const {
             serviceId,
@@ -276,15 +230,14 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
         const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
         if (!svc) {
             const suggestions = await prisma.esteticaProcedure.findMany({
-                where: { empresaId: ctx.empresaId, enabled: true }, // <- cambia a enabled si aplica
+                where: { empresaId: ctx.empresaId, enabled: true },
                 select: { id: true, name: true, durationMin: true },
                 take: 6,
             });
             return { ok: false, reason: "SERVICE_NOT_FOUND", suggestions };
         }
 
-        const durationMin =
-            durationMinArg ?? svc.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+        const durationMin = durationMinArg ?? svc.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
         const appt = await bookCore(
             {
@@ -308,11 +261,12 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
                 id: appt.id,
                 startAt: appt.startAt.toISOString(),
                 status: appt.status,
+                serviceName: svc.name,
             },
         };
     },
 
-    /** Reagendar usando rescheduleCore({ empresaId, appointmentId, newStartAt }) */
+    /** Reagendar */
     async reschedule(args: any) {
         const updated = await rescheduleCore(
             { empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId), newStartAt: new Date(args.newStartISO) },
@@ -343,17 +297,10 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
 
     /** Cancelar varias citas */
     async cancelMany(args: any) {
-        const rows = await cancelManyCore({
-            empresaId: ctx.empresaId,
-            appointmentIds: (args.appointmentIds || []).map(Number),
-        });
+        const rows = await cancelManyCore({ empresaId: ctx.empresaId, appointmentIds: (args.appointmentIds || []).map(Number) });
         return {
             ok: true,
-            data: rows.map((r) => ({
-                id: r.id,
-                startAt: r.startAt.toISOString(),
-                serviceName: r.serviceName || null,
-            })),
+            data: rows.map(r => ({ id: r.id, startAt: r.startAt.toISOString(), serviceName: r.serviceName || null })),
         };
     },
 });
