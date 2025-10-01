@@ -11,7 +11,7 @@ import {
 } from "../estetica.schedule";
 
 /** 🔖 Versión de módulo para auditoría rápida en logs/respuestas */
-export const ESTETICA_MODULE_VERSION = "estetica-tools@2025-10-01-a";
+export const ESTETICA_MODULE_VERSION = "estetica-tools@2025-10-01-b";
 
 /* -------------------------------------------
    Helpers de fechas (TZ)
@@ -24,6 +24,16 @@ function ymdInTZ(d: Date, tz: string): string {
         day: "2-digit",
     });
     return f.format(d);
+}
+function weekdayInTZ(d: Date, tz: string): number {
+    const p = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        weekday: "short",
+    }).formatToParts(d);
+    const w = p.find((x) => x.type === "weekday")?.value?.toLowerCase() ?? "sun";
+    return ({ sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 } as any)[
+        String(w).slice(0, 3)
+    ] as number;
 }
 function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const [y, m, d] = ymd.split("-").map(Number);
@@ -43,14 +53,92 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const deltaMin = h * 60 + mi - (gotH * 60 + gotM);
     return new Date(guess.getTime() + deltaMin * 60000);
 }
-function startOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
-function endOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz); }
-function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000); }
-function startOfTomorrowTZ(tz: string): Date { return startOfDayTZ(addDays(new Date(), 1), tz); }
-function formatLabel(d: Date, tz: string): string {
-    return new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: tz }).format(d);
+function startOfDayTZ(d: Date, tz: string): Date {
+    return makeZonedDate(ymdInTZ(d, tz), "00:00", tz);
 }
-function normalizeToE164(n: string) { return String(n || "").replace(/[^\d]/g, ""); }
+function endOfDayTZ(d: Date, tz: string): Date {
+    return makeZonedDate(ymdInTZ(d, tz), "23:59", tz);
+}
+function addDays(d: Date, days: number) {
+    return new Date(d.getTime() + days * 86400000);
+}
+function startOfTomorrowTZ(tz: string): Date {
+    return startOfDayTZ(addDays(new Date(), 1), tz);
+}
+function formatLabel(d: Date, tz: string): string {
+    return new Intl.DateTimeFormat("es-CO", {
+        dateStyle: "full",
+        timeStyle: "short",
+        timeZone: tz,
+    }).format(d);
+}
+function normalizeToE164(n: string) {
+    return String(n || "").replace(/[^\d]/g, "");
+}
+
+/* -------------------------------------------
+   Resolver de lenguaje natural → hint Date (TZ)
+------------------------------------------- */
+const WD_ES: Record<string, number> = {
+    domingo: 0,
+    lunes: 1,
+    martes: 2,
+    miercoles: 3,
+    miércoles: 3,
+    jueves: 4,
+    viernes: 5,
+    sabado: 6,
+    sábado: 6,
+};
+
+function stripAccentsLower(s: string) {
+    return s.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+}
+
+/** Convierte frases tipo “mañana”, “el lunes”, “próxima semana” → Date (inicio del día en TZ). */
+function resolveHintFromPhrase(tz: string, phrase?: string | null): Date | null {
+    const p = stripAccentsLower(String(phrase ?? "").trim());
+    if (!p) return null;
+
+    const now = new Date();
+    const addDaysTZ = (base: Date, days: number) =>
+        new Date(base.getTime() + days * 86400000);
+    const sod = (d: Date) => startOfDayTZ(d, tz);
+    const ymdNow = ymdInTZ(now, tz);
+
+    // Básicos
+    if (/\b(hoy|el dia de hoy|en el dia)\b/.test(p)) return sod(now);
+    if (/\b(ma[nñ]ana)\b/.test(p)) return sod(addDaysTZ(now, 1));
+    if (/\b(pasado ma[nñ]ana)\b/.test(p)) return sod(addDaysTZ(now, 2));
+
+    // Próxima semana → lunes de la próxima semana
+    if (/\b(proxima semana|la proxima semana|siguiente semana)\b/.test(p)) {
+        const d = makeZonedDate(ymdNow, "00:00", tz);
+        const wd = weekdayInTZ(d, tz);
+        const toNextMon = ((1 - wd + 7) % 7) || 7;
+        return sod(addDaysTZ(d, toNextMon));
+    }
+
+    // Este fin de semana → sábado
+    if (/\b(fin de semana|este fin)\b/.test(p)) {
+        const d = makeZonedDate(ymdNow, "00:00", tz);
+        const wd = weekdayInTZ(d, tz);
+        const toSat = (6 - wd + 7) % 7;
+        return sod(addDaysTZ(d, toSat));
+    }
+
+    // Días por nombre (próximo <día>)
+    for (const [name, targetWd] of Object.entries(WD_ES)) {
+        if (new RegExp(`\\b(${name})\\b`).test(p)) {
+            const d = makeZonedDate(ymdNow, "00:00", tz);
+            const wd = weekdayInTZ(d, tz);
+            const delta = ((targetWd - wd + 7) % 7) || 7;
+            return sod(addDaysTZ(d, delta));
+        }
+    }
+
+    return null; // no resolvible
+}
 
 /* -------------------------------------------
    Resolución robusta de servicio
@@ -70,7 +158,11 @@ async function resolveService(
         const name = q.name.trim();
 
         const row1 = await prisma.esteticaProcedure.findFirst({
-            where: { empresaId, enabled: true, name: { contains: name, mode: "insensitive" } as any },
+            where: {
+                empresaId,
+                enabled: true,
+                name: { contains: name, mode: "insensitive" } as any,
+            },
             select: { id: true, name: true, durationMin: true },
         });
         if (row1) return row1;
@@ -80,7 +172,8 @@ async function resolveService(
             select: { id: true, name: true, durationMin: true },
             take: 25,
         });
-        const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        const norm = (s: string) =>
+            s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
         const target = norm(name);
         const found = few.find((p) => norm(p.name).includes(target));
         return found ?? null;
@@ -96,10 +189,13 @@ export const toolSpecs = [
         type: "function",
         function: {
             name: "listServices",
-            description: "Obtiene el catálogo activo de procedimientos de la clínica.",
+            description:
+                "Obtiene el catálogo activo de procedimientos de la clínica.",
             parameters: {
                 type: "object",
-                properties: { limit: { type: "number", description: "Cantidad máxima (default 6)" } },
+                properties: {
+                    limit: { type: "number", description: "Cantidad máxima (default 6)" },
+                },
                 required: [],
             },
         },
@@ -108,7 +204,8 @@ export const toolSpecs = [
         type: "function",
         function: {
             name: "listUpcomingApptsForPhone",
-            description: "Lista próximas citas de un número de teléfono (para mostrar, reagendar o cancelar).",
+            description:
+                "Lista próximas citas de un número de teléfono (para mostrar, reagendar o cancelar).",
             parameters: {
                 type: "object",
                 properties: {
@@ -130,7 +227,12 @@ export const toolSpecs = [
                 properties: {
                     serviceId: { type: "number", description: "ID del servicio (si se conoce)" },
                     serviceName: { type: "string", description: "Nombre aproximado del servicio" },
-                    fromISO: { type: "string", description: "Inicio sugerido del rango (ISO). Si no viene, se usa mañana 00:00 (TZ negocio)." },
+                    fromISO: { type: "string", description: "Inicio sugerido del rango (ISO). Si viene, tiene prioridad." },
+                    fromText: {
+                        type: "string",
+                        description:
+                            "Referencia natural en español: 'mañana', 'el lunes', 'próxima semana', 'fin de semana'…",
+                    },
                     max: { type: "number", description: "Máximo de opciones a mostrar (default 6)" },
                 },
                 required: [],
@@ -141,7 +243,8 @@ export const toolSpecs = [
         type: "function",
         function: {
             name: "book",
-            description: "Crea una cita (solo si el servicio existe en BD). Valida conflictos y reglas.",
+            description:
+                "Crea una cita (solo si el servicio existe en BD). Valida conflictos y reglas.",
             parameters: {
                 type: "object",
                 properties: {
@@ -151,7 +254,10 @@ export const toolSpecs = [
                     phone: { type: "string" },
                     fullName: { type: "string" },
                     notes: { type: "string" },
-                    durationMin: { type: "number", description: "Duración en minutos (opcional)" },
+                    durationMin: {
+                        type: "number",
+                        description: "Duración en minutos (opcional)",
+                    },
                 },
                 required: ["startISO", "phone", "fullName"],
             },
@@ -164,7 +270,10 @@ export const toolSpecs = [
             description: "Mueve una cita existente a un nuevo horario.",
             parameters: {
                 type: "object",
-                properties: { appointmentId: { type: "number" }, newStartISO: { type: "string" } },
+                properties: {
+                    appointmentId: { type: "number" },
+                    newStartISO: { type: "string" },
+                },
                 required: ["appointmentId", "newStartISO"],
             },
         },
@@ -174,7 +283,11 @@ export const toolSpecs = [
         function: {
             name: "cancel",
             description: "Cancela una cita específica.",
-            parameters: { type: "object", properties: { appointmentId: { type: "number" } }, required: ["appointmentId"] },
+            parameters: {
+                type: "object",
+                properties: { appointmentId: { type: "number" } },
+                required: ["appointmentId"],
+            },
         },
     },
     {
@@ -184,7 +297,9 @@ export const toolSpecs = [
             description: "Cancela varias citas por ID.",
             parameters: {
                 type: "object",
-                properties: { appointmentIds: { type: "array", items: { type: "number" } } },
+                properties: {
+                    appointmentIds: { type: "array", items: { type: "number" } },
+                },
                 required: ["appointmentIds"],
             },
         },
@@ -194,13 +309,27 @@ export const toolSpecs = [
 /* -------------------------------------------
    Handlers (conectan tools ↔ backend)
 ------------------------------------------- */
-export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: number }) => ({
+export const toolHandlers = (
+    ctx: EsteticaCtx,
+    session?: { conversationId?: number }
+) => ({
     async listServices(args: any) {
-        console.debug("[AI.tools] listServices", { v: ESTETICA_MODULE_VERSION, empresaId: ctx.empresaId, args });
+        console.debug("[AI.tools] listServices", {
+            v: ESTETICA_MODULE_VERSION,
+            empresaId: ctx.empresaId,
+            args,
+        });
         const limit = Math.max(1, Number(args?.limit ?? 6));
         const items = await prisma.esteticaProcedure.findMany({
             where: { empresaId: ctx.empresaId, enabled: true },
-            select: { id: true, name: true, durationMin: true, priceMin: true, priceMax: true, requiresAssessment: true },
+            select: {
+                id: true,
+                name: true,
+                durationMin: true,
+                priceMin: true,
+                priceMax: true,
+                requiresAssessment: true,
+            },
             take: limit,
             orderBy: { name: "asc" },
         });
@@ -208,34 +337,68 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
     },
 
     async listUpcomingApptsForPhone(args: any) {
-        console.debug("[AI.tools] listUpcomingApptsForPhone", { v: ESTETICA_MODULE_VERSION, args });
+        console.debug("[AI.tools] listUpcomingApptsForPhone", {
+            v: ESTETICA_MODULE_VERSION,
+            args,
+        });
         const { phone, limit = 5 } = args ?? {};
         const phoneE164 = normalizeToE164(phone || "");
-        if (!phoneE164) return { ok: false, reason: "INVALID_PHONE", meta: { ver: ESTETICA_MODULE_VERSION } };
+        if (!phoneE164)
+            return {
+                ok: false,
+                reason: "INVALID_PHONE",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
 
         const items = await listUpcomingCore(ctx.empresaId, phoneE164);
         const sliced = items.slice(0, Math.max(1, Number(limit)));
         const mapped = sliced.map((r) => ({
             ...r,
-            startISO: r.startAt.toISOString?.() ?? new Date(r.startAt as any).toISOString(),
+            startISO:
+                r.startAt.toISOString?.() ??
+                new Date(r.startAt as any).toISOString(),
             startLabel: formatLabel(new Date(r.startAt as any), ctx.timezone),
         }));
         return { ok: true, items: mapped, meta: { ver: ESTETICA_MODULE_VERSION } };
     },
 
     async findSlots(args: any) {
-        console.debug("[AI.tools] findSlots (in)", { v: ESTETICA_MODULE_VERSION, args, tz: ctx.timezone, rules: ctx.rules });
-        const { serviceId, serviceName, fromISO, max = 6 } = args ?? {};
+        console.debug("[AI.tools] findSlots (in)", {
+            v: ESTETICA_MODULE_VERSION,
+            args,
+            tz: ctx.timezone,
+            rules: ctx.rules,
+        });
 
-        const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
-        const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+        const { serviceId, serviceName, fromISO, fromText, max = 6 } = args ?? {};
 
-        let hint = fromISO ? new Date(fromISO) : startOfTomorrowTZ(ctx.timezone);
+        const svc = await resolveService(ctx.empresaId, {
+            serviceId,
+            name: serviceName,
+        });
+        const durationMin =
+            svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+
+        // Resolver referencia temporal:
+        // 1) fromISO explícito
+        // 2) fromText (mañana, lunes, próxima semana…)
+        // 3) fallback: mañana 00:00
+        let hint: Date | null = null;
+        if (fromISO) {
+            hint = new Date(fromISO);
+        } else {
+            hint = resolveHintFromPhrase(ctx.timezone, fromText);
+            if (!hint) hint = startOfTomorrowTZ(ctx.timezone);
+        }
+
+        // Si no permitimos same-day y el hint cayó "hoy", empujar a mañana
         const sameDayNotAllowed = !(ctx.rules?.allowSameDay ?? false);
         const now = new Date();
         const todayYmd = ymdInTZ(now, ctx.timezone);
         const hintYmd = ymdInTZ(hint, ctx.timezone);
-        if (sameDayNotAllowed && hintYmd === todayYmd) hint = startOfTomorrowTZ(ctx.timezone);
+        if (sameDayNotAllowed && hintYmd === todayYmd) {
+            hint = startOfTomorrowTZ(ctx.timezone);
+        }
 
         const dates = await findSlotsCore({
             empresaId: ctx.empresaId,
@@ -254,7 +417,8 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
             v: ESTETICA_MODULE_VERSION,
             service: svc?.name ?? serviceName ?? null,
             durationMin,
-            hint,
+            hintISO: hint?.toISOString?.() ?? null,
+            refText: fromText ?? null,
             count: dates.length,
         });
 
@@ -269,26 +433,60 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
     },
 
     async book(args: any) {
-        console.debug("[AI.tools] book (in)", { v: ESTETICA_MODULE_VERSION, args });
-        const { serviceId, serviceName, startISO, phone, fullName, notes, durationMin: durationMinArg } = args ?? {};
+        console.debug("[AI.tools] book (in)", {
+            v: ESTETICA_MODULE_VERSION,
+            args,
+        });
+        const {
+            serviceId,
+            serviceName,
+            startISO,
+            phone,
+            fullName,
+            notes,
+            durationMin: durationMinArg,
+        } = args ?? {};
 
         const phoneE164 = normalizeToE164(phone || "");
-        if (!phoneE164) return { ok: false, reason: "INVALID_PHONE", meta: { ver: ESTETICA_MODULE_VERSION } };
-        if (!startISO) return { ok: false, reason: "INVALID_START", meta: { ver: ESTETICA_MODULE_VERSION } };
+        if (!phoneE164)
+            return {
+                ok: false,
+                reason: "INVALID_PHONE",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
+        if (!startISO)
+            return {
+                ok: false,
+                reason: "INVALID_START",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         if (!fullName || String(fullName).trim().length < 2)
-            return { ok: false, reason: "INVALID_NAME", meta: { ver: ESTETICA_MODULE_VERSION } };
+            return {
+                ok: false,
+                reason: "INVALID_NAME",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
 
-        const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
+        const svc = await resolveService(ctx.empresaId, {
+            serviceId,
+            name: serviceName,
+        });
         if (!svc) {
             const suggestions = await prisma.esteticaProcedure.findMany({
                 where: { empresaId: ctx.empresaId, enabled: true },
                 select: { id: true, name: true, durationMin: true },
                 take: 6,
             });
-            return { ok: false, reason: "SERVICE_NOT_FOUND", suggestions, meta: { ver: ESTETICA_MODULE_VERSION } };
+            return {
+                ok: false,
+                reason: "SERVICE_NOT_FOUND",
+                suggestions,
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         }
 
-        const durationMin = durationMinArg ?? svc.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+        const durationMin =
+            durationMinArg ?? svc.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
         const conversationId = Number(session?.conversationId ?? 0);
 
         try {
@@ -323,58 +521,126 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
             return payload;
         } catch (e: any) {
             console.debug("[AI.tools] book (err)", e?.message || e);
-            return { ok: false, reason: "BOOK_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
+            return {
+                ok: false,
+                reason: "BOOK_FAILED",
+                error: e?.message ?? "UNKNOWN",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         }
     },
 
     async reschedule(args: any) {
-        console.debug("[AI.tools] reschedule", { v: ESTETICA_MODULE_VERSION, args });
-        if (!args?.appointmentId || !args?.newStartISO) return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
+        console.debug("[AI.tools] reschedule", {
+            v: ESTETICA_MODULE_VERSION,
+            args,
+        });
+        if (!args?.appointmentId || !args?.newStartISO)
+            return {
+                ok: false,
+                reason: "INVALID_INPUT",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         try {
             const updated = await rescheduleCore(
-                { empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId), newStartAt: new Date(args.newStartISO) },
+                {
+                    empresaId: ctx.empresaId,
+                    appointmentId: Number(args.appointmentId),
+                    newStartAt: new Date(args.newStartISO),
+                },
                 ctx
             );
             return {
                 ok: true,
-                data: { id: updated.id, startAt: updated.startAt.toISOString(), startLabel: formatLabel(updated.startAt, ctx.timezone), status: updated.status },
+                data: {
+                    id: updated.id,
+                    startAt: updated.startAt.toISOString(),
+                    startLabel: formatLabel(updated.startAt, ctx.timezone),
+                    status: updated.status,
+                },
                 meta: { ver: ESTETICA_MODULE_VERSION },
             };
         } catch (e: any) {
-            return { ok: false, reason: "RESCHEDULE_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
+            return {
+                ok: false,
+                reason: "RESCHEDULE_FAILED",
+                error: e?.message ?? "UNKNOWN",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         }
     },
 
     async cancel(args: any) {
-        console.debug("[AI.tools] cancel", { v: ESTETICA_MODULE_VERSION, args });
-        if (!args?.appointmentId) return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
+        console.debug("[AI.tools] cancel", {
+            v: ESTETICA_MODULE_VERSION,
+            args,
+        });
+        if (!args?.appointmentId)
+            return {
+                ok: false,
+                reason: "INVALID_INPUT",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         try {
-            const deleted = await cancelCore({ empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId) });
+            const deleted = await cancelCore({
+                empresaId: ctx.empresaId,
+                appointmentId: Number(args.appointmentId),
+            });
             return {
                 ok: true,
-                data: { id: deleted.id, startAt: deleted.startAt.toISOString(), startLabel: formatLabel(deleted.startAt, ctx.timezone), status: deleted.status },
+                data: {
+                    id: deleted.id,
+                    startAt: deleted.startAt.toISOString(),
+                    startLabel: formatLabel(deleted.startAt, ctx.timezone),
+                    status: deleted.status,
+                },
                 meta: { ver: ESTETICA_MODULE_VERSION },
             };
         } catch (e: any) {
-            return { ok: false, reason: "CANCEL_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
+            return {
+                ok: false,
+                reason: "CANCEL_FAILED",
+                error: e?.message ?? "UNKNOWN",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         }
     },
 
     async cancelMany(args: any) {
-        console.debug("[AI.tools] cancelMany", { v: ESTETICA_MODULE_VERSION, args });
-        const ids: number[] = (args?.appointmentIds || []).map(Number).filter((n: number) => Number.isFinite(n));
-        if (!ids.length) return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
+        console.debug("[AI.tools] cancelMany", {
+            v: ESTETICA_MODULE_VERSION,
+            args,
+        });
+        const ids: number[] = (args?.appointmentIds || [])
+            .map(Number)
+            .filter((n: number) => Number.isFinite(n));
+        if (!ids.length)
+            return {
+                ok: false,
+                reason: "INVALID_INPUT",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         try {
-            const rows = await cancelManyCore({ empresaId: ctx.empresaId, appointmentIds: ids });
+            const rows = await cancelManyCore({
+                empresaId: ctx.empresaId,
+                appointmentIds: ids,
+            });
             const mapped = rows.map((r) => ({
                 id: r.id,
-                startAt: (r.startAt as any as Date).toISOString?.() ?? new Date(r.startAt as any).toISOString(),
+                startAt:
+                    (r.startAt as any as Date).toISOString?.() ??
+                    new Date(r.startAt as any).toISOString(),
                 startLabel: formatLabel(new Date(r.startAt as any), ctx.timezone),
                 serviceName: r.serviceName || null,
             }));
             return { ok: true, data: mapped, meta: { ver: ESTETICA_MODULE_VERSION } };
         } catch (e: any) {
-            return { ok: false, reason: "CANCEL_MANY_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
+            return {
+                ok: false,
+                reason: "CANCEL_MANY_FAILED",
+                error: e?.message ?? "UNKNOWN",
+                meta: { ver: ESTETICA_MODULE_VERSION },
+            };
         }
     },
 });
