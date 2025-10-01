@@ -18,11 +18,61 @@ function normalizeToE164(n: string) {
     return String(n || "").replace(/[^\d]/g, "");
 }
 
+/** YYYY-MM-DD en la TZ del negocio */
+function ymdInTZ(d: Date, tz: string): string {
+    const f = new Intl.DateTimeFormat("en-CA", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    });
+    return f.format(d);
+}
+
+/** Construye Date UTC para YYYY-MM-DD HH:mm en TZ dada */
+function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
+    const [y, m, d] = ymd.split("-").map(Number);
+    const [h, mi] = hhmm.split(":").map(Number);
+    const utcGuess = new Date(Date.UTC(y, m - 1, d, h, mi));
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        hour12: false,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+    }).formatToParts(utcGuess);
+    const gotH = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
+    const gotM = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
+    const deltaMin = h * 60 + mi - (gotH * 60 + gotM);
+    return new Date(utcGuess.getTime() + deltaMin * 60000);
+}
+
+/** Inicio de mañana (00:01) en TZ del negocio */
+function startOfTomorrowTZ(tz: string): Date {
+    const now = new Date();
+    // suma 1 día en TZ de negocio
+    const ymdTomorrow = ((): string => {
+        const parts = new Intl.DateTimeFormat("en-CA", {
+            timeZone: tz,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+        })
+            .formatToParts(new Date(now.getTime() + 24 * 3600 * 1000))
+            .reduce((acc: any, p) => ((acc[p.type] = p.value), acc), {});
+        return `${parts.year}-${parts.month}-${parts.day}`;
+    })();
+    // 00:01 para evitar borde de medianoche
+    return makeZonedDate(ymdTomorrow, "00:01", tz);
+}
+
 /**
  * Resuelve un servicio verificando que exista en la BD.
- * - Si llega serviceId, busca por id.
- * - Si llega name, hace contains (case-insensitive cuando el proveedor lo soporta).
  * Devuelve: { id, name, durationMin } o null.
+ *
+ * ⚠️ Si tu schema usa `enabled` en vez de `isActive`, cambia el where.
  */
 async function resolveService(
     empresaId: number,
@@ -30,19 +80,18 @@ async function resolveService(
 ): Promise<{ id: number; name: string; durationMin: number | null } | null> {
     if (q.serviceId) {
         const row = await prisma.esteticaProcedure.findFirst({
-            where: { id: q.serviceId, empresaId, enabled: true },
+            where: { id: q.serviceId, empresaId, enabled: true }, // <- cámbialo a enabled: true si tu schema lo usa
             select: { id: true, name: true, durationMin: true },
         });
         return row ?? null;
     }
     if (q.name) {
-        // NOTA: algunos proveedores (p.ej. SQLite) no soportan `mode: 'insensitive'` en el cliente de Prisma.
-        // Para evitar el error de tipado, no usamos `mode`; hacemos un contains estándar.
         const row = await prisma.esteticaProcedure.findFirst({
             where: {
                 empresaId,
-                enabled: true,
-                name: { contains: q.name }, // <- sin `mode` para compatibilidad total
+                enabled: true, // <- cámbialo a enabled: true si aplica
+                // sin `mode: 'insensitive'` para evitar error de tipado
+                name: { contains: q.name },
             },
             select: { id: true, name: true, durationMin: true },
         });
@@ -80,14 +129,14 @@ export const toolSpecs = [
         function: {
             name: "findSlots",
             description:
-                "Busca horarios disponibles. Si hay servicio, usa su duración; si no, usa la duración por defecto del negocio.",
+                "Busca horarios disponibles desde MAÑANA en adelante. Si hay servicio, usa su duración; si no, usa la duración por defecto del negocio.",
             parameters: {
                 type: "object",
                 properties: {
                     serviceId: { type: "number", description: "ID del servicio (si se conoce)" },
                     serviceName: { type: "string", description: "Nombre aproximado del servicio" },
                     fromISO: { type: "string", description: "Inicio sugerido del rango (ISO)" },
-                    max: { type: "number", description: "Máximo de opciones a mostrar (default 6)" },
+                    max: { type: "number", description: "Máximo de opciones a mostrar (default 8)" },
                 },
                 required: [],
             },
@@ -168,7 +217,7 @@ export const toolSpecs = [
 ------------------------------------------- */
 
 export const toolHandlers = (ctx: EsteticaCtx) => ({
-    /** Lista próximas citas por teléfono (adapta a tu firma real) */
+    /** Lista próximas citas por teléfono */
     async listUpcomingApptsForPhone(args: any) {
         const { phone, limit = 5 } = args;
         const phoneE164 = normalizeToE164(phone || "");
@@ -176,28 +225,39 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
         return { ok: true, items: items.slice(0, limit) };
     },
 
-    /** Encuentra slots usando la firma de findSlots({ empresaId, ctx, hint, durationMin, count }) */
+    /**
+     * Encuentra slots usando la firma:
+     * findSlotsCore({ empresaId, ctx, hint, durationMin, count })
+     * - hint: desde mañana 00:01 (en TZ) o fromISO si es posterior; nunca hoy.
+     */
     async findSlots(args: any) {
-        const { serviceId, serviceName, fromISO, max = 6 } = args;
+        const { serviceId, serviceName, fromISO, max = 8 } = args;
 
         // 1) Resolver servicio para obtener durationMin (si existe)
         const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
-        const durationMin =
-            svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+        const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
-        // 2) Calcular hint
-        const hint = fromISO ? new Date(fromISO) : null;
+        // 2) Forzar que el hint sea >= mañana 00:01 en la TZ del negocio
+        const minHint = startOfTomorrowTZ(ctx.timezone);
+        const from = fromISO ? new Date(fromISO) : null;
+        const hint = from && from > minHint ? from : minHint;
 
-        // 3) Llamar a la función core
+        // 3) Llamar a la función core (ella ya respeta blackout, caps, etc.)
         const dates = await findSlotsCore({
             empresaId: ctx.empresaId,
             ctx,
             hint,
             durationMin,
-            count: max,
+            count: Math.max(6, Number(max) || 8), // varias horas y varios días
         });
 
-        return { ok: true, slots: dates.map((d) => d.toISOString()), durationMin };
+        return {
+            ok: true,
+            slots: dates.map((d) => d.toISOString()),
+            durationMin,
+            serviceId: svc?.id ?? null,
+            serviceName: svc?.name ?? null,
+        };
     },
 
     /** Agenda adaptando a bookCore(args, ctx) */
@@ -214,10 +274,9 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
         } = args;
 
         const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
-        // Si no existe en catálogo → NO agendar. Sugerir alternativas.
         if (!svc) {
             const suggestions = await prisma.esteticaProcedure.findMany({
-                where: { empresaId: ctx.empresaId, enabled: true },
+                where: { empresaId: ctx.empresaId, enabled: true }, // <- cambia a enabled si aplica
                 select: { id: true, name: true, durationMin: true },
                 take: 6,
             });
@@ -284,10 +343,17 @@ export const toolHandlers = (ctx: EsteticaCtx) => ({
 
     /** Cancelar varias citas */
     async cancelMany(args: any) {
-        const rows = await cancelManyCore({ empresaId: ctx.empresaId, appointmentIds: (args.appointmentIds || []).map(Number) });
+        const rows = await cancelManyCore({
+            empresaId: ctx.empresaId,
+            appointmentIds: (args.appointmentIds || []).map(Number),
+        });
         return {
             ok: true,
-            data: rows.map((r) => ({ id: r.id, startAt: r.startAt.toISOString(), serviceName: r.serviceName || null })),
+            data: rows.map((r) => ({
+                id: r.id,
+                startAt: r.startAt.toISOString(),
+                serviceName: r.serviceName || null,
+            })),
         };
     },
 });
