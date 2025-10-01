@@ -172,6 +172,11 @@ function looksLikeFullNameStrict(text: string): boolean {
 }
 
 /* ========================= ENTRY ========================= */
+
+const USE_AGENT = (process.env.IA_AGENT_MODE || '').toLowerCase() === 'orchestrated'
+if (USE_AGENT) console.log('[AI-Agent] Modo orquestado ACTIVADO')
+
+
 export async function handleEsteticaReply(opts: {
     chatId: number
     empresaId: number
@@ -410,6 +415,8 @@ export async function handleEsteticaReply(opts: {
                 return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
 
+            // si el intent ya parseó múltiple
+            const numbers = (intent as any).numberList as number[] | undefined
             if ((intent as any).cancelAll) {
                 const deleted = await cancelMany({ empresaId, appointmentIds: appts.map(a => a.id) })
                 clearSession(chatId)
@@ -419,8 +426,6 @@ export async function handleEsteticaReply(opts: {
                 const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.respondido, to: phone, phoneNumberId })
                 return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
             }
-
-            const numbers = (intent as any).numberList as number[] | undefined
             if (numbers && numbers.length) {
                 const idxs = numbers.map(n => n - 1).filter(i => i >= 0 && i < appts.length)
                 if (idxs.length) {
@@ -448,10 +453,11 @@ export async function handleEsteticaReply(opts: {
             putSession(chatId, { kind: 'cancel', appts })
             const txt = `Tienes varias citas:\n${lines}\n\nIndícame el número de las que deseas cancelar (puedes decir "1 y 3" o "las dos").`
             const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: conversacion.estado, to: phone, phoneNumberId })
-            return { estado: conversacion.estado, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
         }
 
-        case EsteticaIntent.LIST: {
+        // Si tienes EsteticaIntent.LIST en tu enum, este bloque aplica; si no, puedes quitarlo.
+        case (EsteticaIntent as any).LIST: {
             const phone = (toPhone ?? conversacion.phone) || ''
             const appts = await listUpcomingApptsForPhone(empresaId, phone)
             if (!appts.length) {
@@ -467,6 +473,31 @@ export async function handleEsteticaReply(opts: {
 
         case EsteticaIntent.GENERAL_QA:
         default: {
+            // ====== Modo Asistente Orquestado (tipo ChatGPT) ======
+            if (USE_AGENT) {
+                try {
+                    // import dinámico — no rompe si aún no creaste /assistant/ai.agent.ts
+                    const mod = await import('../../ai/strategies/esteticaModules/assistant/ai.agent').catch(() => null as any)
+                    const runAssistantOrchestrated = mod?.runAssistantOrchestrated as (args: any) => Promise<{ texto: string }>
+                    if (typeof runAssistantOrchestrated === 'function') {
+                        const { texto } = await runAssistantOrchestrated({
+                            empresaId,
+                            conversationId: chatId,
+                            userText,
+                            ctx
+                        })
+                        const saved = await persistBotReply({
+                            conversationId: chatId, empresaId, texto,
+                            nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId
+                        })
+                        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] }
+                    }
+                } catch (e) {
+                    console.warn('[AI-Agent] fallback por error:', e)
+                }
+            }
+
+            // ====== Fallback al flujo actual ======
             const sys = buildSystemPrompt(ctx)
             const history = await getRecentHistory(chatId, last?.id, 10)
             const messages: any[] = [{ role: 'system', content: sys }, ...history, { role: 'user', content: userText || 'Hola' }]
