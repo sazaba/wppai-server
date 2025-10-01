@@ -198,7 +198,12 @@ export async function handleEsteticaReply(opts: {
         const turns = [...history, { role: "user" as const, content: userText }];
 
         try {
-            const texto = await runEsteticaAgent(ctx, turns, { phone: toPhone ?? conversacion.phone ?? undefined });
+            const texto =
+                (await runEsteticaAgent(ctx, turns, {
+                    phone: toPhone ?? conversacion.phone ?? undefined,
+                    conversationId: chatId, // <- importante para book()
+                })) || "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
+
             const saved = await persistBotReply({
                 conversationId: chatId,
                 empresaId,
@@ -216,7 +221,8 @@ export async function handleEsteticaReply(opts: {
             };
         } catch (e) {
             console.warn("[AI-Agent] error:", e);
-            const fallback = "Lo siento, tuve un error procesando tu consulta. ¿Quieres que lo intente de nuevo?";
+            const fallback =
+                "Lo siento, tuve un error procesando tu consulta. ¿Quieres que lo intente de nuevo?";
             const saved = await persistBotReply({
                 conversationId: chatId,
                 empresaId,
