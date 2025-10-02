@@ -114,7 +114,7 @@ async function executeToolWithRetry(
     };
 }
 
-/* ================ Renderizado determinista desde tools ================ */
+/* ============ Renderizado determinista desde tools ============ */
 function tryAutoReplyFromTools(
     calls: Array<{ id: string; name: string; args: any }>,
     toolMsgs: Array<{ role: "tool"; content: string; tool_call_id: string }>,
@@ -217,6 +217,36 @@ function tryAutoReplyFromTools(
     return null;
 }
 
+/* ========== Fallback: inferir tool por el texto del usuario ========== */
+function inferForcedToolCallFromUtterance(
+    utterance: string
+): null | { name: string; args: any } {
+    const t = (utterance || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, " ");
+
+    // disponibilidad / agenda
+    const askAvail =
+        /\b(citas?|disponibilidad|horarios?|agenda(r|rme)?|reservar|reserva|separar|apart(ar)?)\b/.test(
+            t
+        ) ||
+        /\b(hoy|manana|mañana|pasado manana|pasado mañana|proxima semana|pr[oó]xima semana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo|tarde|manana|mañana)\b/.test(
+            t
+        );
+
+    if (askAvail) {
+        return { name: "findSlots", args: { fromText: utterance, max: 6 } };
+    }
+
+    // “qué servicios ofrecen”
+    if (/\b(servicios|tratamientos?|catalogo|cat[aá]logo)\b/.test(t)) {
+        return { name: "listServices", args: { limit: 6 } };
+    }
+
+    return null;
+}
+
 /* ================ Orquestador principal ================ */
 export async function runEsteticaAgent(
     ctx: EsteticaCtx & { __conversationId?: number }, // permitimos inyectar convId
@@ -265,13 +295,13 @@ export async function runEsteticaAgent(
             toolMsgs.push(toolMsg);
         }
 
-        // <<< Respuesta determinista (evita que el LLM invente fechas)
+        // Respuesta determinista (evita que el LLM invente fechas)
         const autoReply = tryAutoReplyFromTools(calls, toolMsgs, ctx);
         if (autoReply) {
             return postProcessReply(autoReply, cleanTurns);
         }
 
-        // 3) Segunda vuelta con resultados de tools (fallback)
+        // 3) Segunda vuelta con resultados de tools (fallback estilístico)
         const follow = await openai.chat.completions.create({
             model: MODEL,
             temperature: TEMPERATURE,
@@ -289,6 +319,25 @@ export async function runEsteticaAgent(
             raw || "¿Quieres que te comparta horarios desde mañana o prefieres más información?",
             cleanTurns
         );
+    }
+
+    // 2.bis) FALLBACK POLÍTICO: si NO hay tool_calls, forzar tool por patrón del usuario
+    const lastUser =
+        [...cleanTurns].reverse().find((t) => t.role === "user")?.content || "";
+    const forced = inferForcedToolCallFromUtterance(lastUser);
+    if (forced) {
+        console.debug("[AI.agent] forcing tool:", forced.name, forced.args);
+        const call = { id: "forced-1", name: forced.name, args: forced.args };
+        const toolMsg = await executeToolWithRetry(
+            ctx,
+            call,
+            extras?.conversationId ?? ctx.__conversationId
+        );
+
+        const autoReply = tryAutoReplyFromTools([call], [toolMsg], ctx);
+        if (autoReply) {
+            return postProcessReply(autoReply, cleanTurns);
+        }
     }
 
     // 4) Sin tools → respuesta directa (igual pasamos post-proc)
