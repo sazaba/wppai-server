@@ -1,3 +1,4 @@
+// utils/ai/strategies/esteticaModules/assistant/ai.tools.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../estetica.rag";
 import {
@@ -10,7 +11,7 @@ import {
 } from "../estetica.schedule";
 
 /** 🔖 Versión de módulo para auditoría rápida en logs/respuestas */
-export const ESTETICA_MODULE_VERSION = "estetica-tools@2025-10-01-c";
+export const ESTETICA_MODULE_VERSION = "estetica-tools@2025-10-01-d";
 
 /* -------------------------------------------
    Helpers de fechas (TZ)
@@ -42,58 +43,35 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const deltaMin = h * 60 + mi - (gotH * 60 + gotM);
     return new Date(guess.getTime() + deltaMin * 60000);
 }
-function startOfDayTZ(d: Date, tz: string): Date {
-    return makeZonedDate(ymdInTZ(d, tz), "00:00", tz);
-}
-function endOfDayTZ(d: Date, tz: string): Date {
-    return makeZonedDate(ymdInTZ(d, tz), "23:59", tz);
-}
-function addDays(d: Date, days: number) {
-    return new Date(d.getTime() + days * 86400000);
-}
-function startOfTomorrowTZ(tz: string): Date {
-    return startOfDayTZ(addDays(new Date(), 1), tz);
-}
+function startOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
+function endOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz); }
+function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000); }
+function startOfTomorrowTZ(tz: string): Date { return startOfDayTZ(addDays(new Date(), 1), tz); }
 function formatLabel(d: Date, tz: string): string {
-    return new Intl.DateTimeFormat("es-CO", {
-        dateStyle: "full",
-        timeStyle: "short",
-        timeZone: tz,
-    }).format(d);
+    return new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: tz }).format(d);
 }
-function normalizeToE164(n: string) {
-    return String(n || "").replace(/[^\d]/g, "");
-}
+function normalizeToE164(n: string) { return String(n || "").replace(/[^\d]/g, ""); }
 
-/** Parsea string ISO robusto. Si viene sin Z ni offset, lo interpreta en TZ negocio. */
-function parseStartISORobusto(raw: string, tz: string): Date | null {
-    if (!raw || typeof raw !== "string") return null;
-    const s = raw.trim();
+/** Parser robusto para fromISO (acepta ISO completo o YYYY-MM-DD[ HH:mm]) */
+function parseStartISORobusto(s: string | undefined, tz: string): Date | null {
+    if (!s || typeof s !== "string") return null;
+    const raw = s.trim();
+    if (!raw) return null;
 
-    // ISO con Z u offset → confía en el parser
-    if (/[zZ]$/.test(s) || /[+\-]\d{2}:\d{2}$/.test(s)) {
-        const d = new Date(s);
-        return isNaN(+d) ? null : d;
-    }
+    // 1) Intentar como ISO nativo (con o sin offset/Z)
+    const direct = new Date(raw);
+    if (!isNaN(+direct)) return direct;
 
-    // “Naive” → interpretarlo en TZ negocio
-    // Acepta YYYY-MM-DDTHH:mm o YYYY-MM-DD HH:mm
-    const m = s.match(
-        /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::\d{2})?$/
-    );
+    // 2) Aceptar "YYYY-MM-DD" o "YYYY-MM-DD HH:mm" o "YYYY-MM-DDTHH:mm" (sin zona)
+    const m = raw.match(/^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}):(\d{2}))?$/);
     if (m) {
-        return makeZonedDate(m[1], m[2], tz);
+        const ymd = m[1];
+        const hh = m[2] ?? "00";
+        const mm = m[3] ?? "00";
+        return makeZonedDate(ymd, `${hh}:${mm}`, tz);
     }
 
-    // Solo fecha → 09:00 local por defecto
-    const m2 = s.match(/^(\d{4}-\d{2}-\d{2})$/);
-    if (m2) {
-        return makeZonedDate(m2[1], "09:00", tz);
-    }
-
-    // Último intento: Date parser
-    const d = new Date(s);
-    return isNaN(+d) ? null : d;
+    return null;
 }
 
 /* -------------------------------------------
@@ -114,11 +92,7 @@ async function resolveService(
         const name = q.name.trim();
 
         const row1 = await prisma.esteticaProcedure.findFirst({
-            where: {
-                empresaId,
-                enabled: true,
-                name: { contains: name, mode: "insensitive" } as any,
-            },
+            where: { empresaId, enabled: true, name: { contains: name, mode: "insensitive" } as any },
             select: { id: true, name: true, durationMin: true },
         });
         if (row1) return row1;
@@ -128,8 +102,7 @@ async function resolveService(
             select: { id: true, name: true, durationMin: true },
             take: 25,
         });
-        const norm = (s: string) =>
-            s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+        const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
         const target = norm(name);
         const found = few.find((p) => norm(p.name).includes(target));
         return found ?? null;
@@ -138,7 +111,7 @@ async function resolveService(
 }
 
 /* -------------------------------------------
-   Tool specs
+   Tool specs (lo que “ve” el modelo)
 ------------------------------------------- */
 export const toolSpecs = [
     {
@@ -272,21 +245,41 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
         return { ok: true, items: mapped, meta: { ver: ESTETICA_MODULE_VERSION } };
     },
 
+    /** ✅ Saneado: ignora fromISO inválido o en el pasado. Respeta reglas de same-day. */
     async findSlots(args: any) {
         console.debug("[AI.tools] findSlots (in)", { v: ESTETICA_MODULE_VERSION, args, tz: ctx.timezone, rules: ctx.rules });
-        const { serviceId, serviceName, fromISO, max = 6 } = args ?? {};
 
+        const { serviceId, serviceName, max = 6 } = args ?? {};
         const svc = await resolveService(ctx.empresaId, { serviceId, name: serviceName });
         const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
-        let hint = fromISO ? parseStartISORobusto(fromISO, ctx.timezone) ?? startOfTomorrowTZ(ctx.timezone)
-            : startOfTomorrowTZ(ctx.timezone);
+        // Punto de partida seguro por defecto
+        let hint: Date = startOfTomorrowTZ(ctx.timezone);
 
+        // fromISO opcional: sanitizar (no fabricar si está mal)
+        const fromISO: string | undefined = typeof args?.fromISO === "string" ? args.fromISO.trim() : undefined;
+        if (fromISO) {
+            const parsed = parseStartISORobusto(fromISO, ctx.timezone);
+            if (parsed && !isNaN(+parsed)) {
+                const now = new Date();
+                if (parsed.getTime() >= now.getTime()) {
+                    hint = parsed;
+                } else {
+                    console.debug("[AI.tools] findSlots: fromISO en el pasado → ignorado", { fromISO, parsed });
+                }
+            } else {
+                console.debug("[AI.tools] findSlots: fromISO inválido → ignorado", { fromISO });
+            }
+        }
+
+        // Política: NO mismo día si no está permitido
         const sameDayNotAllowed = !(ctx.rules?.allowSameDay ?? false);
         const now = new Date();
         const todayYmd = ymdInTZ(now, ctx.timezone);
         const hintYmd = ymdInTZ(hint, ctx.timezone);
-        if (sameDayNotAllowed && hintYmd === todayYmd) hint = startOfTomorrowTZ(ctx.timezone);
+        if (sameDayNotAllowed && hintYmd === todayYmd) {
+            hint = startOfTomorrowTZ(ctx.timezone);
+        }
 
         const dates = await findSlotsCore({
             empresaId: ctx.empresaId,
@@ -306,7 +299,6 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
             service: svc?.name ?? serviceName ?? null,
             durationMin,
             hintISO: hint.toISOString?.() ?? String(hint),
-            refText: args?.fromText ?? null,
             count: dates.length,
         });
 
@@ -322,7 +314,6 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
 
     async book(args: any) {
         console.debug("[AI.tools] book (in)", { v: ESTETICA_MODULE_VERSION, args });
-
         const { serviceId, serviceName, startISO, phone, fullName, notes, durationMin: durationMinArg } = args ?? {};
 
         const phoneE164 = normalizeToE164(phone || "");
@@ -341,9 +332,6 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
             return { ok: false, reason: "SERVICE_NOT_FOUND", suggestions, meta: { ver: ESTETICA_MODULE_VERSION } };
         }
 
-        const startAt = parseStartISORobusto(String(startISO), ctx.timezone);
-        if (!startAt) return { ok: false, reason: "INVALID_START_FORMAT", meta: { ver: ESTETICA_MODULE_VERSION } };
-
         const durationMin = durationMinArg ?? svc.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
         const conversationId = Number(session?.conversationId ?? 0);
 
@@ -355,7 +343,7 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
                     customerPhone: phoneE164,
                     customerName: String(fullName).trim(),
                     serviceName: svc.name,
-                    startAt,
+                    startAt: new Date(startISO),
                     durationMin,
                     timezone: ctx.timezone,
                     procedureId: svc.id,
@@ -378,129 +366,59 @@ export const toolHandlers = (ctx: EsteticaCtx, session?: { conversationId?: numb
             console.debug("[AI.tools] book (ok)", payload);
             return payload;
         } catch (e: any) {
-            const msg = e?.message || "UNKNOWN";
-            console.debug("[AI.tools] book (err)", msg);
-
-            // Idempotencia: si fue duplicado, devuelve la cita existente como éxito
-            if (msg === "DUPLICATE_APPOINTMENT") {
-                try {
-                    const existing = await prisma.appointment.findFirst({
-                        where: {
-                            empresaId: ctx.empresaId,
-                            customerPhone: phoneE164,
-                            startAt,
-                            deletedAt: null,
-                        },
-                    });
-                    if (existing) {
-                        const okPayload = {
-                            ok: true as const,
-                            data: {
-                                id: existing.id,
-                                startAt: existing.startAt.toISOString(),
-                                startLabel: formatLabel(existing.startAt, ctx.timezone),
-                                status: existing.status,
-                                serviceName: existing.serviceName ?? svc.name,
-                            },
-                            meta: { ver: ESTETICA_MODULE_VERSION, dedup: true },
-                        };
-                        console.debug("[AI.tools] book (dedup-ok)", okPayload);
-                        return okPayload;
-                    }
-                } catch { }
-            }
-
-            return {
-                ok: false,
-                reason: "BOOK_FAILED",
-                error: msg,
-                meta: { ver: ESTETICA_MODULE_VERSION },
-            };
+            console.debug("[AI.tools] book (err)", e?.message || e);
+            return { ok: false, reason: "BOOK_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
         }
     },
 
     async reschedule(args: any) {
         console.debug("[AI.tools] reschedule", { v: ESTETICA_MODULE_VERSION, args });
-        if (!args?.appointmentId || !args?.newStartISO)
-            return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
+        if (!args?.appointmentId || !args?.newStartISO) return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
         try {
-            const newStart = parseStartISORobusto(String(args.newStartISO), ctx.timezone);
-            if (!newStart)
-                return { ok: false, reason: "INVALID_START_FORMAT", meta: { ver: ESTETICA_MODULE_VERSION } };
-
             const updated = await rescheduleCore(
-                { empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId), newStartAt: newStart },
+                { empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId), newStartAt: new Date(args.newStartISO) },
                 ctx
             );
             return {
                 ok: true,
-                data: {
-                    id: updated.id,
-                    startAt: updated.startAt.toISOString(),
-                    startLabel: formatLabel(updated.startAt, ctx.timezone),
-                    status: updated.status,
-                },
+                data: { id: updated.id, startAt: updated.startAt.toISOString(), startLabel: formatLabel(updated.startAt, ctx.timezone), status: updated.status },
                 meta: { ver: ESTETICA_MODULE_VERSION },
             };
         } catch (e: any) {
-            return {
-                ok: false,
-                reason: "RESCHEDULE_FAILED",
-                error: e?.message ?? "UNKNOWN",
-                meta: { ver: ESTETICA_MODULE_VERSION },
-            };
+            return { ok: false, reason: "RESCHEDULE_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
         }
     },
 
     async cancel(args: any) {
         console.debug("[AI.tools] cancel", { v: ESTETICA_MODULE_VERSION, args });
-        if (!args?.appointmentId)
-            return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
+        if (!args?.appointmentId) return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
         try {
             const deleted = await cancelCore({ empresaId: ctx.empresaId, appointmentId: Number(args.appointmentId) });
             return {
                 ok: true,
-                data: {
-                    id: deleted.id,
-                    startAt: deleted.startAt.toISOString(),
-                    startLabel: formatLabel(deleted.startAt, ctx.timezone),
-                    status: deleted.status,
-                },
+                data: { id: deleted.id, startAt: deleted.startAt.toISOString(), startLabel: formatLabel(deleted.startAt, ctx.timezone), status: deleted.status },
                 meta: { ver: ESTETICA_MODULE_VERSION },
             };
         } catch (e: any) {
-            return {
-                ok: false,
-                reason: "CANCEL_FAILED",
-                error: e?.message ?? "UNKNOWN",
-                meta: { ver: ESTETICA_MODULE_VERSION },
-            };
+            return { ok: false, reason: "CANCEL_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
         }
     },
 
     async cancelMany(args: any) {
         console.debug("[AI.tools] cancelMany", { v: ESTETICA_MODULE_VERSION, args });
-        const ids: number[] = (args?.appointmentIds || [])
-            .map(Number)
-            .filter((n: number) => Number.isFinite(n));
+        const ids: number[] = (args?.appointmentIds || []).map(Number).filter((n: number) => Number.isFinite(n));
         if (!ids.length) return { ok: false, reason: "INVALID_INPUT", meta: { ver: ESTETICA_MODULE_VERSION } };
         try {
             const rows = await cancelManyCore({ empresaId: ctx.empresaId, appointmentIds: ids });
             const mapped = rows.map((r) => ({
                 id: r.id,
-                startAt:
-                    (r.startAt as any as Date).toISOString?.() ?? new Date(r.startAt as any).toISOString(),
+                startAt: (r.startAt as any as Date).toISOString?.() ?? new Date(r.startAt as any).toISOString(),
                 startLabel: formatLabel(new Date(r.startAt as any), ctx.timezone),
                 serviceName: r.serviceName || null,
             }));
             return { ok: true, data: mapped, meta: { ver: ESTETICA_MODULE_VERSION } };
         } catch (e: any) {
-            return {
-                ok: false,
-                reason: "CANCEL_MANY_FAILED",
-                error: e?.message ?? "UNKNOWN",
-                meta: { ver: ESTETICA_MODULE_VERSION },
-            };
+            return { ok: false, reason: "CANCEL_MANY_FAILED", error: e?.message ?? "UNKNOWN", meta: { ver: ESTETICA_MODULE_VERSION } };
         }
     },
 });
