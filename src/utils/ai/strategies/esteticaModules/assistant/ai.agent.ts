@@ -1,18 +1,15 @@
-// utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
 import { openai } from "../../../../../lib/openai";
 import type { EsteticaCtx } from "../estetica.rag";
 import { toolSpecs, toolHandlers } from "./ai.tools";
-import { systemPrompt, buildFewshots, formatSlotList } from "./ai.prompts";
+import { systemPrompt, buildFewshots } from "./ai.prompts";
 
 /* ================= Config ================= */
 const MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.35);
 
 /* ================ Tipos locales ================ */
-// Primer turno (no se usa role "tool")
 export type ChatTurn = { role: "user" | "assistant"; content: string };
 
-// Para segunda vuelta sí enviamos mensajes "tool"
 type ToolMsg = { role: "tool"; content: string; tool_call_id: string };
 
 type AssistantMsg = {
@@ -51,14 +48,13 @@ function rotateClosing(prev: string | undefined, idxSeed = 0): string {
     const base = prev?.trim() || "";
     if (!base) return "";
     const last = base[base.length - 1];
-    if (["?", "!", "…"].includes(last)) return ""; // ya cierra natural
+    if (["?", "!", "…"].includes(last)) return "";
     const pick = (idxSeed % ENDINGS.length + ENDINGS.length) % ENDINGS.length;
     return (base.endsWith(".") ? " " : ". ") + ENDINGS[pick];
 }
 
 function postProcessReply(reply: string, history: ChatTurn[]): string {
     const clean = dedupSentences(reply.trim());
-    // Evitar repetir exacto el último mensaje del asistente
     const lastAssistant = [...history]
         .reverse()
         .find((h) => h.role === "assistant")?.content?.trim();
@@ -78,7 +74,10 @@ function safeParseArgs(raw?: string) {
     }
 }
 
-/* ================ Ejecución de herramientas con retry ================ */
+/* ================ Política de reintentos ================ */
+/** Herramientas que NO deben reintentarse para evitar doble escritura. */
+const NO_RETRY_TOOLS = new Set(["book", "reschedule", "cancel", "cancelMany"]);
+
 async function executeToolOnce(
     ctx: EsteticaCtx,
     toolName: string,
@@ -97,16 +96,21 @@ async function executeToolOnce(
     }
 }
 
-async function executeToolWithRetry(
+async function executeToolWithPolicy(
     ctx: EsteticaCtx,
     call: { id: string; name: string; args: any },
     conversationId?: number
 ): Promise<ToolMsg> {
     let result = await executeToolOnce(ctx, call.name, call.args, conversationId);
-    if (!result || result.ok === false || (result as any).error) {
-        // retry 1 vez
+
+    // Solo reintenta si: (a) es de lectura y (b) claramente falló
+    if (
+        !NO_RETRY_TOOLS.has(call.name) &&
+        (!result || (result.ok === false) || (result as any).error)
+    ) {
         result = await executeToolOnce(ctx, call.name, call.args, conversationId);
     }
+
     return {
         role: "tool",
         content: JSON.stringify(result ?? null),
@@ -114,142 +118,9 @@ async function executeToolWithRetry(
     };
 }
 
-/* ============ Renderizado determinista desde tools ============ */
-function tryAutoReplyFromTools(
-    calls: Array<{ id: string; name: string; args: any }>,
-    toolMsgs: Array<{ role: "tool"; content: string; tool_call_id: string }>,
-    ctx: EsteticaCtx
-): string | null {
-    const byId = new Map(toolMsgs.map((m) => [m.tool_call_id, m]));
-    for (const c of calls) {
-        const m = byId.get(c.id);
-        if (!m) continue;
-        let payload: any = null;
-        try {
-            payload = JSON.parse(m.content || "null");
-        } catch { }
-        if (!payload) continue;
-
-        // findSlots → lista numerada con labels
-        if (c.name === "findSlots") {
-            if (payload.ok && Array.isArray(payload.labels) && payload.labels.length) {
-                const compact = payload.labels.map((x: any) => ({
-                    idx: x.idx,
-                    startLabel: x.startLabel,
-                }));
-                return formatSlotList(compact, "Aquí tienes horarios disponibles:");
-            }
-            if (payload.ok && (!payload.labels || !payload.labels.length)) {
-                return "No veo cupos en ese rango. ¿Busco otra fecha u horario?";
-            }
-            return "Tuve un problema técnico al consultar los horarios. ¿Intento con otra fecha u horario?";
-        }
-
-        // book → confirmación o manejo de errores comunes
-        if (c.name === "book") {
-            if (payload.ok && payload.data) {
-                const label = payload.data.startLabel || "";
-                const service = payload.data.serviceName || "tu servicio";
-                const code = payload.data.id
-                    ? `APT-${String(payload.data.id).padStart(4, "0")}`
-                    : "sin-código";
-                return `✅ Tu cita de **${service}** quedó confirmada para **${label}** (código ${code}). Te llegará un recordatorio.`;
-            }
-            if (payload?.reason === "SERVICE_NOT_FOUND") {
-                const sug = Array.isArray(payload.suggestions) ? payload.suggestions : [];
-                if (sug.length) {
-                    const list = sug
-                        .map(
-                            (s: any, i: number) => `${i + 1}. ${s.name} (${s.durationMin ?? 60} min)`
-                        )
-                        .join("\n");
-                    return `No identifiqué el servicio. Elige una opción:\n${list}\n\nResponde con el número.`;
-                }
-                return "No identifiqué el servicio. ¿Cómo se llama el procedimiento que quieres agendar?";
-            }
-            if (payload?.reason === "INVALID_NAME")
-                return "Necesito el nombre completo para reservar. ¿A nombre de quién agendamos?";
-            if (payload?.reason === "INVALID_PHONE")
-                return "Necesito el número de teléfono para confirmar la reserva. ¿Cuál es?";
-            if (payload?.reason === "INVALID_START")
-                return "La fecha/hora no es válida. ¿Compartes nuevamente el horario que prefieres?";
-            return "No pude completar la reserva por un error técnico. ¿Intento de nuevo?";
-        }
-
-        // listServices
-        if (c.name === "listServices") {
-            if (payload.ok && Array.isArray(payload.items) && payload.items.length) {
-                const lines = payload.items
-                    .map(
-                        (s: any, i: number) => `${i + 1}. ${s.name} (${s.durationMin ?? 60} min)`
-                    )
-                    .join("\n");
-                return `Estos son los servicios disponibles:\n${lines}\n\n¿Quieres agendar alguno?`;
-            }
-            return "No encontré servicios activos en el sistema ahora mismo.";
-        }
-
-        // listUpcomingApptsForPhone
-        if (c.name === "listUpcomingApptsForPhone") {
-            if (payload.ok && Array.isArray(payload.items) && payload.items.length) {
-                const lines = payload.items
-                    .map(
-                        (x: any, i: number) =>
-                            `${i + 1}. ${x.startLabel} — ${x.serviceName ?? "cita"}`
-                    )
-                    .join("\n");
-                return `Tienes estas próximas citas:\n${lines}\n\n¿Quieres reagendar o cancelar alguna?`;
-            }
-            return "No veo citas próximas asociadas a ese número.";
-        }
-
-        // reschedule / cancel / cancelMany
-        if (c.name === "reschedule" && payload.ok && payload.data) {
-            return `🔄 Cita reagendada para **${payload.data.startLabel}**.`;
-        }
-        if (c.name === "cancel" && payload.ok && payload.data) {
-            return `🗑️ Cita cancelada (${payload.data.startLabel}). ¿Quieres elegir otro horario?`;
-        }
-        if (c.name === "cancelMany" && payload.ok && Array.isArray(payload.data)) {
-            return `🗑️ Cancelé ${payload.data.length} cita(s). ¿Buscamos nuevos horarios?`;
-        }
-    }
-    return null;
-}
-
-/* ========== Fallback: inferir tool por el texto del usuario ========== */
-function inferForcedToolCallFromUtterance(
-    utterance: string
-): null | { name: string; args: any } {
-    const t = (utterance || "")
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, " ");
-
-    // disponibilidad / agenda
-    const askAvail =
-        /\b(citas?|disponibilidad|horarios?|agenda(r|rme)?|reservar|reserva|separar|apart(ar)?)\b/.test(
-            t
-        ) ||
-        /\b(hoy|manana|mañana|pasado manana|pasado mañana|proxima semana|pr[oó]xima semana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo|tarde|manana|mañana)\b/.test(
-            t
-        );
-
-    if (askAvail) {
-        return { name: "findSlots", args: { fromText: utterance, max: 6 } };
-    }
-
-    // “qué servicios ofrecen”
-    if (/\b(servicios|tratamientos?|catalogo|cat[aá]logo)\b/.test(t)) {
-        return { name: "listServices", args: { limit: 6 } };
-    }
-
-    return null;
-}
-
 /* ================ Orquestador principal ================ */
 export async function runEsteticaAgent(
-    ctx: EsteticaCtx & { __conversationId?: number }, // permitimos inyectar convId
+    ctx: EsteticaCtx & { __conversationId?: number },
     turns: ChatTurn[],
     extras?: { phone?: string; conversationId?: number }
 ): Promise<string> {
@@ -260,7 +131,7 @@ export async function runEsteticaAgent(
         (t): t is ChatTurn => !!t && (t.role === "user" || t.role === "assistant")
     );
 
-    // 1) Planificación + tool calls (inyectamos fewshots ANTES del historial real)
+    // 1) Planificación + tool calls
     const result = await openai.chat.completions.create({
         model: MODEL,
         temperature: TEMPERATURE,
@@ -271,23 +142,17 @@ export async function runEsteticaAgent(
 
     const msg = (result.choices?.[0]?.message || {}) as AssistantMsg;
 
-    // 2) Si hay tool calls → ejecutar y responder determinísticamente
+    // 2) Si hay tools → ejecutar con política de retry
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-        const lastUser =
-            [...cleanTurns].reverse().find((t) => t.role === "user")?.content || "";
-
-        // Asegurar fromText para findSlots si el modelo no lo pasó
-        const calls = msg.tool_calls.map((c) => {
-            const parsed = safeParseArgs(c.function.arguments);
-            if (c.function.name === "findSlots" && !parsed.fromISO && !parsed.fromText) {
-                parsed.fromText = lastUser;
-            }
-            return { id: c.id, name: c.function.name, args: parsed };
-        });
+        const calls = msg.tool_calls.map((c) => ({
+            id: c.id,
+            name: c.function.name,
+            args: safeParseArgs(c.function.arguments),
+        }));
 
         const toolMsgs: ToolMsg[] = [];
         for (const call of calls) {
-            const toolMsg = await executeToolWithRetry(
+            const toolMsg = await executeToolWithPolicy(
                 ctx,
                 call,
                 extras?.conversationId ?? ctx.__conversationId
@@ -295,13 +160,7 @@ export async function runEsteticaAgent(
             toolMsgs.push(toolMsg);
         }
 
-        // Respuesta determinista (evita que el LLM invente fechas)
-        const autoReply = tryAutoReplyFromTools(calls, toolMsgs, ctx);
-        if (autoReply) {
-            return postProcessReply(autoReply, cleanTurns);
-        }
-
-        // 3) Segunda vuelta con resultados de tools (fallback estilístico)
+        // 3) Segunda vuelta con resultados
         const follow = await openai.chat.completions.create({
             model: MODEL,
             temperature: TEMPERATURE,
@@ -321,29 +180,9 @@ export async function runEsteticaAgent(
         );
     }
 
-    // 2.bis) FALLBACK POLÍTICO: si NO hay tool_calls, forzar tool por patrón del usuario
-    const lastUser =
-        [...cleanTurns].reverse().find((t) => t.role === "user")?.content || "";
-    const forced = inferForcedToolCallFromUtterance(lastUser);
-    if (forced) {
-        console.debug("[AI.agent] forcing tool:", forced.name, forced.args);
-        const call = { id: "forced-1", name: forced.name, args: forced.args };
-        const toolMsg = await executeToolWithRetry(
-            ctx,
-            call,
-            extras?.conversationId ?? ctx.__conversationId
-        );
-
-        const autoReply = tryAutoReplyFromTools([call], [toolMsg], ctx);
-        if (autoReply) {
-            return postProcessReply(autoReply, cleanTurns);
-        }
-    }
-
-    // 4) Sin tools → respuesta directa (igual pasamos post-proc)
+    // 4) Sin tools
     const direct = (msg.content || "").trim();
     const finalText =
-        direct ||
-        "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
+        direct || "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
     return postProcessReply(finalText, cleanTurns);
 }
