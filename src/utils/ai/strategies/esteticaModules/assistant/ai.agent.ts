@@ -1,8 +1,11 @@
 // utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
 import { openai } from "../../../../../lib/openai";
-import type { EsteticaCtx } from "../domain/estetica.rag";
-import { toolSpecs, toolHandlers } from "../booking/booking.tools"; // ← antes era "./ai.tools"
+import type { EsteticaCtx } from "../domain/estetica.rag"; // si tu rag NO está en /domain/, cambia a "../estetica.rag"
+import { toolSpecs, toolHandlers } from "../booking/booking.tools";
 import { systemPrompt, buildFewshots } from "./ai.prompts";
+import { DBG } from "../../esteticaModules/logger"; // requiere utils/logger.ts con el helper DBG
+
+const log = DBG("AGENT");
 
 /* ================= Config ================= */
 const MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
@@ -73,7 +76,6 @@ function safeParseArgs(raw?: string) {
 }
 
 /* ================ Política de reintentos ================ */
-/** Herramientas que NO deben reintentarse para evitar doble escritura. */
 const NO_RETRY_TOOLS = new Set(["book", "reschedule", "cancel", "cancelMany"]);
 
 async function executeToolOnce(
@@ -101,11 +103,13 @@ async function executeToolWithPolicy(
 ): Promise<ToolMsg> {
     let result = await executeToolOnce(ctx, call.name, call.args, conversationId);
 
-    // Solo reintenta si: (a) es de lectura y (b) falló
-    if (!NO_RETRY_TOOLS.has(call.name) && (!result || result.ok === false || (result as any).error)) {
+    // Solo reintenta si es lectura y falló claramente
+    if (!NO_RETRY_TOOLS.has(call.name) && (!result || (result as any).ok === false || (result as any).error)) {
         result = await executeToolOnce(ctx, call.name, call.args, conversationId);
     }
 
+    const preview = JSON.stringify(result ?? null).slice(0, 300);
+    log.info("tool.result", call.name, preview);
     return {
         role: "tool",
         content: JSON.stringify(result ?? null),
@@ -121,21 +125,44 @@ export async function runEsteticaAgent(
 ): Promise<string> {
     const sys = systemPrompt(ctx);
     const fewshots = buildFewshots(ctx);
+    const kb = await ctx.buildKbContext?.() ?? "";
 
     const cleanTurns: ChatTurn[] = (turns || []).filter(
         (t): t is ChatTurn => !!t && (t.role === "user" || t.role === "assistant")
     );
 
+    const baseMessages = [
+        { role: "system", content: `${sys}\n\n### Conocimiento de la clínica\n${kb}` },
+        ...(fewshots as any),
+        ...cleanTurns,
+    ] as any;
+
+    log.info("prompt.meta", {
+        sysLen: sys.length,
+        kbLen: kb?.length ?? 0,
+        fewshots: fewshots.length,
+        turns: cleanTurns.length,
+    });
+    log.info(
+        "last.user",
+        cleanTurns.length > 0 ? cleanTurns[cleanTurns.length - 1]?.content?.slice(0, 220) : null
+    );
+
+
     // 1) Planificación + tool calls
     const result = await openai.chat.completions.create({
         model: MODEL,
         temperature: TEMPERATURE,
-        messages: [{ role: "system", content: sys }, ...(fewshots as any), ...cleanTurns] as any,
+        messages: baseMessages,
         tools: toolSpecs as any,
         tool_choice: "auto",
     } as any);
 
     const msg = (result.choices?.[0]?.message || {}) as AssistantMsg;
+    log.info(
+        "tool_calls?",
+        Array.isArray(msg.tool_calls) ? msg.tool_calls.map((c) => c.function?.name) : "none"
+    );
 
     // 2) Si hay tools → ejecutar con política
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
@@ -144,6 +171,7 @@ export async function runEsteticaAgent(
             name: c.function.name,
             args: safeParseArgs(c.function.arguments),
         }));
+        log.info("tool.args", calls.map((c) => ({ name: c.name, args: c.args })));
 
         const toolMsgs: ToolMsg[] = [];
         for (const call of calls) {
@@ -160,7 +188,7 @@ export async function runEsteticaAgent(
             model: MODEL,
             temperature: TEMPERATURE,
             messages: [
-                { role: "system", content: sys },
+                { role: "system", content: `${sys}\n\n### Conocimiento de la clínica\n${kb}` },
                 ...(fewshots as any),
                 ...cleanTurns,
                 msg as any,
@@ -169,6 +197,7 @@ export async function runEsteticaAgent(
         } as any);
 
         const raw = follow.choices?.[0]?.message?.content?.trim() || "";
+        log.info("final.reply.preview", raw.slice(0, 240));
         return postProcessReply(
             raw || "¿Quieres que te comparta horarios desde mañana o prefieres más información?",
             cleanTurns
@@ -177,6 +206,7 @@ export async function runEsteticaAgent(
 
     // 4) Sin tools
     const direct = (msg.content || "").trim();
+    log.info("no-tools.reply.preview", direct.slice(0, 240));
     const finalText =
         direct || "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
     return postProcessReply(finalText, cleanTurns);

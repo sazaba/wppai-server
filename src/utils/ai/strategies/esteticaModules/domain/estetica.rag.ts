@@ -3,14 +3,29 @@ import prisma from "../../../../../lib/prisma";
 import type { AppointmentVertical } from "@prisma/client";
 import { AppointmentStatus } from "@prisma/client";
 
+/* ======================= Logger mínimo (namespaced) ======================= */
+const ESTETICA_DEBUG = String(process.env.ESTETICA_DEBUG ?? "0") !== "0";
+type Lvl = "debug" | "info" | "warn" | "error";
+function log(level: Lvl, msg: string, meta?: any) {
+    if (!ESTETICA_DEBUG && level === "debug") return;
+    const tag = `[RAG:${level.toUpperCase()}]`;
+    if (meta !== undefined) {
+        // eslint-disable-next-line no-console
+        (console as any)[level] ? (console as any)[level](tag, msg, meta) : console.log(tag, msg, meta);
+    } else {
+        // eslint-disable-next-line no-console
+        (console as any)[level] ? (console as any)[level](tag, msg) : console.log(tag, msg);
+    }
+}
+
 /* ===================== UTILS de parseo seguro ===================== */
 function asStrArr(v: unknown): string[] | null {
     if (!v && v !== 0) return null;
-    if (Array.isArray(v)) return (v.filter(x => typeof x === "string") as string[]) || null;
+    if (Array.isArray(v)) return (v.filter((x) => typeof x === "string") as string[]) || null;
     if (typeof v === "string") {
         try {
             const j = JSON.parse(v);
-            return Array.isArray(j) ? j.filter(x => typeof x === "string") : null;
+            return Array.isArray(j) ? j.filter((x) => typeof x === "string") : null;
         } catch {
             return null;
         }
@@ -19,7 +34,7 @@ function asStrArr(v: unknown): string[] | null {
 }
 function asNum(v: unknown, dflt?: number | null): number | null {
     const n = Number(v);
-    return Number.isFinite(n) ? n : (dflt ?? null);
+    return Number.isFinite(n) ? n : dflt ?? null;
 }
 function asBool(v: unknown, dflt = false): boolean {
     if (typeof v === "boolean") return v;
@@ -69,10 +84,12 @@ export async function loadApptContext(
     empresaId: number,
     fromOrchestrator?: any
 ): Promise<EsteticaCtx> {
+    const t0 = Date.now();
+
     if (fromOrchestrator) {
         const o = fromOrchestrator ?? {};
         const rules = o.rules ?? {};
-        return {
+        const ctx: EsteticaCtx = {
             empresaId,
             vertical: (o.vertical as AppointmentVertical) ?? "custom",
             timezone: o.timezone ?? "America/Bogota",
@@ -82,8 +99,7 @@ export async function loadApptContext(
             rules: {
                 cancellationWindowHours: asNum(rules?.cancellationWindowHours),
                 noShowPolicy: rules?.noShowPolicy ?? null,
-                depositRequired:
-                    typeof rules?.depositRequired === "boolean" ? rules.depositRequired : null,
+                depositRequired: typeof rules?.depositRequired === "boolean" ? rules.depositRequired : null,
                 depositAmount: rules?.depositAmount ?? null,
                 maxDailyAppointments: asNum(rules?.maxDailyAppointments),
                 bookingWindowDays:
@@ -102,25 +118,43 @@ export async function loadApptContext(
             },
             buildKbContext: async () => {
                 const kb = o.kb ?? {};
-                return [
+                const out = [
                     kb.businessOverview && `Sobre la empresa:\n${kb.businessOverview}`,
                     Array.isArray(kb.faqs) && kb.faqs.length
                         ? `FAQs:\n${kb.faqs.map((f: any) => `- ${f.q}\n  ${f.a}`).join("\n")}`
                         : "",
-                    kb.serviceNotes &&
-                    `Notas de servicios:\n${JSON.stringify(kb.serviceNotes, null, 2)}`,
+                    kb.serviceNotes && `Notas de servicios:\n${JSON.stringify(kb.serviceNotes, null, 2)}`,
                     kb.disclaimers && `Avisos/Disclaimers:\n${kb.disclaimers}`,
                     kb.freeText && `Notas libres:\n${kb.freeText}`,
                 ]
                     .filter(Boolean)
                     .join("\n\n");
+                log("debug", "kb.orchestrator.len", { len: out.length });
+                return out;
             },
         };
+
+        log("info", "ctx.loaded.fromOrchestrator", {
+            empresaId,
+            timezone: ctx.timezone,
+            bufferMin: ctx.bufferMin,
+            rules: {
+                allowSameDay: ctx.rules?.allowSameDay,
+                minNoticeHours: ctx.rules?.minNoticeHours,
+                bookingWindowDays: ctx.rules?.bookingWindowDays,
+                maxDailyAppointments: ctx.rules?.maxDailyAppointments,
+                requireConfirmation: ctx.rules?.requireConfirmation,
+                defaultServiceDurationMin: ctx.rules?.defaultServiceDurationMin,
+                blackoutDatesCount: ctx.rules?.blackoutDates?.length ?? 0,
+            },
+            ms: Date.now() - t0,
+        });
+        return ctx;
     }
 
     const bca = await prisma.businessConfigAppt.findUnique({ where: { empresaId } });
 
-    return {
+    const ctx: EsteticaCtx = {
         empresaId,
         vertical: (bca?.appointmentVertical as AppointmentVertical) ?? "custom",
         timezone: bca?.appointmentTimezone ?? "America/Bogota",
@@ -136,8 +170,7 @@ export async function loadApptContext(
         rules: {
             cancellationWindowHours: asNum(bca?.cancellationWindowHours),
             noShowPolicy: bca?.noShowPolicy ?? null,
-            depositRequired:
-                typeof bca?.depositRequired === "boolean" ? bca.depositRequired : null,
+            depositRequired: typeof bca?.depositRequired === "boolean" ? bca.depositRequired : null,
             depositAmount: bca?.depositAmount ?? null,
             maxDailyAppointments: asNum(bca?.maxDailyAppointments),
             bookingWindowDays:
@@ -151,22 +184,40 @@ export async function loadApptContext(
             defaultServiceDurationMin: asNum(bca?.defaultServiceDurationMin, 60) ?? 60,
             paymentNotes: null,
         },
-        buildKbContext: async () =>
-            [
+        buildKbContext: async () => {
+            const out = [
                 bca?.kbBusinessOverview && `Sobre la empresa:\n${bca.kbBusinessOverview}`,
                 Array.isArray(bca?.kbFAQs) && (bca?.kbFAQs as any[])?.length
-                    ? `FAQs:\n${(bca!.kbFAQs as any[])
-                        .map((f: any) => `- ${f.q}\n  ${f.a}`)
-                        .join("\n")}`
+                    ? `FAQs:\n${(bca!.kbFAQs as any[]).map((f: any) => `- ${f.q}\n  ${f.a}`).join("\n")}`
                     : "",
-                bca?.kbServiceNotes &&
-                `Notas de servicios:\n${JSON.stringify(bca.kbServiceNotes, null, 2)}`,
+                bca?.kbServiceNotes && `Notas de servicios:\n${JSON.stringify(bca.kbServiceNotes, null, 2)}`,
                 bca?.kbDisclaimers && `Avisos/Disclaimers:\n${bca.kbDisclaimers}`,
                 bca?.kbFreeText && `Notas libres:\n${bca.kbFreeText}`,
             ]
                 .filter(Boolean)
-                .join("\n\n"),
+                .join("\n\n");
+            log("debug", "kb.db.len", { len: out.length });
+            return out;
+        },
     };
+
+    log("info", "ctx.loaded.fromDB", {
+        empresaId,
+        timezone: ctx.timezone,
+        bufferMin: ctx.bufferMin,
+        rules: {
+            allowSameDay: ctx.rules?.allowSameDay,
+            minNoticeHours: ctx.rules?.minNoticeHours,
+            bookingWindowDays: ctx.rules?.bookingWindowDays,
+            maxDailyAppointments: ctx.rules?.maxDailyAppointments,
+            requireConfirmation: ctx.rules?.requireConfirmation,
+            defaultServiceDurationMin: ctx.rules?.defaultServiceDurationMin,
+            blackoutDatesCount: ctx.rules?.blackoutDates?.length ?? 0,
+        },
+        ms: Date.now() - t0,
+    });
+
+    return ctx;
 }
 
 /* ==================== Catálogo y matching ==================== */
@@ -184,11 +235,8 @@ const nrm = (s: string) =>
  * Recupera procedimientos (topN) realizando una búsqueda insensible.
  * Si no hay resultados, devuelve los más recientes/alfabéticos.
  */
-export async function retrieveProcedures(
-    empresaId: number,
-    rawQuery?: string,
-    topN = 6
-) {
+export async function retrieveProcedures(empresaId: number, rawQuery?: string, topN = 6) {
+    const t0 = Date.now();
     const q0 = (rawQuery || "").trim();
     const quoted = q0.match(/["“”](.+?)["“”]/)?.[1];
     const q = (quoted || q0)
@@ -242,6 +290,14 @@ export async function retrieveProcedures(
         });
     }
 
+    log("info", "retrieveProcedures", {
+        empresaId,
+        qOriginal: rawQuery ?? "",
+        qProcessed: q,
+        returned: rows.length,
+        ms: Date.now() - t0,
+    });
+
     return rows;
 }
 
@@ -258,8 +314,12 @@ export async function matchProcedureFromText(
     depositRequired?: boolean;
     depositAmount?: unknown;
 } | null> {
+    const t0 = Date.now();
     const q = nrm(text);
-    if (!q) return null;
+    if (!q) {
+        log("warn", "matchProcedureFromText.emptyQuery");
+        return null;
+    }
 
     const rows = await prisma.esteticaProcedure.findMany({
         where: { empresaId, enabled: true },
@@ -280,9 +340,7 @@ export async function matchProcedureFromText(
     for (const r of rows) {
         const nameScore = q.includes(nrm(r.name)) ? 1 : 0;
         let aliasScore = 0;
-        const aliases = Array.isArray(r.aliases)
-            ? (r.aliases as unknown as string[])
-            : [];
+        const aliases = Array.isArray(r.aliases) ? (r.aliases as unknown as string[]) : [];
         for (const a of aliases) {
             if (typeof a === "string" && q.includes(nrm(a))) {
                 aliasScore = Math.max(aliasScore, 0.8);
@@ -294,6 +352,15 @@ export async function matchProcedureFromText(
             bestScore = score;
         }
     }
+
+    log("info", "matchProcedureFromText.result", {
+        q,
+        bestId: best?.id ?? null,
+        bestName: best?.name ?? null,
+        bestScore,
+        considered: rows.length,
+        ms: Date.now() - t0,
+    });
 
     return best && bestScore >= 0.6
         ? {
@@ -311,14 +378,25 @@ export async function confirmLatestPendingForPhone(
     empresaId: number,
     phoneE164: string
 ) {
+    const t0 = Date.now();
     const appt = await prisma.appointment.findFirst({
         where: { empresaId, customerPhone: phoneE164, status: AppointmentStatus.pending },
         orderBy: { startAt: "desc" },
         select: { id: true },
     });
-    if (!appt) return null;
-    return prisma.appointment.update({
+    if (!appt) {
+        log("debug", "confirmLatestPendingForPhone.none", { empresaId, phoneE164, ms: Date.now() - t0 });
+        return null;
+    }
+    const updated = await prisma.appointment.update({
         where: { id: appt.id },
         data: { status: AppointmentStatus.confirmed },
     });
+    log("info", "confirmLatestPendingForPhone.ok", {
+        empresaId,
+        phoneE164,
+        appointmentId: appt.id,
+        ms: Date.now() - t0,
+    });
+    return updated;
 }
