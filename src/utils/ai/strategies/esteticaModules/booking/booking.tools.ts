@@ -1,7 +1,6 @@
 // utils/ai/strategies/esteticaModules/booking/booking.tools.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../domain/estetica.rag";
-// utils/ai/strategies/esteticaModules/booking/booking.tools.ts
 import {
     findSlotsCore,
     bookCore,
@@ -9,8 +8,7 @@ import {
     cancelCore,
     cancelManyCore,
     listUpcomingApptsForPhone as listUpcomingCore,
-} from "./schedule.core";  // ✅ misma carpeta
-
+} from "./schedule.core";
 
 /* ================= Utilidades de fechas ================= */
 
@@ -43,7 +41,6 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
 }
 
 function startOfTomorrowTZ(tz: string) {
-    // 00:00 de mañana en la TZ del negocio
     const now = new Date();
     const ymd = ymdInTZ(now, tz);
     const base = makeZonedDate(ymd, "00:00", tz);
@@ -102,7 +99,7 @@ export async function resolveService(
         });
         if (row) return row;
 
-        // matching aproximado
+        // matching aproximado simple
         const few = await prisma.esteticaProcedure.findMany({
             where: { empresaId, enabled: true },
             select: { id: true, name: true, durationMin: true },
@@ -133,19 +130,13 @@ export async function apiFindSlots(
         serviceId: args.serviceId,
         name: args.serviceName,
     });
-    const durationMin =
-        svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+    const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
     // punto de arranque
-    let hint = args.fromISO
-        ? new Date(args.fromISO)
-        : startOfTomorrowTZ(ctx.timezone);
+    let hint = args.fromISO ? new Date(args.fromISO) : startOfTomorrowTZ(ctx.timezone);
     const sameDayNotAllowed = !(ctx.rules?.allowSameDay ?? false);
     const todayYmd = ymdInTZ(new Date(), ctx.timezone);
-    if (
-        sameDayNotAllowed &&
-        ymdInTZ(hint, ctx.timezone) === todayYmd
-    ) {
+    if (sameDayNotAllowed && ymdInTZ(hint, ctx.timezone) === todayYmd) {
         hint = startOfTomorrowTZ(ctx.timezone);
     }
 
@@ -346,17 +337,15 @@ export async function apiListUpcomingByPhone(
 
     const items = (await listUpcomingCore(ctx.empresaId, phoneE164)) as ApptRowLite[];
 
-    const mapped = items
-        .slice(0, Math.max(1, Number(limit)))
-        .map((r) => {
-            const d = new Date(r.startAt as any);
-            return {
-                id: r.id,
-                startISO: d.toISOString(),
-                startLabel: fmtLabel(d, ctx.timezone),
-                serviceName: r.serviceName ?? null,
-            };
-        });
+    const mapped = items.slice(0, Math.max(1, Number(limit))).map((r) => {
+        const d = new Date(r.startAt as any);
+        return {
+            id: r.id,
+            startISO: d.toISOString(),
+            startLabel: fmtLabel(d, ctx.timezone),
+            serviceName: r.serviceName ?? null,
+        };
+    });
 
     return { ok: true, items: mapped };
 }
@@ -386,8 +375,7 @@ export const toolSpecs = [
         type: "function",
         function: {
             name: "book",
-            description:
-                "Crea una reserva. Requiere servicio, horario ISO, nombre completo y teléfono.",
+            description: "Crea una reserva. Requiere servicio, horario ISO, nombre completo y teléfono.",
             parameters: {
                 type: "object",
                 properties: {

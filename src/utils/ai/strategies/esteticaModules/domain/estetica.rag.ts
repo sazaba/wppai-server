@@ -10,10 +10,8 @@ function log(level: Lvl, msg: string, meta?: any) {
     if (!ESTETICA_DEBUG && level === "debug") return;
     const tag = `[RAG:${level.toUpperCase()}]`;
     if (meta !== undefined) {
-        // eslint-disable-next-line no-console
         (console as any)[level] ? (console as any)[level](tag, msg, meta) : console.log(tag, msg, meta);
     } else {
-        // eslint-disable-next-line no-console
         (console as any)[level] ? (console as any)[level](tag, msg) : console.log(tag, msg);
     }
 }
@@ -102,17 +100,13 @@ export async function loadApptContext(
                 depositRequired: typeof rules?.depositRequired === "boolean" ? rules.depositRequired : null,
                 depositAmount: rules?.depositAmount ?? null,
                 maxDailyAppointments: asNum(rules?.maxDailyAppointments),
-                bookingWindowDays:
-                    asNum(rules?.bookingWindowDays, asNum(o.appointmentMaxAdvanceDays, 30)) ?? 30,
+                bookingWindowDays: asNum(rules?.bookingWindowDays, asNum(o.appointmentMaxAdvanceDays, 30)) ?? 30,
                 blackoutDates: asStrArr(rules?.blackoutDates) ?? null,
                 overlapStrategy: (rules?.overlapStrategy as string) ?? "strict",
                 minNoticeHours: asNum(o.appointmentMinNoticeHours ?? rules?.minNoticeHours),
                 maxAdvanceDays: asNum(o.appointmentMaxAdvanceDays ?? rules?.maxAdvanceDays),
                 allowSameDay: asBool(o.allowSameDayBooking ?? rules?.allowSameDay, false),
-                requireConfirmation: asBool(
-                    o.requireClientConfirmation ?? rules?.requireClientConfirmation,
-                    true
-                ),
+                requireConfirmation: asBool(o.requireClientConfirmation ?? rules?.requireClientConfirmation, true),
                 defaultServiceDurationMin: asNum(o.defaultServiceDurationMin, 60) ?? 60,
                 paymentNotes: o.paymentNotes ?? null,
             },
@@ -173,8 +167,7 @@ export async function loadApptContext(
             depositRequired: typeof bca?.depositRequired === "boolean" ? bca.depositRequired : null,
             depositAmount: bca?.depositAmount ?? null,
             maxDailyAppointments: asNum(bca?.maxDailyAppointments),
-            bookingWindowDays:
-                asNum(bca?.bookingWindowDays, asNum(bca?.appointmentMaxAdvanceDays, 30)) ?? 30,
+            bookingWindowDays: asNum(bca?.bookingWindowDays, asNum(bca?.appointmentMaxAdvanceDays, 30)) ?? 30,
             blackoutDates: asStrArr(bca?.blackoutDates) ?? null,
             overlapStrategy: bca?.overlapStrategy ?? "strict",
             minNoticeHours: asNum(bca?.appointmentMinNoticeHours),

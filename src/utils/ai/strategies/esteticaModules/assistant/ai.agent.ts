@@ -1,9 +1,9 @@
 // utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
 import { openai } from "../../../../../lib/openai";
-import type { EsteticaCtx } from "../domain/estetica.rag"; // si tu rag NO está en /domain/, cambia a "../estetica.rag"
+import type { EsteticaCtx } from "../domain/estetica.rag";
 import { toolSpecs, toolHandlers } from "../booking/booking.tools";
 import { systemPrompt, buildFewshots } from "./ai.prompts";
-import { DBG } from "../../esteticaModules/logger"; // requiere utils/logger.ts con el helper DBG
+import { DBG } from "../../esteticaModules/logger";
 
 const log = DBG("AGENT");
 
@@ -56,9 +56,7 @@ function rotateClosing(prev: string | undefined, idxSeed = 0): string {
 
 function postProcessReply(reply: string, history: ChatTurn[]): string {
     const clean = dedupSentences(reply.trim());
-    const lastAssistant = [...history]
-        .reverse()
-        .find((h) => h.role === "assistant")?.content?.trim();
+    const lastAssistant = [...history].reverse().find((h) => h.role === "assistant")?.content?.trim();
     if (lastAssistant && clean.toLowerCase() === lastAssistant.toLowerCase()) {
         return clean + rotateClosing(clean, Math.floor(Math.random() * 3) + 1);
     }
@@ -102,12 +100,9 @@ async function executeToolWithPolicy(
     conversationId?: number
 ): Promise<ToolMsg> {
     let result = await executeToolOnce(ctx, call.name, call.args, conversationId);
-
-    // Solo reintenta si es lectura y falló claramente
     if (!NO_RETRY_TOOLS.has(call.name) && (!result || (result as any).ok === false || (result as any).error)) {
         result = await executeToolOnce(ctx, call.name, call.args, conversationId);
     }
-
     const preview = JSON.stringify(result ?? null).slice(0, 300);
     log.info("tool.result", call.name, preview);
     return {
@@ -125,7 +120,7 @@ export async function runEsteticaAgent(
 ): Promise<string> {
     const sys = systemPrompt(ctx);
     const fewshots = buildFewshots(ctx);
-    const kb = await ctx.buildKbContext?.() ?? "";
+    const kb = (await ctx.buildKbContext?.()) ?? "";
 
     const cleanTurns: ChatTurn[] = (turns || []).filter(
         (t): t is ChatTurn => !!t && (t.role === "user" || t.role === "assistant")
@@ -147,7 +142,6 @@ export async function runEsteticaAgent(
         "last.user",
         cleanTurns.length > 0 ? cleanTurns[cleanTurns.length - 1]?.content?.slice(0, 220) : null
     );
-
 
     // 1) Planificación + tool calls
     const result = await openai.chat.completions.create({
