@@ -1,3 +1,4 @@
+// utils/ai/strategies/esteticaModules/booking/booking.tools.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import {
@@ -58,16 +59,58 @@ function fmtLabel(d: Date, tz: string) {
     }).format(d);
 }
 
+/* ===== Helpers: limitar por día (2 mañana / 2 tarde) y máx. 6 total ===== */
+
+function isMorning(d: Date, tz: string): boolean {
+    const h = Number(
+        new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", hour12: false })
+            .format(d)
+    );
+    return h < 12;
+}
+
+function dayKey(d: Date, tz: string): string {
+    return ymdInTZ(d, tz); // yyyy-mm-dd en TZ
+}
+
+function pickPerDaySmart(dates: Date[], tz: string, maxTotal = 6): Date[] {
+    const groups = new Map<string, { morning: Date[]; afternoon: Date[] }>();
+
+    for (const d of dates) {
+        const key = dayKey(d, tz);
+        const g = groups.get(key) || { morning: [], afternoon: [] };
+        (isMorning(d, tz) ? g.morning : g.afternoon).push(d);
+        groups.set(key, g);
+    }
+
+    const out: Date[] = [];
+    for (const [_, g] of groups) {
+        // ordenados por hora
+        g.morning.sort((a, b) => a.getTime() - b.getTime());
+        g.afternoon.sort((a, b) => a.getTime() - b.getTime());
+
+        out.push(...g.morning.slice(0, 2));
+        if (out.length >= maxTotal) break;
+        out.push(...g.afternoon.slice(0, 2));
+        if (out.length >= maxTotal) break;
+    }
+
+    return out.slice(0, maxTotal);
+}
+
 /* ================= Tipos mínimos ================= */
 
 type Id = number;
+
 type ApptRowLite = {
     id: Id;
     startAt: Date | string;
     status?: string | null;
     serviceName?: string | null;
 };
+
 type SlotLabel = { idx: number; startISO: string; startLabel: string };
+
 type Ok<T> = { ok: true } & T;
 type Fail<R extends string = string> = { ok: false; reason: R; error?: string };
 
@@ -89,7 +132,7 @@ export async function resolveService(
             where: {
                 empresaId,
                 enabled: true,
-                name: { contains: q.name.trim() },
+                name: { contains: q.name.trim() } as any,
             },
             select: { id: true, name: true, durationMin: true },
         });
@@ -110,59 +153,7 @@ export async function resolveService(
     return null;
 }
 
-/* ============ helpers de render agrupado (2 mañana + 2 tarde) ============ */
-
-function isMorning(d: Date, tz: string) {
-    const hour = Number(
-        new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hour12: false, timeZone: tz })
-            .format(d)
-    );
-    return hour < 12;
-}
-
-function buildPrettyList(slots: Date[], tz: string): string {
-    if (!slots.length) return "No encontré cupos disponibles en las fechas consultadas.";
-
-    // agrupar por día
-    const byDay = new Map<string, Date[]>();
-    for (const d of slots) {
-        const key = new Intl.DateTimeFormat("es-CO", {
-            weekday: "long",
-            day: "2-digit",
-            month: "long",
-            year: "numeric",
-            timeZone: tz,
-        }).format(d);
-        byDay.set(key, [...(byDay.get(key) ?? []), d]);
-    }
-
-    const lines: string[] = [];
-    let globalIdx = 1;
-
-    for (const [dayLabel, arr] of byDay) {
-        const am = arr.filter((d) => isMorning(d, tz)).slice(0, 2);
-        const pm = arr.filter((d) => !isMorning(d, tz)).slice(0, 2);
-
-        const label = dayLabel[0].toUpperCase() + dayLabel.slice(1);
-        lines.push(`**${label}**`);
-        for (const d of [...am, ...pm]) {
-            lines.push(`${globalIdx}. ${new Intl.DateTimeFormat("es-CO", {
-                hour: "2-digit",
-                minute: "2-digit",
-                timeZone: tz,
-            }).format(d)}`);
-            globalIdx++;
-        }
-    }
-
-    return (
-        `Aquí tienes opciones agrupadas por día (máx. 2 en la mañana y 2 en la tarde):\n` +
-        lines.join("\n") +
-        `\n\nResponde con el número de la opción o dime otra fecha.`
-    );
-}
-
-/* ================= API para el agente ================= */
+/* ================= API consumida por el agente ================= */
 
 export async function apiFindSlots(
     ctx: EsteticaCtx,
@@ -172,7 +163,6 @@ export async function apiFindSlots(
         durationMin: number;
         serviceName: string | null;
         slots: SlotLabel[];
-        prettyList?: string;
     }>
 > {
     const svc = await resolveService(ctx.empresaId, {
@@ -190,46 +180,32 @@ export async function apiFindSlots(
         hint = startOfTomorrowTZ(ctx.timezone);
     }
 
-    // 1ª búsqueda
-    let dates = await findSlotsCore({
+    const raw = await findSlotsCore({
         empresaId: ctx.empresaId,
         ctx,
         hint,
         durationMin,
-        count: Math.min(8, Math.max(1, Number(args.max ?? 8))),
+        count: Math.min(12, Math.max(1, Number(args.max ?? 8))), // pedimos más para luego recortar por reglas de presentación
     });
 
-    // Sanity: descartar pasado; si todo es pasado (p.ej. 2023), reintentar desde mañana
-    const nowTZ = new Date();
-    dates = dates.filter((d) => d.getTime() >= nowTZ.getTime());
-    if (!dates.length) {
-        const retryHint = startOfTomorrowTZ(ctx.timezone);
-        dates = await findSlotsCore({
-            empresaId: ctx.empresaId,
-            ctx,
-            hint: retryHint,
-            durationMin,
-            count: Math.min(8, Math.max(1, Number(args.max ?? 8))),
-        });
-        dates = dates.filter((d) => d.getTime() >= nowTZ.getTime());
-    }
+    // 1) filtrar pasado
+    const now = new Date();
+    const futureOnly = raw.filter((d) => d.getTime() > now.getTime());
 
-    // construir labels y lista bonita (2+2 por día)
-    const labels: SlotLabel[] = dates.map((d, i) => ({
+    // 2) limitar por día: 2 mañana / 2 tarde y máx. 6 en total
+    const smart = pickPerDaySmart(futureOnly, ctx.timezone, 6);
+
+    const labels: SlotLabel[] = smart.map((d, i) => ({
         idx: i + 1,
         startISO: d.toISOString(),
         startLabel: fmtLabel(d, ctx.timezone),
     }));
-
-    // limitar las que el modelo verá (hasta 8 crudas) pero dar prettyList agrupado
-    const prettyList = buildPrettyList(dates, ctx.timezone);
 
     return {
         ok: true,
         durationMin,
         serviceName: svc?.name ?? args.serviceName ?? null,
         slots: labels,
-        prettyList,
     };
 }
 
@@ -426,14 +402,14 @@ export const toolSpecs = [
         function: {
             name: "findSlots",
             description:
-                "Busca horarios disponibles (retorna hasta 8 opciones). Respeta políticas: same-day, buffers, blackout. La tool devuelve 'prettyList' agrupada por día (máx. 2 mañana + 2 tarde). **Pega esa lista directamente en la respuesta.**",
+                "Busca horarios disponibles (retorna hasta 6 opciones ya filtradas por día: 2 mañana, 2 tarde). Respeta políticas: same-day, buffers, blackout.",
             parameters: {
                 type: "object",
                 properties: {
                     serviceId: { type: "number", description: "ID interno del servicio" },
                     serviceName: { type: "string", description: "Nombre del servicio si no hay ID" },
                     fromISO: { type: "string", description: "ISO de fecha de inicio sugerida" },
-                    max: { type: "number", description: "Máximo de opciones (1-8)" },
+                    max: { type: "number", description: "Máximo total a devolver (1-6)" },
                 },
                 additionalProperties: false,
             },
@@ -500,11 +476,7 @@ export const toolSpecs = [
             parameters: {
                 type: "object",
                 properties: {
-                    ids: {
-                        type: "array",
-                        items: { type: "number" },
-                        description: "IDs de citas",
-                    },
+                    ids: { type: "array", items: { type: "number" }, description: "IDs de citas" },
                 },
                 required: ["ids"],
                 additionalProperties: false,

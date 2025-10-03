@@ -1,3 +1,4 @@
+// utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
 import { openai } from "../../../../../lib/openai";
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import { toolSpecs, toolHandlers } from "../booking/booking.tools";
@@ -12,7 +13,9 @@ const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.35);
 
 /* ================ Tipos locales ================ */
 export type ChatTurn = { role: "user" | "assistant"; content: string };
+
 type ToolMsg = { role: "tool"; content: string; tool_call_id: string };
+
 type AssistantMsg = {
     role: "assistant";
     content?: string | null;
@@ -23,12 +26,15 @@ type AssistantMsg = {
     }>;
 };
 
-/* ================ Post-proceso ================ */
+/* ================ Utilidades de estilo (post-proc) ================ */
 const SENTENCE_SPLIT = /(?<=\.)\s+|(?<=\?)\s+|(?<=\!)\s+/g;
 const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te va bien?"];
 
 function dedupSentences(text: string): string {
-    const parts = text.split(SENTENCE_SPLIT).map((s) => s.trim()).filter(Boolean);
+    const parts = text
+        .split(SENTENCE_SPLIT)
+        .map((s) => s.trim())
+        .filter(Boolean);
     const seen = new Set<string>();
     const out: string[] = [];
     for (const p of parts) {
@@ -40,6 +46,7 @@ function dedupSentences(text: string): string {
     }
     return out.join(" ");
 }
+
 function rotateClosing(prev: string | undefined, idxSeed = 0): string {
     const base = prev?.trim() || "";
     if (!base) return "";
@@ -48,18 +55,21 @@ function rotateClosing(prev: string | undefined, idxSeed = 0): string {
     const pick = (idxSeed % ENDINGS.length + ENDINGS.length) % ENDINGS.length;
     return (base.endsWith(".") ? " " : ". ") + ENDINGS[pick];
 }
+
 function postProcessReply(reply: string, history: ChatTurn[]): string {
     const clean = dedupSentences(reply.trim());
-    const lastAssistant = [...history]
-        .reverse()
-        .find((h) => h.role === "assistant")?.content?.trim();
-    if (lastAssistant && clean.toLowerCase() === lastAssistant.toLowerCase()) {
+    const lastAssistant = [...history].reverse().find((h) => h.role === "assistant")
+        ?.content?.trim();
+    if (
+        lastAssistant &&
+        clean.toLowerCase() === lastAssistant.toLowerCase()
+    ) {
         return clean + rotateClosing(clean, Math.floor(Math.random() * 3) + 1);
     }
     return clean + rotateClosing(clean, history.length);
 }
 
-/* ================ Utilidades ================ */
+/* ================ Serialización segura de args ================ */
 function safeParseArgs(raw?: string) {
     if (!raw) return {};
     try {
@@ -69,6 +79,7 @@ function safeParseArgs(raw?: string) {
     }
 }
 
+/* ================ Política de reintentos ================ */
 const NO_RETRY_TOOLS = new Set(["book", "reschedule", "cancel", "cancelMany"]);
 
 async function executeToolOnce(
@@ -95,12 +106,22 @@ async function executeToolWithPolicy(
     conversationId?: number
 ): Promise<ToolMsg> {
     let result = await executeToolOnce(ctx, call.name, call.args, conversationId);
-    if (!NO_RETRY_TOOLS.has(call.name) && (!result || (result as any).ok === false || (result as any).error)) {
+
+    // Solo reintenta si es lectura y falló claramente
+    if (
+        !NO_RETRY_TOOLS.has(call.name) &&
+        (!result || (result as any).ok === false || (result as any).error)
+    ) {
         result = await executeToolOnce(ctx, call.name, call.args, conversationId);
     }
+
     const preview = JSON.stringify(result ?? null).slice(0, 300);
     log.info("tool.result", call.name, preview);
-    return { role: "tool", content: JSON.stringify(result ?? null), tool_call_id: call.id };
+    return {
+        role: "tool",
+        content: JSON.stringify(result ?? null),
+        tool_call_id: call.id,
+    };
 }
 
 /* ================ Orquestador principal ================ */
@@ -129,7 +150,12 @@ export async function runEsteticaAgent(
         fewshots: fewshots.length,
         turns: cleanTurns.length,
     });
-    log.info("last.user", cleanTurns.length > 0 ? cleanTurns[cleanTurns.length - 1]?.content?.slice(0, 220) : null);
+    log.info(
+        "last.user",
+        cleanTurns.length > 0
+            ? cleanTurns[cleanTurns.length - 1]?.content?.slice(0, 220)
+            : null
+    );
 
     // 1) Planificación + tool calls
     const result = await openai.chat.completions.create({
@@ -141,9 +167,14 @@ export async function runEsteticaAgent(
     } as any);
 
     const msg = (result.choices?.[0]?.message || {}) as AssistantMsg;
-    log.info("tool_calls?", Array.isArray(msg.tool_calls) ? msg.tool_calls.map((c) => c.function?.name) : "none");
+    log.info(
+        "tool_calls?",
+        Array.isArray(msg.tool_calls)
+            ? msg.tool_calls.map((c) => c.function?.name)
+            : "none"
+    );
 
-    // 2) Si hay tools → ejecutar y hacer segunda vuelta (no enviamos "mensajes previos")
+    // 2) Si hay tools → ejecutar con política
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
         const calls = msg.tool_calls.map((c) => ({
             id: c.id,
@@ -162,6 +193,7 @@ export async function runEsteticaAgent(
             toolMsgs.push(toolMsg);
         }
 
+        // 3) Segunda vuelta con resultados
         const follow = await openai.chat.completions.create({
             model: MODEL,
             temperature: TEMPERATURE,
@@ -182,10 +214,11 @@ export async function runEsteticaAgent(
         );
     }
 
-    // 3) Sin tools
+    // 4) Sin tools
     const direct = (msg.content || "").trim();
     log.info("no-tools.reply.preview", direct.slice(0, 240));
     const finalText =
-        direct || "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
+        direct ||
+        "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
     return postProcessReply(finalText, cleanTurns);
 }
