@@ -1,4 +1,3 @@
-// utils/ai/strategies/esteticaModules/booking/booking.bot.ts
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import { getBookingSession, setBookingSession, clearBookingSession, type BookingState } from "./session.store";
 import { apiFindSlots, apiBook, resolveService } from "./booking.tools";
@@ -13,6 +12,27 @@ function norm(t: string) {
         .normalize("NFD")
         .replace(/[\u0300-\u036f]/g, "")
         .trim();
+}
+
+/** Sinónimos locales → nombre normalizado (evita depender de otra ruta) */
+const SERVICE_SYNONYMS: Record<string, string> = {
+    "botox": "toxina botulínica",
+    "boto x": "toxina botulínica",
+    "bótox": "toxina botulínica",
+    "toxina": "toxina botulínica",
+    "toxinabotulinica": "toxina botulínica",
+    "botulinica": "toxina botulínica",
+    "botulínica": "toxina botulínica",
+    // ejemplos extra
+    "relleno": "rellenos dérmicos",
+    "acido hialuronico": "rellenos dérmicos",
+    "ácido hialurónico": "rellenos dérmicos",
+    "peeling": "peeling químico",
+    "limpieza": "limpieza facial",
+};
+function normalizeServiceName(raw: string) {
+    const key = norm(raw);
+    return SERVICE_SYNONYMS[key] ?? raw;
 }
 
 function parseWhenHint(text: string, tz: string): string | null {
@@ -59,6 +79,36 @@ function listToMessage(slots: { idx: number; startLabel: string }[]) {
     return `Estas son las opciones disponibles:\n${l}\n\nResponde con el número (1-${slots.length}) o dime otra fecha/hora.`;
 }
 
+/** Fallback: si la primera búsqueda no trae cupos, intenta sin fromISO (servidor decide) */
+// Usa el tipo real que espera apiFindSlots (2º argumento)
+type FindSlotsPayload = Parameters<typeof apiFindSlots>[1];
+
+async function findWithFallback(
+    ctx: EsteticaCtx,
+    args: { serviceId: number; serviceName: string; fromISO?: string | null }
+) {
+    // 1) primer intento: solo incluye fromISO si es string
+    const firstArgs: FindSlotsPayload =
+        args.fromISO && typeof args.fromISO === "string"
+            ? { serviceId: args.serviceId, serviceName: args.serviceName, fromISO: args.fromISO }
+            : { serviceId: args.serviceId, serviceName: args.serviceName };
+
+    const first = await apiFindSlots(ctx, firstArgs);
+    if (first.ok && first.slots.length > 0) return first;
+
+    // 2) segundo intento: deja que el backend normalice la ventana
+    const second = await apiFindSlots(ctx, {
+        serviceId: args.serviceId,
+        serviceName: args.serviceName,
+    });
+
+    if (second.ok && second.slots.length > 0) return second;
+
+    // devuelve el más informativo
+    return first.ok ? first : second;
+}
+
+
 export async function handleBookingTurn(
     ctx: EsteticaCtx,
     conversationId: number,
@@ -77,7 +127,8 @@ export async function handleBookingTurn(
     // ====== Step machine ======
     if (state.step === "idle") {
         // intentar detectar servicio + fecha desde el primer mensaje
-        const guessSvc = await resolveService(ctx.empresaId, { name: userText });
+        const serviceHint = normalizeServiceName(userText);
+        const guessSvc = await resolveService(ctx.empresaId, { name: serviceHint });
         const whenYMD = parseWhenHint(userText, ctx.timezone);
 
         state = {
@@ -96,10 +147,10 @@ export async function handleBookingTurn(
             return { reply: "Perfecto. ¿Para qué fecha te gustaría? (puedes decir “mañana”, “pasado mañana” o “la próxima semana”)." };
         }
 
-        // ya tenemos ambos → buscar slots
-        const found = await apiFindSlots(ctx, { serviceId: state.serviceId!, serviceName: state.serviceName!, fromISO: state.fromISO! });
+        // ya tenemos ambos → buscar slots (con fallback)
+        const found = await findWithFallback(ctx, { serviceId: state.serviceId!, serviceName: state.serviceName!, fromISO: state.fromISO! });
         if (!found.ok || !found.slots.length) {
-            return { reply: "No veo cupos disponibles en esa franja. ¿Busco otras fechas u horarios?" };
+            return { reply: "Por ahora no veo cupos en esa franja. ¿Busco otras fechas u otro horario cercano?" };
         }
         state.slots = found.slots;
         setBookingSession(conversationId, state);
@@ -107,7 +158,8 @@ export async function handleBookingTurn(
     }
 
     if (state.step === "await_service") {
-        const svc = await resolveService(ctx.empresaId, { name: userText });
+        const serviceHint = normalizeServiceName(userText);
+        const svc = await resolveService(ctx.empresaId, { name: serviceHint });
         if (!svc) {
             return { reply: "No encontré ese servicio. Dime el nombre como aparece en el catálogo (p. ej., Limpieza facial)." };
         }
@@ -122,8 +174,13 @@ export async function handleBookingTurn(
     if (state.step === "await_when") {
         const whenYMD = parseWhenHint(userText, ctx.timezone) ?? null;
         state.fromISO = whenYMD ? `${whenYMD}T00:00:00` : undefined;
-        // buscar slots
-        const found = await apiFindSlots(ctx, { serviceId: state.serviceId!, serviceName: state.serviceName!, fromISO: state.fromISO ?? undefined });
+
+        const found = await findWithFallback(ctx, {
+            serviceId: state.serviceId!,
+            serviceName: state.serviceName!,
+            fromISO: state.fromISO ?? undefined
+        });
+
         if (!found.ok || !found.slots.length) {
             return { reply: "No veo cupos disponibles en esa franja. ¿Intentamos con otra fecha?" };
         }

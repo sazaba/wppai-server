@@ -1,4 +1,3 @@
-// utils/ai/strategies/esteticaModules/assistant/ai.prompts.ts
 import type { EsteticaCtx } from "../domain/estetica.rag";
 
 /**
@@ -44,7 +43,7 @@ export function systemPrompt(ctx: EsteticaCtx) {
         `- Claro, directo y cordial; **máx. 1 emoji** cuando sume (🙂/✅/✨).`,
         `- Inicia breve (3–5 líneas); amplía solo si piden detalle.`,
         `- Evita repeticiones; confirma pasos en frases cortas.`,
-        `- Varía cierres: “¿Te parece?”, “¿Confirmamos?”, “¿Te va bien?”.`,
+        `- Varía cierres: “¿Te parece?”, “¿Confirmamos?”, “¿Te ayudo con algo más?”.`, // <- actualizado
 
         `# Seguridad`,
         `- No prometas resultados clínicos ni entregues indicaciones médicas personalizadas.`,

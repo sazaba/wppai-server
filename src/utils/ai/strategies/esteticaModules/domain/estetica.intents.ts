@@ -1,4 +1,3 @@
-// server/src/utils/ai/strategies/esteticaModules/estetica.intents.ts
 import type { EsteticaCtx } from "./estetica.rag";
 import { matchProcedureFromText } from "./estetica.rag";
 
@@ -34,6 +33,25 @@ function norm(t: string) {
         .replace(/[\u0300-\u036f]/g, "")
         .replace(/[“”]/g, '"')
         .trim();
+}
+
+/** Exportado por si quieres reusar desde otros módulos */
+export const SERVICE_SYNONYMS: Record<string, string> = {
+    "botox": "toxina botulínica",
+    "bótox": "toxina botulínica",
+    "botulinica": "toxina botulínica",
+    "botulínica": "toxina botulínica",
+    "toxina": "toxina botulínica",
+    "toxinabotulinica": "toxina botulínica",
+    "relleno": "rellenos dérmicos",
+    "acido hialuronico": "rellenos dérmicos",
+    "ácido hialurónico": "rellenos dérmicos",
+    "peeling": "peeling químico",
+    "limpieza": "limpieza facial",
+};
+export function normalizeServiceName(raw: string) {
+    const key = norm(raw);
+    return SERVICE_SYNONYMS[key] ?? raw;
 }
 
 /* ===========================================================
@@ -141,13 +159,6 @@ function parseWhenHint(text: string, tz: string): Date | null {
     const wd = Object.keys(WEEKDAYS).find((w) => new RegExp(`\\b${w}\\b`).test(t));
     if (wd) {
         const dow = WEEKDAYS[wd];
-        let base = today;
-        if (/\b(este|esta)\b/.test(t)) {
-            // si el día ya pasó esta semana, saltar a la próxima ocurrencia
-            const candidate = nextWeekdayInTZ(today, tz, dow);
-            return candidate;
-        }
-        // por defecto y para “próximo”
         return nextWeekdayInTZ(addDays(today, 1), tz, dow);
     }
 
@@ -190,13 +201,13 @@ export async function detectIntent(text: string, ctx: EsteticaCtx): Promise<Inte
 
     // Confirmación explícita corta/coloquial
     if (
-        /\b(s[ii]|\bok\b|dale|listo|perfecto|de una|es correcto|confirmo|si, confirmo|ok, confirmo)\b/.test(t) &&
+        /\b(s[ií]|ok|dale|listo|perfecto|de una|es correcto|confirmo)\b/.test(t) &&
         /\b(confirmo|confirmar|es correcto|listo|dale|ok)\b/.test(t)
     ) {
         return { type: EsteticaIntent.CONFIRM, confirm: true };
     }
     // “confirmo” directo
-    if (/\b(confirmo|si confirmo|ok confirmo)\b/.test(t)) {
+    if (/\b(confirmo|si confirmo|sí confirmo|ok confirmo)\b/.test(t)) {
         return { type: EsteticaIntent.CONFIRM, confirm: true };
     }
 
@@ -234,9 +245,10 @@ export async function detectIntent(text: string, ctx: EsteticaCtx): Promise<Inte
         let durationMin: number | undefined;
 
         try {
-            const match = await matchProcedureFromText(ctx.empresaId, text);
+            const normalizedText = text.replace(/botox/ig, "Toxina botulínica");
+            const match = await matchProcedureFromText(ctx.empresaId, normalizedText);
             if (match) {
-                serviceName = match.name;
+                serviceName = normalizeServiceName(match.name);
                 procedureId = match.id;
                 durationMin = match.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
             } else {

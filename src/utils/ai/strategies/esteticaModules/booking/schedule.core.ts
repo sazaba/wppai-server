@@ -1,4 +1,3 @@
-// utils/ai/strategies/esteticaModules/booking/schedule.core.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import {

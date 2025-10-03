@@ -1,4 +1,3 @@
-// utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
 import { openai } from "../../../../../lib/openai";
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import { toolSpecs, toolHandlers } from "../booking/booking.tools";
@@ -29,7 +28,8 @@ type AssistantMsg = {
 /* ================ Utilidades de estilo (post-proc) ================ */
 
 const SENTENCE_SPLIT = /(?<=\.)\s+|(?<=\?)\s+|(?<=\!)\s+/g;
-const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te va bien?"];
+/** Removimos “¿Te va bien?” y agregamos cierre neutro */
+const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te ayudo con algo más?"];
 
 function dedupSentences(text: string): string {
     const parts = text.split(SENTENCE_SPLIT).map((s) => s.trim()).filter(Boolean);
