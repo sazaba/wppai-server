@@ -459,3 +459,50 @@ export async function listUpcomingApptsForPhone(
         select: { id: true, startAt: true, serviceName: true, timezone: true },
     });
 }
+// === NUEVO: buscador robusto con ventanas escalonadas ===
+export async function findNextSlotsRobust(params: {
+    empresaId: number;
+    ctx: EsteticaCtx;
+    hint?: Date | null;           // p.ej. "lunes" ya normalizado; opcional
+    durationMin?: number;         // default 60 si no llega
+    count?: number;               // cuántos slots devolver (máx 6 recomendado)
+}): Promise<Date[]> {
+    const { empresaId, ctx } = params;
+    const durationMin = params.durationMin ?? (ctx.rules?.defaultServiceDurationMin ?? 60);
+    const count = Math.max(1, Math.min(params.count ?? 6, 12));
+
+    // 1) Si hay hint (lunes), intenta primero esa semana (7 días)
+    const windows: Array<{ from: Date; days: number }> = [];
+    const now = new Date();
+    const base = params.hint ?? now;
+
+    // Semana del hint
+    windows.push({ from: base, days: 7 });
+
+    // Mes desde mañana
+    const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    windows.push({ from: tomorrow, days: 30 });
+
+    // Mes siguiente (ampliar si aún no hay cupos)
+    const in15 = new Date(now.getTime() + 15 * 24 * 60 * 60 * 1000);
+    windows.push({ from: in15, days: 30 });
+
+    const out: Date[] = [];
+    for (const w of windows) {
+        const partial = await findSlotsCore({
+            empresaId,
+            ctx,
+            hint: w.from,
+            durationMin,
+            count: count - out.length,
+        });
+        for (const d of partial) {
+            // dedupe por timestamp
+            if (!out.some((x) => +x === +d)) out.push(d);
+            if (out.length >= count) break;
+        }
+        if (out.length >= count) break;
+    }
+
+    return out.slice(0, count);
+}
