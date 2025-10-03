@@ -96,7 +96,7 @@ export async function resolveService(
             where: {
                 empresaId,
                 enabled: true,
-                name: { contains: q.name.trim(), mode: "insensitive" } as any,
+                name: { contains: q.name.trim() },
             },
             select: { id: true, name: true, durationMin: true },
         });
