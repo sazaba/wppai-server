@@ -1,4 +1,3 @@
-// utils/ai/strategies/esteticaModules/booking/booking.tools.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import {
@@ -59,19 +58,16 @@ function fmtLabel(d: Date, tz: string) {
     }).format(d);
 }
 
-/* ================= Tipos mínimos (para evitar “any”) ================= */
+/* ================= Tipos mínimos ================= */
 
 type Id = number;
-
 type ApptRowLite = {
     id: Id;
     startAt: Date | string;
     status?: string | null;
     serviceName?: string | null;
 };
-
 type SlotLabel = { idx: number; startISO: string; startLabel: string };
-
 type Ok<T> = { ok: true } & T;
 type Fail<R extends string = string> = { ok: false; reason: R; error?: string };
 
@@ -99,7 +95,7 @@ export async function resolveService(
         });
         if (row) return row;
 
-        // matching aproximado simple
+        // matching aproximado básico
         const few = await prisma.esteticaProcedure.findMany({
             where: { empresaId, enabled: true },
             select: { id: true, name: true, durationMin: true },
@@ -114,7 +110,59 @@ export async function resolveService(
     return null;
 }
 
-/* ================= API “limpia” consumida por el agente ================= */
+/* ============ helpers de render agrupado (2 mañana + 2 tarde) ============ */
+
+function isMorning(d: Date, tz: string) {
+    const hour = Number(
+        new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hour12: false, timeZone: tz })
+            .format(d)
+    );
+    return hour < 12;
+}
+
+function buildPrettyList(slots: Date[], tz: string): string {
+    if (!slots.length) return "No encontré cupos disponibles en las fechas consultadas.";
+
+    // agrupar por día
+    const byDay = new Map<string, Date[]>();
+    for (const d of slots) {
+        const key = new Intl.DateTimeFormat("es-CO", {
+            weekday: "long",
+            day: "2-digit",
+            month: "long",
+            year: "numeric",
+            timeZone: tz,
+        }).format(d);
+        byDay.set(key, [...(byDay.get(key) ?? []), d]);
+    }
+
+    const lines: string[] = [];
+    let globalIdx = 1;
+
+    for (const [dayLabel, arr] of byDay) {
+        const am = arr.filter((d) => isMorning(d, tz)).slice(0, 2);
+        const pm = arr.filter((d) => !isMorning(d, tz)).slice(0, 2);
+
+        const label = dayLabel[0].toUpperCase() + dayLabel.slice(1);
+        lines.push(`**${label}**`);
+        for (const d of [...am, ...pm]) {
+            lines.push(`${globalIdx}. ${new Intl.DateTimeFormat("es-CO", {
+                hour: "2-digit",
+                minute: "2-digit",
+                timeZone: tz,
+            }).format(d)}`);
+            globalIdx++;
+        }
+    }
+
+    return (
+        `Aquí tienes opciones agrupadas por día (máx. 2 en la mañana y 2 en la tarde):\n` +
+        lines.join("\n") +
+        `\n\nResponde con el número de la opción o dime otra fecha.`
+    );
+}
+
+/* ================= API para el agente ================= */
 
 export async function apiFindSlots(
     ctx: EsteticaCtx,
@@ -124,13 +172,15 @@ export async function apiFindSlots(
         durationMin: number;
         serviceName: string | null;
         slots: SlotLabel[];
+        prettyList?: string;
     }>
 > {
     const svc = await resolveService(ctx.empresaId, {
         serviceId: args.serviceId,
         name: args.serviceName,
     });
-    const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+    const durationMin =
+        svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
     // punto de arranque
     let hint = args.fromISO ? new Date(args.fromISO) : startOfTomorrowTZ(ctx.timezone);
@@ -140,25 +190,46 @@ export async function apiFindSlots(
         hint = startOfTomorrowTZ(ctx.timezone);
     }
 
-    const dates = await findSlotsCore({
+    // 1ª búsqueda
+    let dates = await findSlotsCore({
         empresaId: ctx.empresaId,
         ctx,
         hint,
         durationMin,
-        count: Math.min(6, Math.max(1, Number(args.max ?? 6))),
+        count: Math.min(8, Math.max(1, Number(args.max ?? 8))),
     });
 
+    // Sanity: descartar pasado; si todo es pasado (p.ej. 2023), reintentar desde mañana
+    const nowTZ = new Date();
+    dates = dates.filter((d) => d.getTime() >= nowTZ.getTime());
+    if (!dates.length) {
+        const retryHint = startOfTomorrowTZ(ctx.timezone);
+        dates = await findSlotsCore({
+            empresaId: ctx.empresaId,
+            ctx,
+            hint: retryHint,
+            durationMin,
+            count: Math.min(8, Math.max(1, Number(args.max ?? 8))),
+        });
+        dates = dates.filter((d) => d.getTime() >= nowTZ.getTime());
+    }
+
+    // construir labels y lista bonita (2+2 por día)
     const labels: SlotLabel[] = dates.map((d, i) => ({
         idx: i + 1,
         startISO: d.toISOString(),
         startLabel: fmtLabel(d, ctx.timezone),
     }));
 
+    // limitar las que el modelo verá (hasta 8 crudas) pero dar prettyList agrupado
+    const prettyList = buildPrettyList(dates, ctx.timezone);
+
     return {
         ok: true,
         durationMin,
         serviceName: svc?.name ?? args.serviceName ?? null,
         slots: labels,
+        prettyList,
     };
 }
 
@@ -240,9 +311,8 @@ export async function apiReschedule(
     ctx: EsteticaCtx,
     args: { appointmentId: number; newStartISO: string }
 ): Promise<
-    Ok<{
-        data: { id: Id; startISO: string; startLabel: string; status?: string | null };
-    }> | Fail<"RESCHEDULE_FAILED">
+    Ok<{ data: { id: Id; startISO: string; startLabel: string; status?: string | null } }>
+    | Fail<"RESCHEDULE_FAILED">
 > {
     try {
         const updated = await rescheduleCore(
@@ -272,9 +342,8 @@ export async function apiCancel(
     ctx: EsteticaCtx,
     args: { appointmentId: number }
 ): Promise<
-    Ok<{
-        data: { id: Id; startISO: string; startLabel: string; status?: string | null };
-    }> | Fail<"CANCEL_FAILED">
+    Ok<{ data: { id: Id; startISO: string; startLabel: string; status?: string | null } }>
+    | Fail<"CANCEL_FAILED">
 > {
     try {
         const deleted = await cancelCore({
@@ -300,9 +369,8 @@ export async function apiCancelMany(
     ctx: EsteticaCtx,
     ids: number[]
 ): Promise<
-    Ok<{
-        data: Array<{ id: Id; startISO: string; startLabel: string; serviceName: string | null }>;
-    }> | Fail<"CANCEL_MANY_FAILED">
+    Ok<{ data: Array<{ id: Id; startISO: string; startLabel: string; serviceName: string | null }> }>
+    | Fail<"CANCEL_MANY_FAILED">
 > {
     try {
         const rows = await cancelManyCore({
@@ -358,14 +426,14 @@ export const toolSpecs = [
         function: {
             name: "findSlots",
             description:
-                "Busca horarios disponibles (retorna hasta 6 opciones). Respeta políticas: same-day, buffers, blackout.",
+                "Busca horarios disponibles (retorna hasta 8 opciones). Respeta políticas: same-day, buffers, blackout. La tool devuelve 'prettyList' agrupada por día (máx. 2 mañana + 2 tarde). **Pega esa lista directamente en la respuesta.**",
             parameters: {
                 type: "object",
                 properties: {
                     serviceId: { type: "number", description: "ID interno del servicio" },
                     serviceName: { type: "string", description: "Nombre del servicio si no hay ID" },
                     fromISO: { type: "string", description: "ISO de fecha de inicio sugerida" },
-                    max: { type: "number", description: "Máximo de opciones a devolver (1-6)" },
+                    max: { type: "number", description: "Máximo de opciones (1-8)" },
                 },
                 additionalProperties: false,
             },
@@ -375,7 +443,8 @@ export const toolSpecs = [
         type: "function",
         function: {
             name: "book",
-            description: "Crea una reserva. Requiere servicio, horario ISO, nombre completo y teléfono.",
+            description:
+                "Crea una reserva. Requiere servicio, horario ISO, nombre completo y teléfono.",
             parameters: {
                 type: "object",
                 properties: {
