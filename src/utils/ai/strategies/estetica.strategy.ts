@@ -1,13 +1,12 @@
-// utils/ai/strategies/estetica.ts (handler principal)
-
+// utils/ai/strategies/estetica.strategy.ts
 import axios from "axios";
 import prisma from "../../../lib/prisma";
 import * as Wam from "../../../services/whatsapp.service";
 import { transcribeAudioBuffer } from "../../../services/transcription.service";
 import { ConversationEstado, MessageFrom } from "@prisma/client";
 
-import { loadApptContext, type EsteticaCtx } from "./esteticaModules/estetica.rag";
-import { runEsteticaAgent } from "./esteticaModules/assistant/ai.agent";
+import { loadApptContext, type EsteticaCtx } from "./esteticaModules/domain/estetica.rag";
+import { routeEsteticaTurn } from "./esteticaModules/domain/router.estetica"; // ← nuevo router híbrido
 
 export type IAReplyResult = {
     estado: ConversationEstado;
@@ -93,7 +92,7 @@ async function persistBotReply({
     return { messageId: msg.id, texto, wamid };
 }
 
-/* =============== Historial reciente para el agente =============== */
+/* =============== Historial reciente para el agente (full-agent) =============== */
 
 async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
     const where: any = { conversationId };
@@ -114,15 +113,13 @@ async function getRecentHistory(conversationId: number, excludeMessageId?: numbe
 
 /* ========================= ENTRY ========================= */
 
-const USE_AGENT = true; // 🔥 siempre orquestado
-
 export async function handleEsteticaReply(opts: {
     chatId: number;
     empresaId: number;
     mensajeArg?: string;
     toPhone?: string;
     phoneNumberId?: string;
-    apptConfig?: any;
+    apptConfig?: any; // inyectado desde el orquestador si existe
 }): Promise<IAReplyResult | null> {
     const { chatId, empresaId, mensajeArg = "", toPhone, phoneNumberId } = opts;
 
@@ -149,6 +146,7 @@ export async function handleEsteticaReply(opts: {
     });
     if (last?.id && seenInboundRecently(last.id)) return null;
 
+    // Cargar contexto de negocio (BD o override del orquestador)
     const ctx: EsteticaCtx = await loadApptContext(empresaId, opts.apptConfig);
 
     // === Voz → texto
@@ -167,15 +165,10 @@ export async function handleEsteticaReply(opts: {
                 }
                 if (audioBuf) {
                     const name =
-                        last.mimeType?.includes("mpeg")
-                            ? "audio.mp3"
-                            : last.mimeType?.includes("wav")
-                                ? "audio.wav"
-                                : last.mimeType?.includes("m4a")
-                                    ? "audio.m4a"
-                                    : last.mimeType?.includes("webm")
-                                        ? "audio.webm"
-                                        : "audio.ogg";
+                        last.mimeType?.includes("mpeg") ? "audio.mp3" :
+                            last.mimeType?.includes("wav") ? "audio.wav" :
+                                last.mimeType?.includes("m4a") ? "audio.m4a" :
+                                    last.mimeType?.includes("webm") ? "audio.webm" : "audio.ogg";
                     transcript = await transcribeAudioBuffer(audioBuf, name);
                     if (transcript) {
                         await prisma.message.update({ where: { id: last.id }, data: { transcription: transcript } });
@@ -192,55 +185,48 @@ export async function handleEsteticaReply(opts: {
     // Si no hay nada que procesar, corta acá
     if (!userText) return null;
 
-    // ===== Orquestación con el agente =====
-    if (USE_AGENT) {
+    // ===== Enrutamiento híbrido (booking bot + agente informativo)
+    try {
         const history = await getRecentHistory(chatId, last?.id, 10);
-        const turns = [...history, { role: "user" as const, content: userText }];
+        const routed = await routeEsteticaTurn(ctx, chatId, userText, {
+            history,
+            phone: toPhone ?? conversacion.phone ?? undefined,
+            conversationId: chatId,
+        });
 
-        try {
-            const texto =
-                (await runEsteticaAgent(ctx, turns, {
-                    phone: toPhone ?? conversacion.phone ?? undefined,
-                    conversationId: chatId, // <- importante para book()
-                })) || "¿Quieres que te comparta horarios desde mañana o prefieres más información?";
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: routed.text || "¿Quieres que te comparta horarios desde mañana o prefieres más información?",
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
 
-            const saved = await persistBotReply({
-                conversationId: chatId,
-                empresaId,
-                texto,
-                nuevoEstado: ConversationEstado.respondido,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
-            });
-            return {
-                estado: ConversationEstado.respondido,
-                mensaje: saved.texto,
-                messageId: saved.messageId,
-                wamid: saved.wamid,
-                media: [],
-            };
-        } catch (e) {
-            console.warn("[AI-Agent] error:", e);
-            const fallback =
-                "Lo siento, tuve un error procesando tu consulta. ¿Quieres que lo intente de nuevo?";
-            const saved = await persistBotReply({
-                conversationId: chatId,
-                empresaId,
-                texto: fallback,
-                nuevoEstado: ConversationEstado.respondido,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
-            });
-            return {
-                estado: ConversationEstado.respondido,
-                mensaje: saved.texto,
-                messageId: saved.messageId,
-                wamid: saved.wamid,
-                media: [],
-            };
-        }
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    } catch (e) {
+        console.warn("[Estética Router] error:", e);
+        const fallback = "Lo siento, tuve un error procesando tu consulta. ¿Quieres que lo intente de nuevo?";
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: fallback,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
     }
-
-    // (No debería entrar aquí con USE_AGENT=true)
-    return null;
 }

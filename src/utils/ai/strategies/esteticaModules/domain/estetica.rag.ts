@@ -1,7 +1,32 @@
 // server/src/utils/ai/strategies/esteticaModules/estetica.rag.ts
-import prisma from "../../../../lib/prisma";
+import prisma from "../../../../../lib/prisma";
 import type { AppointmentVertical } from "@prisma/client";
 import { AppointmentStatus } from "@prisma/client";
+
+/* ===================== UTILS de parseo seguro ===================== */
+function asStrArr(v: unknown): string[] | null {
+    if (!v && v !== 0) return null;
+    if (Array.isArray(v)) return (v.filter(x => typeof x === "string") as string[]) || null;
+    if (typeof v === "string") {
+        try {
+            const j = JSON.parse(v);
+            return Array.isArray(j) ? j.filter(x => typeof x === "string") : null;
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
+function asNum(v: unknown, dflt?: number | null): number | null {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : (dflt ?? null);
+}
+function asBool(v: unknown, dflt = false): boolean {
+    if (typeof v === "boolean") return v;
+    if (typeof v === "string") return ["true", "1", "yes", "si", "sí"].includes(v.toLowerCase());
+    if (typeof v === "number") return v !== 0;
+    return dflt;
+}
 
 /* ===========================================================
  * Contexto de negocio para agenda estética (RAG liviano)
@@ -51,23 +76,28 @@ export async function loadApptContext(
             empresaId,
             vertical: (o.vertical as AppointmentVertical) ?? "custom",
             timezone: o.timezone ?? "America/Bogota",
-            bufferMin: Number(o.bufferMin ?? 10),
+            bufferMin: asNum(o.bufferMin, 10) ?? 10,
             policies: o.policies ?? null,
             logistics: o.logistics ?? {},
             rules: {
-                cancellationWindowHours: rules?.cancellationWindowHours ?? null,
+                cancellationWindowHours: asNum(rules?.cancellationWindowHours),
                 noShowPolicy: rules?.noShowPolicy ?? null,
-                depositRequired: rules?.depositRequired ?? null,
+                depositRequired:
+                    typeof rules?.depositRequired === "boolean" ? rules.depositRequired : null,
                 depositAmount: rules?.depositAmount ?? null,
-                maxDailyAppointments: rules?.maxDailyAppointments ?? null,
-                bookingWindowDays: rules?.bookingWindowDays ?? 30,
-                blackoutDates: (rules?.blackoutDates as string[] | null) ?? null,
-                overlapStrategy: rules?.overlapStrategy ?? "strict",
-                minNoticeHours: o.appointmentMinNoticeHours ?? rules?.minNoticeHours ?? null,
-                maxAdvanceDays: o.appointmentMaxAdvanceDays ?? rules?.maxAdvanceDays ?? null,
-                allowSameDay: o.allowSameDayBooking ?? rules?.allowSameDay ?? false,
-                requireConfirmation: o.requireClientConfirmation ?? rules?.requireClientConfirmation ?? true,
-                defaultServiceDurationMin: o.defaultServiceDurationMin ?? 60,
+                maxDailyAppointments: asNum(rules?.maxDailyAppointments),
+                bookingWindowDays:
+                    asNum(rules?.bookingWindowDays, asNum(o.appointmentMaxAdvanceDays, 30)) ?? 30,
+                blackoutDates: asStrArr(rules?.blackoutDates) ?? null,
+                overlapStrategy: (rules?.overlapStrategy as string) ?? "strict",
+                minNoticeHours: asNum(o.appointmentMinNoticeHours ?? rules?.minNoticeHours),
+                maxAdvanceDays: asNum(o.appointmentMaxAdvanceDays ?? rules?.maxAdvanceDays),
+                allowSameDay: asBool(o.allowSameDayBooking ?? rules?.allowSameDay, false),
+                requireConfirmation: asBool(
+                    o.requireClientConfirmation ?? rules?.requireClientConfirmation,
+                    true
+                ),
+                defaultServiceDurationMin: asNum(o.defaultServiceDurationMin, 60) ?? 60,
                 paymentNotes: o.paymentNotes ?? null,
             },
             buildKbContext: async () => {
@@ -77,7 +107,8 @@ export async function loadApptContext(
                     Array.isArray(kb.faqs) && kb.faqs.length
                         ? `FAQs:\n${kb.faqs.map((f: any) => `- ${f.q}\n  ${f.a}`).join("\n")}`
                         : "",
-                    kb.serviceNotes && `Notas de servicios:\n${JSON.stringify(kb.serviceNotes, null, 2)}`,
+                    kb.serviceNotes &&
+                    `Notas de servicios:\n${JSON.stringify(kb.serviceNotes, null, 2)}`,
                     kb.disclaimers && `Avisos/Disclaimers:\n${kb.disclaimers}`,
                     kb.freeText && `Notas libres:\n${kb.freeText}`,
                 ]
@@ -93,7 +124,7 @@ export async function loadApptContext(
         empresaId,
         vertical: (bca?.appointmentVertical as AppointmentVertical) ?? "custom",
         timezone: bca?.appointmentTimezone ?? "America/Bogota",
-        bufferMin: Number(bca?.appointmentBufferMin ?? 10),
+        bufferMin: asNum(bca?.appointmentBufferMin, 10) ?? 10,
         policies: bca?.appointmentPolicies ?? null,
         logistics: {
             locationName: bca?.locationName ?? undefined,
@@ -103,28 +134,33 @@ export async function loadApptContext(
             parkingInfo: bca?.parkingInfo ?? undefined,
         },
         rules: {
-            cancellationWindowHours: bca?.cancellationWindowHours ?? null,
+            cancellationWindowHours: asNum(bca?.cancellationWindowHours),
             noShowPolicy: bca?.noShowPolicy ?? null,
-            depositRequired: bca?.depositRequired ?? null,
+            depositRequired:
+                typeof bca?.depositRequired === "boolean" ? bca.depositRequired : null,
             depositAmount: bca?.depositAmount ?? null,
-            maxDailyAppointments: bca?.maxDailyAppointments ?? null,
-            bookingWindowDays: bca?.bookingWindowDays ?? 30,
-            blackoutDates: (bca?.blackoutDates as unknown as string[]) ?? null,
+            maxDailyAppointments: asNum(bca?.maxDailyAppointments),
+            bookingWindowDays:
+                asNum(bca?.bookingWindowDays, asNum(bca?.appointmentMaxAdvanceDays, 30)) ?? 30,
+            blackoutDates: asStrArr(bca?.blackoutDates) ?? null,
             overlapStrategy: bca?.overlapStrategy ?? "strict",
-            minNoticeHours: bca?.appointmentMinNoticeHours ?? null,
-            maxAdvanceDays: bca?.appointmentMaxAdvanceDays ?? null,
-            allowSameDay: bca?.allowSameDayBooking ?? false,
-            requireConfirmation: bca?.requireClientConfirmation ?? true,
-            defaultServiceDurationMin: bca?.defaultServiceDurationMin ?? 60,
+            minNoticeHours: asNum(bca?.appointmentMinNoticeHours),
+            maxAdvanceDays: asNum(bca?.appointmentMaxAdvanceDays),
+            allowSameDay: asBool(bca?.allowSameDayBooking, false),
+            requireConfirmation: asBool(bca?.requireClientConfirmation, true),
+            defaultServiceDurationMin: asNum(bca?.defaultServiceDurationMin, 60) ?? 60,
             paymentNotes: null,
         },
         buildKbContext: async () =>
             [
                 bca?.kbBusinessOverview && `Sobre la empresa:\n${bca.kbBusinessOverview}`,
                 Array.isArray(bca?.kbFAQs) && (bca?.kbFAQs as any[])?.length
-                    ? `FAQs:\n${(bca!.kbFAQs as any[]).map((f: any) => `- ${f.q}\n  ${f.a}`).join("\n")}`
+                    ? `FAQs:\n${(bca!.kbFAQs as any[])
+                        .map((f: any) => `- ${f.q}\n  ${f.a}`)
+                        .join("\n")}`
                     : "",
-                bca?.kbServiceNotes && `Notas de servicios:\n${JSON.stringify(bca.kbServiceNotes, null, 2)}`,
+                bca?.kbServiceNotes &&
+                `Notas de servicios:\n${JSON.stringify(bca.kbServiceNotes, null, 2)}`,
                 bca?.kbDisclaimers && `Avisos/Disclaimers:\n${bca.kbDisclaimers}`,
                 bca?.kbFreeText && `Notas libres:\n${bca.kbFreeText}`,
             ]
@@ -244,7 +280,9 @@ export async function matchProcedureFromText(
     for (const r of rows) {
         const nameScore = q.includes(nrm(r.name)) ? 1 : 0;
         let aliasScore = 0;
-        const aliases = Array.isArray(r.aliases) ? (r.aliases as unknown as string[]) : [];
+        const aliases = Array.isArray(r.aliases)
+            ? (r.aliases as unknown as string[])
+            : [];
         for (const a of aliases) {
             if (typeof a === "string" && q.includes(nrm(a))) {
                 aliasScore = Math.max(aliasScore, 0.8);
@@ -269,7 +307,10 @@ export async function matchProcedureFromText(
 }
 
 /** Confirma la última cita en estado pending para un teléfono (si existe) */
-export async function confirmLatestPendingForPhone(empresaId: number, phoneE164: string) {
+export async function confirmLatestPendingForPhone(
+    empresaId: number,
+    phoneE164: string
+) {
     const appt = await prisma.appointment.findFirst({
         where: { empresaId, customerPhone: phoneE164, status: AppointmentStatus.pending },
         orderBy: { startAt: "desc" },

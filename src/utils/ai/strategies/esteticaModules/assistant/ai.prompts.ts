@@ -1,5 +1,5 @@
 // utils/ai/strategies/esteticaModules/assistant/ai.prompts.ts
-import type { EsteticaCtx } from "../estetica.rag";
+import type { EsteticaCtx } from "../domain/estetica.rag";
 
 /**
  * Prompt principal del agente de clínica estética (full-agent, ES-CO).

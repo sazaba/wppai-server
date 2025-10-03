@@ -1,6 +1,7 @@
+// utils/ai/strategies/esteticaModules/assistant/ai.agent.ts
 import { openai } from "../../../../../lib/openai";
-import type { EsteticaCtx } from "../estetica.rag";
-import { toolSpecs, toolHandlers } from "./ai.tools";
+import type { EsteticaCtx } from "../domain/estetica.rag";
+import { toolSpecs, toolHandlers } from "../booking/booking.tools"; // ← antes era "./ai.tools"
 import { systemPrompt, buildFewshots } from "./ai.prompts";
 
 /* ================= Config ================= */
@@ -28,10 +29,7 @@ const SENTENCE_SPLIT = /(?<=\.)\s+|(?<=\?)\s+|(?<=\!)\s+/g;
 const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te va bien?"];
 
 function dedupSentences(text: string): string {
-    const parts = text
-        .split(SENTENCE_SPLIT)
-        .map((s) => s.trim())
-        .filter(Boolean);
+    const parts = text.split(SENTENCE_SPLIT).map((s) => s.trim()).filter(Boolean);
     const seen = new Set<string>();
     const out: string[] = [];
     for (const p of parts) {
@@ -103,11 +101,8 @@ async function executeToolWithPolicy(
 ): Promise<ToolMsg> {
     let result = await executeToolOnce(ctx, call.name, call.args, conversationId);
 
-    // Solo reintenta si: (a) es de lectura y (b) claramente falló
-    if (
-        !NO_RETRY_TOOLS.has(call.name) &&
-        (!result || (result.ok === false) || (result as any).error)
-    ) {
+    // Solo reintenta si: (a) es de lectura y (b) falló
+    if (!NO_RETRY_TOOLS.has(call.name) && (!result || result.ok === false || (result as any).error)) {
         result = await executeToolOnce(ctx, call.name, call.args, conversationId);
     }
 
@@ -142,7 +137,7 @@ export async function runEsteticaAgent(
 
     const msg = (result.choices?.[0]?.message || {}) as AssistantMsg;
 
-    // 2) Si hay tools → ejecutar con política de retry
+    // 2) Si hay tools → ejecutar con política
     if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
         const calls = msg.tool_calls.map((c) => ({
             id: c.id,
