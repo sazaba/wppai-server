@@ -8,10 +8,13 @@ import {
     type SessionStore,
 } from "../booking/booking.router";
 
+// 🔒 Sticky agenda (para no perder el contexto en medio de una cita)
+import { getBookingSession } from "../booking/session.store";
+
 /**
  * Router híbrido:
- *   1) Primero intenta manejar la INTENCIÓN DE AGENDA con el "full-bot" determinístico.
- *   2) Si no aplica agenda, delega al "full-agent" para conversación/KB.
+ *   1) Si hay sesión activa de agenda → siempre pasa por el "full-bot" determinístico.
+ *   2) Si no hay sesión, intenta agenda; si no aplica → agente (KB).
  *
  * Nota:
  *  - El store acá es in-memory simple (suficiente para una instancia). Si quieres
@@ -40,23 +43,36 @@ export async function routeEsteticaTurn(
     userText: string,
     extras?: { history?: ChatTurn[]; phone?: string; conversationId?: number }
 ): Promise<{ text: string }> {
-    // 1) Agenda determinística primero
-    //    Usamos como clave de sesión el teléfono si lo tenemos, si no el id de conversación.
+    // Clave de sesión para el store del bot (string): usa teléfono si existe, si no el id de conversación
     const userKey = String(extras?.phone || conversationId);
 
+    // 🟢 Sticky agenda:
+    // getBookingSession usa NUMBER como clave → usamos el id de conversación numérico.
+    const sessionKeyNum = Number(extras?.conversationId ?? conversationId);
+    const activeSession = getBookingSession(sessionKeyNum);
+
+    if (activeSession && activeSession.step && activeSession.step !== "idle") {
+        const agendaReplySticky = await handleAgendaTurn(
+            ctx,
+            store,
+            userKey, // el store propio del bot sí usa string
+            userText,
+            { phone: extras?.phone, conversationId: sessionKeyNum }
+        );
+        if (agendaReplySticky) return { text: agendaReplySticky };
+    }
+
+    // 🧠 Intento agenda (aunque no hubiera sesión activa)
     const agendaReply = await handleAgendaTurn(
         ctx,
         store,
         userKey,
         userText,
-        { phone: extras?.phone, conversationId: extras?.conversationId ?? conversationId }
+        { phone: extras?.phone, conversationId: sessionKeyNum }
     );
+    if (agendaReply) return { text: agendaReply };
 
-    if (agendaReply) {
-        return { text: agendaReply };
-    }
-
-    // 2) Si no fue agenda → agente conversacional (KB, FAQs, etc.)
+    // 🤖 Si no fue agenda → agente conversacional (KB, FAQs, general)
     const turns: ChatTurn[] = [
         ...(extras?.history ?? []),
         { role: "user", content: userText },
@@ -65,7 +81,7 @@ export async function routeEsteticaTurn(
     const reply = await runEsteticaAgent(
         ctx as any,
         turns,
-        { phone: extras?.phone, conversationId }
+        { phone: extras?.phone, conversationId: sessionKeyNum }
     );
 
     return { text: reply };
