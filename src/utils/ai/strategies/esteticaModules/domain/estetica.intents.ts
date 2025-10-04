@@ -1,3 +1,4 @@
+// utils/ai/strategies/esteticaModules/domain/estetica.intents.ts
 import type { EsteticaCtx } from "./estetica.rag";
 import { matchProcedureFromText } from "./estetica.rag";
 
@@ -87,34 +88,12 @@ function extractAppointmentId(t: string): number | undefined {
 }
 
 /* ===== fechas (TZ) ===== */
-function addMinutes(d: Date, min: number) { return new Date(d.getTime() + min * 60000); }
 function addDays(d: Date, days: number) { return new Date(d.getTime() + days * 86400000); }
-
-function ymdInTZ(d: Date, tz: string): string {
-    const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-    return f.format(d);
+function startOfDayTZ(d: Date, tz: string): Date {
+    const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+    const [y, m, dd] = ymd.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, dd, 0, 0));
 }
-function weekdayInTZ(d: Date, tz: string): number {
-    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).formatToParts(d);
-    const w = p.find((x) => x.type === "weekday")?.value?.toLowerCase();
-    return ({ sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 } as any)[String(w).slice(0, 3)] ?? 0;
-}
-/** Convierte (YYYY-MM-DD + HH:mm) en instante UTC de esa TZ */
-function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
-    const [y, m, d] = ymd.split("-").map(Number);
-    const [h, mi] = hhmm.split(":").map(Number);
-    const guess = new Date(Date.UTC(y, m - 1, d, h, mi));
-    const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone: tz, hour12: false, year: "numeric", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit",
-    }).formatToParts(guess);
-    const gotH = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
-    const gotM = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
-    const deltaMin = (h * 60 + mi) - (gotH * 60 + gotM);
-    return new Date(guess.getTime() + deltaMin * 60000);
-}
-
-function startOfDayTZ(d: Date, tz: string): Date { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
 
 const WEEKDAYS: Record<string, number> = {
     domingo: 0, dom: 0,
@@ -130,7 +109,9 @@ function nextWeekdayInTZ(from: Date, tz: string, targetDow: number): Date {
     const start = startOfDayTZ(from, tz);
     let d = new Date(start);
     for (let i = 0; i < 14; i++) {
-        if (weekdayInTZ(d, tz) === targetDow) return d;
+        const wd = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(d).slice(0, 3).toLowerCase();
+        const map: any = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+        if (map[wd] === targetDow) return d;
         d = addDays(d, 1);
     }
     return d;
@@ -143,46 +124,22 @@ function parseWhenHint(text: string, tz: string): Date | null {
     const now = new Date();
     const today = startOfDayTZ(now, tz);
 
-    // Palabras clave
-    if (/\b(hoy)\b/.test(t)) return today; // el core ya maneja same-day policy
+    if (/\b(hoy)\b/.test(t)) return today;
     if (/\b(ma[nñ]ana)\b/.test(t)) return addDays(today, 1);
     if (/\b(pasado\s+ma[nñ]ana)\b/.test(t)) return addDays(today, 2);
 
-    // “la otra semana / próxima semana”: usar lunes próximo
     if (/\b(otra|proxima|pr[oó]xima|siguiente)\s+semana\b/.test(t)) {
-        const dow = weekdayInTZ(today, tz);
-        const daysToNextMonday = ((1 - dow + 7) % 7) || 7;
+        const wdToday = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(today).slice(0, 3).toLowerCase();
+        const map: any = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+        const cur = map[wdToday] ?? 0;
+        const daysToNextMonday = ((1 - cur + 7) % 7) || 7;
         return addDays(today, daysToNextMonday);
     }
 
-    // “próximo lunes”, “este viernes”
-    const wd = Object.keys(WEEKDAYS).find((w) => new RegExp(`\\b${w}\\b`).test(t));
-    if (wd) {
-        const dow = WEEKDAYS[wd];
+    const wdKey = Object.keys(WEEKDAYS).find((w) => new RegExp(`\\b${w}\\b`).test(t));
+    if (wdKey) {
+        const dow = WEEKDAYS[wdKey];
         return nextWeekdayInTZ(addDays(today, 1), tz, dow);
-    }
-
-    // Horas “3 pm”, “15:30”, “a las 9”
-    let hour: number | null = null;
-    let minute = 0;
-    const m1 = t.match(/\b(\d{1,2}):(\d{2})\b/); // 15:30
-    const m2 = t.match(/\b(?:a\s*las\s*)?(\d{1,2})\s*(a\.?m\.?|p\.?m\.?)\b/); // 3 pm
-    const m3 = t.match(/\b(?:a\s*las\s*)?(\d{1,2})\b/); // a las 9
-
-    if (m1) {
-        hour = Number(m1[1]); minute = Number(m1[2]);
-    } else if (m2) {
-        hour = Number(m2[1]); const ap = m2[2].replace(/\./g, "");
-        if (ap.startsWith("p") && hour < 12) hour += 12;
-        if (ap.startsWith("a") && hour === 12) hour = 0;
-    } else if (m3) {
-        hour = Number(m3[1]);
-    }
-
-    if (hour != null && hour >= 0 && hour <= 23) {
-        // Si mencionan hora pero no día, apuntar a mañana a esa hora
-        const base = addDays(today, 1);
-        return makeZonedDate(ymdInTZ(base, tz), `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`, tz);
     }
 
     return null;
@@ -199,15 +156,8 @@ function parseWhenHint(text: string, tz: string): Date | null {
 export async function detectIntent(text: string, ctx: EsteticaCtx): Promise<IntentResult> {
     const t = norm(text);
 
-    // Confirmación explícita corta/coloquial
-    if (
-        /\b(s[ií]|ok|dale|listo|perfecto|de una|es correcto|confirmo)\b/.test(t) &&
-        /\b(confirmo|confirmar|es correcto|listo|dale|ok)\b/.test(t)
-    ) {
-        return { type: EsteticaIntent.CONFIRM, confirm: true };
-    }
-    // “confirmo” directo
-    if (/\b(confirmo|si confirmo|sí confirmo|ok confirmo)\b/.test(t)) {
+    // Confirmación explícita
+    if (/\b(confirmo|si confirmo|sí confirmo|es correcto|listo|ok)\b/.test(t)) {
         return { type: EsteticaIntent.CONFIRM, confirm: true };
     }
 
@@ -225,7 +175,7 @@ export async function detectIntent(text: string, ctx: EsteticaCtx): Promise<Inte
         return { type: EsteticaIntent.RESCHEDULE, when: when ?? null, confirm, appointmentId, numberList };
     }
 
-    // Cancelar (acepta “cota” typo)
+    // Cancelar
     if (/(cancel(ar|acion|ación)|anular)\s*(cita|cota)?/.test(t)) {
         const numberList = extractNumberList(t);
         const appointmentId = extractAppointmentId(text);
@@ -258,7 +208,6 @@ export async function detectIntent(text: string, ctx: EsteticaCtx): Promise<Inte
             durationMin = ctx.rules?.defaultServiceDurationMin ?? 60;
         }
 
-        // pista temporal para findSlots
         const when = parseWhenHint(text, ctx.timezone);
 
         return {

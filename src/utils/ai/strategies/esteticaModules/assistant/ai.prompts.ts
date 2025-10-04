@@ -65,7 +65,7 @@ export function buildFewshots(
     ctx: EsteticaCtx
 ): { role: "user" | "assistant"; content: string }[] {
     const allowSameDayTxt = ctx.rules?.allowSameDay
-        ? "Si hay disponibilidad para hoy te mostraré opciones; si no, te muestro desde mañana."
+        ? "Si hay disponibilidad para hoy te compartiré opciones; si no, te muestro desde mañana."
         : "Por política interna no agendamos el mismo día; te muestro desde mañana.";
 
     return [
@@ -87,7 +87,7 @@ export function buildFewshots(
         {
             role: "assistant",
             content:
-                "Perfecto. Buscaré cupos a partir del lunes próximo y te comparto hasta 6 horarios válidos, listados por día (máx. 2 mañana y 2 tarde por día).",
+                "Perfecto. Te comparto hasta 6 horarios válidos listados por día (máx. 2 en la mañana y 2 en la tarde por día).",
         },
         { role: "user", content: "quiero reagendar" },
         {

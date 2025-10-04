@@ -1,5 +1,4 @@
 // utils/ai/strategies/esteticaModules/booking/session.store.ts
-
 export type BookingStep =
     | "idle"
     | "await_service"

@@ -60,10 +60,7 @@ function postProcessReply(reply: string, history: ChatTurn[]): string {
     const clean = dedupSentences(reply.trim());
     const lastAssistant = [...history].reverse().find((h) => h.role === "assistant")
         ?.content?.trim();
-    if (
-        lastAssistant &&
-        clean.toLowerCase() === lastAssistant.toLowerCase()
-    ) {
+    if (lastAssistant && clean.toLowerCase() === lastAssistant.toLowerCase()) {
         return clean + rotateClosing(clean, Math.floor(Math.random() * 3) + 1);
     }
     return clean + rotateClosing(clean, history.length);

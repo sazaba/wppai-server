@@ -1,3 +1,4 @@
+// utils/ai/strategies/esteticaModules/booking/booking.bot.ts
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import { getBookingSession, setBookingSession, clearBookingSession, type BookingState } from "./session.store";
 import { apiFindSlots, apiBook, resolveService } from "./booking.tools";
@@ -23,7 +24,6 @@ const SERVICE_SYNONYMS: Record<string, string> = {
     "toxinabotulinica": "toxina botulínica",
     "botulinica": "toxina botulínica",
     "botulínica": "toxina botulínica",
-    // ejemplos extra
     "relleno": "rellenos dérmicos",
     "acido hialuronico": "rellenos dérmicos",
     "ácido hialurónico": "rellenos dérmicos",
@@ -80,14 +80,12 @@ function listToMessage(slots: { idx: number; startLabel: string }[]) {
 }
 
 /** Fallback: si la primera búsqueda no trae cupos, intenta sin fromISO (servidor decide) */
-// Usa el tipo real que espera apiFindSlots (2º argumento)
 type FindSlotsPayload = Parameters<typeof apiFindSlots>[1];
 
 async function findWithFallback(
     ctx: EsteticaCtx,
     args: { serviceId: number; serviceName: string; fromISO?: string | null }
 ) {
-    // 1) primer intento: solo incluye fromISO si es string
     const firstArgs: FindSlotsPayload =
         args.fromISO && typeof args.fromISO === "string"
             ? { serviceId: args.serviceId, serviceName: args.serviceName, fromISO: args.fromISO }
@@ -96,7 +94,6 @@ async function findWithFallback(
     const first = await apiFindSlots(ctx, firstArgs);
     if (first.ok && first.slots.length > 0) return first;
 
-    // 2) segundo intento: deja que el backend normalice la ventana
     const second = await apiFindSlots(ctx, {
         serviceId: args.serviceId,
         serviceName: args.serviceName,
@@ -104,10 +101,8 @@ async function findWithFallback(
 
     if (second.ok && second.slots.length > 0) return second;
 
-    // devuelve el más informativo
     return first.ok ? first : second;
 }
-
 
 export async function handleBookingTurn(
     ctx: EsteticaCtx,

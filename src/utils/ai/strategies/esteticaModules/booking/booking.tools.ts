@@ -84,7 +84,7 @@ function pickPerDaySmart(dates: Date[], tz: string, maxTotal = 6): Date[] {
     }
 
     const out: Date[] = [];
-    for (const [_, g] of groups) {
+    for (const [, g] of groups) {
         // ordenados por hora
         g.morning.sort((a, b) => a.getTime() - b.getTime());
         g.afternoon.sort((a, b) => a.getTime() - b.getTime());

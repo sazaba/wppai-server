@@ -1,3 +1,4 @@
+// utils/ai/strategies/esteticaModules/booking/schedule.core.ts
 import prisma from "../../../../../lib/prisma";
 import type { EsteticaCtx } from "../domain/estetica.rag";
 import {
@@ -459,6 +460,7 @@ export async function listUpcomingApptsForPhone(
         select: { id: true, startAt: true, serviceName: true, timezone: true },
     });
 }
+
 // === NUEVO: buscador robusto con ventanas escalonadas ===
 export async function findNextSlotsRobust(params: {
     empresaId: number;
