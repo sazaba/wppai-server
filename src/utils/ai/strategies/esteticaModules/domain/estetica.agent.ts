@@ -62,8 +62,8 @@ function startOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz)
 function endOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz) }
 
 /* ====== Corrección opcional de timezone en appointmentHours ====== */
-// Si tus hours están guardadas en UTC y el negocio opera en America/Bogota (-300 min),
-// define: APPT_HOURS_TZ_OFFSET_MIN=-300
+// Si tus hours están en UTC y el negocio opera en America/Bogota (-300 min):
+// APPT_HOURS_TZ_OFFSET_MIN=-300
 const HOURS_TZ_OFFSET_MIN = Number(process.env.APPT_HOURS_TZ_OFFSET_MIN ?? 0)
 function hhmmWithOffset(hhmm: string): string {
     if (!HOURS_TZ_OFFSET_MIN) return hhmm
@@ -92,7 +92,7 @@ type StaffRow = {
     id: number
     name: string
     enabled: boolean | null
-    specialties?: any | null // se espera array/JSON con ids de procedimientos
+    specialties?: any | null // array/JSON con ids de procedimientos
 }
 
 async function fetchHours(empresaId: number): Promise<HourRow[]> {
@@ -120,10 +120,7 @@ async function fetchStaffSafe(empresaId: number): Promise<StaffRow[]> {
             orderBy: { id: "asc" },
         } as any)
         return rows as unknown as StaffRow[]
-    } catch {
-        // si no existe tabla staff, seguimos en modo compatible
-        return []
-    }
+    } catch { return [] }
 }
 
 function weekdayCode(d: Date, tz: string): HourRow["day"] {
@@ -160,8 +157,7 @@ function tryParseIdList(v: any): number[] {
 
 async function hasFreeStaffForSlot(empresaId: number, start: Date, durationMin: number, bufferMin: number, procedureId?: number | null) {
     const staff = await fetchStaffSafe(empresaId)
-    if (!staff.length) return true // modo compatible: no hay dimensión de staff
-
+    if (!staff.length) return true
     const end = addMinutes(start, durationMin)
     for (const s of staff) {
         if (s.enabled === false) continue
@@ -323,8 +319,7 @@ async function toolFindSlots(ctx: EsteticaCtx, args: { serviceId?: number; servi
         }))
 
     if (!labels.length) {
-        const hint2 = (hint ? new Date(hint) : new Date())
-        hint2.setDate(hint2.getDate() + 1)
+        const hint2 = (hint ? new Date(hint) : new Date()); hint2.setDate(hint2.getDate() + 1)
         const raw2 = await findSlotsCore({
             empresaId: ctx.empresaId, ctx, hint: hint2, durationMin, count: 12, procedureId: svc?.id ?? null,
         })
@@ -468,7 +463,7 @@ async function toolListUpcoming(ctx: EsteticaCtx, args: { phone: string; limit?:
     return { ok: true, items }
 }
 
-/* === NUEVO: obtener la cita “actual” de la conversación (ayuda a reagendar rápido) === */
+/* === NUEVO: cita actual por conversación (para reagendar rápido) === */
 async function toolGetCurrentAppt(
     ctx: EsteticaCtx,
     _args: { limit?: number },
@@ -545,19 +540,23 @@ export function systemPrompt(ctx: EsteticaCtx) {
         `- Antelación mínima: **${minNoticeH}h**.`,
         `- Solo ofrece horarios que devuelven las tools (máx. 6 por respuesta; reparte en mañana/tarde).`,
         ``,
-        `# Cómo interpretar fechas/horas del usuario`,
-        `- Si el usuario dice “martes”, “mañana”, “la otra semana”, “3pm del lunes”, “el 15”: **convierte eso a una fecha/hora real en ${tz}** y pásala como **fromISO** a la tool **findSlots**.`,
-        `  - “martes”: usa el **próximo martes 06:00** local (${tz}) como fromISO.`,
-        `  - “la otra semana”: usa el **lunes de la próxima semana 06:00** local.`,
-        `  - “lunes 3pm”: usa ese lunes a las **15:00** local como fromISO.`,
-        `- Si no hay cupos ese día, **muestra automáticamente** los siguientes días cercanos (hasta 6 opciones).`,
+        `# Interpretación de fechas/horas del usuario`,
+        `- Convierte “martes/mañana/pasado/3pm del lunes/el 15” a fecha/hora real en ${tz} y pásala como **fromISO** a **findSlots**.`,
+        `- Si no hay cupos ese día, ofrece automáticamente los más cercanos (hasta 6).`,
+        ``,
+        `# Flujo de Reagendar (OBLIGATORIO)`,
+        `1) Llama **getCurrentAppt** (por conversación) para obtener la cita vigente.`,
+        `2) Confirma con el usuario servicio y duración de esa cita.`,
+        `3) Llama **findSlots** usando la intención (p.ej. “jueves en la tarde”) para proponer hasta 6 opciones.`,
+        `4) Cuando elija una, llama **reschedule** con {appointmentId, newStartISO, staffId?}.`,
+        `5) Resume y pide confirmación final.`,
         ``,
         `# Datos obligatorios antes de reservar`,
-        `- Servicio, fecha/hora exacta (uno de los slots devueltos), nombre completo y teléfono.`,
-        `- **Doble confirmación**: (1) resume todo; (2) pregunta “¿Confirmamos?”. Sólo si la respuesta es clara (sí/ok/dale/listo/confirmo), llama **book**.`,
+        `- Servicio, fecha/hora exacta (de los slots), nombre completo y teléfono.`,
+        `- **Doble confirmación**: (1) resume; (2) pregunta “¿Confirmamos?”. Solo ante un “sí/ok/listo/confirmo” llamas **book**/**reschedule**.`,
         ``,
         `# KB`,
-        `- Todo lo de duración/precios/notas sale de la KB; si falta, dilo con transparencia.`,
+        `- Duración/precios/notas salen de la KB; si falta, dilo.`,
         ``,
         `# Estilo`,
         `- 2–5 líneas, directo, cercano, **1 emoji** siempre.`,
@@ -569,8 +568,14 @@ export function buildFewshots(_ctx: EsteticaCtx): ChatTurn[] {
         { role: "user", content: "hola" },
         { role: "assistant", content: "¡Hola! ¿Quieres info de tratamientos o prefieres ver horarios para agendar? 🙂" },
 
+        // Nueva cita
         { role: "user", content: "me sirve el martes en la tarde para botox" },
-        { role: "assistant", content: "Perfecto. Buscaré cupos desde el **próximo martes 06:00** (hora local) para *Toxina botulínica*. Te muestro hasta 6 opciones y luego tomo tus datos para confirmar. 😉" },
+        { role: "assistant", content: "Perfecto. Buscaré cupos desde el **próximo martes 06:00** (hora local) para *Toxina botulínica*. Te muestro opciones y luego tomamos tus datos. 😉" },
+
+        // Reagendar
+        { role: "user", content: "quiero reagendar mi cita" },
+        { role: "assistant", content: "Ya reviso tu cita actual y te propongo horarios. Un momento. 🙂" },
+        // El modelo debe llamar: getCurrentAppt -> findSlots -> reschedule
     ]
 }
 
