@@ -196,11 +196,21 @@ export async function loadApptContext(
             paymentNotes: null,
         },
         buildKbContext: async () => {
+            // KB desde businessconfig_appt + catálogo de servicios (nombres/duraciones)
+            const services = await prisma.esteticaProcedure.findMany({
+                where: { empresaId, enabled: true },
+                select: { id: true, name: true, durationMin: true, priceMin: true, priceMax: true },
+                orderBy: { name: "asc" },
+                take: 30,
+            })
+            const svcLines = services.map(s => `- ${s.name}${s.durationMin ? ` (${s.durationMin} min)` : ""}${(s.priceMin || s.priceMax) ? ` — $${s.priceMin ?? ""}${s.priceMax ? ` - $${s.priceMax}` : ""}` : ""}`).join("\n")
+
             const out = [
                 bca?.kbBusinessOverview && `Sobre la clínica:\n${bca.kbBusinessOverview}`,
                 Array.isArray(bca?.kbFAQs) && (bca.kbFAQs as any[])?.length
                     ? `FAQs:\n${(bca.kbFAQs as any[]).map((f: any) => `- ${f.q}\n  ${f.a}`).join("\n")}`
                     : "",
+                services.length ? `Servicios:\n${svcLines}` : "",
                 bca?.kbServiceNotes && `Servicios (notas):\n${JSON.stringify(bca.kbServiceNotes as any, null, 2)}`,
                 bca?.kbDisclaimers && `Avisos:\n${bca.kbDisclaimers}`,
                 bca?.kbFreeText && `Notas libres:\n${bca.kbFreeText}`,

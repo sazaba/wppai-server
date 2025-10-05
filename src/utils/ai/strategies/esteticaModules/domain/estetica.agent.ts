@@ -1,9 +1,9 @@
-// utils/ai/strategies/esteticaModules/domain/estetica.strategy.ts
-// Full-agent (agenda natural + tools + KB)
+// utils/ai/strategies/esteticaModules/domain/estetica.agent.ts
+// Full-agent (agenda natural + tools + KB) CON staff-awareness y sin delays
 
 import prisma from "../../../../../lib/prisma"
 import { openai } from "../../../../../lib/openai"
-import { AppointmentStatus, AppointmentSource, type AppointmentVertical } from "@prisma/client"
+import { AppointmentStatus, AppointmentSource } from "@prisma/client"
 import type { EsteticaCtx } from "./estetica.rag"
 
 /* ======================= LLM CFG ======================= */
@@ -58,7 +58,7 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
 function startOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz) }
 function endOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz) }
 
-/* ======================= Disponibilidad ======================= */
+/* ======================= Disponibilidad base ======================= */
 type HourRow = {
     day: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"
     isOpen: boolean
@@ -70,6 +70,12 @@ type ExceptionRow = {
     isOpen: boolean | null
     start1: string | null; end1: string | null
     start2: string | null; end2: string | null
+}
+type StaffRow = {
+    id: number
+    name: string
+    enabled: boolean | null
+    specialties?: any | null // se espera array/JSON con ids de procedimientos
 }
 
 async function fetchHours(empresaId: number): Promise<HourRow[]> {
@@ -89,6 +95,20 @@ async function fetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
         start1: r.start1 ?? null, end1: r.end1 ?? null, start2: r.start2 ?? null, end2: r.end2 ?? null,
     }))
 }
+async function fetchStaffSafe(empresaId: number): Promise<StaffRow[]> {
+    try {
+        const rows = await prisma.staff.findMany({
+            where: { empresaId, OR: [{ enabled: true }, { enabled: null }] },
+            select: { id: true, name: true, enabled: true, specialties: true },
+            orderBy: { id: "asc" },
+        } as any)
+        return rows as unknown as StaffRow[]
+    } catch {
+        // si no existe tabla staff, seguimos en modo compatible
+        return []
+    }
+}
+
 function weekdayCode(d: Date, tz: string): HourRow["day"] {
     const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).formatToParts(d)
     const w = (p.find(x => x.type === "weekday")?.value ?? "sun").toLowerCase().slice(0, 3)
@@ -107,7 +127,46 @@ function windowsForYMD(ymd: string, tz: string, hours: HourRow[], exceptions: Ex
         .filter(([s, e]) => s && e)
     return pairs.map(([s, e]) => ({ start: s!, end: e! }))
 }
-async function isSlotFree(empresaId: number, start: Date, durationMin: number, bufferMin = 0) {
+
+/* ====== staff availability ====== */
+function tryParseIdList(v: any): number[] {
+    if (!v) return []
+    if (Array.isArray(v)) return v.map(Number).filter(n => Number.isFinite(n))
+    if (typeof v === "string") {
+        try { const j = JSON.parse(v); return Array.isArray(j) ? j.map(Number).filter(Number.isFinite) : [] }
+        catch { return [] }
+    }
+    return []
+}
+
+async function hasFreeStaffForSlot(empresaId: number, start: Date, durationMin: number, bufferMin: number, procedureId?: number | null) {
+    const staff = await fetchStaffSafe(empresaId)
+    if (!staff.length) return true // modo compatible: no hay dimensión de staff
+
+    const end = addMinutes(start, durationMin)
+    for (const s of staff) {
+        if (s.enabled === false) continue
+        // si hay specialties, validar que pueda hacer el procedimiento
+        if (procedureId != null) {
+            const spec = tryParseIdList(s.specialties)
+            if (spec.length && !spec.includes(Number(procedureId))) continue
+        }
+        // ¿tiene choque?
+        const overlap = await prisma.appointment.count({
+            where: {
+                empresaId,
+                deletedAt: null,
+                staffId: s.id,
+                status: { notIn: [AppointmentStatus.cancelled, AppointmentStatus.no_show] },
+                AND: [{ startAt: { lt: addMinutes(end, bufferMin) } }, { endAt: { gt: addMinutes(start, -bufferMin) } }],
+            },
+        } as any)
+        if (overlap === 0) return { ok: true, staffId: s.id }
+    }
+    return { ok: false }
+}
+
+async function isSlotFree(empresaId: number, start: Date, durationMin: number, bufferMin = 0, procedureId?: number | null) {
     const startWithBuffer = new Date(start.getTime() - bufferMin * 60000)
     const endWithBuffer = new Date(start.getTime() + (durationMin + bufferMin) * 60000)
     const overlap = await prisma.appointment.count({
@@ -118,8 +177,14 @@ async function isSlotFree(empresaId: number, start: Date, durationMin: number, b
             AND: [{ startAt: { lt: endWithBuffer } }, { endAt: { gt: startWithBuffer } }],
         },
     })
-    return overlap === 0
+    if (overlap > 0) return { ok: false }
+
+    const staffOk = await hasFreeStaffForSlot(empresaId, start, durationMin, bufferMin, procedureId ?? null)
+    if (staffOk === true) return { ok: true, staffId: undefined }
+    if ((staffOk as any)?.ok) return staffOk as any
+    return { ok: false }
 }
+
 async function underDailyCap(empresaId: number, d: Date, tz: string, cap?: number | null) {
     if (!cap) return true
     const s = startOfDayTZ(d, tz); const e = endOfDayTZ(d, tz)
@@ -133,13 +198,33 @@ async function underDailyCap(empresaId: number, d: Date, tz: string, cap?: numbe
     return count < cap
 }
 
+async function resolveService(ctx: EsteticaCtx, q: { serviceId?: number; name?: string }) {
+    if (q.serviceId) {
+        const r = await prisma.esteticaProcedure.findFirst({
+            where: { id: q.serviceId, empresaId: ctx.empresaId, enabled: true },
+            select: { id: true, name: true, durationMin: true },
+        })
+        if (r) return r
+    }
+    if (q.name && q.name.trim()) {
+        const r = await prisma.esteticaProcedure.findFirst({
+            where: { empresaId: ctx.empresaId, enabled: true, name: { contains: q.name.trim() } as any },
+            select: { id: true, name: true, durationMin: true },
+        })
+        if (r) return r
+    }
+    return null
+}
+
+/* ======================= Núcleo de búsqueda de slots ======================= */
 async function findSlotsCore(opts: {
     empresaId: number
     ctx: EsteticaCtx
     hint?: Date | null
     durationMin: number
     count: number
-}): Promise<Date[]> {
+    procedureId?: number | null
+}): Promise<Array<{ start: Date; staffId?: number }>> {
     const { empresaId, ctx } = opts
     const now = new Date()
     const tz = ctx.timezone
@@ -152,7 +237,7 @@ async function findSlotsCore(opts: {
     const to = addDays(from, Math.max(1, bookingWindowDays))
     const [hours, exceptions] = await Promise.all([fetchHours(empresaId), fetchExceptions(empresaId)])
 
-    const out: Date[] = []
+    const out: Array<{ start: Date; staffId?: number }> = []
     let cursor = new Date(from)
     while (cursor < to && out.length < opts.count) {
         const ymd = ymdInTZ(cursor, tz)
@@ -168,10 +253,12 @@ async function findSlotsCore(opts: {
             while (s.getTime() + opts.durationMin * 60000 <= e.getTime()) {
                 const slotEnd = addMinutes(s, opts.durationMin)
                 if (slotEnd >= earliest) {
-                    const okFree = await isSlotFree(empresaId, s, opts.durationMin, ctx.bufferMin)
+                    const free = await isSlotFree(empresaId, s, opts.durationMin, ctx.bufferMin, opts.procedureId)
                     const okCap = await underDailyCap(empresaId, s, tz, ctx.rules?.maxDailyAppointments ?? null)
-                    if (okFree && okCap) out.push(new Date(s))
-                    if (out.length >= opts.count) break
+                    if ((free as any)?.ok && okCap) {
+                        out.push({ start: new Date(s), staffId: (free as any).staffId })
+                        if (out.length >= opts.count) break
+                    }
                 }
                 s = addMinutes(s, 15)
             }
@@ -192,45 +279,36 @@ async function toolListProcedures(ctx: EsteticaCtx, _args: any) {
     })
     return { ok: true, items: rows }
 }
-async function resolveService(ctx: EsteticaCtx, q: { serviceId?: number; name?: string }) {
-    if (q.serviceId) {
-        const r = await prisma.esteticaProcedure.findFirst({
-            where: { id: q.serviceId, empresaId: ctx.empresaId, enabled: true },
-            select: { id: true, name: true, durationMin: true },
-        })
-        if (r) return r
-    }
-    if (q.name && q.name.trim()) {
-        const r = await prisma.esteticaProcedure.findFirst({
-            where: { empresaId: ctx.empresaId, enabled: true, name: { contains: q.name.trim() } as any },
-            select: { id: true, name: true, durationMin: true },
-        })
-        if (r) return r
-    }
-    return null
-}
+
 async function toolFindSlots(ctx: EsteticaCtx, args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }) {
     const svc = await resolveService(ctx, { serviceId: args.serviceId, name: args.serviceName })
     const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60
 
     const hint = args.fromISO ? new Date(args.fromISO) : undefined
     const raw = await findSlotsCore({
-        empresaId: ctx.empresaId, ctx, hint: hint ?? null,
-        durationMin, count: Math.min(12, Math.max(6, Number(args.max ?? 8))),
+        empresaId: ctx.empresaId,
+        ctx,
+        hint: hint ?? null,
+        durationMin,
+        count: Math.min(12, Math.max(6, Number(args.max ?? 8))),
+        procedureId: svc?.id ?? null,
     })
 
     const now = new Date()
-    const future = raw.filter(d => d.getTime() > now.getTime())
+    const future = raw.filter(d => d.start.getTime() > now.getTime())
     const labels = future.slice(0, 12).map((d, i) => ({
         idx: i + 1,
-        startISO: d.toISOString(),
-        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d),
+        startISO: d.start.toISOString(),
+        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
+        staffId: d.staffId ?? null,
     }))
+    // Devolvemos sólo 6 (la UI/LLM ya sabe presentar 2 mañana/2 tarde por día)
     return { ok: true, durationMin, serviceName: svc?.name ?? args.serviceName ?? null, slots: labels.slice(0, 6) }
 }
+
 async function toolBook(
     ctx: EsteticaCtx,
-    args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number },
+    args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number; staffId?: number },
     conversationId?: number
 ) {
     const phone = String(args.phone || "").replace(/[^\d]/g, "")
@@ -243,8 +321,11 @@ async function toolBook(
     const startAt = new Date(args.startISO)
     const endAt = addMinutes(startAt, durationMin)
 
-    const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin)
-    if (!free) return { ok: false, reason: "CONFLICT_SLOT" }
+    // validar staff seleccionado si viene; si no viene, elegir uno disponible
+    let finalStaffId: number | undefined = args.staffId
+    const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin, svc.id)
+    if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" }
+    if (finalStaffId == null) finalStaffId = (free as any)?.staffId
 
     const status: AppointmentStatus = (ctx.rules?.requireConfirmation ?? true)
         ? AppointmentStatus.pending
@@ -265,8 +346,9 @@ async function toolBook(
             procedureId: svc.id,
             notas: args.notes ?? null,
             locationNameCache: ctx.logistics?.locationName ?? null,
+            staffId: finalStaffId ?? null,
         },
-    })
+    } as any)
 
     return {
         ok: true,
@@ -276,20 +358,27 @@ async function toolBook(
             startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(appt.startAt),
             status: appt.status,
             serviceName: appt.serviceName,
+            staffId: appt.staffId ?? null,
         },
     }
 }
-async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; newStartISO: string }) {
-    const appt = await prisma.appointment.findUnique({ where: { id: Number(args.appointmentId) } })
+
+async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; newStartISO: string; staffId?: number }) {
+    const appt = await prisma.appointment.findUnique({ where: { id: Number(args.appointmentId) } } as any)
     if (!appt || appt.deletedAt || appt.empresaId !== ctx.empresaId) return { ok: false, reason: "NOT_FOUND" }
     const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((+appt.endAt - +appt.startAt) / 60000))
     const newStart = new Date(args.newStartISO)
-    const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin)
-    if (!free) return { ok: false, reason: "CONFLICT_SLOT" }
+    const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin, appt.procedureId ?? null)
+    if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" }
     const updated = await prisma.appointment.update({
         where: { id: appt.id },
-        data: { startAt: newStart, endAt: addMinutes(newStart, duration), status: AppointmentStatus.rescheduled },
-    })
+        data: {
+            startAt: newStart,
+            endAt: addMinutes(newStart, duration),
+            status: AppointmentStatus.rescheduled,
+            staffId: args.staffId ?? (free as any)?.staffId ?? appt.staffId ?? null,
+        },
+    } as any)
     return {
         ok: true,
         data: {
@@ -297,15 +386,17 @@ async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; n
             startISO: updated.startAt.toISOString(),
             startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(updated.startAt),
             status: updated.status,
+            staffId: updated.staffId ?? null,
         },
     }
 }
+
 async function toolCancel(ctx: EsteticaCtx, args: { appointmentId: number }) {
-    const appt = await prisma.appointment.findUnique({ where: { id: Number(args.appointmentId) } })
+    const appt = await prisma.appointment.findUnique({ where: { id: Number(args.appointmentId) } } as any)
     if (!appt || appt.empresaId !== ctx.empresaId || appt.deletedAt) return { ok: false, reason: "NOT_FOUND" }
     const deleted = await prisma.appointment.update({
         where: { id: appt.id }, data: { status: AppointmentStatus.cancelled, deletedAt: new Date() },
-    })
+    } as any)
     return {
         ok: true,
         data: {
@@ -316,6 +407,7 @@ async function toolCancel(ctx: EsteticaCtx, args: { appointmentId: number }) {
         },
     }
 }
+
 async function toolListUpcoming(ctx: EsteticaCtx, args: { phone: string; limit?: number }) {
     const phone = String(args.phone || "").replace(/[^\d]/g, "")
     if (!phone) return { ok: false, reason: "INVALID_PHONE" }
@@ -330,7 +422,7 @@ async function toolListUpcoming(ctx: EsteticaCtx, args: { phone: string; limit?:
         orderBy: { startAt: "asc" },
         select: { id: true, startAt: true, serviceName: true, timezone: true },
         take: Math.max(1, Number(args.limit ?? 5)),
-    })
+    } as any)
     const items = rows.map(r => ({
         id: r.id,
         startISO: r.startAt.toISOString(),
@@ -344,8 +436,8 @@ async function toolListUpcoming(ctx: EsteticaCtx, args: { phone: string; limit?:
 export const toolSpecs = [
     { type: "function", function: { name: "listProcedures", description: "Lista breve de servicios/procedimientos disponibles.", parameters: { type: "object", properties: {}, additionalProperties: false } } },
     { type: "function", function: { name: "findSlots", description: "Busca horarios disponibles (máx. 6).", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, fromISO: { type: "string" }, max: { type: "number" } }, additionalProperties: false } } },
-    { type: "function", function: { name: "book", description: "Crea una reserva confirmada/pending según política.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, startISO: { type: "string" }, phone: { type: "string" }, fullName: { type: "string" }, notes: { type: "string" }, durationMin: { type: "number" } }, required: ["startISO", "phone", "fullName"], additionalProperties: false } } },
-    { type: "function", function: { name: "reschedule", description: "Reagenda una cita existente.", parameters: { type: "object", properties: { appointmentId: { type: "number" }, newStartISO: { type: "string" } }, required: ["appointmentId", "newStartISO"], additionalProperties: false } } },
+    { type: "function", function: { name: "book", description: "Crea una reserva confirmada/pending según política.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, startISO: { type: "string" }, phone: { type: "string" }, fullName: { type: "string" }, notes: { type: "string" }, durationMin: { type: "number" }, staffId: { type: "number" } }, required: ["startISO", "phone", "fullName"], additionalProperties: false } } },
+    { type: "function", function: { name: "reschedule", description: "Reagenda una cita existente.", parameters: { type: "object", properties: { appointmentId: { type: "number" }, newStartISO: { type: "string" }, staffId: { type: "number" } }, required: ["appointmentId", "newStartISO"], additionalProperties: false } } },
     { type: "function", function: { name: "cancel", description: "Cancela una cita por ID.", parameters: { type: "object", properties: { appointmentId: { type: "number" } }, required: ["appointmentId"], additionalProperties: false } } },
     { type: "function", function: { name: "listUpcomingApptsForPhone", description: "Lista próximas citas filtrando por teléfono.", parameters: { type: "object", properties: { phone: { type: "string" }, limit: { type: "number" } }, required: ["phone"], additionalProperties: false } } },
 ] as const
@@ -356,10 +448,10 @@ export function toolHandlers(ctx: EsteticaCtx, convId?: number) {
         async findSlots(args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }) {
             return toolFindSlots(ctx, args)
         },
-        async book(args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number }) {
+        async book(args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number; staffId?: number }) {
             return toolBook(ctx, args, convId)
         },
-        async reschedule(args: { appointmentId: number; newStartISO: string }) {
+        async reschedule(args: { appointmentId: number; newStartISO: string; staffId?: number }) {
             return toolReschedule(ctx, args)
         },
         async cancel(args: { appointmentId: number }) { return toolCancel(ctx, args) },
@@ -375,7 +467,7 @@ export function systemPrompt(ctx: EsteticaCtx) {
 
     return [
         `Eres coordinador/a de una clínica estética premium (español de Colombia).`,
-        `Objetivo: conversa natural y empática y **usa herramientas** para listar horarios, agendar, reagendar, cancelar y consultar próximas citas.`,
+        `Objetivo: conversación natural y usa **tools** para listar horarios, agendar, reagendar, cancelar y consultar próximas citas.`,
         `Para dudas de servicios (qué incluye/duración/precios/políticas): responde solo con la **base de conocimiento (KB)**. No inventes datos.`,
         ``,
         `# Reglas de agenda`,
@@ -383,14 +475,14 @@ export function systemPrompt(ctx: EsteticaCtx) {
         `- Citas del mismo día: ${allowSameDay ? "permitidas si hay cupo" : "NO permitidas"}.`,
         `- Antelación mínima: **${minNoticeH}h**.`,
         `- Cuando pidan “mañana / pasado / la otra semana / próximo lunes”: llama **findSlots**.`,
-        `- Al mostrar horarios: usa exclusivamente lo que devuelva la tool (máx. 6).`,
+        `- Muestra exclusivamente lo que devuelvan las tools (máx. 6; 2 mañana y 2 tarde por día).`,
         `- Antes de reservar: valida explícitamente **servicio + horario + nombre completo + teléfono**.`,
-        `- **Doble confirmación**: (1) resume datos; (2) pregunta “¿Confirmamos?”; solo entonces llama **book**.`,
+        `- **Doble confirmación**: (1) resume datos; (2) pregunta “¿Confirmamos?”; sólo entonces llama **book**.`,
         `- Acepta confirmaciones coloquiales (“sí/ok/dale/listo/confirmo”).`,
         ``,
         `# Estilo`,
         `- Claro, cercano y profesional. 2–5 líneas. 1 emoji máximo si aporta.`,
-        `- Evita frases de espera (“voy a buscar…”, “un momento…”). Responde directo.`,
+        `- Evita frases de espera (“voy a buscar…/un momento…”). Responde directo.`,
         ``,
         `# Seguridad`,
         `- No diagnostiques ni prescribas indicaciones médicas personalizadas.`,

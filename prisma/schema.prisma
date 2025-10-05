@@ -483,13 +483,17 @@ model Appointment {
   procedureId       Int?
   EsteticaProcedure EsteticaProcedure? @relation(name: "ProcedureToAppointments", fields: [procedureId], references: [id])
 
+  // ✅ NUEVO: staff asignado (opcional)
+  staffId Int?
+  staff   Staff? @relation(fields: [staffId], references: [id])
+
   empresa      Empresa       @relation(fields: [empresaId], references: [id])
   conversation Conversation? @relation(fields: [conversationId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  /// 👇 NUEVO: soft delete
+  /// 👇 Soft delete
   deletedAt DateTime?
 
   AppointmentReminderLog AppointmentReminderLog[]
@@ -499,8 +503,9 @@ model Appointment {
   @@index([conversationId])
   @@index([empresaId, customerPhone, startAt])
   @@index([empresaId, status, startAt, customerPhone])
-  @@index([deletedAt]) // 👈 recomendado para filtros
+  @@index([deletedAt])
   @@index([empresaId, deletedAt, startAt])
+  @@index([empresaId, staffId]) // ✅ útil para consultas por recurso
   @@map("appointment")
 }
 
@@ -712,6 +717,9 @@ model Staff {
   updatedAt DateTime @updatedAt
 
   empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  // ✅ Relación inversa (opcional pero útil)
+  appointments Appointment[]
 
   @@index([empresaId])
   @@map("staff")

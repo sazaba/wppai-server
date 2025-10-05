@@ -1,5 +1,6 @@
 // utils/ai/strategies/estetica.strategy.ts
 // Full-agent unificado (agenda natural + tools + KB) con flujo compatible con agent.strategy
+// *** Respuesta inmediata: sin retrasos configurados ***
 
 import prisma from "../../../lib/prisma"
 import * as Wam from "../../../services/whatsapp.service"
@@ -10,10 +11,8 @@ import type { IAReplyResult } from "../../handleIAReply.ecommerce"
 import { loadApptContext, type EsteticaCtx } from "./esteticaModules/domain/estetica.rag"
 import { runEsteticaAgent, type ChatTurn } from "./esteticaModules/domain/estetica.agent"
 
+// === Desactivamos delays (respuesta inmediata)
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000)
-const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000)
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)
-
 const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>()
 
 function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = REPLY_DEDUP_WINDOW_MS) {
@@ -27,17 +26,7 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
 function markActuallyReplied(conversationId: number, clientTs: Date) {
     recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: Date.now() })
 }
-
 function normalizeToE164(n: string) { return String(n || "").replace(/[^\d]/g, "") }
-async function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)) }
-
-async function computeReplyDelayMs(conversationId: number) {
-    const prevBot = await prisma.message.findFirst({
-        where: { conversationId, from: MessageFrom.bot },
-        select: { id: true },
-    })
-    return prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
-}
 
 async function persistBotReply({
     conversationId, empresaId, texto, nuevoEstado, to, phoneNumberId,
@@ -139,7 +128,7 @@ export async function handleEsteticaReply(args: {
         content: (m.contenido || ""),
     }))
 
-    // === LLM (motor de la strategy)
+    // === LLM (motor)
     let texto = ""
     try {
         texto = await runEsteticaAgent({ ...ctx, __conversationId: chatId }, [
@@ -151,11 +140,7 @@ export async function handleEsteticaReply(args: {
         texto = "Gracias por tu mensaje. Puedo ayudarte con horarios o información de nuestros tratamientos."
     }
 
-    // “retraso humano” (mismo comportamiento que agent.strategy)
-    const delayMs = await computeReplyDelayMs(chatId)
-    await sleep(delayMs)
-
-    // === persistir & enviar por WhatsApp
+    // === persistir & enviar por WhatsApp (SIN ESPERA)
     const saved = await persistBotReply({
         conversationId: chatId,
         empresaId,
