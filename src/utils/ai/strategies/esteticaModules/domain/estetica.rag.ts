@@ -1,120 +1,105 @@
 // utils/ai/strategies/esteticaModules/domain/estetica.rag.ts
-import prisma from "../../../../../lib/prisma";
-import type { AppointmentVertical } from "@prisma/client";
+import prisma from "../../../../../lib/prisma"
+import type { AppointmentVertical } from "@prisma/client"
 
-/* ===========================================================
- * Helpers de logging (silencioso por default)
- * =========================================================== */
-const ESTETICA_DEBUG = String(process.env.ESTETICA_DEBUG ?? "0") !== "0";
-type Lvl = "debug" | "info" | "warn" | "error";
+const ESTETICA_DEBUG = String(process.env.ESTETICA_DEBUG ?? "0") !== "0"
+type Lvl = "debug" | "info" | "warn" | "error"
 function log(level: Lvl, msg: string, meta?: any) {
-    if (!ESTETICA_DEBUG && level === "debug") return;
-    const tag = `[RAG:${level.toUpperCase()}]`;
-    if (meta !== undefined) {
-        (console as any)[level]?.(tag, msg, meta) ?? console.log(tag, msg, meta);
-    } else {
-        (console as any)[level]?.(tag, msg) ?? console.log(tag, msg);
-    }
+    if (!ESTETICA_DEBUG && level === "debug") return
+    const tag = `[RAG:${level.toUpperCase()}]`
+    if (meta !== undefined) (console as any)[level]?.(tag, msg, meta) ?? console.log(tag, msg, meta)
+    else (console as any)[level]?.(tag, msg) ?? console.log(tag, msg)
 }
 
-/* ===========================================================
- * Helpers de parseo seguro
- * =========================================================== */
+/* ======================== Types ======================== */
+export type EsteticaCtx = {
+    empresaId: number
+    vertical: AppointmentVertical | "custom"
+    timezone: string
+    bufferMin: number
+    policies?: string | null
+    logistics?: {
+        locationName?: string
+        locationAddress?: string
+        locationMapsUrl?: string
+        instructionsArrival?: string
+        parkingInfo?: string
+    }
+    rules?: {
+        cancellationWindowHours?: number | null
+        noShowPolicy?: string | null
+        depositRequired?: boolean | null
+        depositAmount?: unknown
+        maxDailyAppointments?: number | null
+        bookingWindowDays?: number | null
+        blackoutDates?: string[] | null
+        overlapStrategy?: string | null
+        minNoticeHours?: number | null
+        maxAdvanceDays?: number | null
+        allowSameDay?: boolean | null
+        requireConfirmation?: boolean | null
+        defaultServiceDurationMin?: number | null
+        paymentNotes?: string | null
+    }
+    buildKbContext: () => Promise<string>
+}
+
+/* ======================== Parsers ======================== */
 function asStrArr(v: unknown): string[] | null {
-    if (v == null) return null;
-    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string");
+    if (v == null) return null
+    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string")
     if (typeof v === "string") {
         try {
-            const j = JSON.parse(v);
-            return Array.isArray(j) ? j.filter((x): x is string => typeof x === "string") : null;
-        } catch { return null; }
+            const j = JSON.parse(v)
+            return Array.isArray(j) ? j.filter((x): x is string => typeof x === "string") : null
+        } catch { return null }
     }
-    return null;
+    return null
 }
 function asNum(v: unknown, dflt?: number | null): number | null {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : (dflt ?? null);
+    const n = Number(v)
+    return Number.isFinite(n) ? n : (dflt ?? null)
 }
 function asBool(v: unknown, dflt = false): boolean {
-    if (typeof v === "boolean") return v;
-    if (typeof v === "string") return ["true", "1", "yes", "si", "sí"].includes(v.toLowerCase());
-    if (typeof v === "number") return v !== 0;
-    return dflt;
+    if (typeof v === "boolean") return v
+    if (typeof v === "string") return ["true", "1", "yes", "si", "sí"].includes(v.toLowerCase())
+    if (typeof v === "number") return v !== 0
+    return dflt
 }
 
-/* ===========================================================
- * Contrato del contexto consumido por estetica.strategy.ts
- * =========================================================== */
-export type EsteticaCtx = {
-    empresaId: number;
-    vertical: AppointmentVertical | "custom";
-    timezone: string;
-    bufferMin: number;
-    policies?: string | null;
-    logistics?: {
-        locationName?: string;
-        locationAddress?: string;
-        locationMapsUrl?: string;
-        instructionsArrival?: string;
-        parkingInfo?: string;
-    };
-    rules?: {
-        cancellationWindowHours?: number | null;
-        noShowPolicy?: string | null;
-        depositRequired?: boolean | null;
-        depositAmount?: unknown;
-        maxDailyAppointments?: number | null;
-        bookingWindowDays?: number | null;
-        blackoutDates?: string[] | null;
-        overlapStrategy?: string | null;
-        minNoticeHours?: number | null;
-        maxAdvanceDays?: number | null;
-        allowSameDay?: boolean | null;
-        requireConfirmation?: boolean | null;
-        defaultServiceDurationMin?: number | null;
-        paymentNotes?: string | null;
-    };
-    /** Texto consolidado de KB para el prompt del agente */
-    buildKbContext: () => Promise<string>;
-};
+/* ======================== Context Loader ======================== */
+type OrchestratorOverrides = {
+    vertical?: AppointmentVertical | "custom"
+    timezone?: string
+    bufferMin?: number
+    policies?: string | null
+    logistics?: Record<string, unknown>
+    appointmentMinNoticeHours?: number | null
+    appointmentMaxAdvanceDays?: number | null
+    allowSameDayBooking?: boolean | null
+    requireClientConfirmation?: boolean | null
+    defaultServiceDurationMin?: number | null
+    bookingWindowDays?: number | null
+    maxDailyAppointments?: number | null
+    blackoutDates?: string[] | string | null
+    overlapStrategy?: string | null
+    kb?: {
+        businessOverview?: string
+        faqs?: Array<{ q: string; a: string }>
+        serviceNotes?: Record<string, unknown>
+        disclaimers?: string
+        freeText?: string
+    }
+}
 
-/* ===========================================================
- * Carga de contexto (fuente: orquestador o DB)
- *  - Oficial de agenda: BusinessConfigAppt
- *  - KB: kbBusinessOverview, kbFAQs, kbServiceNotes, kbDisclaimers, kbFreeText
- * =========================================================== */
 export async function loadApptContext(
     empresaId: number,
-    fromOrchestrator?: {
-        vertical?: AppointmentVertical | "custom";
-        timezone?: string;
-        bufferMin?: number;
-        policies?: string | null;
-        logistics?: Record<string, unknown>;
-        // reglas “flattened” que puedas mandar desde tu router
-        appointmentMinNoticeHours?: number | null;
-        appointmentMaxAdvanceDays?: number | null;
-        allowSameDayBooking?: boolean | null;
-        requireClientConfirmation?: boolean | null;
-        defaultServiceDurationMin?: number | null;
-        bookingWindowDays?: number | null;
-        maxDailyAppointments?: number | null;
-        blackoutDates?: string[] | string | null;
-        overlapStrategy?: string | null;
-        // KB opcional ya precompilada
-        kb?: {
-            businessOverview?: string;
-            faqs?: Array<{ q: string; a: string }>;
-            serviceNotes?: Record<string, unknown>;
-            disclaimers?: string;
-            freeText?: string;
-        };
-    }
+    fromOrchestrator?: OrchestratorOverrides
 ): Promise<EsteticaCtx> {
-    const t0 = Date.now();
+    const t0 = Date.now()
 
     if (fromOrchestrator) {
-        const o = fromOrchestrator;
+        const o = fromOrchestrator
         const ctx: EsteticaCtx = {
             empresaId,
             vertical: (o.vertical as AppointmentVertical) ?? "custom",
@@ -145,7 +130,7 @@ export async function loadApptContext(
                 paymentNotes: null,
             },
             buildKbContext: async () => {
-                const kb = o.kb ?? {};
+                const kb = o.kb ?? {}
                 const out = [
                     kb.businessOverview && `Sobre la clínica:\n${kb.businessOverview}`,
                     Array.isArray(kb.faqs) && kb.faqs.length
@@ -154,11 +139,11 @@ export async function loadApptContext(
                     kb.serviceNotes && `Servicios (notas):\n${JSON.stringify(kb.serviceNotes, null, 2)}`,
                     kb.disclaimers && `Avisos:\n${kb.disclaimers}`,
                     kb.freeText && `Notas libres:\n${kb.freeText}`,
-                ].filter(Boolean).join("\n\n");
-                log("debug", "kb.orchestrator.len", { len: out.length });
-                return out;
+                ].filter(Boolean).join("\n\n")
+                log("debug", "kb.orchestrator.len", { len: out.length })
+                return out
             },
-        };
+        }
 
         log("info", "ctx.loaded.fromOrchestrator", {
             empresaId,
@@ -174,13 +159,12 @@ export async function loadApptContext(
                 blackoutDatesCount: ctx.rules?.blackoutDates?.length ?? 0,
             },
             ms: Date.now() - t0,
-        });
-
-        return ctx;
+        })
+        return ctx
     }
 
-    // ===== Carga desde DB =====
-    const bca = await prisma.businessConfigAppt.findUnique({ where: { empresaId } });
+    // ——— Carga desde DB ———
+    const bca = await prisma.businessConfigAppt.findUnique({ where: { empresaId } })
 
     const ctx: EsteticaCtx = {
         empresaId,
@@ -220,11 +204,11 @@ export async function loadApptContext(
                 bca?.kbServiceNotes && `Servicios (notas):\n${JSON.stringify(bca.kbServiceNotes as any, null, 2)}`,
                 bca?.kbDisclaimers && `Avisos:\n${bca.kbDisclaimers}`,
                 bca?.kbFreeText && `Notas libres:\n${bca.kbFreeText}`,
-            ].filter(Boolean).join("\n\n");
-            log("debug", "kb.db.len", { len: out.length });
-            return out;
+            ].filter(Boolean).join("\n\n")
+            log("debug", "kb.db.len", { len: out.length })
+            return out
         },
-    };
+    }
 
     log("info", "ctx.loaded.fromDB", {
         empresaId,
@@ -240,48 +224,44 @@ export async function loadApptContext(
             blackoutDatesCount: ctx.rules?.blackoutDates?.length ?? 0,
         },
         ms: Date.now() - t0,
-    });
+    })
 
-    return ctx;
+    return ctx
 }
 
-/* ===========================================================
- * (Opcional) util para normalizar nombres de servicio/alias
- * =========================================================== */
+/* ======================= Procedimientos: matching ======================= */
 const nrm = (s: string) =>
     String(s || "")
         .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
         .toLowerCase().replace(/[^\w\s]/g, " ")
-        .replace(/\s+/g, " ").trim();
+        .replace(/\s+/g, " ").trim()
 
-/** Búsqueda flexible de procedimiento por texto (nombre o alias) */
 export async function matchProcedureFromText(empresaId: number, text: string) {
-    const q = nrm(text);
-    if (!q) return null;
+    const q = nrm(text)
+    if (!q) return null
 
     const rows = await prisma.esteticaProcedure.findMany({
         where: { empresaId, enabled: true },
         select: { id: true, name: true, durationMin: true, aliases: true },
-    });
+    })
 
-    type Row = (typeof rows)[number];
-    let best: Row | null = null;
-    let bestScore = 0;
+    type Row = (typeof rows)[number]
+    let best: Row | null = null
+    let bestScore = 0
 
     for (const r of rows) {
-        const nameKey = nrm(r.name);
-        const byName = q.includes(nameKey) ? 1 : 0;
+        const nameKey = nrm(r.name)
+        const byName = q.includes(nameKey) ? 1 : 0
 
-        let byAlias = 0;
-        const aliases = Array.isArray(r.aliases) ? (r.aliases as unknown as string[]) : [];
-        for (const a of aliases) {
-            if (typeof a === "string" && q.includes(nrm(a))) byAlias = Math.max(byAlias, 0.8);
-        }
-        const score = Math.max(byName, byAlias);
-        if (score > bestScore) { best = r; bestScore = score; }
+        let byAlias = 0
+        const aliases = Array.isArray(r.aliases) ? (r.aliases as unknown as string[]) : []
+        for (const a of aliases) if (typeof a === "string" && q.includes(nrm(a))) byAlias = Math.max(byAlias, 0.8)
+
+        const score = Math.max(byName, byAlias)
+        if (score > bestScore) { best = r; bestScore = score }
     }
 
     return best && bestScore >= 0.6
         ? { id: best.id, name: best.name, durationMin: best.durationMin ?? undefined }
-        : null;
+        : null
 }

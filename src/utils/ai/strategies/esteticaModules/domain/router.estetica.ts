@@ -1,7 +1,7 @@
 // Router minimal para el full-agent unificado.
 // Delegamos la respuesta al agente y devolvemos solo el texto.
 
-import { runEsteticaAgent, type ChatTurn } from "./estetica.strategy";
+import { runEsteticaAgent, type ChatTurn } from "../../estetica.strategy";
 import type { EsteticaCtx } from "./estetica.rag";
 
 export async function routeEsteticaTurn(
