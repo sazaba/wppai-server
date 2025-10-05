@@ -1,5 +1,5 @@
 // utils/ai/strategies/esteticaModules/domain/estetica.agent.ts
-// Full-agent (agenda natural + tools + KB) CON staff-awareness y sin delays
+// Full-agent (agenda natural + tools + KB) CON staff-awareness, estilo humano y sin delays
 
 import prisma from "../../../../../lib/prisma"
 import { openai } from "../../../../../lib/openai"
@@ -29,11 +29,17 @@ function safeParseArgs(raw?: string) {
     try { return JSON.parse(raw) } catch { return {} }
 }
 const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te va bien?"]
+
+// Añade un cierre amable y asegura un (1) emoji por turno
 function postProcessReply(reply: string, history: ChatTurn[]): string {
     const clean = reply.trim().replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n")
     if (!clean) return clean
     const add = ENDINGS[(history.length) % ENDINGS.length]
-    return /[.?!…]$/.test(clean) ? `${clean} ${add}` : `${clean}. ${add}`
+    const withEnding = /[.?!…]$/.test(clean) ? `${clean} ${add}` : `${clean}. ${add}`
+
+    // si no hay emoji visible, agrega uno neutro
+    const hasEmoji = /\p{Extended_Pictographic}/u.test(withEnding)
+    return hasEmoji ? withEnding : `${withEnding} 🙂`
 }
 
 /* ======================= Fecha/TZ helpers ======================= */
@@ -57,6 +63,20 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
 }
 function startOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz) }
 function endOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz) }
+
+/* ====== Corrección opcional de timezone en appointmentHours ====== */
+// Si tus hours están guardadas en UTC y el negocio opera en America/Bogota (-300 min),
+// define: APPT_HOURS_TZ_OFFSET_MIN=-300
+const HOURS_TZ_OFFSET_MIN = Number(process.env.APPT_HOURS_TZ_OFFSET_MIN ?? 0)
+function hhmmWithOffset(hhmm: string): string {
+    if (!HOURS_TZ_OFFSET_MIN) return hhmm
+    const [h, m] = hhmm.split(":").map(Number)
+    let total = h * 60 + m + HOURS_TZ_OFFSET_MIN
+    total = ((total % 1440) + 1440) % 1440
+    const H = Math.floor(total / 60).toString().padStart(2, "0")
+    const M = (total % 60).toString().padStart(2, "0")
+    return `${H}:${M}`
+}
 
 /* ======================= Disponibilidad base ======================= */
 type HourRow = {
@@ -119,13 +139,15 @@ function windowsForYMD(ymd: string, tz: string, hours: HourRow[], exceptions: Ex
     if (ex) {
         if (ex.isOpen === false) return []
         const pairs: [string | null, string | null][] = [[ex.start1, ex.end1], [ex.start2, ex.end2]]
-        return pairs.filter(([s, e]) => s && e).map(([s, e]) => ({ start: s!, end: e! }))
+        return pairs
+            .filter(([s, e]) => s && e)
+            .map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }))
     }
     const wd = weekdayCode(makeZonedDate(ymd, "00:00", tz), tz)
     const todays = hours.filter(h => h.day === wd && h.isOpen)
     const pairs = todays.flatMap(h => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
         .filter(([s, e]) => s && e)
-    return pairs.map(([s, e]) => ({ start: s!, end: e! }))
+    return pairs.map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }))
 }
 
 /* ====== staff availability ====== */
@@ -296,13 +318,34 @@ async function toolFindSlots(ctx: EsteticaCtx, args: { serviceId?: number; servi
 
     const now = new Date()
     const future = raw.filter(d => d.start.getTime() > now.getTime())
-    const labels = future.slice(0, 12).map((d, i) => ({
+    let labels = future.slice(0, 12).map((d, i) => ({
         idx: i + 1,
         startISO: d.start.toISOString(),
         startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
         staffId: d.staffId ?? null,
     }))
-    // Devolvemos sólo 6 (la UI/LLM ya sabe presentar 2 mañana/2 tarde por día)
+
+    // Fallback: si el día exacto no tiene cupos, sugiere a partir del día siguiente
+    if (!labels.length) {
+        const hint2 = (hint ? new Date(hint) : new Date())
+        hint2.setDate(hint2.getDate() + 1)
+        const raw2 = await findSlotsCore({
+            empresaId: ctx.empresaId,
+            ctx,
+            hint: hint2,
+            durationMin,
+            count: 12,
+            procedureId: svc?.id ?? null,
+        })
+        const future2 = raw2.filter(d => d.start.getTime() > Date.now())
+        labels = future2.slice(0, 12).map((d, i) => ({
+            idx: i + 1,
+            startISO: d.start.toISOString(),
+            startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
+            staffId: d.staffId ?? null,
+        }))
+    }
+
     return { ok: true, durationMin, serviceName: svc?.name ?? args.serviceName ?? null, slots: labels.slice(0, 6) }
 }
 
@@ -466,39 +509,41 @@ export function systemPrompt(ctx: EsteticaCtx) {
     const minNoticeH = ctx.rules?.minNoticeHours ?? 0
 
     return [
-        `Eres coordinador/a de una clínica estética premium (español de Colombia).`,
-        `Objetivo: conversación natural y usa **tools** para listar horarios, agendar, reagendar, cancelar y consultar próximas citas.`,
-        `Para dudas de servicios (qué incluye/duración/precios/políticas): responde solo con la **base de conocimiento (KB)**. No inventes datos.`,
+        `Eres coordinador/a humano/a de una clínica estética premium en Colombia. Respondes como una persona: cálida, breve, natural y con **1 emoji** en cada turno. Nada de “voy a buscar / dame un momento”.`,
+        `Usa **TOOLS** para todo lo de agenda: listar cupos, reservar, reagendar, cancelar, próximas.`,
         ``,
         `# Reglas de agenda`,
-        `- Zona horaria: **${tz}**.`,
+        `- Zona horaria del negocio: **${tz}**.`,
         `- Citas del mismo día: ${allowSameDay ? "permitidas si hay cupo" : "NO permitidas"}.`,
         `- Antelación mínima: **${minNoticeH}h**.`,
-        `- Cuando pidan “mañana / pasado / la otra semana / próximo lunes”: llama **findSlots**.`,
-        `- Muestra exclusivamente lo que devuelvan las tools (máx. 6; 2 mañana y 2 tarde por día).`,
-        `- Antes de reservar: valida explícitamente **servicio + horario + nombre completo + teléfono**.`,
-        `- **Doble confirmación**: (1) resume datos; (2) pregunta “¿Confirmamos?”; sólo entonces llama **book**.`,
-        `- Acepta confirmaciones coloquiales (“sí/ok/dale/listo/confirmo”).`,
+        `- Solo ofrece horarios que devuelven las tools (máx. 6 por respuesta; reparte en mañana/tarde).`,
+        ``,
+        `# Cómo interpretar fechas/horas del usuario`,
+        `- Si el usuario dice “martes”, “mañana”, “la otra semana”, “3pm del lunes”, “el 15”: **convierte eso a una fecha/hora real en ${tz}** y pásala como **fromISO** a la tool **findSlots**.`,
+        `  - “martes”: usa el **próximo martes 06:00** local (${tz}) como fromISO.`,
+        `  - “la otra semana”: usa el **lunes de la próxima semana 06:00** local.`,
+        `  - “lunes 3pm”: usa ese lunes a las **15:00** local como fromISO.`,
+        `- Si no hay cupos ese día, **muestra automáticamente** los siguientes días cercanos (hasta 6 opciones).`,
+        ``,
+        `# Datos obligatorios antes de reservar`,
+        `- Servicio, fecha/hora exacta (uno de los slots devueltos), nombre completo y teléfono.`,
+        `- **Doble confirmación**: (1) resume todo; (2) pregunta “¿Confirmamos?”. Sólo si la respuesta es clara (sí/ok/dale/listo/confirmo), llama **book**.`,
+        ``,
+        `# KB`,
+        `- Todo lo de duración/precios/notas sale de la KB; si falta, dilo con transparencia.`,
         ``,
         `# Estilo`,
-        `- Claro, cercano y profesional. 2–5 líneas. 1 emoji máximo si aporta.`,
-        `- Evita frases de espera (“voy a buscar…/un momento…”). Responde directo.`,
-        ``,
-        `# Seguridad`,
-        `- No diagnostiques ni prescribas indicaciones médicas personalizadas.`,
-        ``,
-        `# Fallos de tools`,
-        `- Si una tool falla, informa el problema breve y ofrece escalar a un humano.`,
+        `- 2–5 líneas, directo, cercano, **1 emoji** siempre.`,
     ].join("\n")
 }
+
 export function buildFewshots(_ctx: EsteticaCtx): ChatTurn[] {
     return [
         { role: "user", content: "hola" },
-        { role: "assistant", content: "¡Hola! 🙂 ¿Quieres info de nuestros tratamientos o prefieres ver horarios para agendar?" },
-        { role: "user", content: "¿qué servicios ofrecen?" },
-        { role: "assistant", content: "Te comparto nuestro catálogo principal y, si uno te interesa, te muestro cupos de una vez." },
-        { role: "user", content: "puede ser para hoy?" },
-        { role: "assistant", content: "Por política no agendamos el mismo día; puedo mostrarte desde mañana. ¿Te sirve?" },
+        { role: "assistant", content: "¡Hola! ¿Quieres info de tratamientos o prefieres ver horarios para agendar? 🙂" },
+
+        { role: "user", content: "me sirve el martes en la tarde para botox" },
+        { role: "assistant", content: "Perfecto. Buscaré cupos desde el **próximo martes 06:00** (hora local) para *Toxina botulínica*. Te muestro hasta 6 opciones y luego tomo tus datos para confirmar. 😉" },
     ]
 }
 
@@ -527,8 +572,17 @@ export async function runEsteticaAgent(
     const few = buildFewshots(ctx)
     const kb = (await ctx.buildKbContext?.()) ?? ""
 
+    // HINT temporal (ancla "hoy/mañana/pasado" a la TZ del negocio)
+    const nowParts = new Intl.DateTimeFormat("es-CO", {
+        timeZone: ctx.timezone,
+        dateStyle: "full",
+        timeStyle: "short",
+    }).format(new Date())
+    const todayHint = `Contexto temporal: ahora mismo, en ${ctx.timezone}, es ${nowParts}.`
+
     const base: any = [
         { role: "system", content: `${sys}\n\n### Conocimiento de la clínica\n${kb}` },
+        { role: "system", content: todayHint }, // 👈 NUEVO
         ...few,
         ...turns,
     ]
