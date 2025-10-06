@@ -31,7 +31,7 @@ import {
     fromLocalTZToUTC,
     fromUTCtoLocalTZ,
     combineLocalDateTime,
-    parseHHMM,
+    parseHHMM, // keep import (no-op safe)
 } from "./esteticaModules/datetime";
 
 /** ===== Config imagen/texto ===== */
@@ -57,15 +57,19 @@ function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS
 }
 
 /** ===== Utils ===== */
-function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); } // no se usa para delay de respuesta
+function sleep(ms: number) {
+    return new Promise((res) => setTimeout(res, ms));
+} // no se usa para delay de respuesta
 
 /** ===== Detección de referencia explícita a imagen ===== */
 function mentionsImageExplicitly(t: string) {
     const s = String(t || "").toLowerCase();
-    return /\b(foto|imagen|selfie|captura|screenshot)\b/.test(s)
-        || /(mira|revisa|checa|ve|verifica)\s+la\s+(foto|imagen)/.test(s)
-        || /(te\s+mand(e|é)|te\s+envi(e|é))\s+(la\s+)?(foto|imagen)/.test(s)
-        || /\b(de|en)\s+la\s+(foto|imagen)\b/.test(s);
+    return (
+        /\b(foto|imagen|selfie|captura|screenshot)\b/.test(s) ||
+        /(mira|revisa|checa|ve|verifica)\s+la\s+(foto|imagen)/.test(s) ||
+        /(te\s+mand(e|é)|te\s+envi(e|é))\s+(la\s+)?(foto|imagen)/.test(s) ||
+        /\b(de|en)\s+la\s+(foto|imagen)\b/.test(s)
+    );
 }
 
 /** ===== Selección de imagen contextual ===== */
@@ -79,7 +83,10 @@ async function pickImageForContext(opts: {
     const { conversationId, directUrl, userText, caption, referenceTs } = opts;
 
     if (directUrl) {
-        return { url: String(directUrl), noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : "" };
+        return {
+            url: String(directUrl),
+            noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : "",
+        };
     }
     if (!userText) return { url: null, noteToAppend: "" };
 
@@ -120,9 +127,12 @@ async function pickImageForContext(opts: {
 }
 
 /** ===== Intents mínimos (texto) ===== */
-function detectIntent(text: string): "saludo" | "faq" | "agendar" | "reagendar" | "cancelar" | "confirmar" | "smalltalk" {
+function detectIntent(
+    text: string
+): "saludo" | "faq" | "agendar" | "reagendar" | "cancelar" | "confirmar" | "smalltalk" {
     const t = text.toLowerCase();
-    if (/(confirmo|confirmar|sí,?\s*correcto|si,?\s*correcto|correcto|dale|listo|agéndala|agendala)/i.test(t)) return "confirmar";
+    if (/(confirmo|confirmar|sí,?\s*correcto|si,?\s*correcto|correcto|dale|listo|agéndala|agendala)/i.test(t))
+        return "confirmar";
     if (/(reagendar|cambiar|mover|otra hora|reprogramar)/i.test(t)) return "reagendar";
     if (/(cancelar|anular)/i.test(t)) return "cancelar";
     if (/(cita|agendar|agenda|programar|reservar)/i.test(t)) return "agendar";
@@ -150,12 +160,16 @@ function extractTime(text: string): string | undefined {
 /** ===== Util: duración segura del servicio ===== */
 function readSvcDuration(svc: any, kbRules?: any): number | undefined {
     if (!svc) return undefined;
-    // contemplamos ambas variantes comunes
     return svc.duration ?? svc.durationMin ?? kbRules?.defaultServiceDurationMin;
 }
 
 /** ===== Estado temporal (borrador) ===== */
-type DraftStage = "oferta" | "confirm" | "reagendar_pedir" | "reagendar_confirm" | "cancel_confirm";
+type DraftStage =
+    | "oferta"
+    | "confirm"
+    | "reagendar_pedir"
+    | "reagendar_confirm"
+    | "cancel_confirm";
 type Draft = {
     empresaId: number;
     serviceId?: number;
@@ -171,38 +185,63 @@ type Draft = {
 
 async function getDraft(chatId: number): Promise<Draft | undefined> {
     const last = await prisma.message.findFirst({
-        where: { conversationId: chatId, from: MessageFrom.bot, contenido: { startsWith: "[DEBUG booking]" } },
+        where: {
+            conversationId: chatId,
+            from: MessageFrom.bot,
+            contenido: { startsWith: "[DEBUG booking]" },
+        },
         orderBy: { id: "desc" },
         select: { contenido: true },
     });
     if (!last) return;
-    try { return JSON.parse(last.contenido.replace("[DEBUG booking] ", "")) as Draft; }
-    catch { return; }
+    try {
+        return JSON.parse(last.contenido.replace("[DEBUG booking] ", "")) as Draft;
+    } catch {
+        return;
+    }
 }
 async function putDraft(chatId: number, d: Draft) {
     await prisma.message.create({
-        data: { empresaId: d.empresaId, conversationId: chatId, from: MessageFrom.bot, contenido: `[DEBUG booking] ${JSON.stringify(d)}` } as any,
+        data: {
+            empresaId: d.empresaId,
+            conversationId: chatId,
+            from: MessageFrom.bot,
+            contenido: `[DEBUG booking] ${JSON.stringify(d)}`,
+        } as any,
     });
 }
 
 /** ===== Historial compacto ===== */
-async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
+async function getRecentHistory(
+    conversationId: number,
+    excludeMessageId?: number,
+    take = 10
+) {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({
-        where, orderBy: { timestamp: "desc" }, take,
+        where,
+        orderBy: { timestamp: "desc" },
+        take,
         select: { from: true, contenido: true },
     });
-    return rows.reverse().map(r => ({
+    return rows.reverse().map((r) => ({
         role: r.from === MessageFrom.client ? "user" : "assistant",
         content: softTrim(r.contenido || "", 220),
     }));
 }
 
 /** ===== Persistencia y envío ===== */
-function normalizeToE164(n: string) { return String(n || "").replace(/[^\d]/g, ""); }
+function normalizeToE164(n: string) {
+    return String(n || "").replace(/[^\d]/g, "");
+}
 async function persistBotReply({
-    conversationId, empresaId, texto, nuevoEstado, to, phoneNumberId,
+    conversationId,
+    empresaId,
+    texto,
+    nuevoEstado,
+    to,
+    phoneNumberId,
 }: {
     conversationId: number;
     empresaId: number;
@@ -214,27 +253,42 @@ async function persistBotReply({
     const msg = await prisma.message.create({
         data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId },
     });
-    await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
+    await prisma.conversation.update({
+        where: { id: conversationId },
+        data: { estado: nuevoEstado },
+    });
 
     let wamid: string | undefined;
     if (to && String(to).trim()) {
         try {
             const resp = await Wam.sendWhatsappMessage({
-                empresaId, to: normalizeToE164(to), body: texto, phoneNumberIdHint: phoneNumberId,
+                empresaId,
+                to: normalizeToE164(to),
+                body: texto,
+                phoneNumberIdHint: phoneNumberId,
             });
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id;
-            if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } });
-        } catch { /* noop */ }
+            if (wamid)
+                await prisma.message.update({
+                    where: { id: msg.id },
+                    data: { externalId: wamid },
+                });
+        } catch {
+            /* noop */
+        }
     }
     return { messageId: msg.id, texto, wamid };
 }
 
 /** ===== prompt budgeting / formato breve ===== */
 function softTrim(s: string | null | undefined, max = 140) {
-    const t = (s || "").trim(); if (!t) return "";
+    const t = (s || "").trim();
+    if (!t) return "";
     return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
 }
-function approxTokens(str: string) { return Math.ceil((str || "").length / 4); }
+function approxTokens(str: string) {
+    return Math.ceil((str || "").length / 4);
+}
 function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
     let t = String(text || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
     if (!t) return t;
@@ -245,7 +299,12 @@ function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_
     }
     return t;
 }
-function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_CHARS, allowEmoji = IA_ALLOW_EMOJI): string {
+function formatConcise(
+    text: string,
+    maxLines = IA_MAX_LINES,
+    maxChars = IA_MAX_CHARS,
+    allowEmoji = IA_ALLOW_EMOJI
+): string {
     let t = String(text || "").trim();
     if (!t) return "Gracias por escribirnos. ¿Cómo puedo ayudarte?";
     t = t.replace(/^[•\-]\s*/gm, "").replace(/\s+\n/g, "\n").replace(/\n{2,}/g, "\n").trim();
@@ -257,7 +316,9 @@ function formatConcise(text: string, maxLines = IA_MAX_LINES, maxChars = IA_MAX_
     }
     return t;
 }
-function endsWithPunctuation(t: string) { return /[.!?…]\s*$/.test((t || "").trim()); }
+function endsWithPunctuation(t: string) {
+    return /[.!?…]\s*$/.test((t || "").trim());
+}
 function closeNicely(raw: string): string {
     let t = (raw || "").trim();
     if (!t) return t;
@@ -272,16 +333,22 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     if (!sys) return messages;
 
     const sysText = String(sys.content || "");
-    const userText = typeof user?.content === "string"
-        ? user?.content
-        : Array.isArray(user?.content) ? String(user?.content?.[0]?.text || "") : "";
+    const userText =
+        typeof user?.content === "string"
+            ? user?.content
+            : Array.isArray(user?.content)
+                ? String(user?.content?.[0]?.text || "")
+                : "";
 
     let total = approxTokens(sysText) + approxTokens(userText);
     for (const m of messages) {
         if (m.role !== "system" && m !== user) {
-            const t = typeof m.content === "string"
-                ? m.content
-                : Array.isArray(m.content) ? String(m.content?.[0]?.text || "") : "";
+            const t =
+                typeof m.content === "string"
+                    ? m.content
+                    : Array.isArray(m.content)
+                        ? String(m.content?.[0]?.text || "")
+                        : "";
             total += approxTokens(t);
         }
     }
@@ -290,7 +357,12 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     const lines = sysText.split("\n").map((l: string) => l.trim()).filter(Boolean);
     const keep: string[] = [];
     for (const l of lines) {
-        if (/Asistente de clínica estética|Responde en|Puedes usar|Mantente|Ámbito:|Incluye cuando|Sigue estas/i.test(l)) keep.push(l);
+        if (
+            /Asistente de clínica estética|Responde en|Puedes usar|Mantente|Ámbito:|Incluye cuando|Sigue estas/i.test(
+                l
+            )
+        )
+            keep.push(l);
         if (keep.length >= 6) break;
     }
     (sys as any).content = keep.join("\n") || lines.slice(0, 6).join("\n");
@@ -316,10 +388,20 @@ async function runChatWithBudget(opts: {
     const firstMax = opts.maxTokens;
 
     try {
-        const resp1 = await (openai.chat.completions.create as any)({ model, messages, temperature, max_tokens: firstMax });
+        const resp1 = await (openai.chat.completions.create as any)({
+            model,
+            messages,
+            temperature,
+            max_tokens: firstMax,
+        });
         return resp1?.choices?.[0]?.message?.content?.trim() || "";
     } catch {
-        const resp2 = await (openai.chat.completions.create as any)({ model, messages, temperature, max_tokens: 32 });
+        const resp2 = await (openai.chat.completions.create as any)({
+            model,
+            messages,
+            temperature,
+            max_tokens: 32,
+        });
         return resp2?.choices?.[0]?.message?.content?.trim() || "";
     }
 }
@@ -337,12 +419,23 @@ async function getUpcomingAppointmentForConversation(empresaId: number, conversa
         where: {
             empresaId,
             conversationId,
-            status: { in: [AppointmentStatus.pending, AppointmentStatus.confirmed, AppointmentStatus.rescheduled] },
+            status: {
+                in: [AppointmentStatus.pending, AppointmentStatus.confirmed, AppointmentStatus.rescheduled],
+            },
             startAt: { gte: nowDB },
             deletedAt: null,
         },
         orderBy: { startAt: "asc" },
-        select: { id: true, serviceName: true, startAt: true, endAt: true, timezone: true, customerName: true, customerPhone: true, serviceDurationMin: true },
+        select: {
+            id: true,
+            serviceName: true,
+            startAt: true,
+            endAt: true,
+            timezone: true,
+            customerName: true,
+            customerPhone: true,
+            serviceDurationMin: true,
+        },
     });
     if (!appt) return null;
     return {
@@ -350,6 +443,14 @@ async function getUpcomingAppointmentForConversation(empresaId: number, conversa
         startAt: applyApptOffsetRead(appt.startAt),
         endAt: applyApptOffsetRead(appt.endAt),
     };
+}
+
+/** ===== Helpers: lista de servicios habilitados ===== */
+function listEnabledServices(kb: any, max = 12): string {
+    const names = (kb?.services ?? [])
+        .filter((s: any) => s && s.enabled !== false)
+        .map((s: any) => s.name);
+    return names.slice(0, max).join(", ");
 }
 
 /** ======= PUBLIC: handleEsteticaReply ======= */
@@ -409,14 +510,19 @@ export async function handleEsteticaReply(args: {
 
     // 🔒 Idempotencia inbound
     if (last?.id && seenInboundRecently(last.id)) {
-        if (process.env.DEBUG_AI === "1") console.log("[EST] Skip: inbound already processed", { lastId: last.id });
+        if (process.env.DEBUG_AI === "1")
+            console.log("[EST] Skip: inbound already processed", { lastId: last.id });
         return { estado: conversacion.estado, mensaje: "" };
     }
 
     // 2) KB
     const kb = await loadEsteticaKB(empresaId);
     if (!kb) {
-        return { estado: ConversationEstado.requiere_agente, mensaje: "Ahora mismo no tengo la configuración completa de la clínica. Te comunico con un asesor humano. 🙏" };
+        return {
+            estado: ConversationEstado.requiere_agente,
+            mensaje:
+                "Ahora mismo no tengo la configuración completa de la clínica. Te comunico con un asesor humano. 🙏",
+        };
     }
 
     // 3) Texto del usuario (nota de voz → transcripción si aplica)
@@ -427,20 +533,33 @@ export async function handleEsteticaReply(args: {
             try {
                 let audioBuf: Buffer | null = null;
                 if (last.mediaUrl && /^https?:\/\//i.test(String(last.mediaUrl))) {
-                    const { data } = await axios.get(String(last.mediaUrl), { responseType: "arraybuffer", timeout: 30000 });
+                    const { data } = await axios.get(String(last.mediaUrl), {
+                        responseType: "arraybuffer",
+                        timeout: 30000,
+                    });
                     audioBuf = Buffer.from(data);
                 }
                 if (audioBuf) {
                     const name =
-                        last.mimeType?.includes("mpeg") ? "audio.mp3" :
-                            last.mimeType?.includes("wav") ? "audio.wav" :
-                                last.mimeType?.includes("m4a") ? "audio.m4a" :
-                                    last.mimeType?.includes("webm") ? "audio.webm" : "audio.ogg";
+                        last.mimeType?.includes("mpeg")
+                            ? "audio.mp3"
+                            : last.mimeType?.includes("wav")
+                                ? "audio.wav"
+                                : last.mimeType?.includes("m4a")
+                                    ? "audio.m4a"
+                                    : last.mimeType?.includes("webm")
+                                        ? "audio.webm"
+                                        : "audio.ogg";
                     transcript = await transcribeAudioBuffer(audioBuf, name);
-                    if (transcript) await prisma.message.update({ where: { id: last.id }, data: { transcription: transcript } });
+                    if (transcript)
+                        await prisma.message.update({
+                            where: { id: last.id },
+                            data: { transcription: transcript },
+                        });
                 }
             } catch (e) {
-                if (process.env.DEBUG_AI === "1") console.error("[EST] Transcription error:", (e as any)?.message || e);
+                if (process.env.DEBUG_AI === "1")
+                    console.error("[EST] Transcription error:", (e as any)?.message || e);
             }
         }
         if (transcript) userText = transcript;
@@ -462,10 +581,12 @@ export async function handleEsteticaReply(args: {
 
     // 4) INTENT + flujo de agenda (draft/confirmaciones)
     const intent = detectIntent(userText || caption || "");
-    const draft = (await getDraft(chatId)) ?? { empresaId } as Draft;
+    const draft = (await getDraft(chatId)) ?? ({ empresaId } as Draft);
 
     // Resolver servicio por texto o mantener el previo (solo para agendar)
-    const svc = resolveServiceName(kb, userText) ?? (draft.serviceId ? kb.services.find(s => s.id === draft.serviceId) ?? null : null);
+    const svc =
+        resolveServiceName(kb, userText) ??
+        (draft.serviceId ? kb.services.find((s: any) => s.id === draft.serviceId) ?? null : null);
     if (svc && (!draft.serviceId || draft.serviceId !== svc.id)) {
         draft.serviceId = svc.id;
         draft.serviceName = svc.name;
@@ -491,8 +612,17 @@ export async function handleEsteticaReply(args: {
             draft.stage = "confirm";
             await putDraft(chatId, draft);
             const local = fromUTCtoLocalTZ(new Date(draft.whenUTC), kb.timezone);
-            const fecha = local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit" });
-            const hora = local.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", hour12: false });
+            const fecha = local.toLocaleDateString("es-CO", {
+                weekday: "long",
+                year: "numeric",
+                month: "long",
+                day: "2-digit",
+            });
+            const hora = local.toLocaleTimeString("es-CO", {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            });
             const resumen =
                 `Voy a reservar tu cita, ¿me confirmas por favor?\n` +
                 `• Servicio: ${draft.serviceName}\n` +
@@ -501,57 +631,113 @@ export async function handleEsteticaReply(args: {
                 `• Teléfono: ${draft.phone}\n\n` +
                 `Si está correcto, dime *"confirmo"* y la agendo ✅`;
             const saved = await persistBotReply({
-                conversationId: chatId, empresaId, texto: resumen, nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId: chatId,
+                empresaId,
+                texto: resumen,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
             });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
 
         if (!svc) {
-            const hint = `Perfecto. Trabajo con los servicios habilitados de la clínica. ¿Cuál te interesa? (Ej.: ${kb.services.slice(0, 3).map(s => s.name).join(", ")})`;
+            const hint = `Perfecto. Trabajo con los servicios habilitados de la clínica. ¿Cuál te interesa? (Ej.: ${kb.services
+                .slice(0, 3)
+                .map((s: any) => s.name)
+                .join(", ")})`;
             const saved = await persistBotReply({
-                conversationId: chatId, empresaId, texto: hint, nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId: chatId,
+                empresaId,
+                texto: hint,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
             });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
 
-        const duration =
-            draft.duration
-            ?? readSvcDuration(svc, (kb as any)?.rules)
-            ?? 60;
+        const duration = draft.duration ?? readSvcDuration(svc, (kb as any)?.rules) ?? 60;
 
         const nowLocal = new Date();
         const anchorLocal = rel.ok ? rel.localStart : nowLocal;
         const anchorUTC = fromLocalTZToUTC(anchorLocal, kb.timezone);
 
         const slots: SlotView[] = await findNextSlots({
-            empresaId, timezone: kb.timezone, serviceDurationMin: duration, fromDateUTC: anchorUTC, days: 14, bufferMin: kb.bufferMin ?? 10,
+            empresaId,
+            timezone: kb.timezone,
+            serviceDurationMin: duration,
+            fromDateUTC: anchorUTC,
+            days: 14,
+            bufferMin: kb.bufferMin ?? 10,
         });
 
         if (!slots.length) {
             const txt = `Puedo ayudarte con *${svc.name}*, pero no veo horarios disponibles en los próximos días. ¿Te contacto con un asesor para coordinar?`;
             const saved = await persistBotReply({
-                conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId: chatId,
+                empresaId,
+                texto: txt,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
             });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
 
-        draft.serviceId = svc.id; draft.serviceName = svc.name; draft.duration = duration; draft.stage = "oferta";
+        draft.serviceId = svc.id;
+        draft.serviceName = svc.name;
+        draft.duration = duration;
+        draft.stage = "oferta";
         await putDraft(chatId, draft);
 
-        const primeros = slots.slice(0, 5).map(s => `• ${s.label}`).join("\n");
-        const prompt = `Para *${svc.name}* tengo estas opciones próximas:\n${primeros}\n\n` +
+        const primeros = slots.slice(0, 5).map((s) => `• ${s.label}`).join("\n");
+        const prompt =
+            `Para *${svc.name}* tengo estas opciones próximas:\n${primeros}\n\n` +
             `¿Te funciona alguna? Si ya tienes fecha/hora exacta, dímela (ej. “mañana 10:30”). También necesito tu *nombre* y *teléfono* para reservar.`;
         const saved = await persistBotReply({
-            conversationId: chatId, empresaId, texto: prompt, nuevoEstado: ConversationEstado.en_proceso,
-            to: toPhone ?? conversacion.phone, phoneNumberId,
+            conversationId: chatId,
+            empresaId,
+            texto: prompt,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
         });
-        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
     }
 
-    if (intent === "confirmar" && draft.stage === "confirm" && draft.serviceId && draft.whenUTC && draft.name && draft.phone) {
+    if (
+        intent === "confirmar" &&
+        draft.stage === "confirm" &&
+        draft.serviceId &&
+        draft.whenUTC &&
+        draft.name &&
+        draft.phone
+    ) {
         try {
             const appt = await bookAppointment({
                 empresaId,
@@ -565,22 +751,51 @@ export async function handleEsteticaReply(args: {
                 source: "ai",
             });
             const local = fromUTCtoLocalTZ(new Date(draft.whenUTC), kb.timezone);
-            const fecha = local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit" });
-            const hora = local.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", hour12: false });
+            const fecha = local.toLocaleDateString("es-CO", {
+                weekday: "long",
+                year: "numeric",
+                month: "long",
+                day: "2-digit",
+            });
+            const hora = local.toLocaleTimeString("es-CO", {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            });
 
             const ok = `¡Listo! Tu cita de *${draft.serviceName}* quedó para **${fecha} a las ${hora}** a nombre de *${draft.name}*. 📅`;
             const saved = await persistBotReply({
-                conversationId: chatId, empresaId, texto: ok, nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId: chatId,
+                empresaId,
+                texto: ok,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
             });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         } catch (e: any) {
             const fail = `Ese horario acaba de ocuparse. ¿Te paso 5 opciones cercanas para *${draft.serviceName}*?`;
             const saved = await persistBotReply({
-                conversationId: chatId, empresaId, texto: fail, nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId: chatId,
+                empresaId,
+                texto: fail,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
             });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
     }
 
@@ -589,9 +804,24 @@ export async function handleEsteticaReply(args: {
         // 1) obtener cita futura más cercana ligada a esta conversación
         const appt = await getUpcomingAppointmentForConversation(empresaId, chatId);
         if (!appt) {
-            const txt = `No encuentro una cita futura asociada a esta conversación. ¿Podrías indicarme el *nombre completo* con el que quedó la reserva o el *teléfono*?`;
-            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            const txt =
+                `No encuentro una cita futura asociada a esta conversación. ` +
+                `¿Podrías indicarme el *nombre completo* con el que quedó la reserva o el *teléfono*?`;
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: txt,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
 
         draft.targetApptId = appt.id;
@@ -599,11 +829,33 @@ export async function handleEsteticaReply(args: {
         await putDraft(chatId, draft);
 
         const local = fromUTCtoLocalTZ(appt.startAt, appt.timezone || kb.timezone);
-        const fecha = local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit" });
-        const hora = local.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", hour12: false });
+        const fecha = local.toLocaleDateString("es-CO", {
+            weekday: "long",
+            year: "numeric",
+            month: "long",
+            day: "2-digit",
+        });
+        const hora = local.toLocaleTimeString("es-CO", {
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+        });
         const ask = `Tienes *${appt.serviceName}* para **${fecha} a las ${hora}**. Dime la *nueva fecha y hora* (ej. “mañana 10:30”) y te paso la confirmación.`;
-        const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: ask, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: ask,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
     }
 
     // Si ya estamos en etapa de reagendar y recibimos una nueva fecha/hora → confirmar
@@ -614,36 +866,106 @@ export async function handleEsteticaReply(args: {
             await putDraft(chatId, draft);
 
             const local = fromUTCtoLocalTZ(new Date(draft.whenUTC), kb.timezone);
-            const fecha = local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit" });
-            const hora = local.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", hour12: false });
+            const fecha = local.toLocaleDateString("es-CO", {
+                weekday: "long",
+                year: "numeric",
+                month: "long",
+                day: "2-digit",
+            });
+            const hora = local.toLocaleTimeString("es-CO", {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            });
             const resumen = `¿Confirmas mover tu cita a **${fecha} a las ${hora}**? Di *"confirmo"* y la reagendo ✅`;
-            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: resumen, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: resumen,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         } else {
             const hint = `Entiendo, dime la *fecha y hora exacta* (ej. “pasado mañana 15:00”) para reagendar.`;
-            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: hint, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: hint,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
     }
 
     if (intent === "confirmar" && draft.stage === "reagendar_confirm" && draft.targetApptId && draft.whenUTC) {
         try {
-            const updated = await rescheduleAppointment({
+            await rescheduleAppointment({
                 empresaId,
                 appointmentId: draft.targetApptId,
                 newStartAtUTC: new Date(draft.whenUTC),
             });
 
             const local = fromUTCtoLocalTZ(new Date(draft.whenUTC), kb.timezone);
-            const fecha = local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit" });
-            const hora = local.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", hour12: false });
+            const fecha = local.toLocaleDateString("es-CO", {
+                weekday: "long",
+                year: "numeric",
+                month: "long",
+                day: "2-digit",
+            });
+            const hora = local.toLocaleTimeString("es-CO", {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+            });
             const ok = `¡Hecho! Reagendé tu cita para **${fecha} a las ${hora}**.`;
-            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: ok, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: ok,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         } catch (e: any) {
             const fail = `Ese nuevo horario acaba de ocuparse. ¿Te comparto otras opciones cercanas?`;
-            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: fail, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: fail,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
     }
 
@@ -651,35 +973,140 @@ export async function handleEsteticaReply(args: {
     if (intent === "cancelar") {
         const appt = await getUpcomingAppointmentForConversation(empresaId, chatId);
         if (!appt) {
-            const txt = `No encuentro una cita futura asociada a esta conversación. ¿Podrías indicarme el *nombre completo* o el *teléfono* con el que quedó la reserva?`;
-            const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            const txt =
+                `No encuentro una cita futura asociada a esta conversación. ` +
+                `¿Podrías indicarme el *nombre completo* o el *teléfono* con el que quedó la reserva?`;
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: txt,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
-        draft.targetApptId = appt.id; draft.stage = "cancel_confirm";
+        draft.targetApptId = appt.id;
+        draft.stage = "cancel_confirm";
         await putDraft(chatId, draft);
 
         const local = fromUTCtoLocalTZ(appt.startAt, appt.timezone || kb.timezone);
-        const fecha = local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit" });
-        const hora = local.toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit", hour12: false });
+        const fecha = local.toLocaleDateString("es-CO", {
+            weekday: "long",
+            year: "numeric",
+            month: "long",
+            day: "2-digit",
+        });
+        const hora = local.toLocaleTimeString("es-CO", {
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+        });
         const ask = `Vas a cancelar *${appt.serviceName}* del **${fecha} a las ${hora}**. ¿Lo confirmas? Di *"confirmo"* y la cancelo.`;
-        const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: ask, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: ask,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
     }
 
     if (intent === "confirmar" && draft.stage === "cancel_confirm" && draft.targetApptId) {
         await cancelAppointment(empresaId, draft.targetApptId, "Cancelación solicitada por el cliente (IA).");
         const ok = `Tu cita fue cancelada ✅. Si deseas, puedo proponerte nuevos horarios.`;
-        const saved = await persistBotReply({ conversationId: chatId, empresaId, texto: ok, nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId });
-        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: ok,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
+    /** ==== FAQ directa: "qué servicios tienes" ==== */
+    if (
+        /(qué\s+servicios|que\s+servicios|servicios\s+disponibles|tienes\s+servicios|lista\s+de\s+servicios)/i.test(
+            (userText || caption || "")
+        )
+    ) {
+        const serviciosTxt = listEnabledServices(kb);
+        const cuerpo = serviciosTxt
+            ? `Estos son nuestros servicios disponibles: ${serviciosTxt}.\n¿Te interesa agendar alguno en particular?`
+            : `Por ahora no tengo servicios configurados para agendar. Si quieres, te doy orientación general sobre tratamientos estéticos.`;
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: cuerpo,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
+    /** ==== Saludo sin listar catálogo genérico ==== */
+    if (intent === "saludo" && !svc && !/servicio/i.test(userText)) {
+        const saludo =
+            `¡Hola! Soy el asistente de la clínica estética. ` +
+            `Puedo ayudarte con orientación y agendar tu cita. ¿Qué procedimiento te interesa?`;
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: saludo,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
     }
 
     /** ====== SALUDO / FAQ / GENERAL (LLM con imagen) ====== */
-    const baseIntro = kb.empresaNombre ? `Asistente de clínica estética de "${kb.empresaNombre}".` : `Asistente de clínica estética.`;
+    const baseIntro = kb.empresaNombre
+        ? `Asistente de clínica estética de "${kb.empresaNombre}".`
+        : `Asistente de clínica estética.`;
     const system = [
         baseIntro,
         "Habla en primera persona (yo), cercano y profesional. Responde en 2–5 líneas, específico, sin párrafos largos.",
         "Puedes usar 1 emoji ocasionalmente.",
         "Sé full-agent sobre temas de clínica estética; evita salirte del ámbito.",
+        // 👇 REGLAS DURAS DE SERVICIOS
+        "Al listar u ofrecer servicios para agendar usa SOLO los que estén en la base de datos (kb.services).",
+        "Si el cliente menciona un tratamiento que NO está en kb.services, puedes dar orientación general, pero NO lo ofrezcas para agendar. En su lugar, sugiere alguno de los servicios disponibles que sea equivalente.",
         "Si preguntan por servicios/horarios/dirección/políticas, usa SOLO la información del negocio (KB).",
         kb.kbTexts.businessOverview ? `Contexto negocio: ${softTrim(kb.kbTexts.businessOverview, 220)}` : "",
         kb.logistics?.locationAddress ? `Dirección: ${kb.logistics.locationAddress}` : "",
@@ -687,7 +1114,9 @@ export async function handleEsteticaReply(args: {
         kb.logistics?.locationMapsUrl ? `Maps: ${kb.logistics.locationMapsUrl}` : "",
         kb.kbTexts.disclaimers ? `Avisos: ${softTrim(kb.kbTexts.disclaimers, 220)}` : "",
         "Si detectas intención de agendar, guía a escoger servicio habilitado y ofrece horarios.",
-    ].filter(Boolean).join("\n");
+    ]
+        .filter(Boolean)
+        .join("\n");
 
     const history = await getRecentHistory(chatId, last?.id, 10);
 
@@ -725,7 +1154,12 @@ export async function handleEsteticaReply(args: {
 
     let texto = "";
     try {
-        texto = await runChatWithBudget({ model, messages, temperature, maxTokens: IA_MAX_TOKENS });
+        texto = await runChatWithBudget({
+            model,
+            messages,
+            temperature,
+            maxTokens: IA_MAX_TOKENS,
+        });
     } catch (err: any) {
         console.error("[EST] OpenAI error (final):", err?.response?.data || err?.message || err);
         texto = "Gracias por escribirnos. Te puedo orientar sobre procedimientos y agendar tu cita.";
@@ -743,5 +1177,11 @@ export async function handleEsteticaReply(args: {
         phoneNumberId,
     });
 
-    return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    return {
+        estado: ConversationEstado.respondido,
+        mensaje: saved.texto,
+        messageId: saved.messageId,
+        wamid: saved.wamid,
+        media: [],
+    };
 }
