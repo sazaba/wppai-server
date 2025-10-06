@@ -137,7 +137,8 @@ export async function handleEsteticaReply(args: {
         ])
     } catch (err: any) {
         console.error("[ESTETICA] runEsteticaAgent error:", err?.message || err)
-        texto = "Gracias por tu mensaje. Puedo ayudarte con horarios o información de nuestros tratamientos."
+        // fallback: saludo natural, sin sonar a bot
+        texto = "¡Hola! Puedo ayudarte con información de tratamientos o mostrarte horarios desde mañana. ¿Qué te gustaría hacer? 🙂"
     }
 
     // === persistir & enviar por WhatsApp (SIN ESPERA)

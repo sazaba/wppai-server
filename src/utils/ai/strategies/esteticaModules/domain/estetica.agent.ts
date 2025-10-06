@@ -1,5 +1,5 @@
 // utils/ai/strategies/esteticaModules/domain/estetica.agent.ts
-// Full-agent (agenda natural + tools + KB) CON staff-awareness, estilo humano y sin delays
+// Full-agent (agenda natural + tools + KB) con staff-awareness y saludo humano
 
 import prisma from "../../../../../lib/prisma"
 import { openai } from "../../../../../lib/openai"
@@ -30,11 +30,12 @@ function safeParseArgs(raw?: string) {
 }
 const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te va bien?"]
 
+// Cierre amable y 1 emoji
 function postProcessReply(reply: string, history: ChatTurn[]): string {
     const clean = reply.trim().replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n")
     if (!clean) return clean
-    const ending = ENDINGS[(history.length) % ENDINGS.length]
-    const withEnding = /[.?!…]$/.test(clean) ? `${clean} ${ending}` : `${clean}. ${ending}`
+    const add = ENDINGS[(history.length) % ENDINGS.length]
+    const withEnding = /[.?!…]$/.test(clean) ? `${clean} ${add}` : `${clean}. ${add}`
     const hasEmoji = /\p{Extended_Pictographic}/u.test(withEnding)
     return hasEmoji ? withEnding : `${withEnding} 🙂`
 }
@@ -61,9 +62,16 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
 function startOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz) }
 function endOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz) }
 
+// Buscar “mañana 06:00” local por defecto
+function nextLocalMorning(ctx: EsteticaCtx, daysAhead = 1): Date {
+    const tz = ctx.timezone
+    const base = addDays(new Date(), daysAhead)
+    return makeZonedDate(ymdInTZ(base, tz), "06:00", tz)
+}
+
 /* ====== Corrección opcional de timezone en appointmentHours ====== */
-// Si tus hours están en UTC y el negocio opera en America/Bogota (-300 min):
-// APPT_HOURS_TZ_OFFSET_MIN=-300
+// Si tus hours están guardadas en UTC y el negocio opera en America/Bogota (-300 min),
+// define: APPT_HOURS_TZ_OFFSET_MIN=-300
 const HOURS_TZ_OFFSET_MIN = Number(process.env.APPT_HOURS_TZ_OFFSET_MIN ?? 0)
 function hhmmWithOffset(hhmm: string): string {
     if (!HOURS_TZ_OFFSET_MIN) return hhmm
@@ -120,7 +128,9 @@ async function fetchStaffSafe(empresaId: number): Promise<StaffRow[]> {
             orderBy: { id: "asc" },
         } as any)
         return rows as unknown as StaffRow[]
-    } catch { return [] }
+    } catch {
+        return [] // modo compatible si no existe tabla
+    }
 }
 
 function weekdayCode(d: Date, tz: string): HourRow["day"] {
@@ -144,7 +154,7 @@ function windowsForYMD(ymd: string, tz: string, hours: HourRow[], exceptions: Ex
     return pairs.map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }))
 }
 
-/* ====== staff availability ====== */
+/* ====== Staff availability ====== */
 function tryParseIdList(v: any): number[] {
     if (!v) return []
     if (Array.isArray(v)) return v.map(Number).filter(n => Number.isFinite(n))
@@ -157,7 +167,8 @@ function tryParseIdList(v: any): number[] {
 
 async function hasFreeStaffForSlot(empresaId: number, start: Date, durationMin: number, bufferMin: number, procedureId?: number | null) {
     const staff = await fetchStaffSafe(empresaId)
-    if (!staff.length) return true
+    if (!staff.length) return true // sin dimensión de staff
+
     const end = addMinutes(start, durationMin)
     for (const s of staff) {
         if (s.enabled === false) continue
@@ -297,41 +308,43 @@ async function toolFindSlots(ctx: EsteticaCtx, args: { serviceId?: number; servi
     const svc = await resolveService(ctx, { serviceId: args.serviceId, name: args.serviceName })
     const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60
 
-    const hint = args.fromISO ? new Date(args.fromISO) : undefined
+    // Si no hay fecha, arrancamos en “mañana 06:00” local
+    const hint = args.fromISO ? new Date(args.fromISO) : nextLocalMorning(ctx, 1)
+
     const raw = await findSlotsCore({
         empresaId: ctx.empresaId,
         ctx,
-        hint: hint ?? null,
+        hint,
         durationMin,
         count: Math.min(12, Math.max(6, Number(args.max ?? 8))),
         procedureId: svc?.id ?? null,
     })
 
-    const now = new Date()
-    let labels = raw
-        .filter(d => d.start.getTime() > now.getTime())
-        .slice(0, 12)
-        .map((d, i) => ({
-            idx: i + 1,
-            startISO: d.start.toISOString(),
-            startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
-            staffId: d.staffId ?? null,
-        }))
+    const future = raw.filter(d => d.start.getTime() > Date.now())
+    const first = future[0]
 
-    if (!labels.length) {
-        const hint2 = (hint ? new Date(hint) : new Date()); hint2.setDate(hint2.getDate() + 1)
-        const raw2 = await findSlotsCore({
-            empresaId: ctx.empresaId, ctx, hint: hint2, durationMin, count: 12, procedureId: svc?.id ?? null,
-        })
-        labels = raw2.filter(d => d.start > new Date()).slice(0, 12).map((d, i) => ({
-            idx: i + 1,
-            startISO: d.start.toISOString(),
-            startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
-            staffId: d.staffId ?? null,
-        }))
+    const labels = future.slice(0, 12).map((d, i) => ({
+        idx: i + 1,
+        startISO: d.start.toISOString(),
+        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
+        staffId: d.staffId ?? null,
+    }))
+
+    // Fallback automático: si el día exacto no tiene cupos, ya future estará vacío → el LLM ofrecerá otro día al preguntar
+
+    return {
+        ok: true,
+        durationMin,
+        serviceName: svc?.name ?? args.serviceName ?? null,
+        firstSuggestion: first
+            ? {
+                startISO: first.start.toISOString(),
+                startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(first.start),
+                staffId: first.staffId ?? null,
+            }
+            : null,
+        slots: labels.slice(0, 6),
     }
-
-    return { ok: true, durationMin, serviceName: svc?.name ?? args.serviceName ?? null, slots: labels.slice(0, 6) }
 }
 
 async function toolBook(
@@ -349,6 +362,7 @@ async function toolBook(
     const startAt = new Date(args.startISO)
     const endAt = addMinutes(startAt, durationMin)
 
+    // validar staff
     let finalStaffId: number | undefined = args.staffId
     const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin, svc.id)
     if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" }
@@ -393,13 +407,10 @@ async function toolBook(
 async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; newStartISO: string; staffId?: number }) {
     const appt = await prisma.appointment.findUnique({ where: { id: Number(args.appointmentId) } } as any)
     if (!appt || appt.deletedAt || appt.empresaId !== ctx.empresaId) return { ok: false, reason: "NOT_FOUND" }
-
     const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((+appt.endAt - +appt.startAt) / 60000))
     const newStart = new Date(args.newStartISO)
-
     const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin, appt.procedureId ?? null)
     if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" }
-
     const updated = await prisma.appointment.update({
         where: { id: appt.id },
         data: {
@@ -409,7 +420,6 @@ async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; n
             staffId: args.staffId ?? (free as any)?.staffId ?? appt.staffId ?? null,
         },
     } as any)
-
     return {
         ok: true,
         data: {
@@ -463,47 +473,14 @@ async function toolListUpcoming(ctx: EsteticaCtx, args: { phone: string; limit?:
     return { ok: true, items }
 }
 
-/* === NUEVO: cita actual por conversación (para reagendar rápido) === */
-async function toolGetCurrentAppt(
-    ctx: EsteticaCtx,
-    _args: { limit?: number },
-    conversationId?: number
-) {
-    if (!conversationId) return { ok: false, reason: "NO_CONVERSATION_ID" }
-    const rows = await prisma.appointment.findMany({
-        where: {
-            empresaId: ctx.empresaId,
-            conversationId,
-            deletedAt: null,
-            status: { notIn: [AppointmentStatus.cancelled, AppointmentStatus.no_show] },
-        },
-        orderBy: { startAt: "desc" },
-        take: Math.max(1, Number(_args?.limit ?? 1)),
-        select: { id: true, startAt: true, endAt: true, serviceName: true, timezone: true, status: true, staffId: true, serviceDurationMin: true, procedureId: true },
-    } as any)
-    const items = rows.map(r => ({
-        id: r.id,
-        startISO: r.startAt.toISOString(),
-        endISO: r.endAt.toISOString(),
-        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: r.timezone || ctx.timezone }).format(r.startAt),
-        serviceName: r.serviceName,
-        status: r.status,
-        staffId: r.staffId,
-        durationMin: r.serviceDurationMin ?? Math.max(15, Math.round((+r.endAt - +r.startAt) / 60000)),
-        procedureId: r.procedureId ?? null,
-    }))
-    return { ok: true, items }
-}
-
 /* ======================= Tools spec/handlers ======================= */
 export const toolSpecs = [
     { type: "function", function: { name: "listProcedures", description: "Lista breve de servicios/procedimientos disponibles.", parameters: { type: "object", properties: {}, additionalProperties: false } } },
-    { type: "function", function: { name: "findSlots", description: "Busca horarios disponibles (máx. 6).", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, fromISO: { type: "string" }, max: { type: "number" } }, additionalProperties: false } } },
+    { type: "function", function: { name: "findSlots", description: "Busca horarios disponibles (máx. 6) y sugiere el primer cupo del día.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, fromISO: { type: "string" }, max: { type: "number" } }, additionalProperties: false } } },
     { type: "function", function: { name: "book", description: "Crea una reserva confirmada/pending según política.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, startISO: { type: "string" }, phone: { type: "string" }, fullName: { type: "string" }, notes: { type: "string" }, durationMin: { type: "number" }, staffId: { type: "number" } }, required: ["startISO", "phone", "fullName"], additionalProperties: false } } },
     { type: "function", function: { name: "reschedule", description: "Reagenda una cita existente.", parameters: { type: "object", properties: { appointmentId: { type: "number" }, newStartISO: { type: "string" }, staffId: { type: "number" } }, required: ["appointmentId", "newStartISO"], additionalProperties: false } } },
     { type: "function", function: { name: "cancel", description: "Cancela una cita por ID.", parameters: { type: "object", properties: { appointmentId: { type: "number" } }, required: ["appointmentId"], additionalProperties: false } } },
     { type: "function", function: { name: "listUpcomingApptsForPhone", description: "Lista próximas citas filtrando por teléfono.", parameters: { type: "object", properties: { phone: { type: "string" }, limit: { type: "number" } }, required: ["phone"], additionalProperties: false } } },
-    { type: "function", function: { name: "getCurrentAppt", description: "Obtiene la cita vigente/reciente de la conversación para reagendar rápido.", parameters: { type: "object", properties: { limit: { type: "number" } }, additionalProperties: false } } },
 ] as const
 
 export function toolHandlers(ctx: EsteticaCtx, convId?: number) {
@@ -520,7 +497,6 @@ export function toolHandlers(ctx: EsteticaCtx, convId?: number) {
         },
         async cancel(args: { appointmentId: number }) { return toolCancel(ctx, args) },
         async listUpcomingApptsForPhone(args: { phone: string; limit?: number }) { return toolListUpcoming(ctx, args) },
-        async getCurrentAppt(args: { limit?: number }) { return toolGetCurrentAppt(ctx, args, convId) },
     }
 }
 
@@ -531,51 +507,35 @@ export function systemPrompt(ctx: EsteticaCtx) {
     const minNoticeH = ctx.rules?.minNoticeHours ?? 0
 
     return [
-        `Eres coordinador/a humano/a de una clínica estética premium en Colombia. Respondes como una persona: cálida, breve, natural y con **1 emoji** en cada turno. Nada de “voy a buscar / dame un momento”.`,
+        `Eres coordinador/a humano/a de una clínica estética premium en Colombia. Respondes cálido/a, cercano/a y natural, en 2–5 líneas, con **1 emoji** por turno. Nada de “voy a buscar / dame un momento”.`,
         `Usa **TOOLS** para todo lo de agenda: listar cupos, reservar, reagendar, cancelar, próximas.`,
         ``,
         `# Reglas de agenda`,
         `- Zona horaria del negocio: **${tz}**.`,
         `- Citas del mismo día: ${allowSameDay ? "permitidas si hay cupo" : "NO permitidas"}.`,
         `- Antelación mínima: **${minNoticeH}h**.`,
-        `- Solo ofrece horarios que devuelven las tools (máx. 6 por respuesta; reparte en mañana/tarde).`,
+        `- Si el usuario no da fecha: **busca desde mañana 06:00 (${tz})** y **propón el primer cupo**; además muestra 2–3 alternativas del mismo día.`,
+        `- Solo ofrece horarios que devuelven las tools (máx. 6 por respuesta).`,
         ``,
-        `# Interpretación de fechas/horas del usuario`,
-        `- Convierte “martes/mañana/pasado/3pm del lunes/el 15” a fecha/hora real en ${tz} y pásala como **fromISO** a **findSlots**.`,
-        `- Si no hay cupos ese día, ofrece automáticamente los más cercanos (hasta 6).`,
+        `# Interpretación de fechas del usuario`,
+        `- “mañana / pasado / martes / la otra semana / 3pm del lunes”: conviértelo a fecha/hora real en ${tz} y pásalo como **fromISO** a **findSlots**.`,
         ``,
-        `# Flujo de Reagendar (OBLIGATORIO)`,
-        `1) Llama **getCurrentAppt** (por conversación) para obtener la cita vigente.`,
-        `2) Confirma con el usuario servicio y duración de esa cita.`,
-        `3) Llama **findSlots** usando la intención (p.ej. “jueves en la tarde”) para proponer hasta 6 opciones.`,
-        `4) Cuando elija una, llama **reschedule** con {appointmentId, newStartISO, staffId?}.`,
-        `5) Resume y pide confirmación final.`,
-        ``,
-        `# Datos obligatorios antes de reservar`,
-        `- Servicio, fecha/hora exacta (de los slots), nombre completo y teléfono.`,
-        `- **Doble confirmación**: (1) resume; (2) pregunta “¿Confirmamos?”. Solo ante un “sí/ok/listo/confirmo” llamas **book**/**reschedule**.`,
-        ``,
-        `# KB`,
-        `- Duración/precios/notas salen de la KB; si falta, dilo.`,
+        `# Flujo de reserva (full agent)`,
+        `1) Detecta el servicio. 2) Propón el primer cupo y 2–3 alternos. 3) Pide nombre completo y teléfono. 4) **Doble confirmación**: resume y pregunta “¿Confirmamos?”. Solo si la respuesta es clara (sí/ok/dale/listo/confirmo), llama **book**.`,
         ``,
         `# Estilo`,
-        `- 2–5 líneas, directo, cercano, **1 emoji** siempre.`,
+        `- Saludo natural y útil: NO digas que el cliente “no tiene cita” salvo que lo pregunte.`,
+        `- Evita frases tipo “un momento”, “procedo a…”; escribe como persona real.`,
     ].join("\n")
 }
 
 export function buildFewshots(_ctx: EsteticaCtx): ChatTurn[] {
     return [
         { role: "user", content: "hola" },
-        { role: "assistant", content: "¡Hola! ¿Quieres info de tratamientos o prefieres ver horarios para agendar? 🙂" },
+        { role: "assistant", content: "¡Hola! ¿Quieres ver horarios o resolver una duda de tratamientos? 🙂" },
 
-        // Nueva cita
         { role: "user", content: "me sirve el martes en la tarde para botox" },
-        { role: "assistant", content: "Perfecto. Buscaré cupos desde el **próximo martes 06:00** (hora local) para *Toxina botulínica*. Te muestro opciones y luego tomamos tus datos. 😉" },
-
-        // Reagendar
-        { role: "user", content: "quiero reagendar mi cita" },
-        { role: "assistant", content: "Ya reviso tu cita actual y te propongo horarios. Un momento. 🙂" },
-        // El modelo debe llamar: getCurrentAppt -> findSlots -> reschedule
+        { role: "assistant", content: "Perfecto, miro cupos desde ese *martes* y te propongo el primero disponible en la tarde y 2–3 opciones más. 😉" },
     ]
 }
 
@@ -587,7 +547,6 @@ async function runTools(ctx: EsteticaCtx, calls: AssistantMsg["tool_calls"], con
         const args = safeParseArgs(c.function?.arguments)
         let res: any
         try {
-            // @ts-ignore
             res = await (handlers as any)[c.function.name](args)
         } catch (e: any) {
             res = { ok: false, error: e?.message || "TOOL_ERROR" }
@@ -611,12 +570,14 @@ export async function runEsteticaAgent(
         ...turns,
     ]
 
+    // Pase 1
     const r1 = await openai.chat.completions.create({
         model: MODEL, temperature: TEMPERATURE,
         messages: base, tools: toolSpecs as any, tool_choice: "auto",
     } as any)
     const m1 = (r1.choices?.[0]?.message || {}) as AssistantMsg
 
+    // Tools
     if (Array.isArray(m1.tool_calls) && m1.tool_calls.length) {
         const toolMsgs = await runTools(ctx, m1.tool_calls, ctx.__conversationId)
         const r2 = await openai.chat.completions.create({
@@ -624,9 +585,10 @@ export async function runEsteticaAgent(
             messages: [...base, m1 as any, ...toolMsgs] as any,
         } as any)
         const final = r2.choices?.[0]?.message?.content?.trim() || ""
-        return postProcessReply(final || "¿Te comparto horarios desde mañana o prefieres resolver una duda específica?", turns)
+        return postProcessReply(final || "¿Te comparto el primer horario disponible desde mañana o prefieres resolver una duda específica?", turns)
     }
 
+    // Sin tools
     const txt = (m1.content || "").trim()
-    return postProcessReply(txt || "¿Te comparto horarios o prefieres información de los tratamientos?", turns)
+    return postProcessReply(txt || "¿Te comparto horarios desde mañana o prefieres info de los tratamientos?", turns)
 }
