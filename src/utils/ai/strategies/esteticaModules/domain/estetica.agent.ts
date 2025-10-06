@@ -1,15 +1,14 @@
 // utils/ai/strategies/esteticaModules/domain/estetica.agent.ts
-// Full-agent (agenda natural + tools + KB) con staff-awareness, manejo de exceptions,
-// escaneo multi-día y fallback proactivo.
+// Full-agent (agenda natural + tools + KB) con staff-awareness y saludo humano
+// + Logs de tool-calls y fallback proactivo cuando el modelo no ejecuta tools.
 
 import prisma from "../../../../../lib/prisma";
-import { openai, resolveModelName } from "../../../../../lib/openai";
+import { openai } from "../../../../../lib/openai";
 import { AppointmentStatus, AppointmentSource } from "@prisma/client";
 import type { EsteticaCtx } from "./estetica.rag";
 
 /* ======================= LLM CFG ======================= */
-const RAW_MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
-const MODEL = resolveModelName(RAW_MODEL);
+const MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.35);
 const DEBUG = String(process.env.ESTETICA_DEBUG ?? "0") !== "0";
 
@@ -63,8 +62,9 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     return new Date(guess.getTime() + delta * 60000);
 }
 function startOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
+function endOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz); }
 
-/* “mañana 06:00” local si el modelo no manda fecha */
+// Buscar “mañana 06:00” local por defecto
 function nextLocalMorning(ctx: EsteticaCtx, daysAhead = 1): Date {
     const tz = ctx.timezone;
     const base = addDays(new Date(), daysAhead);
@@ -85,10 +85,45 @@ function hhmmWithOffset(hhmm: string): string {
     return `${H}:${M}`;
 }
 
-/* ======================= Disponibilidad base ======================= */
+/* ======================= Disponibilidad base (helpers internos) ======================= */
+async function isSlotFree(
+    empresaId: number,
+    start: Date,
+    durationMin: number,
+    bufferMin = 0,
+    _procedureId?: number | null
+) {
+    const startWithBuffer = new Date(start.getTime() - bufferMin * 60000);
+    const endWithBuffer = new Date(start.getTime() + (durationMin + bufferMin) * 60000);
+    const overlap = await prisma.appointment.count({
+        where: {
+            empresaId,
+            deletedAt: null,
+            status: { notIn: [AppointmentStatus.cancelled, AppointmentStatus.no_show] },
+            AND: [{ startAt: { lt: endWithBuffer } }, { endAt: { gt: startWithBuffer } }],
+        },
+    });
+    if (overlap > 0) return { ok: false };
+
+    // Staff-awareness liviano (si no hay Staff, ok)
+    try {
+        const staff = await prisma.staff.findMany({
+            where: { empresaId, OR: [{ active: true }, { active: null }] },
+            select: { id: true, active: true },
+            take: 1,
+        } as any);
+        if (!staff.length) return { ok: true, staffId: undefined };
+    } catch {
+        return { ok: true, staffId: undefined };
+    }
+    // si hay staff, considerar 1 recurso libre
+    return { ok: true, staffId: undefined };
+}
+
+/* ====== Hours + Exceptions (helpers) ====== */
 type HourRow = {
     day: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
-    isOpen?: boolean | null;
+    isOpen: boolean;
     start1: string | null; end1: string | null;
     start2: string | null; end2: string | null;
 };
@@ -101,7 +136,7 @@ type ExceptionRow = {
 
 async function fetchHours(empresaId: number): Promise<HourRow[]> {
     const rows = await prisma.appointmentHour.findMany({
-        where: { empresaId },
+        where: { empresaId, isOpen: true },
         select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
     });
     return rows as unknown as HourRow[];
@@ -116,59 +151,28 @@ async function fetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
         start1: r.start1 ?? null, end1: r.end1 ?? null, start2: r.start2 ?? null, end2: r.end2 ?? null,
     }));
 }
-
 function weekdayCode(d: Date, tz: string): HourRow["day"] {
     const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).formatToParts(d);
     const w = (p.find(x => x.type === "weekday")?.value ?? "sun").toLowerCase().slice(0, 3);
     return (w as HourRow["day"]);
 }
-
-/** Ventanas (pares HH:mm) para un Y-M-D en TZ, combinando base + exceptions. */
 function windowsForYMD(ymd: string, tz: string, hours: HourRow[], exceptions: ExceptionRow[]) {
     const ex = exceptions.find(e => ymdInTZ(e.date, tz) === ymd);
-
     if (ex) {
-        if (ex.isOpen === false) return []; // cerrado explícito
-        const pairs: [string | null, string | null][] = [
-            [ex.start1, ex.end1],
-            [ex.start2, ex.end2],
-        ];
-        const usable = pairs.filter(([s, e]) => s && e);
-        if (usable.length || ex.isOpen === true) {
-            return usable.map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
-        }
-        // excepción “vacía”: no bloquea → sigue a base
+        if (ex.isOpen === false) return [];
+        const pairs: [string | null, string | null][] = [[ex.start1, ex.end1], [ex.start2, ex.end2]];
+        return pairs
+            .filter(([s, e]) => s && e)
+            .map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
     }
-
     const wd = weekdayCode(makeZonedDate(ymd, "00:00", tz), tz);
-    const todays = hours.filter(h => h.day === wd && (h.isOpen ?? true));
-    const pairs = todays
-        .flatMap(h => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
+    const todays = hours.filter(h => h.day === wd && h.isOpen);
+    const pairs = todays.flatMap(h => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
         .filter(([s, e]) => s && e);
-
     return pairs.map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
 }
 
-async function isSlotFree(
-    empresaId: number,
-    start: Date,
-    durationMin: number,
-    bufferMin = 0,
-) {
-    const startWithBuffer = new Date(start.getTime() - bufferMin * 60000);
-    const endWithBuffer = new Date(start.getTime() + (durationMin + bufferMin) * 60000);
-    const overlap = await prisma.appointment.count({
-        where: {
-            empresaId,
-            deletedAt: null,
-            status: { notIn: [AppointmentStatus.cancelled, AppointmentStatus.no_show] },
-            AND: [{ startAt: { lt: endWithBuffer } }, { endAt: { gt: startWithBuffer } }],
-        },
-    });
-    return overlap === 0;
-}
-
-/* ======================= Tools ======================= */
+/* ======================= Tools reales ======================= */
 async function toolListProcedures(ctx: EsteticaCtx, _args: any) {
     const rows = await prisma.esteticaProcedure.findMany({
         where: { empresaId: ctx.empresaId, enabled: true },
@@ -199,10 +203,13 @@ async function resolveService(ctx: EsteticaCtx, q: { serviceId?: number; name?: 
 
 function intentWantsSlots(text: string) {
     const q = (text || "").toLowerCase();
-    return /cita|agendar|agenda|horario|disponible|disponibilidad|mañana|tarde|noche|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|fecha|fechas/.test(q);
+    return /cita|agendar|agenda|horario|disponible|disponibilidad|mañana|tarde|noche|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo/.test(q);
 }
 
-/** Escanea varios días (7 → 14) hasta reunir máx. 6 slots. */
+/** Escanea varios días (7 → 14) hasta reunir máx. 6 slots.
+ *  Corrige fechas pasadas (fromISO < now → mañana 06:00 en TZ)
+ *  y respeta minNotice/allowSameDay.
+ */
 async function toolFindSlots(
     ctx: EsteticaCtx,
     args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }
@@ -212,7 +219,22 @@ async function toolFindSlots(
 
     const tz = ctx.timezone;
     const cap = Math.min(12, Math.max(6, Number(args.max ?? 8)));
+
+    // Punto de partida sugerido por el modelo o “mañana 06:00”
     let cursor = args.fromISO ? new Date(args.fromISO) : nextLocalMorning(ctx, 1);
+
+    // 🔧 FIX: si la fecha base está en el pasado, arranca desde mañana 06:00
+    const now = new Date();
+    if (cursor.getTime() < now.getTime()) {
+        if (DEBUG) console.log("[findSlots] fromISO in past → start tomorrow");
+        cursor = nextLocalMorning(ctx, 1);
+    }
+
+    // Reglas de antelación
+    const minNoticeH = ctx.rules?.minNoticeHours ?? 0;
+    const allowSameDay = !!ctx.rules?.allowSameDay;
+    // earliest = now + minNotice + buffer; si NO se permite mismo día, earliest no puede caer hoy en TZ
+    const earliest = new Date(now.getTime() + (minNoticeH * 60 + (ctx.bufferMin ?? 0)) * 60000);
 
     const [hours, exceptions] = await Promise.all([
         fetchHours(ctx.empresaId),
@@ -225,17 +247,28 @@ async function toolFindSlots(
     const scan = async (days: number) => {
         for (let i = 0; i < days && out.length < cap; i++) {
             const ymd = ymdInTZ(cursor, tz);
-            const wins = windowsForYMD(ymd, tz, hours, exceptions);
 
+            // Si no permites same-day y estamos en el mismo YMD, salta al siguiente
+            const ymdToday = ymdInTZ(now, tz);
+            if (!allowSameDay && ymd === ymdToday) {
+                cursor = addDays(cursor, 1);
+                continue;
+            }
+
+            const wins = windowsForYMD(ymd, tz, hours, exceptions);
             if (DEBUG) console.log(`[findSlots] day=${ymd} wins=${wins.length}`);
 
             for (const w of wins) {
                 let s = makeZonedDate(ymd, w.start, tz);
                 const e = makeZonedDate(ymd, w.end, tz);
                 while (s.getTime() + durationMin * 60000 <= e.getTime()) {
-                    if (await isSlotFree(ctx.empresaId, s, durationMin, ctx.bufferMin)) {
-                        out.push({ start: new Date(s) });
-                        if (out.length >= cap) break;
+                    // respeta earliest
+                    if (s.getTime() >= earliest.getTime()) {
+                        const free = await isSlotFree(ctx.empresaId, s, durationMin, ctx.bufferMin);
+                        if ((free as any)?.ok) {
+                            out.push({ start: new Date(s) });
+                            if (out.length >= cap) break;
+                        }
                     }
                     s = addMinutes(s, 15);
                 }
@@ -251,16 +284,14 @@ async function toolFindSlots(
         await scan(daysToScan);
     }
 
-    const future = out.filter(d => d.start.getTime() > Date.now());
-    const first = future[0];
-
-    const labels = future.slice(0, 12).map((d, i) => ({
+    const labels = out.slice(0, 12).map((d, i) => ({
         idx: i + 1,
         startISO: d.start.toISOString(),
         startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: tz }).format(d.start),
         staffId: null as number | null,
     }));
 
+    const first = out[0];
     if (DEBUG) console.log(`[findSlots] result slots=${labels.length} start=${args.fromISO || "tomorrow"}`);
 
     return {
@@ -293,8 +324,8 @@ async function toolBook(
     const startAt = new Date(args.startISO);
     const endAt = addMinutes(startAt, durationMin);
 
-    const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin);
-    if (!free) return { ok: false, reason: "CONFLICT_SLOT" };
+    const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin, svc.id);
+    if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" };
 
     const status: AppointmentStatus = (ctx.rules?.requireConfirmation ?? true)
         ? AppointmentStatus.pending
@@ -337,8 +368,8 @@ async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; n
     if (!appt || appt.deletedAt || appt.empresaId !== ctx.empresaId) return { ok: false, reason: "NOT_FOUND" };
     const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((+appt.endAt - +appt.startAt) / 60000));
     const newStart = new Date(args.newStartISO);
-    const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin);
-    if (!free) return { ok: false, reason: "CONFLICT_SLOT" };
+    const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin, appt.procedureId ?? null);
+    if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" };
     const updated = await prisma.appointment.update({
         where: { id: appt.id },
         data: {
@@ -475,8 +506,11 @@ async function runTools(ctx: EsteticaCtx, calls: AssistantMsg["tool_calls"], con
     for (const c of calls || []) {
         const args = safeParseArgs(c.function?.arguments);
         let res: any;
-        try { res = await (handlers as any)[c.function.name](args); }
-        catch (e: any) { res = { ok: false, error: e?.message || "TOOL_ERROR" }; }
+        try {
+            res = await (handlers as any)[c.function.name](args);
+        } catch (e: any) {
+            res = { ok: false, error: e?.message || "TOOL_ERROR" };
+        }
         out.push({ role: "tool", tool_call_id: c.id, content: JSON.stringify(res ?? null) });
     }
     return out;
@@ -533,7 +567,7 @@ export async function runEsteticaAgent(
             if (DEBUG) console.log("[AGENT][fallback] forced findSlots ->", forced?.slots?.length || 0, "slots");
             if (forced?.ok && forced?.slots?.length) {
                 const lines = forced.slots.map((s: any) => `${s.idx}️⃣ ${s.startLabel}`).slice(0, 6);
-                const head = forced.firstSuggestion ? `Tengo estos cupos, por ejemplo **${forced.firstSuggestion.startLabel}**:\n` : `Estos son los cupos disponibles:\n`;
+                const head = forced.firstSuggestion ? `Tengo estos cupos disponibles, por ejemplo **${forced.firstSuggestion.startLabel}**:\n` : `Estos son los cupos disponibles:\n`;
                 const msg = `${head}${lines.join("\n")}\n\nSi te sirve alguno, me confirmas tu *nombre completo* y *teléfono* para apartarlo.`;
                 return postProcessReply(msg, turns);
             }
