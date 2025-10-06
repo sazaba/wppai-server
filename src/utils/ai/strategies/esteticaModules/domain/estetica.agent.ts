@@ -1,6 +1,6 @@
 // utils/ai/strategies/esteticaModules/domain/estetica.agent.ts
-// Full-agent (agenda natural + tools + KB) con staff-awareness, manejo de exceptions
-// y fallback proactivo cuando el modelo no ejecuta tools.
+// Full-agent (agenda natural + tools + KB) con staff-awareness, manejo de exceptions,
+// escaneo multi-día y fallback proactivo.
 
 import prisma from "../../../../../lib/prisma";
 import { openai, resolveModelName } from "../../../../../lib/openai";
@@ -63,9 +63,8 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     return new Date(guess.getTime() + delta * 60000);
 }
 function startOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
-// function endOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz); }
 
-// Buscar “mañana 06:00” local por defecto
+/* “mañana 06:00” local si el modelo no manda fecha */
 function nextLocalMorning(ctx: EsteticaCtx, daysAhead = 1): Date {
     const tz = ctx.timezone;
     const base = addDays(new Date(), daysAhead);
@@ -99,11 +98,6 @@ type ExceptionRow = {
     start1: string | null; end1: string | null;
     start2: string | null; end2: string | null;
 };
-type StaffRow = {
-    id: number;
-    enabled?: boolean | null; // compat
-    active?: boolean | null;  // compat
-};
 
 async function fetchHours(empresaId: number): Promise<HourRow[]> {
     const rows = await prisma.appointmentHour.findMany({
@@ -122,18 +116,6 @@ async function fetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
         start1: r.start1 ?? null, end1: r.end1 ?? null, start2: r.start2 ?? null, end2: r.end2 ?? null,
     }));
 }
-async function fetchStaffSafe(empresaId: number): Promise<StaffRow[]> {
-    try {
-        const rows = await prisma.staff.findMany({
-            where: { empresaId, OR: [{ enabled: true }, { enabled: null }, { active: true }, { active: null }] },
-            select: { id: true, enabled: true, active: true },
-            orderBy: { id: "asc" },
-        } as any);
-        return rows as unknown as StaffRow[];
-    } catch {
-        return []; // modo compatible si no existe tabla
-    }
-}
 
 function weekdayCode(d: Date, tz: string): HourRow["day"] {
     const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).formatToParts(d);
@@ -141,37 +123,21 @@ function weekdayCode(d: Date, tz: string): HourRow["day"] {
     return (w as HourRow["day"]);
 }
 
-/**
- * Ventanas para un YYYY-MM-DD:
- * - Si hay exception con isOpen === false => cerrado.
- * - Si hay exception con horas (o isOpen === true) => usa esas horas.
- * - Si hay exception sin horas y sin cierre explícito => NO anula el día; cae a horarios base.
- */
-function windowsForYMD(
-    ymd: string,
-    tz: string,
-    hours: HourRow[],
-    exceptions: ExceptionRow[]
-) {
+/** Ventanas (pares HH:mm) para un Y-M-D en TZ, combinando base + exceptions. */
+function windowsForYMD(ymd: string, tz: string, hours: HourRow[], exceptions: ExceptionRow[]) {
     const ex = exceptions.find(e => ymdInTZ(e.date, tz) === ymd);
 
     if (ex) {
-        if (ex.isOpen === false) return []; // cierra explícitamente
-
-        const hasPairs =
-            (ex.start1 && ex.end1) ||
-            (ex.start2 && ex.end2);
-
-        if (hasPairs || ex.isOpen === true) {
-            const pairs: [string | null, string | null][] = [
-                [ex.start1, ex.end1],
-                [ex.start2, ex.end2],
-            ];
-            return pairs
-                .filter(([s, e]) => s && e)
-                .map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
+        if (ex.isOpen === false) return []; // cerrado explícito
+        const pairs: [string | null, string | null][] = [
+            [ex.start1, ex.end1],
+            [ex.start2, ex.end2],
+        ];
+        const usable = pairs.filter(([s, e]) => s && e);
+        if (usable.length || ex.isOpen === true) {
+            return usable.map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
         }
-        // excepción presente pero “vacía”: no bloquea → seguimos a base
+        // excepción “vacía”: no bloquea → sigue a base
     }
 
     const wd = weekdayCode(makeZonedDate(ymd, "00:00", tz), tz);
@@ -188,7 +154,6 @@ async function isSlotFree(
     start: Date,
     durationMin: number,
     bufferMin = 0,
-    procedureId?: number | null
 ) {
     const startWithBuffer = new Date(start.getTime() - bufferMin * 60000);
     const endWithBuffer = new Date(start.getTime() + (durationMin + bufferMin) * 60000);
@@ -200,21 +165,10 @@ async function isSlotFree(
             AND: [{ startAt: { lt: endWithBuffer } }, { endAt: { gt: startWithBuffer } }],
         },
     });
-    if (overlap > 0) return { ok: false };
-
-    // dimensión staff (si no hay, ok)
-    try {
-        const staff = await fetchStaffSafe(empresaId);
-        if (!staff.length) return { ok: true, staffId: undefined };
-    } catch {
-        return { ok: true, staffId: undefined };
-    }
-
-    // Para versión liviana: asumimos al menos un recurso disponible si no hay solapes de citas
-    return { ok: true, staffId: undefined };
+    return overlap === 0;
 }
 
-/* ======================= Tools reales ======================= */
+/* ======================= Tools ======================= */
 async function toolListProcedures(ctx: EsteticaCtx, _args: any) {
     const rows = await prisma.esteticaProcedure.findMany({
         where: { empresaId: ctx.empresaId, enabled: true },
@@ -248,7 +202,7 @@ function intentWantsSlots(text: string) {
     return /cita|agendar|agenda|horario|disponible|disponibilidad|mañana|tarde|noche|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|fecha|fechas/.test(q);
 }
 
-/** Busca slots usando horarios base + exceptions con correción de offset */
+/** Escanea varios días (7 → 14) hasta reunir máx. 6 slots. */
 async function toolFindSlots(
     ctx: EsteticaCtx,
     args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }
@@ -256,42 +210,58 @@ async function toolFindSlots(
     const svc = await resolveService(ctx, { serviceId: args.serviceId, name: args.serviceName });
     const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
 
-    // Si no hay fecha, arrancamos en “mañana 06:00” local
-    const hint = args.fromISO ? new Date(args.fromISO) : nextLocalMorning(ctx, 1);
-
     const tz = ctx.timezone;
-    const ymd = ymdInTZ(hint, tz);
+    const cap = Math.min(12, Math.max(6, Number(args.max ?? 8)));
+    let cursor = args.fromISO ? new Date(args.fromISO) : nextLocalMorning(ctx, 1);
 
     const [hours, exceptions] = await Promise.all([
         fetchHours(ctx.empresaId),
         fetchExceptions(ctx.empresaId),
     ]);
 
-    const wins = windowsForYMD(ymd, tz, hours, exceptions);
+    const out: Array<{ start: Date }> = [];
+    let daysToScan = 7;
 
-    const cap = Math.min(12, Math.max(6, Number(args.max ?? 8)));
-    const raw: Array<{ start: Date }> = [];
-    for (const w of wins) {
-        let s = makeZonedDate(ymd, w.start, tz);
-        const e = makeZonedDate(ymd, w.end, tz);
-        while (s.getTime() + durationMin * 60000 <= e.getTime()) {
-            const free = await isSlotFree(ctx.empresaId, s, durationMin, ctx.bufferMin, svc?.id ?? null);
-            if ((free as any)?.ok) raw.push({ start: new Date(s) });
-            if (raw.length >= cap) break;
-            s = addMinutes(s, 15);
+    const scan = async (days: number) => {
+        for (let i = 0; i < days && out.length < cap; i++) {
+            const ymd = ymdInTZ(cursor, tz);
+            const wins = windowsForYMD(ymd, tz, hours, exceptions);
+
+            if (DEBUG) console.log(`[findSlots] day=${ymd} wins=${wins.length}`);
+
+            for (const w of wins) {
+                let s = makeZonedDate(ymd, w.start, tz);
+                const e = makeZonedDate(ymd, w.end, tz);
+                while (s.getTime() + durationMin * 60000 <= e.getTime()) {
+                    if (await isSlotFree(ctx.empresaId, s, durationMin, ctx.bufferMin)) {
+                        out.push({ start: new Date(s) });
+                        if (out.length >= cap) break;
+                    }
+                    s = addMinutes(s, 15);
+                }
+                if (out.length >= cap) break;
+            }
+            cursor = addDays(cursor, 1);
         }
-        if (raw.length >= cap) break;
+    };
+
+    await scan(daysToScan);
+    if (!out.length) { // ampliar ventana si el primer barrido quedó vacío
+        daysToScan = 14;
+        await scan(daysToScan);
     }
 
-    const future = raw.filter(d => d.start.getTime() > Date.now());
+    const future = out.filter(d => d.start.getTime() > Date.now());
     const first = future[0];
 
     const labels = future.slice(0, 12).map((d, i) => ({
         idx: i + 1,
         startISO: d.start.toISOString(),
-        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
+        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: tz }).format(d.start),
         staffId: null as number | null,
     }));
+
+    if (DEBUG) console.log(`[findSlots] result slots=${labels.length} start=${args.fromISO || "tomorrow"}`);
 
     return {
         ok: true,
@@ -300,7 +270,7 @@ async function toolFindSlots(
         firstSuggestion: first
             ? {
                 startISO: first.start.toISOString(),
-                startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(first.start),
+                startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: tz }).format(first.start),
                 staffId: null as number | null,
             }
             : null,
@@ -323,8 +293,8 @@ async function toolBook(
     const startAt = new Date(args.startISO);
     const endAt = addMinutes(startAt, durationMin);
 
-    const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin, svc.id);
-    if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" };
+    const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin);
+    if (!free) return { ok: false, reason: "CONFLICT_SLOT" };
 
     const status: AppointmentStatus = (ctx.rules?.requireConfirmation ?? true)
         ? AppointmentStatus.pending
@@ -367,8 +337,8 @@ async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; n
     if (!appt || appt.deletedAt || appt.empresaId !== ctx.empresaId) return { ok: false, reason: "NOT_FOUND" };
     const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((+appt.endAt - +appt.startAt) / 60000));
     const newStart = new Date(args.newStartISO);
-    const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin, appt.procedureId ?? null);
-    if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" };
+    const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin);
+    if (!free) return { ok: false, reason: "CONFLICT_SLOT" };
     const updated = await prisma.appointment.update({
         where: { id: appt.id },
         data: {
@@ -445,6 +415,7 @@ export function toolHandlers(ctx: EsteticaCtx, convId?: number) {
     return {
         async listProcedures(_args: {}) { return toolListProcedures(ctx, _args); },
         async findSlots(args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }) {
+            if (DEBUG) console.log("[tool.findSlots] args=", args);
             return toolFindSlots(ctx, args);
         },
         async book(args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number; staffId?: number }) {
@@ -562,7 +533,7 @@ export async function runEsteticaAgent(
             if (DEBUG) console.log("[AGENT][fallback] forced findSlots ->", forced?.slots?.length || 0, "slots");
             if (forced?.ok && forced?.slots?.length) {
                 const lines = forced.slots.map((s: any) => `${s.idx}️⃣ ${s.startLabel}`).slice(0, 6);
-                const head = forced.firstSuggestion ? `Tengo estos cupos disponibles, por ejemplo **${forced.firstSuggestion.startLabel}**:\n` : `Estos son los cupos disponibles:\n`;
+                const head = forced.firstSuggestion ? `Tengo estos cupos, por ejemplo **${forced.firstSuggestion.startLabel}**:\n` : `Estos son los cupos disponibles:\n`;
                 const msg = `${head}${lines.join("\n")}\n\nSi te sirve alguno, me confirmas tu *nombre completo* y *teléfono* para apartarlo.`;
                 return postProcessReply(msg, turns);
             }
