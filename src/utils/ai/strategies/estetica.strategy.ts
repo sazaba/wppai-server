@@ -38,7 +38,6 @@ type ApptConfigOverrides = {
         bookingWindowDays?: number;
         blackoutDates?: any;
         overlapStrategy?: string;
-        // alias por compatibilidad
         minNoticeHours?: number;
         appointmentMinNoticeHours?: number;
         appointmentMaxAdvanceDays?: number;
@@ -136,13 +135,13 @@ export async function handleEsteticaReply(args: {
     mensajeArg: string;
     toPhone?: string;
     phoneNumberId?: string;
-    apptConfig?: unknown; // viene del orquestador; normalizamos abajo
+    apptConfig?: unknown; // viene del orquestador; lo normalizamos abajo
 }): Promise<IAReplyResult | null> {
     const { chatId, empresaId, mensajeArg, toPhone, phoneNumberId, apptConfig } = args;
 
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
-        select: { id: true, estado: true, phone: true },
+        select: { id: true, estado: true, phone: true, empresaId: true },
     });
     if (!conversacion) return null;
     if (conversacion.estado === ConversationEstado.cerrado) {
@@ -150,6 +149,13 @@ export async function handleEsteticaReply(args: {
         return null;
     }
 
+    // 👇 nombre de la empresa para el saludo y tono
+    const empresa = await prisma.empresa.findUnique({
+        where: { id: conversacion.empresaId },
+        select: { nombre: true },
+    });
+
+    // último mensaje del cliente
     const last = await prisma.message.findFirst({
         where: { conversationId: chatId, from: MessageFrom.client },
         orderBy: { timestamp: "desc" },
@@ -162,7 +168,7 @@ export async function handleEsteticaReply(args: {
         return null;
     }
 
-    // === Normalización de overrides que vienen del orquestador
+    // === Cargar contexto RAG (desde DB o con overrides del orquestador)
     const cfg = (apptConfig ?? {}) as ApptConfigOverrides;
 
     const ctx: EsteticaCtx = await loadApptContext(
@@ -176,12 +182,10 @@ export async function handleEsteticaReply(args: {
             rules: cfg.rules,
             remindersConfig: cfg.remindersConfig,
             kb: cfg.kb,
+            // 👇 pasamos marca
+            businessName: empresa?.nombre ?? undefined,
         } as any
     );
-
-    // Helper para preservar el literal del tipo en `role`
-    const roleFrom = (from: MessageFrom): ChatTurn["role"] =>
-        from === MessageFrom.client ? "user" : "assistant";
 
     // === Historial compacto → ChatTurn[]
     const historyRaw = await prisma.message.findMany({
@@ -190,15 +194,14 @@ export async function handleEsteticaReply(args: {
         take: 8,
         select: { from: true, contenido: true },
     });
-
     const turns: ChatTurn[] = historyRaw
         .reverse()
         .filter((m) => (m.contenido || "").trim().length > 0)
         .map((m) => ({
-            role: roleFrom(m.from),                // <- tipo exacto 'user' | 'assistant'
+            role: m.from === MessageFrom.client ? "user" : "assistant",
             content: m.contenido || "",
         }))
-        .concat([{ role: "user" as const, content: userText }]); // <- as const fija el literal
+        .concat([{ role: "user", content: userText }]);
 
     // === Ejecutar agente
     let texto = "";
@@ -207,7 +210,8 @@ export async function handleEsteticaReply(args: {
     } catch (err: any) {
         console.error("[ESTETICA] runEsteticaAgent error:", err?.message || err);
         texto =
-            "¡Hola! Puedo ayudarte con información de tratamientos o mostrarte horarios desde mañana. ¿Qué te gustaría hacer? 🙂";
+            `¡Hola! Soy coordinación de ${empresa?.nombre ?? "la clínica"}. ` +
+            "Puedo ayudarte con información de tratamientos o mostrarte horarios desde mañana. ¿Qué te gustaría hacer? 🙂";
     }
 
     // === Persistir y enviar por WhatsApp

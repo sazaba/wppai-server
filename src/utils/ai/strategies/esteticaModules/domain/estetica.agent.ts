@@ -1,5 +1,6 @@
 // utils/ai/strategies/esteticaModules/domain/estetica.agent.ts
 // Full-agent natural: agenda contra DB, extracción por historial y doble confirmación.
+// Sin “botty” ni relistar: solo propone cuando hace falta, y confirma cuando ya hay todo.
 
 import prisma from "../../../../../lib/prisma";
 import { openai, resolveModelName } from "../../../../../lib/openai";
@@ -10,6 +11,7 @@ import type { EsteticaCtx } from "./estetica.rag";
 const RAW_MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
 const MODEL = resolveModelName(RAW_MODEL);
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.35);
+const DEBUG = String(process.env.ESTETICA_DEBUG ?? "0") !== "0";
 
 /* ======================= Tipos chat ======================= */
 export type ChatTurn = { role: "user" | "assistant"; content: string };
@@ -23,29 +25,6 @@ type AssistantMsg = {
     }>;
 };
 type ToolMsg = { role: "tool"; tool_call_id: string; content: string };
-
-/* ======================= Tipos fuertes (tools) ======================= */
-type BookResultOk = {
-    ok: true;
-    data: {
-        id: number;
-        startISO: string;
-        startLabel: string;
-        status: AppointmentStatus;
-        serviceName: string;
-        staffId: number | null;
-    };
-};
-type BookResultErr = { ok: false; reason: string };
-type BookResult = BookResultOk | BookResultErr;
-
-type FindSlotsResult = {
-    ok: true;
-    durationMin: number;
-    serviceName: string | null;
-    firstSuggestion: { startISO: string; startLabel: string; staffId: number | null } | null;
-    slots: Array<{ idx: number; startISO: string; startLabel: string; staffId: number | null }>;
-};
 
 /* ========== Memoria volátil (últimos slots útiles) ========== */
 type RememberedSlot = { idx: number; startISO: string; startLabel: string; staffId: number | null };
@@ -98,7 +77,7 @@ function nextLocalMorning(ctx: EsteticaCtx, daysAhead = 1): Date {
     return makeZonedDate(ymdInTZ(base, tz), "06:00", tz);
 }
 
-/* ====== (Opcional) offset si AppointmentHour está en otra TZ ====== */
+/* ====== (Opcional) offset si tus AppointmentHour están en UTC ====== */
 const HOURS_TZ_OFFSET_MIN = Number(process.env.APPT_HOURS_TZ_OFFSET_MIN ?? 0);
 function hhmmWithOffset(hhmm: string): string {
     if (!HOURS_TZ_OFFSET_MIN) return hhmm;
@@ -123,6 +102,14 @@ async function isSlotFree(empresaId: number, start: Date, durationMin: number, b
         },
     });
     if (overlap > 0) return { ok: false };
+    // Staff-awareness liviano: si no hay staff → ok
+    try {
+        const staff = await prisma.staff.findMany({
+            where: { empresaId, OR: [{ active: true }, { active: null }] },
+            select: { id: true }, take: 1,
+        } as any);
+        if (!staff.length) return { ok: true, staffId: undefined };
+    } catch { return { ok: true, staffId: undefined }; }
     return { ok: true, staffId: undefined };
 }
 
@@ -144,7 +131,6 @@ async function resolveService(ctx: EsteticaCtx, q: { serviceId?: number; name?: 
     }
     return null;
 }
-
 async function toolListProcedures(ctx: EsteticaCtx) {
     const rows = await prisma.esteticaProcedure.findMany({
         where: { empresaId: ctx.empresaId, enabled: true },
@@ -159,14 +145,17 @@ function intentWantsSlots(text: string) {
     const q = norm(text);
     return /cita|agendar|agenda|horario|disponible|disponibilidad|mañana|tarde|noche|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo/.test(q);
 }
+function intentWantsServices(text: string) {
+    const q = norm(text);
+    return /(servicio|servicios|tratamiento|tratamientos)\??$/i.test(q) || q.includes("que servicios");
+}
 
-async function toolFindSlots(
-    ctx: EsteticaCtx,
-    args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }
-): Promise<FindSlotsResult> {
+async function toolFindSlots(ctx: EsteticaCtx, args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }) {
     const svc = await resolveService(ctx, { serviceId: args.serviceId, name: args.serviceName });
     const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
+
     const hint = args.fromISO ? new Date(args.fromISO) : nextLocalMorning(ctx, 1);
+
     const tz = ctx.timezone;
     const ymd = ymdInTZ(hint, tz);
 
@@ -181,8 +170,7 @@ async function toolFindSlots(
         ?.slice(0, 3) as "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 
     const todays = hours.filter(h => h.day === weekday);
-    const pairs = todays
-        .flatMap(h => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
+    const pairs = todays.flatMap(h => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
         .filter(([s, e]) => s && e)
         .map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
 
@@ -228,7 +216,7 @@ async function toolBook(
     ctx: EsteticaCtx,
     args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number; staffId?: number },
     conversationId?: number
-): Promise<BookResult> {
+) {
     const phone = onlyDigits(String(args.phone || ""));
     if (!phone) return { ok: false, reason: "INVALID_PHONE" };
 
@@ -242,8 +230,9 @@ async function toolBook(
     const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin, svc.id);
     if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" };
 
-    const status: AppointmentStatus =
-        (ctx.rules?.requireConfirmation ?? true) ? AppointmentStatus.pending : AppointmentStatus.confirmed;
+    const status: AppointmentStatus = (ctx.rules?.requireConfirmation ?? true)
+        ? AppointmentStatus.pending
+        : AppointmentStatus.confirmed;
 
     const appt = await prisma.appointment.create({
         data: {
@@ -296,24 +285,28 @@ export function toolHandlers(ctx: EsteticaCtx, convId?: number) {
     };
 }
 
-/* ======================= Prompt cortito ======================= */
+/* ======================= Prompt cortito (estilo humano) ======================= */
 export function systemPrompt(ctx: EsteticaCtx) {
     const tz = ctx.timezone;
     const allowSameDay = !!ctx.rules?.allowSameDay;
     const minNoticeH = ctx.rules?.minNoticeHours ?? 0;
+    const who = ctx as any;
+    const brand = who?.businessName ? `de *${who.businessName}*` : "de la clínica";
 
     return [
-        `Eres coordinador/a humano/a de una clínica estética premium. Respondes cálido/a, directo/a, en 2–5 líneas y 1 emoji. Nada de “estoy buscando” o “soy IA”.`,
+        `Eres coordinador/a humano/a ${brand}. Respondes cálido/a, directo/a, en 2–5 líneas y 1 emoji. Nada de “estoy buscando” o “soy IA”.`,
         `Usa TOOLS solo para disponibilidad/booking. No inventes horarios.`,
         `Zona horaria: ${tz}. Mismo día: ${allowSameDay ? "sí" : "no"}. Antelación mínima: ${minNoticeH}h.`,
         `Si falta un dato para cerrar (nombre, teléfono o horario), pide SOLO ese dato.`,
         `Cuando ya tengas servicio + horario + nombre + teléfono, arma un resumen claro y pregunta: “¿Confirmamos?”. Solo si el cliente confirma explícitamente, llama book.`,
     ].join("\n");
 }
-export function buildFewshots(_ctx: EsteticaCtx): ChatTurn[] {
+export function buildFewshots(ctx: EsteticaCtx): ChatTurn[] {
+    const brand = (ctx as any)?.businessName;
+    const hi = brand ? `¡Hola! Soy coordinación de ${brand}.` : "¡Hola!";
     return [
         { role: "user", content: "hola" },
-        { role: "assistant", content: "¡Hola! ¿Buscas horarios o prefieres resolver una duda rápida del tratamiento? 🙂" },
+        { role: "assistant", content: `${hi} ¿Buscas horarios o prefieres resolver una duda rápida del tratamiento? 🙂` },
     ];
 }
 
@@ -326,13 +319,12 @@ async function detectServiceFromHistory(ctx: EsteticaCtx, turns: ChatTurn[]) {
         select: { id: true, name: true }, take: 30,
     });
     const body = norm(turns.map(t => t.content).join(" "));
-    let hit: { id: number; name: string } | null = null;
+    let hit = null as { id: number; name: string } | null;
     for (const p of procs) {
         if (body.includes(norm(p.name))) { hit = p; break; }
     }
     return hit;
 }
-
 function detectPhoneFromHistory(turns: ChatTurn[]): string | null {
     const body = turns.filter(t => t.role === "user").map(t => t.content).reverse();
     for (const txt of body) {
@@ -341,7 +333,6 @@ function detectPhoneFromHistory(turns: ChatTurn[]): string | null {
     }
     return null;
 }
-
 function detectNameFromHistory(turns: ChatTurn[]): string | null {
     const lines = turns.filter(t => t.role === "user").map(t => t.content);
     for (const s of lines) {
@@ -356,7 +347,6 @@ function detectNameFromHistory(turns: ChatTurn[]): string | null {
     }
     return null;
 }
-
 function parsePickIndexOrTime(text: string): { pickIdx?: number; hhmm?: string } {
     const t = norm(text);
     const idxMatch = t.match(/(?:opcion|opción)?\s*([1-6])\b/) || t.match(/^\s*([1-6])\s*$/);
@@ -370,7 +360,6 @@ function parsePickIndexOrTime(text: string): { pickIdx?: number; hhmm?: string }
     }
     return {};
 }
-
 function detectSlotFromHistory(ctx: EsteticaCtx & { __conversationId?: number }, turns: ChatTurn[]) {
     const mem = readSlots(ctx.__conversationId);
     const lastUser = [...turns].reverse().find(t => t.role === "user")?.content || "";
@@ -384,7 +373,6 @@ function detectSlotFromHistory(ctx: EsteticaCtx & { __conversationId?: number },
     }
     return null;
 }
-
 function lastAssistantAskedConfirmation(turns: ChatTurn[]): boolean {
     const lastA = [...turns].reverse().find(t => t.role === "assistant")?.content || "";
     return /¿confirmamos\??/i.test(lastA);
@@ -413,36 +401,32 @@ export async function runEsteticaAgent(
     turns: ChatTurn[],
 ): Promise<string> {
 
-    // 1) Intento determinista: ¿ya tengo todo para doble confirmación?
+    // ===== 1) Intento determinista: ¿ya tengo todo para doble confirmación? =====
     const svc = await detectServiceFromHistory(ctx, turns);
     const phone = detectPhoneFromHistory(turns);
     const fullName = detectNameFromHistory(turns);
     const chosen = detectSlotFromHistory(ctx, turns);
 
-    // Si el asistente pidió confirmación y el cliente confirmó → BOOK
     if (lastAssistantAskedConfirmation(turns) && userJustConfirmed(turns) && svc && phone && fullName && chosen?.startISO) {
         const booked = await toolBook(ctx, {
             serviceId: svc.id, serviceName: svc.name,
             startISO: chosen.startISO, phone, fullName,
         }, ctx.__conversationId);
-
-        if (booked.ok) {
+        if (booked?.ok) {
             const label = booked.data.startLabel;
             const msg = `¡Listo! Reservé *${booked.data.serviceName}* para **${label}** a nombre de *${fullName}*. Te llegará la confirmación por este medio. 🎉`;
             return msg;
         }
-        // conflicto → pedir alternativa breve
         return postProcessReply("Ese cupo acaba de ocuparse. ¿Busco otra hora cercana el mismo día u otro día?", turns);
     }
 
-    // Si ya tengo datos pero aún NO se pidió confirmación → resumen + “¿Confirmamos?”
     if (svc && phone && fullName && chosen?.startISO && !lastAssistantAskedConfirmation(turns)) {
         const label = chosen.startLabel;
         const resum = `Quedaría así:\n• Servicio: *${svc.name}*\n• Fecha y hora: **${label}**\n• A nombre de: *${fullName}*\n• Teléfono: *${phone}*\n¿Confirmamos para agendar?`;
         return postProcessReply(resum, turns);
     }
 
-    // 2) Falta algún dato → pedir SOLO lo que falte
+    // ===== 2) Si falta algún dato, pedimos SOLO lo que falta (estilo humano) =====
     const missing: string[] = [];
     if (!svc) missing.push("servicio");
     if (!chosen?.startISO) missing.push("horario");
@@ -450,39 +434,52 @@ export async function runEsteticaAgent(
     if (!phone) missing.push("teléfono");
 
     if (missing.length) {
-        const needsSlots = missing.includes("horario") && intentWantsSlots([...turns].reverse().find(t => t.role === "user")?.content || "");
+        const lastUser = [...turns].reverse().find(t => t.role === "user")?.content || "";
+
+        // Si preguntó por servicios → listar desde la BD
+        if (intentWantsServices(lastUser)) {
+            const list = await toolListProcedures(ctx);
+            const items = (list.items || []).slice(0, 6).map((i: any) => `• ${i.name}`).join("\n");
+            const trail = missing.length > 1 ? "\n\nSi te interesa alguno, me dices a nombre de quién sería y vemos horarios." : "";
+            return postProcessReply(`Claro, estos son algunos de nuestros tratamientos:\n${items}${trail}`, turns);
+        }
+
+        // Si falta horario y quiere ver disponibilidad → slots
+        const needsSlots = missing.includes("horario") && intentWantsSlots(lastUser);
         if (needsSlots) {
             const forced = await toolFindSlots(ctx, { max: 8 });
-            if (forced.ok && forced.slots.length) {
+            if (forced?.ok && forced?.slots?.length) {
                 rememberSlots(ctx.__conversationId, forced.slots as any);
-                const head = forced.firstSuggestion ? `Tengo estos cupos disponibles, por ejemplo **${forced.firstSuggestion.startLabel}**:\n` : `Estos son los cupos disponibles:\n`;
+                const head = forced.firstSuggestion
+                    ? `Tengo estos cupos disponibles, por ejemplo **${forced.firstSuggestion.startLabel}**:\n`
+                    : `Estos son los cupos disponibles:\n`;
                 const lines = forced.slots.map((s: any) => `${s.idx}️⃣ ${s.startLabel}`).slice(0, 6).join("\n");
                 const still = missing.filter(m => m !== "horario");
                 const tail = still.length ? `\n\nY para agendar, ${still.length === 2 ? still.join(" y ") : still.join(", ")}.` : `\n\nElige una opción (1–6).`;
-                const msg = `${head}${lines}${tail}`;
-                return postProcessReply(msg, turns);
+                return postProcessReply(`${head}${lines}${tail}`, turns);
             }
             return postProcessReply("Puedo revisar opciones desde mañana y proponerte los primeros cupos del día. ¿Quieres que los consulte?", turns);
         }
 
-        if (missing.length === 1 && missing[0] === "nombre") {
+        // Pedidos puntuales
+        if (missing.length === 1 && missing[0] === "nombre")
             return postProcessReply("¿A nombre de quién agendo? (nombre completo)", turns);
-        }
-        if (missing.length === 1 && missing[0] === "teléfono") {
-            return postProcessReply("¿Me compartes tu número de teléfono para dejarte confirmación por aquí?", turns);
-        }
+        if (missing.length === 1 && missing[0] === "teléfono")
+            return postProcessReply("¿Me compartes tu número de teléfono para dejarte la confirmación por aquí?", turns);
         if (missing.length === 1 && missing[0] === "servicio") {
             const list = await toolListProcedures(ctx);
-            const opts = (list as any).items?.slice(0, 5).map((i: any) => `• ${i.name}`).join("\n") || "";
-            return postProcessReply(`¿Qué tratamiento te gustaría agendar?\n${opts}`, turns);
+            const items = (list.items || []).slice(0, 5).map((i: any) => `• ${i.name}`).join("\n");
+            return postProcessReply(`¿Qué tratamiento te gustaría agendar?\n${items}`, turns);
         }
+
+        // Faltan varios
         return postProcessReply("Te ayudo a agendar. ¿Qué tratamiento quieres y a nombre de quién sería? Si ya tienes un horario en mente, me dices.", turns);
     }
 
-    // 3) LLM para estilo libre (cuando no aplica lo anterior)
+    // ===== 3) Si no faltan datos pero tampoco confirmación → LLM libre con tools
     const sys = systemPrompt(ctx);
     const few = buildFewshots(ctx);
-    const kb = (await ctx.buildKbContext?.()) ?? "";
+    const kb = (await (ctx as any).buildKbContext?.()) ?? "";
     const base: any = [
         { role: "system", content: `${sys}\n\n### Conocimiento de la clínica\n${kb}` },
         ...few,
@@ -498,6 +495,7 @@ export async function runEsteticaAgent(
     } as any);
     const m1 = (r1.choices?.[0]?.message || {}) as AssistantMsg;
 
+    // Si ejecutó tools (lista/slots) guardamos slots si aplica y cerramos con estilo humano
     if (Array.isArray(m1.tool_calls) && m1.tool_calls.length) {
         const toolMsgs = await runTools(ctx, m1.tool_calls, ctx.__conversationId);
         for (const c of m1.tool_calls) {
@@ -517,6 +515,7 @@ export async function runEsteticaAgent(
         return postProcessReply(final || "¿Te comparto el primer horario disponible desde mañana o prefieres resolver una duda específica?", turns);
     }
 
+    // Fallback sobrio
     const text = (m1.content || "").trim();
     if (text) return postProcessReply(text, turns);
 
