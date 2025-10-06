@@ -453,6 +453,34 @@ function listEnabledServices(kb: any, max = 12): string {
     return names.slice(0, max).join(", ");
 }
 
+/** ===== Helper: inferir servicio desde el historial reciente ===== */
+// Reemplaza la función inferServiceFromHistory por esta
+async function inferServiceFromHistory(kb: any, chatId: number) {
+    const lastMsgs = await prisma.message.findMany({
+        where: { conversationId: chatId },
+        orderBy: { timestamp: "desc" },
+        take: 10,
+        select: { contenido: true },
+    });
+
+    const enabled = (kb.services || []).filter((s: any) => s.enabled !== false);
+
+    // Recorremos del mensaje más nuevo al más viejo y devolvemos
+    // el PRIMER servicio que aparezca (nombre o alias).
+    for (const m of lastMsgs) {
+        const t = String(m.contenido || "").toLowerCase();
+        for (const s of enabled) {
+            const nameHit = t.includes(String(s.name || "").toLowerCase());
+            const aliasHit = (s.aliases || []).some((a: string) =>
+                t.includes(String(a || "").toLowerCase())
+            );
+            if (nameHit || aliasHit) return s; // ← gana el más reciente
+        }
+    }
+    return null;
+}
+
+
 /** ======= PUBLIC: handleEsteticaReply ======= */
 export async function handleEsteticaReply(args: {
     chatId: number;
@@ -591,6 +619,8 @@ export async function handleEsteticaReply(args: {
         draft.serviceId = svc.id;
         draft.serviceName = svc.name;
         draft.duration = readSvcDuration(svc, (kb as any)?.rules) ?? 60;
+        // ✅ persistimos el servicio en foco de inmediato
+        await putDraft(chatId, draft);
     }
 
     // Fecha relativa + hora (si vienen)
@@ -608,6 +638,7 @@ export async function handleEsteticaReply(args: {
 
     /** ====== AGENDAR ====== */
     if (intent === "agendar") {
+        // Si ya está todo para confirmar:
         if (draft.serviceId && draft.whenUTC && draft.name && draft.phone && draft.stage !== "confirm") {
             draft.stage = "confirm";
             await putDraft(chatId, draft);
@@ -647,7 +678,21 @@ export async function handleEsteticaReply(args: {
             };
         }
 
-        if (!svc) {
+        // Si no detectamos servicio en el mensaje, intentamos inferirlo del contexto reciente
+        let serviceToUse = svc;
+        if (!serviceToUse) {
+            const inferred = await inferServiceFromHistory(kb, chatId);
+            if (inferred) {
+                draft.serviceId = inferred.id;
+                draft.serviceName = inferred.name;
+                draft.duration = readSvcDuration(inferred, (kb as any)?.rules) ?? 60;
+                await putDraft(chatId, draft);
+                serviceToUse = inferred;
+            }
+        }
+
+        // Si aún no hay servicio, preguntar
+        if (!serviceToUse) {
             const hint = `Perfecto. Trabajo con los servicios habilitados de la clínica. ¿Cuál te interesa? (Ej.: ${kb.services
                 .slice(0, 3)
                 .map((s: any) => s.name)
@@ -669,7 +714,7 @@ export async function handleEsteticaReply(args: {
             };
         }
 
-        const duration = draft.duration ?? readSvcDuration(svc, (kb as any)?.rules) ?? 60;
+        const duration = draft.duration ?? readSvcDuration(serviceToUse, (kb as any)?.rules) ?? 60;
 
         const nowLocal = new Date();
         const anchorLocal = rel.ok ? rel.localStart : nowLocal;
@@ -685,7 +730,7 @@ export async function handleEsteticaReply(args: {
         });
 
         if (!slots.length) {
-            const txt = `Puedo ayudarte con *${svc.name}*, pero no veo horarios disponibles en los próximos días. ¿Te contacto con un asesor para coordinar?`;
+            const txt = `Puedo ayudarte con *${serviceToUse.name}*, pero no veo horarios disponibles en los próximos días. ¿Te contacto con un asesor para coordinar?`;
             const saved = await persistBotReply({
                 conversationId: chatId,
                 empresaId,
@@ -703,15 +748,15 @@ export async function handleEsteticaReply(args: {
             };
         }
 
-        draft.serviceId = svc.id;
-        draft.serviceName = svc.name;
+        draft.serviceId = serviceToUse.id;
+        draft.serviceName = serviceToUse.name;
         draft.duration = duration;
         draft.stage = "oferta";
         await putDraft(chatId, draft);
 
         const primeros = slots.slice(0, 5).map((s) => `• ${s.label}`).join("\n");
         const prompt =
-            `Para *${svc.name}* tengo estas opciones próximas:\n${primeros}\n\n` +
+            `Para *${serviceToUse.name}* tengo estas opciones próximas:\n${primeros}\n\n` +
             `¿Te funciona alguna? Si ya tienes fecha/hora exacta, dímela (ej. “mañana 10:30”). También necesito tu *nombre* y *teléfono* para reservar.`;
         const saved = await persistBotReply({
             conversationId: chatId,
@@ -739,7 +784,7 @@ export async function handleEsteticaReply(args: {
         draft.phone
     ) {
         try {
-            const appt = await bookAppointment({
+            await bookAppointment({
                 empresaId,
                 conversationId: chatId,
                 customerName: draft.name!,
