@@ -1,16 +1,15 @@
 // utils/ai/strategies/esteticaModules/domain/estetica.agent.ts
-// Full-agent (agenda natural + tools + KB) con staff-awareness y saludo humano
-// + Logs de tool-calls y fallback proactivo cuando el modelo no ejecuta tools.
+// Full-agent natural: agenda contra DB, extracción por historial y doble confirmación.
 
 import prisma from "../../../../../lib/prisma";
-import { openai } from "../../../../../lib/openai";
+import { openai, resolveModelName } from "../../../../../lib/openai";
 import { AppointmentStatus, AppointmentSource } from "@prisma/client";
 import type { EsteticaCtx } from "./estetica.rag";
 
 /* ======================= LLM CFG ======================= */
-const MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
+const RAW_MODEL = process.env.ESTETICA_MODEL || "gpt-4o-mini";
+const MODEL = resolveModelName(RAW_MODEL);
 const TEMPERATURE = Number(process.env.IA_TEMPERATURE ?? 0.35);
-const DEBUG = String(process.env.ESTETICA_DEBUG ?? "0") !== "0";
 
 /* ======================= Tipos chat ======================= */
 export type ChatTurn = { role: "user" | "assistant"; content: string };
@@ -25,22 +24,54 @@ type AssistantMsg = {
 };
 type ToolMsg = { role: "tool"; tool_call_id: string; content: string };
 
-/* ======================= Utils ======================= */
-function safeParseArgs(raw?: string) {
-    if (!raw) return {};
-    try { return JSON.parse(raw); } catch { return {}; }
-}
-const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te va bien?"];
+/* ======================= Tipos fuertes (tools) ======================= */
+type BookResultOk = {
+    ok: true;
+    data: {
+        id: number;
+        startISO: string;
+        startLabel: string;
+        status: AppointmentStatus;
+        serviceName: string;
+        staffId: number | null;
+    };
+};
+type BookResultErr = { ok: false; reason: string };
+type BookResult = BookResultOk | BookResultErr;
 
-// Cierre amable y 1 emoji
+type FindSlotsResult = {
+    ok: true;
+    durationMin: number;
+    serviceName: string | null;
+    firstSuggestion: { startISO: string; startLabel: string; staffId: number | null } | null;
+    slots: Array<{ idx: number; startISO: string; startLabel: string; staffId: number | null }>;
+};
+
+/* ========== Memoria volátil (últimos slots útiles) ========== */
+type RememberedSlot = { idx: number; startISO: string; startLabel: string; staffId: number | null };
+const lastSlots = new Map<number, RememberedSlot[]>();
+function rememberSlots(convId: number | undefined, slots?: RememberedSlot[]) {
+    if (!convId || !slots?.length) return;
+    lastSlots.set(convId, slots.slice(0, 6));
+}
+function readSlots(convId: number | undefined): RememberedSlot[] {
+    if (!convId) return [];
+    return lastSlots.get(convId) || [];
+}
+
+/* ======================= Utils ======================= */
+const ENDINGS = ["¿Te parece?", "¿Confirmamos?", "¿Te va bien?"];
 function postProcessReply(reply: string, history: ChatTurn[]): string {
-    const clean = reply.trim().replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+    const clean = (reply || "").trim().replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
     if (!clean) return clean;
     const add = ENDINGS[history.length % ENDINGS.length];
     const withEnding = /[.?!…]$/.test(clean) ? `${clean} ${add}` : `${clean}. ${add}`;
     const hasEmoji = /\p{Extended_Pictographic}/u.test(withEnding);
     return hasEmoji ? withEnding : `${withEnding} 🙂`;
 }
+function safeParseArgs(raw?: string) { try { return raw ? JSON.parse(raw) : {}; } catch { return {}; } }
+const norm = (s: string) => (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+const onlyDigits = (s: string) => (s || "").replace(/[^\d]/g, "");
 
 /* ======================= Fecha/TZ helpers ======================= */
 function addMinutes(d: Date, m: number) { return new Date(d.getTime() + m * 60000); }
@@ -61,19 +92,13 @@ function makeZonedDate(ymd: string, hhmm: string, tz: string): Date {
     const delta = h * 60 + mi - (gotH * 60 + gotM);
     return new Date(guess.getTime() + delta * 60000);
 }
-function startOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "00:00", tz); }
-function endOfDayTZ(d: Date, tz: string) { return makeZonedDate(ymdInTZ(d, tz), "23:59", tz); }
-
-// Buscar “mañana 06:00” local por defecto
 function nextLocalMorning(ctx: EsteticaCtx, daysAhead = 1): Date {
     const tz = ctx.timezone;
     const base = addDays(new Date(), daysAhead);
     return makeZonedDate(ymdInTZ(base, tz), "06:00", tz);
 }
 
-/* ====== Corrección opcional de timezone en appointmentHours ====== */
-// Si tus hours están guardadas en UTC y el negocio opera en America/Bogota (-300 min),
-// define: APPT_HOURS_TZ_OFFSET_MIN=-300
+/* ====== (Opcional) offset si AppointmentHour está en otra TZ ====== */
 const HOURS_TZ_OFFSET_MIN = Number(process.env.APPT_HOURS_TZ_OFFSET_MIN ?? 0);
 function hhmmWithOffset(hhmm: string): string {
     if (!HOURS_TZ_OFFSET_MIN) return hhmm;
@@ -85,14 +110,8 @@ function hhmmWithOffset(hhmm: string): string {
     return `${H}:${M}`;
 }
 
-/* ======================= Disponibilidad base (helpers internos) ======================= */
-async function isSlotFree(
-    empresaId: number,
-    start: Date,
-    durationMin: number,
-    bufferMin = 0,
-    _procedureId?: number | null
-) {
+/* ======================= Disponibilidad base ======================= */
+async function isSlotFree(empresaId: number, start: Date, durationMin: number, bufferMin = 0, _procedureId?: number | null) {
     const startWithBuffer = new Date(start.getTime() - bufferMin * 60000);
     const endWithBuffer = new Date(start.getTime() + (durationMin + bufferMin) * 60000);
     const overlap = await prisma.appointment.count({
@@ -104,85 +123,10 @@ async function isSlotFree(
         },
     });
     if (overlap > 0) return { ok: false };
-
-    // Staff-awareness liviano (si no hay Staff, ok)
-    try {
-        const staff = await prisma.staff.findMany({
-            where: { empresaId, OR: [{ active: true }, { active: null }] },
-            select: { id: true, active: true },
-            take: 1,
-        } as any);
-        if (!staff.length) return { ok: true, staffId: undefined };
-    } catch {
-        return { ok: true, staffId: undefined };
-    }
-    // si hay staff, considerar 1 recurso libre
     return { ok: true, staffId: undefined };
 }
 
-/* ====== Hours + Exceptions (helpers) ====== */
-type HourRow = {
-    day: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
-    isOpen: boolean;
-    start1: string | null; end1: string | null;
-    start2: string | null; end2: string | null;
-};
-type ExceptionRow = {
-    date: Date;
-    isOpen: boolean | null;
-    start1: string | null; end1: string | null;
-    start2: string | null; end2: string | null;
-};
-
-async function fetchHours(empresaId: number): Promise<HourRow[]> {
-    const rows = await prisma.appointmentHour.findMany({
-        where: { empresaId, isOpen: true },
-        select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
-    });
-    return rows as unknown as HourRow[];
-}
-async function fetchExceptions(empresaId: number): Promise<ExceptionRow[]> {
-    const rows = await prisma.appointmentException.findMany({
-        where: { empresaId },
-        select: { date: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
-    });
-    return rows.map(r => ({
-        date: r.date, isOpen: r.isOpen ?? null,
-        start1: r.start1 ?? null, end1: r.end1 ?? null, start2: r.start2 ?? null, end2: r.end2 ?? null,
-    }));
-}
-function weekdayCode(d: Date, tz: string): HourRow["day"] {
-    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).formatToParts(d);
-    const w = (p.find(x => x.type === "weekday")?.value ?? "sun").toLowerCase().slice(0, 3);
-    return (w as HourRow["day"]);
-}
-function windowsForYMD(ymd: string, tz: string, hours: HourRow[], exceptions: ExceptionRow[]) {
-    const ex = exceptions.find(e => ymdInTZ(e.date, tz) === ymd);
-    if (ex) {
-        if (ex.isOpen === false) return [];
-        const pairs: [string | null, string | null][] = [[ex.start1, ex.end1], [ex.start2, ex.end2]];
-        return pairs
-            .filter(([s, e]) => s && e)
-            .map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
-    }
-    const wd = weekdayCode(makeZonedDate(ymd, "00:00", tz), tz);
-    const todays = hours.filter(h => h.day === wd && h.isOpen);
-    const pairs = todays.flatMap(h => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
-        .filter(([s, e]) => s && e);
-    return pairs.map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
-}
-
 /* ======================= Tools reales ======================= */
-async function toolListProcedures(ctx: EsteticaCtx, _args: any) {
-    const rows = await prisma.esteticaProcedure.findMany({
-        where: { empresaId: ctx.empresaId, enabled: true },
-        select: { id: true, name: true, durationMin: true, priceMin: true, priceMax: true },
-        orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
-        take: 6,
-    });
-    return { ok: true, items: rows };
-}
-
 async function resolveService(ctx: EsteticaCtx, q: { serviceId?: number; name?: string }) {
     if (q.serviceId) {
         const r = await prisma.esteticaProcedure.findFirst({
@@ -201,98 +145,69 @@ async function resolveService(ctx: EsteticaCtx, q: { serviceId?: number; name?: 
     return null;
 }
 
-function intentWantsSlots(text: string) {
-    const q = (text || "").toLowerCase();
-    return /cita|agendar|agenda|horario|disponible|disponibilidad|mañana|tarde|noche|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo/.test(q);
+async function toolListProcedures(ctx: EsteticaCtx) {
+    const rows = await prisma.esteticaProcedure.findMany({
+        where: { empresaId: ctx.empresaId, enabled: true },
+        select: { id: true, name: true, durationMin: true, priceMin: true, priceMax: true },
+        orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
+        take: 10,
+    });
+    return { ok: true, items: rows };
 }
 
-/** Escanea varios días (7 → 14) hasta reunir máx. 6 slots.
- *  Corrige fechas pasadas (fromISO < now → mañana 06:00 en TZ)
- *  y respeta minNotice/allowSameDay.
- */
+function intentWantsSlots(text: string) {
+    const q = norm(text);
+    return /cita|agendar|agenda|horario|disponible|disponibilidad|mañana|tarde|noche|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo/.test(q);
+}
+
 async function toolFindSlots(
     ctx: EsteticaCtx,
     args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }
-) {
+): Promise<FindSlotsResult> {
     const svc = await resolveService(ctx, { serviceId: args.serviceId, name: args.serviceName });
     const durationMin = svc?.durationMin ?? ctx.rules?.defaultServiceDurationMin ?? 60;
-
+    const hint = args.fromISO ? new Date(args.fromISO) : nextLocalMorning(ctx, 1);
     const tz = ctx.timezone;
-    const cap = Math.min(12, Math.max(6, Number(args.max ?? 8)));
+    const ymd = ymdInTZ(hint, tz);
 
-    // Punto de partida sugerido por el modelo o “mañana 06:00”
-    let cursor = args.fromISO ? new Date(args.fromISO) : nextLocalMorning(ctx, 1);
+    const hours = await prisma.appointmentHour.findMany({
+        where: { empresaId: ctx.empresaId, isOpen: true },
+        select: { day: true, start1: true, end1: true, start2: true, end2: true },
+    });
 
-    // 🔧 FIX: si la fecha base está en el pasado, arranca desde mañana 06:00
-    const now = new Date();
-    if (cursor.getTime() < now.getTime()) {
-        if (DEBUG) console.log("[findSlots] fromISO in past → start tomorrow");
-        cursor = nextLocalMorning(ctx, 1);
-    }
+    const weekday = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" })
+        .formatToParts(makeZonedDate(ymd, "00:00", tz))
+        .find(p => p.type === "weekday")?.value?.toLowerCase()
+        ?.slice(0, 3) as "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 
-    // Reglas de antelación
-    const minNoticeH = ctx.rules?.minNoticeHours ?? 0;
-    const allowSameDay = !!ctx.rules?.allowSameDay;
-    // earliest = now + minNotice + buffer; si NO se permite mismo día, earliest no puede caer hoy en TZ
-    const earliest = new Date(now.getTime() + (minNoticeH * 60 + (ctx.bufferMin ?? 0)) * 60000);
+    const todays = hours.filter(h => h.day === weekday);
+    const pairs = todays
+        .flatMap(h => [[h.start1, h.end1], [h.start2, h.end2]] as [string | null, string | null][])
+        .filter(([s, e]) => s && e)
+        .map(([s, e]) => ({ start: hhmmWithOffset(s!), end: hhmmWithOffset(e!) }));
 
-    const [hours, exceptions] = await Promise.all([
-        fetchHours(ctx.empresaId),
-        fetchExceptions(ctx.empresaId),
-    ]);
-
-    const out: Array<{ start: Date }> = [];
-    let daysToScan = 7;
-
-    const scan = async (days: number) => {
-        for (let i = 0; i < days && out.length < cap; i++) {
-            const ymd = ymdInTZ(cursor, tz);
-
-            // Si no permites same-day y estamos en el mismo YMD, salta al siguiente
-            const ymdToday = ymdInTZ(now, tz);
-            if (!allowSameDay && ymd === ymdToday) {
-                cursor = addDays(cursor, 1);
-                continue;
-            }
-
-            const wins = windowsForYMD(ymd, tz, hours, exceptions);
-            if (DEBUG) console.log(`[findSlots] day=${ymd} wins=${wins.length}`);
-
-            for (const w of wins) {
-                let s = makeZonedDate(ymd, w.start, tz);
-                const e = makeZonedDate(ymd, w.end, tz);
-                while (s.getTime() + durationMin * 60000 <= e.getTime()) {
-                    // respeta earliest
-                    if (s.getTime() >= earliest.getTime()) {
-                        const free = await isSlotFree(ctx.empresaId, s, durationMin, ctx.bufferMin);
-                        if ((free as any)?.ok) {
-                            out.push({ start: new Date(s) });
-                            if (out.length >= cap) break;
-                        }
-                    }
-                    s = addMinutes(s, 15);
-                }
-                if (out.length >= cap) break;
-            }
-            cursor = addDays(cursor, 1);
+    const raw: Array<{ start: Date }> = [];
+    for (const w of pairs) {
+        let s = makeZonedDate(ymd, w.start, tz);
+        const e = makeZonedDate(ymd, w.end, tz);
+        while (s.getTime() + durationMin * 60000 <= e.getTime()) {
+            const free = await isSlotFree(ctx.empresaId, s, durationMin, ctx.bufferMin, svc?.id ?? null);
+            if ((free as any)?.ok) raw.push({ start: new Date(s) });
+            if (raw.length >= Math.min(12, Math.max(6, Number(args.max ?? 8)))) break;
+            s = addMinutes(s, 15);
         }
-    };
-
-    await scan(daysToScan);
-    if (!out.length) { // ampliar ventana si el primer barrido quedó vacío
-        daysToScan = 14;
-        await scan(daysToScan);
+        if (raw.length >= Math.min(12, Math.max(6, Number(args.max ?? 8)))) break;
     }
 
-    const labels = out.slice(0, 12).map((d, i) => ({
+    const future = raw.filter(d => d.start.getTime() > Date.now());
+    const first = future[0];
+
+    const labels = future.slice(0, 12).map((d, i) => ({
         idx: i + 1,
         startISO: d.start.toISOString(),
-        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: tz }).format(d.start),
+        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(d.start),
         staffId: null as number | null,
     }));
-
-    const first = out[0];
-    if (DEBUG) console.log(`[findSlots] result slots=${labels.length} start=${args.fromISO || "tomorrow"}`);
 
     return {
         ok: true,
@@ -301,7 +216,7 @@ async function toolFindSlots(
         firstSuggestion: first
             ? {
                 startISO: first.start.toISOString(),
-                startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: tz }).format(first.start),
+                startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(first.start),
                 staffId: null as number | null,
             }
             : null,
@@ -313,8 +228,8 @@ async function toolBook(
     ctx: EsteticaCtx,
     args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number; staffId?: number },
     conversationId?: number
-) {
-    const phone = String(args.phone || "").replace(/[^\d]/g, "");
+): Promise<BookResult> {
+    const phone = onlyDigits(String(args.phone || ""));
     if (!phone) return { ok: false, reason: "INVALID_PHONE" };
 
     const svc = await resolveService(ctx, { serviceId: args.serviceId, name: args.serviceName });
@@ -327,9 +242,8 @@ async function toolBook(
     const free = await isSlotFree(ctx.empresaId, startAt, durationMin, ctx.bufferMin, svc.id);
     if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" };
 
-    const status: AppointmentStatus = (ctx.rules?.requireConfirmation ?? true)
-        ? AppointmentStatus.pending
-        : AppointmentStatus.confirmed;
+    const status: AppointmentStatus =
+        (ctx.rules?.requireConfirmation ?? true) ? AppointmentStatus.pending : AppointmentStatus.confirmed;
 
     const appt = await prisma.appointment.create({
         data: {
@@ -363,140 +277,121 @@ async function toolBook(
     };
 }
 
-async function toolReschedule(ctx: EsteticaCtx, args: { appointmentId: number; newStartISO: string; staffId?: number }) {
-    const appt = await prisma.appointment.findUnique({ where: { id: Number(args.appointmentId) } } as any);
-    if (!appt || appt.deletedAt || appt.empresaId !== ctx.empresaId) return { ok: false, reason: "NOT_FOUND" };
-    const duration = appt.serviceDurationMin ?? Math.max(15, Math.round((+appt.endAt - +appt.startAt) / 60000));
-    const newStart = new Date(args.newStartISO);
-    const free = await isSlotFree(ctx.empresaId, newStart, duration, ctx.bufferMin, appt.procedureId ?? null);
-    if (!(free as any)?.ok) return { ok: false, reason: "CONFLICT_SLOT" };
-    const updated = await prisma.appointment.update({
-        where: { id: appt.id },
-        data: {
-            startAt: newStart,
-            endAt: addMinutes(newStart, duration),
-            status: AppointmentStatus.rescheduled,
-            staffId: args.staffId ?? appt.staffId ?? null,
-        },
-    } as any);
-    return {
-        ok: true,
-        data: {
-            id: updated.id,
-            startISO: updated.startAt.toISOString(),
-            startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(updated.startAt),
-            status: updated.status,
-            staffId: updated.staffId ?? null,
-        },
-    };
-}
-
-async function toolCancel(ctx: EsteticaCtx, args: { appointmentId: number }) {
-    const appt = await prisma.appointment.findUnique({ where: { id: Number(args.appointmentId) } } as any);
-    if (!appt || appt.empresaId !== ctx.empresaId || appt.deletedAt) return { ok: false, reason: "NOT_FOUND" };
-    const deleted = await prisma.appointment.update({
-        where: { id: appt.id }, data: { status: AppointmentStatus.cancelled, deletedAt: new Date() },
-    } as any);
-    return {
-        ok: true,
-        data: {
-            id: deleted.id,
-            startISO: deleted.startAt.toISOString(),
-            startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: ctx.timezone }).format(deleted.startAt),
-            status: deleted.status,
-        },
-    };
-}
-
-async function toolListUpcoming(ctx: EsteticaCtx, args: { phone: string; limit?: number }) {
-    const phone = String(args.phone || "").replace(/[^\d]/g, "");
-    if (!phone) return { ok: false, reason: "INVALID_PHONE" };
-    const rows = await prisma.appointment.findMany({
-        where: {
-            empresaId: ctx.empresaId,
-            customerPhone: phone,
-            deletedAt: null,
-            status: { in: [AppointmentStatus.pending, AppointmentStatus.confirmed, AppointmentStatus.rescheduled] },
-            startAt: { gt: new Date() },
-        },
-        orderBy: { startAt: "asc" },
-        select: { id: true, startAt: true, serviceName: true, timezone: true },
-        take: Math.max(1, Number(args.limit ?? 5)),
-    } as any);
-    const items = rows.map(r => ({
-        id: r.id,
-        startISO: r.startAt.toISOString(),
-        startLabel: new Intl.DateTimeFormat("es-CO", { dateStyle: "full", timeStyle: "short", timeZone: r.timezone || ctx.timezone }).format(r.startAt),
-        serviceName: r.serviceName ?? null,
-    }));
-    return { ok: true, items };
-}
-
 /* ======================= Tools spec/handlers ======================= */
 export const toolSpecs = [
-    { type: "function", function: { name: "listProcedures", description: "Lista breve de servicios/procedimientos disponibles.", parameters: { type: "object", properties: {}, additionalProperties: false } } },
-    { type: "function", function: { name: "findSlots", description: "Busca horarios disponibles (máx. 6) y sugiere el primer cupo del día.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, fromISO: { type: "string" }, max: { type: "number" } }, additionalProperties: false } } },
-    { type: "function", function: { name: "book", description: "Crea una reserva confirmada/pending según política.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, startISO: { type: "string" }, phone: { type: "string" }, fullName: { type: "string" }, notes: { type: "string" }, durationMin: { type: "number" }, staffId: { type: "number" } }, required: ["startISO", "phone", "fullName"], additionalProperties: false } } },
-    { type: "function", function: { name: "reschedule", description: "Reagenda una cita existente.", parameters: { type: "object", properties: { appointmentId: { type: "number" }, newStartISO: { type: "string" }, staffId: { type: "number" } }, required: ["appointmentId", "newStartISO"], additionalProperties: false } } },
-    { type: "function", function: { name: "cancel", description: "Cancela una cita por ID.", parameters: { type: "object", properties: { appointmentId: { type: "number" } }, required: ["appointmentId"], additionalProperties: false } } },
-    { type: "function", function: { name: "listUpcomingApptsForPhone", description: "Lista próximas citas filtrando por teléfono.", parameters: { type: "object", properties: { phone: { type: "string" }, limit: { type: "number" } }, required: ["phone"], additionalProperties: false } } },
+    { type: "function", function: { name: "listProcedures", description: "Lista de servicios/procedimientos.", parameters: { type: "object", properties: {}, additionalProperties: false } } },
+    { type: "function", function: { name: "findSlots", description: "Busca horarios disponibles (máx. 6) y sugiere el primero.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, fromISO: { type: "string" }, max: { type: "number" } }, additionalProperties: false } } },
+    { type: "function", function: { name: "book", description: "Crea la reserva.", parameters: { type: "object", properties: { serviceId: { type: "number" }, serviceName: { type: "string" }, startISO: { type: "string" }, phone: { type: "string" }, fullName: { type: "string" }, notes: { type: "string" }, durationMin: { type: "number" }, staffId: { type: "number" } }, required: ["startISO", "phone", "fullName"], additionalProperties: false } } },
 ] as const;
 
 export function toolHandlers(ctx: EsteticaCtx, convId?: number) {
     return {
-        async listProcedures(_args: {}) { return toolListProcedures(ctx, _args); },
+        async listProcedures(_args: {}) { return toolListProcedures(ctx); },
         async findSlots(args: { serviceId?: number; serviceName?: string; fromISO?: string; max?: number }) {
-            if (DEBUG) console.log("[tool.findSlots] args=", args);
             return toolFindSlots(ctx, args);
         },
         async book(args: { serviceId?: number; serviceName?: string; startISO: string; phone: string; fullName: string; notes?: string; durationMin?: number; staffId?: number }) {
             return toolBook(ctx, args, convId);
         },
-        async reschedule(args: { appointmentId: number; newStartISO: string; staffId?: number }) {
-            return toolReschedule(ctx, args);
-        },
-        async cancel(args: { appointmentId: number }) { return toolCancel(ctx, args); },
-        async listUpcomingApptsForPhone(args: { phone: string; limit?: number }) { return toolListUpcoming(ctx, args); },
     };
 }
 
-/* ======================= Prompt & fewshots ======================= */
+/* ======================= Prompt cortito ======================= */
 export function systemPrompt(ctx: EsteticaCtx) {
     const tz = ctx.timezone;
     const allowSameDay = !!ctx.rules?.allowSameDay;
     const minNoticeH = ctx.rules?.minNoticeHours ?? 0;
 
     return [
-        `Eres coordinador/a humano/a de una clínica estética premium en Colombia. Respondes cálido/a, cercano/a y natural, en 2–5 líneas, con **1 emoji** por turno. Nada de “voy a buscar / dame un momento”.`,
-        `Usa **TOOLS** para todo lo de agenda: listar cupos, reservar, reagendar, cancelar, próximas.`,
-        ``,
-        `# Reglas de agenda`,
-        `- Zona horaria del negocio: **${tz}**.`,
-        `- Citas del mismo día: ${allowSameDay ? "permitidas si hay cupo" : "NO permitidas"}.`,
-        `- Antelación mínima: **${minNoticeH}h**.`,
-        `- Si el usuario no da fecha: **busca desde mañana 06:00 (${tz})** y **propón el primer cupo**; además muestra 2–3 alternativas del mismo día.`,
-        `- Solo ofrece horarios que devuelven las tools (máx. 6 por respuesta).`,
-        ``,
-        `# Interpretación de fechas del usuario`,
-        `- “mañana / pasado / martes / la otra semana / 3pm del lunes”: conviértelo a fecha/hora real en ${tz} y pásalo como **fromISO** a **findSlots**.`,
-        ``,
-        `# Flujo de reserva (full agent)`,
-        `1) Detecta el servicio. 2) Propón el primer cupo y 2–3 alternos. 3) Pide nombre completo y teléfono. 4) **Doble confirmación**: resume y pregunta “¿Confirmamos?”. Solo si la respuesta es clara (sí/ok/dale/listo/confirmo), llama **book**.`,
-        ``,
-        `# Estilo`,
-        `- Saludo natural y útil: NO digas que el cliente “no tiene cita” salvo que lo pregunte.`,
-        `- Evita frases tipo “un momento”, “procedo a…”; escribe como persona real.`,
+        `Eres coordinador/a humano/a de una clínica estética premium. Respondes cálido/a, directo/a, en 2–5 líneas y 1 emoji. Nada de “estoy buscando” o “soy IA”.`,
+        `Usa TOOLS solo para disponibilidad/booking. No inventes horarios.`,
+        `Zona horaria: ${tz}. Mismo día: ${allowSameDay ? "sí" : "no"}. Antelación mínima: ${minNoticeH}h.`,
+        `Si falta un dato para cerrar (nombre, teléfono o horario), pide SOLO ese dato.`,
+        `Cuando ya tengas servicio + horario + nombre + teléfono, arma un resumen claro y pregunta: “¿Confirmamos?”. Solo si el cliente confirma explícitamente, llama book.`,
     ].join("\n");
 }
-
 export function buildFewshots(_ctx: EsteticaCtx): ChatTurn[] {
     return [
         { role: "user", content: "hola" },
-        { role: "assistant", content: "¡Hola! ¿Quieres ver horarios o resolver una duda de tratamientos? 🙂" },
-
-        { role: "user", content: "me sirve el martes en la tarde para botox" },
-        { role: "assistant", content: "Perfecto, miro cupos desde ese *martes* y te propongo el primero disponible en la tarde y 2–3 opciones más. 😉" },
+        { role: "assistant", content: "¡Hola! ¿Buscas horarios o prefieres resolver una duda rápida del tratamiento? 🙂" },
     ];
+}
+
+/* ======================= Extractores por historial ======================= */
+const YES_RE = /\b(si|sí|dale|ok|okay|listo|confirmo|confirmamos|perfecto)\b/i;
+
+async function detectServiceFromHistory(ctx: EsteticaCtx, turns: ChatTurn[]) {
+    const procs = await prisma.esteticaProcedure.findMany({
+        where: { empresaId: ctx.empresaId, enabled: true },
+        select: { id: true, name: true }, take: 30,
+    });
+    const body = norm(turns.map(t => t.content).join(" "));
+    let hit: { id: number; name: string } | null = null;
+    for (const p of procs) {
+        if (body.includes(norm(p.name))) { hit = p; break; }
+    }
+    return hit;
+}
+
+function detectPhoneFromHistory(turns: ChatTurn[]): string | null {
+    const body = turns.filter(t => t.role === "user").map(t => t.content).reverse();
+    for (const txt of body) {
+        const m = txt.replace(/\s/g, " ").match(/\+?\d[\d\s().-]{7,}/);
+        if (m) return onlyDigits(m[0]);
+    }
+    return null;
+}
+
+function detectNameFromHistory(turns: ChatTurn[]): string | null {
+    const lines = turns.filter(t => t.role === "user").map(t => t.content);
+    for (const s of lines) {
+        const m1 = s.match(/me llamo\s+([a-záéíóúñ ]{3,60})/i);
+        if (m1) return m1[1].replace(/\s+/g, " ").trim().replace(/[^ a-zA-ZÁÉÍÓÚÑáéíóúñ'.-]/g, "");
+        const m2 = s.match(/\bsoy\s+([a-záéíóúñ ]{3,60})/i);
+        if (m2) return m2[1].replace(/\s+/g, " ").trim();
+        const clean = s.replace(/[^\p{L}\s'.-]/gu, " ").trim();
+        if (clean.split(/\s+/).length >= 2 && clean.split(/\s+/).length <= 4 && /^[\p{L}'.-]+(\s[\p{L}'.-]+){1,3}$/u.test(clean)) {
+            return clean;
+        }
+    }
+    return null;
+}
+
+function parsePickIndexOrTime(text: string): { pickIdx?: number; hhmm?: string } {
+    const t = norm(text);
+    const idxMatch = t.match(/(?:opcion|opción)?\s*([1-6])\b/) || t.match(/^\s*([1-6])\s*$/);
+    if (idxMatch) return { pickIdx: Number(idxMatch[1]) };
+    const hm = t.match(/\b(\d{1,2})[:.](\d{2})\s*(a\.?m\.?|p\.?m\.?)?/i);
+    if (hm) {
+        let H = Number(hm[1]); const M = hm[2]; const ap = (hm[3] || "").toLowerCase().replace(/\./g, "");
+        if (ap === "pm" && H < 12) H += 12;
+        if (ap === "am" && H === 12) H = 0;
+        return { hhmm: `${String(H).padStart(2, "0")}:${M}` };
+    }
+    return {};
+}
+
+function detectSlotFromHistory(ctx: EsteticaCtx & { __conversationId?: number }, turns: ChatTurn[]) {
+    const mem = readSlots(ctx.__conversationId);
+    const lastUser = [...turns].reverse().find(t => t.role === "user")?.content || "";
+    if (mem.length) {
+        const { pickIdx, hhmm } = parsePickIndexOrTime(lastUser);
+        if (pickIdx && pickIdx >= 1 && pickIdx <= mem.length) return mem[pickIdx - 1];
+        if (hhmm) {
+            const hit = mem.find(s => s.startLabel.includes(hhmm));
+            if (hit) return hit;
+        }
+    }
+    return null;
+}
+
+function lastAssistantAskedConfirmation(turns: ChatTurn[]): boolean {
+    const lastA = [...turns].reverse().find(t => t.role === "assistant")?.content || "";
+    return /¿confirmamos\??/i.test(lastA);
+}
+function userJustConfirmed(turns: ChatTurn[]): boolean {
+    const lastU = [...turns].reverse().find(t => t.role === "user")?.content || "";
+    return YES_RE.test(lastU);
 }
 
 /* ======================= Orquestación LLM ======================= */
@@ -506,11 +401,8 @@ async function runTools(ctx: EsteticaCtx, calls: AssistantMsg["tool_calls"], con
     for (const c of calls || []) {
         const args = safeParseArgs(c.function?.arguments);
         let res: any;
-        try {
-            res = await (handlers as any)[c.function.name](args);
-        } catch (e: any) {
-            res = { ok: false, error: e?.message || "TOOL_ERROR" };
-        }
+        try { res = await (handlers as any)[c.function.name](args); }
+        catch (e: any) { res = { ok: false, error: e?.message || "TOOL_ERROR" }; }
         out.push({ role: "tool", tool_call_id: c.id, content: JSON.stringify(res ?? null) });
     }
     return out;
@@ -520,17 +412,83 @@ export async function runEsteticaAgent(
     ctx: EsteticaCtx & { __conversationId?: number },
     turns: ChatTurn[],
 ): Promise<string> {
+
+    // 1) Intento determinista: ¿ya tengo todo para doble confirmación?
+    const svc = await detectServiceFromHistory(ctx, turns);
+    const phone = detectPhoneFromHistory(turns);
+    const fullName = detectNameFromHistory(turns);
+    const chosen = detectSlotFromHistory(ctx, turns);
+
+    // Si el asistente pidió confirmación y el cliente confirmó → BOOK
+    if (lastAssistantAskedConfirmation(turns) && userJustConfirmed(turns) && svc && phone && fullName && chosen?.startISO) {
+        const booked = await toolBook(ctx, {
+            serviceId: svc.id, serviceName: svc.name,
+            startISO: chosen.startISO, phone, fullName,
+        }, ctx.__conversationId);
+
+        if (booked.ok) {
+            const label = booked.data.startLabel;
+            const msg = `¡Listo! Reservé *${booked.data.serviceName}* para **${label}** a nombre de *${fullName}*. Te llegará la confirmación por este medio. 🎉`;
+            return msg;
+        }
+        // conflicto → pedir alternativa breve
+        return postProcessReply("Ese cupo acaba de ocuparse. ¿Busco otra hora cercana el mismo día u otro día?", turns);
+    }
+
+    // Si ya tengo datos pero aún NO se pidió confirmación → resumen + “¿Confirmamos?”
+    if (svc && phone && fullName && chosen?.startISO && !lastAssistantAskedConfirmation(turns)) {
+        const label = chosen.startLabel;
+        const resum = `Quedaría así:\n• Servicio: *${svc.name}*\n• Fecha y hora: **${label}**\n• A nombre de: *${fullName}*\n• Teléfono: *${phone}*\n¿Confirmamos para agendar?`;
+        return postProcessReply(resum, turns);
+    }
+
+    // 2) Falta algún dato → pedir SOLO lo que falte
+    const missing: string[] = [];
+    if (!svc) missing.push("servicio");
+    if (!chosen?.startISO) missing.push("horario");
+    if (!fullName) missing.push("nombre");
+    if (!phone) missing.push("teléfono");
+
+    if (missing.length) {
+        const needsSlots = missing.includes("horario") && intentWantsSlots([...turns].reverse().find(t => t.role === "user")?.content || "");
+        if (needsSlots) {
+            const forced = await toolFindSlots(ctx, { max: 8 });
+            if (forced.ok && forced.slots.length) {
+                rememberSlots(ctx.__conversationId, forced.slots as any);
+                const head = forced.firstSuggestion ? `Tengo estos cupos disponibles, por ejemplo **${forced.firstSuggestion.startLabel}**:\n` : `Estos son los cupos disponibles:\n`;
+                const lines = forced.slots.map((s: any) => `${s.idx}️⃣ ${s.startLabel}`).slice(0, 6).join("\n");
+                const still = missing.filter(m => m !== "horario");
+                const tail = still.length ? `\n\nY para agendar, ${still.length === 2 ? still.join(" y ") : still.join(", ")}.` : `\n\nElige una opción (1–6).`;
+                const msg = `${head}${lines}${tail}`;
+                return postProcessReply(msg, turns);
+            }
+            return postProcessReply("Puedo revisar opciones desde mañana y proponerte los primeros cupos del día. ¿Quieres que los consulte?", turns);
+        }
+
+        if (missing.length === 1 && missing[0] === "nombre") {
+            return postProcessReply("¿A nombre de quién agendo? (nombre completo)", turns);
+        }
+        if (missing.length === 1 && missing[0] === "teléfono") {
+            return postProcessReply("¿Me compartes tu número de teléfono para dejarte confirmación por aquí?", turns);
+        }
+        if (missing.length === 1 && missing[0] === "servicio") {
+            const list = await toolListProcedures(ctx);
+            const opts = (list as any).items?.slice(0, 5).map((i: any) => `• ${i.name}`).join("\n") || "";
+            return postProcessReply(`¿Qué tratamiento te gustaría agendar?\n${opts}`, turns);
+        }
+        return postProcessReply("Te ayudo a agendar. ¿Qué tratamiento quieres y a nombre de quién sería? Si ya tienes un horario en mente, me dices.", turns);
+    }
+
+    // 3) LLM para estilo libre (cuando no aplica lo anterior)
     const sys = systemPrompt(ctx);
     const few = buildFewshots(ctx);
     const kb = (await ctx.buildKbContext?.()) ?? "";
-
     const base: any = [
         { role: "system", content: `${sys}\n\n### Conocimiento de la clínica\n${kb}` },
         ...few,
         ...turns,
     ];
 
-    // Pase 1
     const r1 = await openai.chat.completions.create({
         model: MODEL,
         temperature: TEMPERATURE,
@@ -540,16 +498,16 @@ export async function runEsteticaAgent(
     } as any);
     const m1 = (r1.choices?.[0]?.message || {}) as AssistantMsg;
 
-    if (DEBUG) {
-        console.log("[AGENT] model=", MODEL, "tool_calls=", Array.isArray(m1.tool_calls) ? m1.tool_calls.length : 0);
-        if (!m1.tool_calls?.length && m1.content) {
-            console.log("[AGENT] no-tools content preview:", String(m1.content).slice(0, 160));
-        }
-    }
-
-    // Tools
     if (Array.isArray(m1.tool_calls) && m1.tool_calls.length) {
         const toolMsgs = await runTools(ctx, m1.tool_calls, ctx.__conversationId);
+        for (const c of m1.tool_calls) {
+            if (c.function?.name === "findSlots") {
+                try {
+                    const res = safeParseArgs(toolMsgs.find(t => t.tool_call_id === c.id)?.content || "");
+                    if (res?.ok && Array.isArray(res?.slots)) rememberSlots(ctx.__conversationId, res.slots);
+                } catch { /* ignore */ }
+            }
+        }
         const r2 = await openai.chat.completions.create({
             model: MODEL,
             temperature: TEMPERATURE,
@@ -559,25 +517,8 @@ export async function runEsteticaAgent(
         return postProcessReply(final || "¿Te comparto el primer horario disponible desde mañana o prefieres resolver una duda específica?", turns);
     }
 
-    // ============ Fallback proactivo ============
-    const lastUser = [...turns].reverse().find(t => t.role === "user")?.content || "";
-    if (intentWantsSlots(lastUser)) {
-        try {
-            const forced = await toolFindSlots(ctx, { serviceName: undefined, fromISO: undefined, max: 8 });
-            if (DEBUG) console.log("[AGENT][fallback] forced findSlots ->", forced?.slots?.length || 0, "slots");
-            if (forced?.ok && forced?.slots?.length) {
-                const lines = forced.slots.map((s: any) => `${s.idx}️⃣ ${s.startLabel}`).slice(0, 6);
-                const head = forced.firstSuggestion ? `Tengo estos cupos disponibles, por ejemplo **${forced.firstSuggestion.startLabel}**:\n` : `Estos son los cupos disponibles:\n`;
-                const msg = `${head}${lines.join("\n")}\n\nSi te sirve alguno, me confirmas tu *nombre completo* y *teléfono* para apartarlo.`;
-                return postProcessReply(msg, turns);
-            }
-            return postProcessReply("Puedo revisar opciones desde mañana y proponerte los primeros cupos del día. ¿Quieres que los consulte?", turns);
-        } catch (e: any) {
-            if (DEBUG) console.warn("[AGENT][fallback] error forcing findSlots:", e?.message || e);
-        }
-    }
+    const text = (m1.content || "").trim();
+    if (text) return postProcessReply(text, turns);
 
-    // Sin tools y sin intención clara de agenda → responde normal
-    const txt = (m1.content || "").trim();
-    return postProcessReply(txt || "¿Te comparto horarios desde mañana o prefieres info de los tratamientos?", turns);
+    return postProcessReply("¿Prefieres que te pase horarios o resolvemos primero alguna duda del tratamiento?", turns);
 }

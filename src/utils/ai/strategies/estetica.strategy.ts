@@ -1,6 +1,5 @@
 // utils/ai/strategies/estetica.strategy.ts
 // Full-agent unificado (agenda natural + tools + KB) con respuesta inmediata.
-// Compatible con el wrapper de OpenAI/OpenRouter y el agente de estética.
 
 import prisma from "../../../lib/prisma";
 import * as Wam from "../../../services/whatsapp.service";
@@ -10,6 +9,60 @@ import type { IAReplyResult } from "../../handleIAReply.ecommerce";
 // Agente y contexto (RAG)
 import { loadApptContext, type EsteticaCtx } from "./esteticaModules/domain/estetica.rag";
 import { runEsteticaAgent, type ChatTurn } from "./esteticaModules/domain/estetica.agent";
+
+/* -------------------- Tipos locales para overrides -------------------- */
+type ApptConfigOverrides = {
+    vertical?: string;
+    verticalCustom?: string | null;
+    timezone?: string;
+    bufferMin?: number;
+    enabled?: boolean;
+    policies?: string | null;
+    reminders?: boolean;
+    services?: any[];
+    servicesText?: string;
+    logistics?: {
+        locationName?: string;
+        locationAddress?: string;
+        locationMapsUrl?: string;
+        parkingInfo?: string;
+        virtualMeetingLink?: string;
+        instructionsArrival?: string;
+    };
+    rules?: {
+        cancellationWindowHours?: number;
+        noShowPolicy?: string;
+        depositRequired?: boolean;
+        depositAmount?: any;
+        maxDailyAppointments?: number;
+        bookingWindowDays?: number;
+        blackoutDates?: any;
+        overlapStrategy?: string;
+        // alias por compatibilidad
+        minNoticeHours?: number;
+        appointmentMinNoticeHours?: number;
+        appointmentMaxAdvanceDays?: number;
+        allowSameDay?: boolean;
+        allowSameDayBooking?: boolean;
+        requireConfirmation?: boolean;
+        requireClientConfirmation?: boolean;
+        defaultServiceDurationMin?: number;
+    };
+    remindersConfig?: {
+        schedule?: any;
+        templateId?: string;
+        postBookingMessage?: string;
+    };
+    kb?: {
+        businessOverview?: string;
+        faqs?: any;
+        serviceNotes?: any;
+        escalationRules?: any;
+        disclaimers?: string;
+        media?: any;
+        freeText?: string;
+    };
+};
 
 /* ========================= Anti doble respuesta ========================= */
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000);
@@ -83,7 +136,7 @@ export async function handleEsteticaReply(args: {
     mensajeArg: string;
     toPhone?: string;
     phoneNumberId?: string;
-    apptConfig?: any; // overrides opcionales que vienen del orquestador
+    apptConfig?: unknown; // viene del orquestador; normalizamos abajo
 }): Promise<IAReplyResult | null> {
     const { chatId, empresaId, mensajeArg, toPhone, phoneNumberId, apptConfig } = args;
 
@@ -97,7 +150,6 @@ export async function handleEsteticaReply(args: {
         return null;
     }
 
-    // último mensaje del cliente (para anti-doble-respuesta y contenido)
     const last = await prisma.message.findFirst({
         where: { conversationId: chatId, from: MessageFrom.client },
         orderBy: { timestamp: "desc" },
@@ -110,32 +162,26 @@ export async function handleEsteticaReply(args: {
         return null;
     }
 
-    // === Cargar contexto RAG (desde DB o con overrides del orquestador)
+    // === Normalización de overrides que vienen del orquestador
+    const cfg = (apptConfig ?? {}) as ApptConfigOverrides;
+
     const ctx: EsteticaCtx = await loadApptContext(
         empresaId,
-        apptConfig
-            ? {
-                vertical: apptConfig.vertical ?? "custom",
-                timezone: apptConfig.timezone ?? "America/Bogota",
-                bufferMin: apptConfig.bufferMin ?? 10,
-                policies: apptConfig.policies,
-                logistics: apptConfig.logistics,
-                appointmentMinNoticeHours:
-                    apptConfig?.rules?.appointmentMinNoticeHours ?? apptConfig?.rules?.minNoticeHours,
-                appointmentMaxAdvanceDays:
-                    apptConfig?.rules?.appointmentMaxAdvanceDays ?? apptConfig?.rules?.maxAdvanceDays,
-                allowSameDayBooking: apptConfig?.rules?.allowSameDayBooking ?? apptConfig?.rules?.allowSameDay,
-                requireClientConfirmation:
-                    apptConfig?.rules?.requireClientConfirmation ?? apptConfig?.rules?.requireConfirmation,
-                defaultServiceDurationMin: apptConfig?.rules?.defaultServiceDurationMin,
-                bookingWindowDays: apptConfig?.rules?.bookingWindowDays,
-                maxDailyAppointments: apptConfig?.rules?.maxDailyAppointments,
-                blackoutDates: apptConfig?.rules?.blackoutDates,
-                overlapStrategy: apptConfig?.rules?.overlapStrategy,
-                kb: apptConfig?.kb,
-            }
-            : undefined
+        {
+            vertical: cfg.vertical ?? "custom",
+            timezone: cfg.timezone ?? "America/Bogota",
+            bufferMin: cfg.bufferMin ?? 10,
+            policies: cfg.policies ?? null,
+            logistics: cfg.logistics,
+            rules: cfg.rules,
+            remindersConfig: cfg.remindersConfig,
+            kb: cfg.kb,
+        } as any
     );
+
+    // Helper para preservar el literal del tipo en `role`
+    const roleFrom = (from: MessageFrom): ChatTurn["role"] =>
+        from === MessageFrom.client ? "user" : "assistant";
 
     // === Historial compacto → ChatTurn[]
     const historyRaw = await prisma.message.findMany({
@@ -144,23 +190,27 @@ export async function handleEsteticaReply(args: {
         take: 8,
         select: { from: true, contenido: true },
     });
-    const turns: ChatTurn[] = historyRaw.reverse().map((m) => ({
-        role: m.from === MessageFrom.client ? "user" : "assistant",
-        content: m.contenido || "",
-    }));
+
+    const turns: ChatTurn[] = historyRaw
+        .reverse()
+        .filter((m) => (m.contenido || "").trim().length > 0)
+        .map((m) => ({
+            role: roleFrom(m.from),                // <- tipo exacto 'user' | 'assistant'
+            content: m.contenido || "",
+        }))
+        .concat([{ role: "user" as const, content: userText }]); // <- as const fija el literal
 
     // === Ejecutar agente
     let texto = "";
     try {
-        texto = await runEsteticaAgent({ ...ctx, __conversationId: chatId }, [...turns, { role: "user", content: userText }]);
+        texto = await runEsteticaAgent({ ...ctx, __conversationId: chatId }, turns);
     } catch (err: any) {
         console.error("[ESTETICA] runEsteticaAgent error:", err?.message || err);
-        // Fallback amable si falló el modelo
         texto =
             "¡Hola! Puedo ayudarte con información de tratamientos o mostrarte horarios desde mañana. ¿Qué te gustaría hacer? 🙂";
     }
 
-    // === Persistir y enviar por WhatsApp (sin espera)
+    // === Persistir y enviar por WhatsApp
     const saved = await persistBotReply({
         conversationId: chatId,
         empresaId,
