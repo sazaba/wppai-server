@@ -413,10 +413,13 @@ export async function runEsteticaAgent(
             startISO: chosen.startISO, phone, fullName,
         }, ctx.__conversationId);
         if (booked?.ok) {
-            const label = booked.data.startLabel;
-            const msg = `¡Listo! Reservé *${booked.data.serviceName}* para **${label}** a nombre de *${fullName}*. Te llegará la confirmación por este medio. 🎉`;
+            const label = booked?.data?.startLabel ?? chosen.startLabel;
+            const svcName = booked?.data?.serviceName ?? svc.name;
+            const msg = `¡Listo! Reservé *${svcName}* para **${label}** a nombre de *${fullName}*. Te llegará la confirmación por este medio. 🎉`;
             return msg;
         }
+
+
         return postProcessReply("Ese cupo acaba de ocuparse. ¿Busco otra hora cercana el mismo día u otro día?", turns);
     }
 

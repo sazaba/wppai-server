@@ -19,7 +19,7 @@ type ApptConfigOverrides = {
     enabled?: boolean;
     policies?: string | null;
     reminders?: boolean;
-    services?: any[];
+    services?: any[];          // viene de Prisma Json; lo normalizamos en el orquestador
     servicesText?: string;
     logistics?: {
         locationName?: string;
@@ -38,6 +38,7 @@ type ApptConfigOverrides = {
         bookingWindowDays?: number;
         blackoutDates?: any;
         overlapStrategy?: string;
+        // alias por compatibilidad
         minNoticeHours?: number;
         appointmentMinNoticeHours?: number;
         appointmentMaxAdvanceDays?: number;
@@ -141,19 +142,13 @@ export async function handleEsteticaReply(args: {
 
     const conversacion = await prisma.conversation.findUnique({
         where: { id: chatId },
-        select: { id: true, estado: true, phone: true, empresaId: true },
+        select: { id: true, estado: true, phone: true },
     });
     if (!conversacion) return null;
     if (conversacion.estado === ConversationEstado.cerrado) {
         console.warn(`[handleEsteticaReply] Chat ${chatId} está cerrado.`);
         return null;
     }
-
-    // 👇 nombre de la empresa para el saludo y tono
-    const empresa = await prisma.empresa.findUnique({
-        where: { id: conversacion.empresaId },
-        select: { nombre: true },
-    });
 
     // último mensaje del cliente
     const last = await prisma.message.findFirst({
@@ -182,8 +177,6 @@ export async function handleEsteticaReply(args: {
             rules: cfg.rules,
             remindersConfig: cfg.remindersConfig,
             kb: cfg.kb,
-            // 👇 pasamos marca
-            businessName: empresa?.nombre ?? undefined,
         } as any
     );
 
@@ -194,14 +187,17 @@ export async function handleEsteticaReply(args: {
         take: 8,
         select: { from: true, contenido: true },
     });
-    const turns: ChatTurn[] = historyRaw
+
+    // 🔧 FIX: tipar el retorno del map para preservar el literal "user" | "assistant"
+    const mapped: ChatTurn[] = historyRaw
         .reverse()
         .filter((m) => (m.contenido || "").trim().length > 0)
-        .map((m) => ({
+        .map((m): ChatTurn => ({
             role: m.from === MessageFrom.client ? "user" : "assistant",
             content: m.contenido || "",
-        }))
-        .concat([{ role: "user", content: userText }]);
+        }));
+
+    const turns: ChatTurn[] = [...mapped, { role: "user", content: userText }];
 
     // === Ejecutar agente
     let texto = "";
@@ -210,8 +206,7 @@ export async function handleEsteticaReply(args: {
     } catch (err: any) {
         console.error("[ESTETICA] runEsteticaAgent error:", err?.message || err);
         texto =
-            `¡Hola! Soy coordinación de ${empresa?.nombre ?? "la clínica"}. ` +
-            "Puedo ayudarte con información de tratamientos o mostrarte horarios desde mañana. ¿Qué te gustaría hacer? 🙂";
+            "¡Hola! Puedo ayudarte con información de tratamientos o mostrarte horarios desde mañana. ¿Qué te gustaría hacer? 🙂";
     }
 
     // === Persistir y enviar por WhatsApp
