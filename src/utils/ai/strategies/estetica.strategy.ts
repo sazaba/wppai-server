@@ -61,6 +61,16 @@ function sleep(ms: number) {
     return new Promise((res) => setTimeout(res, ms));
 } // no se usa para delay de respuesta
 
+/** Moneda: COP */
+function formatCOP(value?: number | null): string | null {
+    if (value == null || isNaN(Number(value))) return null;
+    return new Intl.NumberFormat("es-CO", {
+        style: "currency",
+        currency: "COP",
+        maximumFractionDigits: 0,
+    }).format(Number(value));
+}
+
 /** ===== Detección de referencia explícita a imagen ===== */
 function mentionsImageExplicitly(t: string) {
     const s = String(t || "").toLowerCase();
@@ -453,34 +463,6 @@ function listEnabledServices(kb: any, max = 12): string {
     return names.slice(0, max).join(", ");
 }
 
-/** ===== Helper: inferir servicio desde el historial reciente ===== */
-// Reemplaza la función inferServiceFromHistory por esta
-async function inferServiceFromHistory(kb: any, chatId: number) {
-    const lastMsgs = await prisma.message.findMany({
-        where: { conversationId: chatId },
-        orderBy: { timestamp: "desc" },
-        take: 10,
-        select: { contenido: true },
-    });
-
-    const enabled = (kb.services || []).filter((s: any) => s.enabled !== false);
-
-    // Recorremos del mensaje más nuevo al más viejo y devolvemos
-    // el PRIMER servicio que aparezca (nombre o alias).
-    for (const m of lastMsgs) {
-        const t = String(m.contenido || "").toLowerCase();
-        for (const s of enabled) {
-            const nameHit = t.includes(String(s.name || "").toLowerCase());
-            const aliasHit = (s.aliases || []).some((a: string) =>
-                t.includes(String(a || "").toLowerCase())
-            );
-            if (nameHit || aliasHit) return s; // ← gana el más reciente
-        }
-    }
-    return null;
-}
-
-
 /** ======= PUBLIC: handleEsteticaReply ======= */
 export async function handleEsteticaReply(args: {
     chatId: number;
@@ -619,8 +601,6 @@ export async function handleEsteticaReply(args: {
         draft.serviceId = svc.id;
         draft.serviceName = svc.name;
         draft.duration = readSvcDuration(svc, (kb as any)?.rules) ?? 60;
-        // ✅ persistimos el servicio en foco de inmediato
-        await putDraft(chatId, draft);
     }
 
     // Fecha relativa + hora (si vienen)
@@ -636,9 +616,35 @@ export async function handleEsteticaReply(args: {
     if (name) draft.name = name;
     if (phone) draft.phone = phone;
 
+    /** ==== Preguntas de precio de un servicio específico (respuesta estructurada en COP) ==== */
+    if (/(precio|costo|cu[aá]nto\s+(vale|sale)|valor|tarifa)/i.test(userText) && svc) {
+        const price = formatCOP((svc as any).price ?? null);
+        const dur = readSvcDuration(svc, (kb as any)?.rules);
+        const partes: string[] = [];
+        partes.push(`El tratamiento de *${svc.name}* ${price ? `tiene un costo desde ${price}` : "no tiene un precio publicado actualmente"}.`);
+        if (dur) partes.push(`La sesión dura aproximadamente *${dur} min*.`);
+        partes.push(`¿Te gustaría que te proponga horarios para agendar?`);
+        const cuerpo = partes.join(" ");
+
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: cuerpo,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
     /** ====== AGENDAR ====== */
     if (intent === "agendar") {
-        // Si ya está todo para confirmar:
         if (draft.serviceId && draft.whenUTC && draft.name && draft.phone && draft.stage !== "confirm") {
             draft.stage = "confirm";
             await putDraft(chatId, draft);
@@ -678,21 +684,7 @@ export async function handleEsteticaReply(args: {
             };
         }
 
-        // Si no detectamos servicio en el mensaje, intentamos inferirlo del contexto reciente
-        let serviceToUse = svc;
-        if (!serviceToUse) {
-            const inferred = await inferServiceFromHistory(kb, chatId);
-            if (inferred) {
-                draft.serviceId = inferred.id;
-                draft.serviceName = inferred.name;
-                draft.duration = readSvcDuration(inferred, (kb as any)?.rules) ?? 60;
-                await putDraft(chatId, draft);
-                serviceToUse = inferred;
-            }
-        }
-
-        // Si aún no hay servicio, preguntar
-        if (!serviceToUse) {
+        if (!svc) {
             const hint = `Perfecto. Trabajo con los servicios habilitados de la clínica. ¿Cuál te interesa? (Ej.: ${kb.services
                 .slice(0, 3)
                 .map((s: any) => s.name)
@@ -714,7 +706,7 @@ export async function handleEsteticaReply(args: {
             };
         }
 
-        const duration = draft.duration ?? readSvcDuration(serviceToUse, (kb as any)?.rules) ?? 60;
+        const duration = draft.duration ?? readSvcDuration(svc, (kb as any)?.rules) ?? 60;
 
         const nowLocal = new Date();
         const anchorLocal = rel.ok ? rel.localStart : nowLocal;
@@ -730,7 +722,7 @@ export async function handleEsteticaReply(args: {
         });
 
         if (!slots.length) {
-            const txt = `Puedo ayudarte con *${serviceToUse.name}*, pero no veo horarios disponibles en los próximos días. ¿Te contacto con un asesor para coordinar?`;
+            const txt = `Puedo ayudarte con *${svc.name}*, pero no veo horarios disponibles en los próximos días. ¿Te contacto con un asesor para coordinar?`;
             const saved = await persistBotReply({
                 conversationId: chatId,
                 empresaId,
@@ -748,15 +740,15 @@ export async function handleEsteticaReply(args: {
             };
         }
 
-        draft.serviceId = serviceToUse.id;
-        draft.serviceName = serviceToUse.name;
+        draft.serviceId = svc.id;
+        draft.serviceName = svc.name;
         draft.duration = duration;
         draft.stage = "oferta";
         await putDraft(chatId, draft);
 
         const primeros = slots.slice(0, 5).map((s) => `• ${s.label}`).join("\n");
         const prompt =
-            `Para *${serviceToUse.name}* tengo estas opciones próximas:\n${primeros}\n\n` +
+            `Para *${svc.name}* tengo estas opciones próximas:\n${primeros}\n\n` +
             `¿Te funciona alguna? Si ya tienes fecha/hora exacta, dímela (ej. “mañana 10:30”). También necesito tu *nombre* y *teléfono* para reservar.`;
         const saved = await persistBotReply({
             conversationId: chatId,
@@ -784,7 +776,7 @@ export async function handleEsteticaReply(args: {
         draft.phone
     ) {
         try {
-            await bookAppointment({
+            const appt = await bookAppointment({
                 empresaId,
                 conversationId: chatId,
                 customerName: draft.name!,
@@ -1153,6 +1145,7 @@ export async function handleEsteticaReply(args: {
         "Al listar u ofrecer servicios para agendar usa SOLO los que estén en la base de datos (kb.services).",
         "Si el cliente menciona un tratamiento que NO está en kb.services, puedes dar orientación general, pero NO lo ofrezcas para agendar. En su lugar, sugiere alguno de los servicios disponibles que sea equivalente.",
         "Si preguntan por servicios/horarios/dirección/políticas, usa SOLO la información del negocio (KB).",
+        "Cuando menciones precios, exprésalos en pesos colombianos (COP) sin decimales y con separadores de miles (ej. $60.000).",
         kb.kbTexts.businessOverview ? `Contexto negocio: ${softTrim(kb.kbTexts.businessOverview, 220)}` : "",
         kb.logistics?.locationAddress ? `Dirección: ${kb.logistics.locationAddress}` : "",
         kb.logistics?.locationName ? `Sede: ${kb.logistics.locationName}` : "",
