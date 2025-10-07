@@ -618,13 +618,24 @@ export async function handleEsteticaReply(args: {
 
     /** ==== Preguntas de precio de un servicio específico (respuesta estructurada en COP) ==== */
     if (/(precio|costo|cu[aá]nto\s+(vale|sale)|valor|tarifa)/i.test(userText) && svc) {
-        const price = formatCOP((svc as any).price ?? null);
+        // ⚠️ Usar EXCLUSIVAMENTE los campos del KB (priceMin/priceMax/deposit/priceNote)
+        const pMin = formatCOP((svc as any).priceMin ?? null);
+        const pMax = formatCOP((svc as any).priceMax ?? null);
+        const dep = formatCOP((svc as any).deposit ?? null);
+        const note = (svc as any).priceNote as string | null | undefined;
+
+        let priceLine = "";
+        if (pMin && pMax) priceLine = `tiene un costo entre ${pMin} y ${pMax}.`;
+        else if (pMin) priceLine = `tiene un costo desde ${pMin}.`;
+        else if (pMax) priceLine = `puede llegar hasta ${pMax}.`;
+        else priceLine = `no tiene un precio registrado en el sistema.`;
+
         const dur = readSvcDuration(svc, (kb as any)?.rules);
-        const partes: string[] = [];
-        partes.push(`El tratamiento de *${svc.name}* ${price ? `tiene un costo desde ${price}` : "no tiene un precio publicado actualmente"}.`);
-        if (dur) partes.push(`La sesión dura aproximadamente *${dur} min*.`);
-        partes.push(`¿Te gustaría que te proponga horarios para agendar?`);
-        const cuerpo = partes.join(" ");
+        const depLine = dep ? ` Requerimos un anticipo de ${dep} para reservar.` : "";
+        const noteLine = note ? ` ${note}` : "";
+        const durLine = dur ? ` La sesión dura aproximadamente *${dur} min*.` : "";
+
+        const cuerpo = `El tratamiento de *${svc.name}* ${priceLine}${durLine}${depLine}${noteLine} ¿Te paso opciones de horario?`;
 
         const saved = await persistBotReply({
             conversationId: chatId,
@@ -1141,10 +1152,11 @@ export async function handleEsteticaReply(args: {
         "Habla en primera persona (yo), cercano y profesional. Responde en 2–5 líneas, específico, sin párrafos largos.",
         "Puedes usar 1 emoji ocasionalmente.",
         "Sé full-agent sobre temas de clínica estética; evita salirte del ámbito.",
-        // 👇 REGLAS DURAS DE SERVICIOS
+        // 👇 REGLAS DURAS DE SERVICIOS/PRECIOS
         "Al listar u ofrecer servicios para agendar usa SOLO los que estén en la base de datos (kb.services).",
         "Si el cliente menciona un tratamiento que NO está en kb.services, puedes dar orientación general, pero NO lo ofrezcas para agendar. En su lugar, sugiere alguno de los servicios disponibles que sea equivalente.",
         "Si preguntan por servicios/horarios/dirección/políticas, usa SOLO la información del negocio (KB).",
+        "Para precios usa EXCLUSIVAMENTE los campos del KB (priceMin, priceMax, deposit, priceNote). Si no hay datos, dilo explícitamente y NO inventes valores, zonas ni paquetes.",
         "Cuando menciones precios, exprésalos en pesos colombianos (COP) sin decimales y con separadores de miles (ej. $60.000).",
         kb.kbTexts.businessOverview ? `Contexto negocio: ${softTrim(kb.kbTexts.businessOverview, 220)}` : "",
         kb.logistics?.locationAddress ? `Dirección: ${kb.logistics.locationAddress}` : "",
