@@ -5,42 +5,40 @@ import { Logger } from "../../esteticaModules/log";
 const log = Logger.child("estetica.kb");
 
 // ———————————————————————————————————————————————————————————————————————
-// Tipos expuestos
+// Tipos expuestos al resto del agente
 // ———————————————————————————————————————————————————————————————————————
 export type KBService = {
     id: number;
     name: string;
     description?: string | null;
     enabled: boolean;
-    duration?: number | null;      // minutos (variante 1)
-    durationMin?: number | null;   // minutos (variante 2)
-    // 💵 NUEVO: precios estructurados
-    priceMin?: number | null;      // precio mínimo (COP)
-    priceMax?: number | null;      // precio máximo (COP)
-    deposit?: number | null;       // anticipo/deposito (COP)
-    currency?: string | null;      // "COP" por defecto si viene vacío
-    priceNote?: string | null;     // notas de precio/condiciones
-    aliases?: string[];            // palabras/alias para matching
+    duration?: number | null;     // variantes: duration | durationMin
+    durationMin?: number | null;
+    price?: number | null;        // mapeamos priceMin si existe
+    currency?: string | null;
+    aliases?: string[];
 };
 
 export type KBStaff = {
     id: number;
     name: string;
-    role?: string | null;
-    phone?: string | null;
-    email?: string | null;
+    role?: string | null;         // StaffRole (string)
+    phone?: string | null;        // no está en el schema; queda opcional
+    email?: string | null;        // idem
     enabled: boolean;
-    specialties?: number[] | string[] | null;
+    specialties?: number[] | string[] | null; // libre
 };
 
 export type EsteticaKB = {
     empresaId: number;
     empresaNombre?: string | null;
 
+    // Reglas/params de agenda (la lógica vive en schedule)
     timezone: string;
     bufferMin?: number | null;
     rules?: Record<string, any> | null;
 
+    // Logística/UI
     logistics?: {
         locationName?: string | null;
         locationAddress?: string | null;
@@ -50,13 +48,16 @@ export type EsteticaKB = {
         instructionsArrival?: string | null;
     };
 
+    // Políticas y recordatorios
     policies?: string | null;
     reminders?: boolean | null;
     remindersConfig?: Record<string, any> | null;
 
+    // Catálogo
     services: KBService[];
     staff: KBStaff[];
 
+    // Bloques de texto útiles para el prompt
     kbTexts: {
         businessOverview?: string | null;
         disclaimers?: string | null;
@@ -97,37 +98,48 @@ function parseJSON<T = any>(v: any): T | null {
 
 function splitAliases(raw?: string | null): string[] {
     if (!raw) return [];
-    return raw.split(/[;,/|]/g).map(x => x.trim()).filter(Boolean);
+    return raw
+        .split(/[;,/|]/g)
+        .map((x) => x.trim())
+        .filter(Boolean);
 }
 
 // ———————————————————————————————————————————————————————————————————————
 // Carga KB
 // ———————————————————————————————————————————————————————————————————————
 export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | null> {
-    // 1) businessconfig_appt
-    const cfg =
-        (await (prisma as any)["businessconfig_appt"]?.findFirst?.({ where: { empresaId } } as any)) ??
-        (await (prisma as any).businessConfigAppt?.findFirst?.({ where: { empresaId } }));
+    // 1) BusinessConfigAppt (camelCase) o businessconfig_appt (snake_case)
+    const cfgCamel =
+        await (prisma as any).businessConfigAppt?.findFirst?.({
+            where: { empresaId },
+        } as any);
 
-    // 2) procedimientos
+    const cfgSnake =
+        await (prisma as any)["businessconfig_appt"]?.findFirst?.({
+            where: { empresaId },
+        } as any);
+
+    const cfg: any = cfgCamel ?? cfgSnake ?? null;
+
+    // 2) EsteticaProcedure (camelCase) o estetica_procedure (snake_case)
     const procedures =
-        (await (prisma as any)["estetica_procedure"]?.findMany?.({
+        (await (prisma as any).esteticaProcedure?.findMany?.({
             where: { empresaId },
             orderBy: { id: "asc" },
         } as any)) ??
-        (await (prisma as any).esteticaProcedure?.findMany?.({
+        (await (prisma as any)["estetica_procedure"]?.findMany?.({
             where: { empresaId },
             orderBy: { id: "asc" },
         } as any)) ??
         [];
 
-    // 3) staff
+    // 3) Staff (camelCase) o staff (snake_case)
     const staffRows =
-        (await (prisma as any)["staff"]?.findMany?.({
+        (await (prisma as any).Staff?.findMany?.({
             where: { empresaId },
             orderBy: { id: "asc" },
         } as any)) ??
-        (await (prisma as any).Staff?.findMany?.({
+        (await (prisma as any)["staff"]?.findMany?.({
             where: { empresaId },
             orderBy: { id: "asc" },
         } as any)) ??
@@ -151,42 +163,65 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
         };
     }
 
-    // ——— mapear config
-    const timezone = cfg?.timezone || cfg?.timeZone || cfg?.tz || "America/Santiago";
-    const bufferMin = cfg?.bufferMin ?? cfg?.bookingBufferMin ?? cfg?.defaultBufferMin ?? null;
-    const empresaNombre = cfg?.nombre || cfg?.businessName || cfg?.companyName || null;
+    // ——— mapeo de config usando nombres reales del schema:
+    // BusinessConfigAppt:
+    // appointmentTimezone, appointmentBufferMin, appointmentPolicies,
+    // appointmentReminders, servicesText, location*, kbBusinessOverview, kbDisclaimers
+    const timezone: string =
+        cfg?.appointmentTimezone ||
+        cfg?.timezone ||
+        "America/Santiago";
 
-    const rules =
+    const bufferMin: number | null =
+        (typeof cfg?.appointmentBufferMin === "number" ? cfg.appointmentBufferMin : null) ??
+        (typeof cfg?.bufferMin === "number" ? cfg.bufferMin : null);
+
+    const empresaNombre: string | null =
+        cfg?.businessName || cfg?.companyName || cfg?.nombre || null;
+
+    const rules: Record<string, any> | null =
+        parseJSON<Record<string, any>>(cfg?.appointmentRules) ??
         parseJSON<Record<string, any>>(cfg?.rules) ??
-        parseJSON<Record<string, any>>(cfg?.rulesJson) ??
         null;
 
-    const remindersConfig =
+    const remindersConfig: Record<string, any> | null =
+        parseJSON<Record<string, any>>(cfg?.reminderSchedule) ??
         parseJSON<Record<string, any>>(cfg?.remindersConfig) ??
-        parseJSON<Record<string, any>>(cfg?.reminders_json) ??
         null;
 
     const logistics = {
-        locationName: cfg?.locationName || cfg?.clinicName || cfg?.sede || null,
-        locationAddress: cfg?.locationAddress || cfg?.address || null,
-        locationMapsUrl: cfg?.locationMapsUrl || cfg?.mapsUrl || null,
-        virtualMeetingLink: cfg?.virtualMeetingLink || null,
-        parkingInfo: cfg?.parkingInfo || null,
-        instructionsArrival: cfg?.instructionsArrival || cfg?.arrivalNotes || null,
+        locationName: cfg?.locationName ?? null,
+        locationAddress: cfg?.locationAddress ?? null,
+        locationMapsUrl: cfg?.locationMapsUrl ?? null,
+        virtualMeetingLink: cfg?.virtualMeetingLink ?? null,
+        parkingInfo: cfg?.parkingInfo ?? null,
+        instructionsArrival: cfg?.instructionsArrival ?? null,
     };
 
-    const policies = cfg?.policies || cfg?.politicas || cfg?.policyText || null;
-    const reminders = typeof cfg?.reminders === "boolean" ? cfg.reminders : cfg?.sendReminders ?? null;
-    const businessOverview = cfg?.businessOverview || cfg?.overview || cfg?.about || null;
-    const servicesText = cfg?.servicesText || cfg?.serviciosTexto || null;
-    const disclaimers = cfg?.disclaimers || cfg?.avisos || null;
+    const policies: string | null =
+        cfg?.appointmentPolicies ?? cfg?.policies ?? null;
+
+    const reminders: boolean | null =
+        typeof cfg?.appointmentReminders === "boolean"
+            ? cfg.appointmentReminders
+            : (typeof cfg?.reminders === "boolean" ? cfg.reminders : null);
+
+    const businessOverview: string | null =
+        cfg?.kbBusinessOverview ?? cfg?.businessOverview ?? null;
+
+    const servicesText: string | null =
+        cfg?.servicesText ?? null;
+
+    const disclaimers: string | null =
+        cfg?.kbDisclaimers ?? cfg?.disclaimers ?? null;
 
     // ——— mapear procedimientos a KBService[]
     const services: KBService[] = procedures.map((p: any) => {
         const name = p?.name ?? p?.nombre ?? `#${p?.id ?? "?"}`;
         const description = p?.description ?? p?.descripcion ?? null;
 
-        const duration = typeof p?.duration === "number" ? p.duration : null;
+        const duration =
+            typeof p?.duration === "number" ? p.duration : null;
         const durationMin =
             typeof p?.durationMin === "number"
                 ? p.durationMin
@@ -194,36 +229,22 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
                     ? p.duracionMin
                     : null;
 
-        // 💵 capturamos variantes de precio
-        const priceMin =
-            asNumber(p?.priceMin) ??
-            asNumber(p?.precioMin) ??
-            asNumber(p?.price) ??
-            asNumber(p?.precio) ??
-            asNumber(p?.basePrice) ??
-            null;
+        // En tu schema, EsteticaProcedure tiene priceMin/priceMax
+        const price =
+            typeof p?.priceMin === "number"
+                ? Number(p.priceMin)
+                : typeof p?.precio === "number"
+                    ? p.precio
+                    : null;
 
-        const priceMax =
-            asNumber(p?.priceMax) ??
-            asNumber(p?.precioMax) ??
-            asNumber(p?.maxPrice) ??
-            asNumber(p?.precio_max) ??
-            null;
-
-        const deposit =
-            asNumber(p?.deposit) ??
-            asNumber(p?.deposito) ??
-            asNumber(p?.downpayment) ??
-            null;
-
-        const currency = (p?.currency ?? p?.moneda ?? "COP") as string | null;
-        const priceNote = p?.priceNote ?? p?.notaPrecio ?? p?.condicionesPrecio ?? null;
+        const currency = p?.currency ?? p?.moneda ?? null;
 
         const enabled = (p?.enabled ?? p?.activo ?? true) !== false;
 
-        const aliasesArr: string[] = Array.isArray(p?.aliases)
-            ? p.aliases
-            : splitAliases(p?.aliases || p?.keywords || p?.etiquetas || null);
+        const aliasesArr: string[] =
+            Array.isArray(p?.aliases)
+                ? (p.aliases as string[])
+                : splitAliases(p?.aliases || p?.keywords || p?.etiquetas || null);
 
         return {
             id: Number(p?.id),
@@ -232,11 +253,8 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
             enabled,
             duration,
             durationMin,
-            priceMin,
-            priceMax,
-            deposit,
+            price,
             currency,
-            priceNote,
             aliases: aliasesArr,
         };
     });
@@ -248,9 +266,12 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
         role: s?.role ?? s?.cargo ?? null,
         phone: s?.phone ?? s?.telefono ?? null,
         email: s?.email ?? null,
-        enabled: (s?.enabled ?? s?.activo ?? true) !== false,
+        enabled: (s?.active ?? s?.enabled ?? s?.activo ?? true) !== false,
         specialties:
-            s?.specialties ?? s?.especialidades ?? parseJSON(s?.specialtiesJson) ?? null,
+            s?.specialties ??
+            s?.especialidades ??
+            parseJSON(s?.specialtiesJson) ??
+            null,
     }));
 
     const kb: EsteticaKB = {
@@ -282,36 +303,38 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
     return kb;
 }
 
-function asNumber(v: any): number | null {
-    if (v == null) return null;
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-}
-
 // ———————————————————————————————————————————————————————————————————————
-// Matching de servicio
+// Matching de servicio por texto libre
 // ———————————————————————————————————————————————————————————————————————
 export function resolveServiceName(kb: EsteticaKB, text: string): KBService | null {
     if (!text || !kb?.services?.length) return null;
 
     const t = text.toLowerCase();
-    const candidates = kb.services.filter(s => s.enabled !== false);
+    const candidates = kb.services.filter((s) => s.enabled !== false);
 
+    // 1) Coincidencia exacta por nombre normalizado
     const ntext = norm(t);
-    for (const s of candidates) if (norm(s.name) === ntext) return s;
+    for (const s of candidates) {
+        if (norm(s.name) === ntext) return s;
+    }
 
+    // 2) Coincidencia por "incluye" en nombre o aliases
     for (const s of candidates) {
         const nameHit = ntext.includes(norm(s.name));
-        const aliasHit = (s.aliases || []).some(a => ntext.includes(norm(a)));
+        const aliasHit = (s.aliases || []).some((a) => ntext.includes(norm(a)));
         if (nameHit || aliasHit) return s;
     }
 
+    // 3) Heurística por score de tokens
     let best: { svc: KBService; score: number } | null = null;
     for (const s of candidates) {
         let score = tokenScore(s.name, t);
-        for (const a of s.aliases || []) score = Math.max(score, tokenScore(a, t));
+        for (const a of s.aliases || []) {
+            score = Math.max(score, tokenScore(a, t));
+        }
         if (!best || score > best.score) best = { svc: s, score };
     }
+
     if (best && best.score >= 0.45) return best.svc;
     return null;
 }
