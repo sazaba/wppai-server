@@ -142,18 +142,25 @@ async function pickImageForContext(opts: {
 
 /** ====== Normalizador & Matchers semánticos ====== */
 function norm(s: string) {
-    return (s || "")
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .toLowerCase();
+    return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 }
 
 function isCatalogQuery(t: string) {
     const s = ` ${norm(t)} `;
-    const nouns = ["servicio", "servicios", "procedimiento", "procedimientos", "tratamiento", "tratamientos", "catalogo", "catálogo", "catalog"];
+    const nouns = [
+        "servicio",
+        "servicios",
+        "procedimiento",
+        "procedimientos",
+        "tratamiento",
+        "tratamientos",
+        "catalogo",
+        "catálogo",
+        "catalog",
+    ];
     const intents = ["que ", "qué ", "cuales", "cuáles", "lista", "disponible", "disponibles", "ofreces", "ofrecen", "tienes", "hay", "oferta"];
-    const hitNoun = nouns.some(k => s.includes(` ${k} `));
-    const hitIntent = intents.some(k => s.includes(k));
+    const hitNoun = nouns.some((k) => s.includes(` ${k} `));
+    const hitIntent = intents.some((k) => s.includes(k));
     return hitNoun && hitIntent;
 }
 
@@ -167,14 +174,14 @@ function detectIntent(
     if (/(reagendar|cambiar|mover|otra hora|reprogramar)/i.test(t)) return "reagendar";
     if (/(cancelar|anular)/i.test(t)) return "cancelar";
     if (/(cita|agendar|agenda|programar|reservar)/i.test(t)) return "agendar";
-    if (/(horario|direccion|dónde|servicios|procedimientos|tratamientos|cat[aá]logo|precios|costo|valor)/i.test(t)) return "faq";
+    if (/(horario|direccion|dónde|servicios|procedimientos|tratamientos|cat[aá]logo|precios|costo|valor)/i.test(t))
+        return "faq";
     if (/(hola|buen[oa]s|qué tal|como estas|saludo)/i.test(t)) return "saludo";
-    // señal semántica de catálogo
     if (isCatalogQuery(text)) return "faq";
     return "smalltalk";
 }
 
-/** ==== Pregunta de precio (incluye “¿qué vale…?”) ==== */
+/** ==== Pregunta de precio ==== */
 function asksPrice(t: string) {
     const s = (t || "").toLowerCase();
     return (
@@ -184,18 +191,29 @@ function asksPrice(t: string) {
     );
 }
 
-/** ==== Follow-up de precio por contexto reciente (“¿y el peeling?”) ==== */
+/** ==== Follow-up de precio (“¿y el peeling?”) ==== */
 type LastIntentTag = "price" | "schedule";
 function isFollowupPriceAsk(text: string, d?: Draft) {
     const s = (text || "").toLowerCase().trim();
     const looksLikeFollow =
         /^y\s+(el|la|los|las)\b/.test(s) ||
         /\b(peeling|botox|toxina|limpieza|facial|depilaci[oó]n|laser)\b/.test(s);
-    const recent = d?.lastIntent === "price" && (Date.now() - (d.lastIntentAt || 0) < 15 * 60_000);
+    const recent = d?.lastIntent === "price" && Date.now() - (d.lastIntentAt || 0) < 15 * 60_000;
     return looksLikeFollow && !!recent;
 }
 
-/** ===== Extractores sencillos ===== */
+/** ==== Q&A de información de procedimiento (escape durante oferta) ==== */
+function isServiceInfoQuestion(t: string) {
+    const s = (t || "").toLowerCase();
+    return (
+        /\b(beneficios?|ventajas?|resultados?)\b/.test(s) ||
+        /\b(preparaci[oó]n|indicaciones|antes de|previo|ayuno|suspender)\b/.test(s) ||
+        /\b(contraindicaciones?|riesgos?|efectos?\s+secundarios?)\b/.test(s) ||
+        /\b(cuidados?|post\s*cuidado|post\s*operatorio|despu[eé]s de)\b/.test(s)
+    );
+}
+
+/** ===== Extractores ===== */
 function extractPhone(text: string): string | undefined {
     const clean = text.replace(/[^\d+]/g, " ");
     const m = /(\+?57)?\s*(\d{10})\b/.exec(clean);
@@ -218,27 +236,23 @@ function readSvcDuration(svc: any, kbRules?: any): number | undefined {
 }
 
 /** ===== Estado temporal (borrador) ===== */
-type DraftStage =
-    | "oferta"
-    | "confirm"
-    | "reagendar_pedir"
-    | "reagendar_confirm"
-    | "cancel_confirm";
+type DraftStage = "oferta" | "confirm" | "reagendar_pedir" | "reagendar_confirm" | "cancel_confirm";
 type Draft = {
     empresaId: number;
     serviceId?: number;
     serviceName?: string;
     duration?: number;
-    whenUTC?: string; // ISO (para agendar o nueva fecha en reagendar)
+    whenUTC?: string; // ISO
     name?: string;
     phone?: string;
     stage?: DraftStage;
     // Para reagendar/cancelar:
     targetApptId?: number;
 
-    // === Memoria de intención para follow-ups ===
+    // Memoria de intención y cooldown
     lastIntent?: LastIntentTag;
     lastIntentAt?: number; // Date.now()
+    lastOfferAt?: number; // Date.now() cuando enviamos slots
 };
 
 async function getDraft(chatId: number): Promise<Draft | undefined> {
@@ -259,22 +273,25 @@ async function getDraft(chatId: number): Promise<Draft | undefined> {
     }
 }
 async function putDraft(chatId: number, d: Draft) {
-    await prisma.message.create({
-        data: {
-            empresaId: d.empresaId,
-            conversationId: chatId,
-            from: MessageFrom.bot,
-            contenido: `[DEBUG booking] ${JSON.stringify(d)}`,
-        } as any,
-    });
+    // Log a consola
+    if (process.env.DEBUG_AI === "1") {
+        console.debug("[EST][DRAFT]", { chatId, ...d });
+    }
+    // Solo persistir como mensaje visible si se habilita explícitamente
+    if (process.env.IA_DEBUG_DRAFT_TO_CHAT === "1") {
+        await prisma.message.create({
+            data: {
+                empresaId: d.empresaId,
+                conversationId: chatId,
+                from: MessageFrom.bot,
+                contenido: `[DEBUG booking] ${JSON.stringify(d)}`,
+            } as any,
+        });
+    }
 }
 
 /** ===== Historial compacto ===== */
-async function getRecentHistory(
-    conversationId: number,
-    excludeMessageId?: number,
-    take = 10
-) {
+async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({
@@ -415,9 +432,7 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     const keep: string[] = [];
     for (const l of lines) {
         if (
-            /Asistente de clínica estética|Responde en|Puedes usar|Mantente|Ámbito:|Incluye cuando|Sigue estas/i.test(
-                l
-            )
+            /Asistente de clínica estética|Responde en|Puedes usar|Mantente|Ámbito:|Incluye cuando|Sigue estas/i.test(l)
         )
             keep.push(l);
         if (keep.length >= 6) break;
@@ -432,6 +447,37 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
         user.content[0].text = softTrim(ut, 200);
     }
     return messages;
+}
+
+/** ===== Core LLM ===== */
+async function runChatWithBudget({
+    model,
+    messages,
+    temperature,
+    maxTokens,
+}: {
+    model: string;
+    messages: any[];
+    temperature: number;
+    maxTokens: number;
+}) {
+    try {
+        const resp = await (openai.chat.completions.create as any)({
+            model,
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+        });
+        return resp?.choices?.[0]?.message?.content?.trim() || "";
+    } catch {
+        const resp2 = await (openai.chat.completions.create as any)({
+            model,
+            messages,
+            temperature,
+            max_tokens: 32,
+        });
+        return resp2?.choices?.[0]?.message?.content?.trim() || "";
+    }
 }
 
 /** ====== Helpers de citas (offset 5h en APPOINTMENT) ====== */
@@ -481,9 +527,12 @@ function listEnabledServices(kb: any, max = 12): string {
     return names.slice(0, max).join(", ");
 }
 
-/** ====== Clasificador LLM de intención (B) ====== */
-async function classifyIntentLLM(text: string): Promise<"catalog" | "price" | "schedule" | "reschedule" | "cancel" | "other"> {
-    const sys = "Clasifica el mensaje del usuario en una sola etiqueta: catalog|price|schedule|reschedule|cancel|other. SOLO responde la etiqueta.";
+/** ====== Clasificador LLM de intención (backup) ====== */
+async function classifyIntentLLM(
+    text: string
+): Promise<"catalog" | "price" | "schedule" | "reschedule" | "cancel" | "other"> {
+    const sys =
+        "Clasifica el mensaje del usuario en una sola etiqueta: catalog|price|schedule|reschedule|cancel|other. SOLO responde la etiqueta.";
     try {
         const resp = await (openai.chat.completions.create as any)({
             model: process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini",
@@ -496,37 +545,6 @@ async function classifyIntentLLM(text: string): Promise<"catalog" | "price" | "s
         return "other";
     } catch {
         return "other";
-    }
-}
-
-/** ===== Helper: ejecución con control de tokens ===== */
-async function runChatWithBudget({
-    model,
-    messages,
-    temperature,
-    maxTokens,
-}: {
-    model: string;
-    messages: any[];
-    temperature: number;
-    maxTokens: number;
-}) {
-    try {
-        const resp = await (openai.chat.completions.create as any)({
-            model,
-            messages,
-            temperature,
-            max_tokens: maxTokens,
-        });
-        return resp?.choices?.[0]?.message?.content?.trim() || "";
-    } catch (e) {
-        const resp2 = await (openai.chat.completions.create as any)({
-            model,
-            messages,
-            temperature,
-            max_tokens: 32,
-        });
-        return resp2?.choices?.[0]?.message?.content?.trim() || "";
     }
 }
 
@@ -587,8 +605,7 @@ export async function handleEsteticaReply(args: {
 
     // 🔒 Idempotencia inbound
     if (last?.id && seenInboundRecently(last.id)) {
-        if (process.env.DEBUG_AI === "1")
-            console.log("[EST] Skip: inbound already processed", { lastId: last.id });
+        if (process.env.DEBUG_AI === "1") console.log("[EST] Skip: inbound already processed", { lastId: last.id });
         return { estado: conversacion.estado, mensaje: "" };
     }
 
@@ -597,8 +614,7 @@ export async function handleEsteticaReply(args: {
     if (!kb) {
         return {
             estado: ConversationEstado.requiere_agente,
-            mensaje:
-                "Ahora mismo no tengo la configuración completa de la clínica. Te comunico con un asesor humano. 🙏",
+            mensaje: "Ahora mismo no tengo la configuración completa de la clínica. Te comunico con un asesor humano. 🙏",
         };
     }
 
@@ -617,16 +633,15 @@ export async function handleEsteticaReply(args: {
                     audioBuf = Buffer.from(data);
                 }
                 if (audioBuf) {
-                    const name =
-                        last.mimeType?.includes("mpeg")
-                            ? "audio.mp3"
-                            : last.mimeType?.includes("wav")
-                                ? "audio.wav"
-                                : last.mimeType?.includes("m4a")
-                                    ? "audio.m4a"
-                                    : last.mimeType?.includes("webm")
-                                        ? "audio.webm"
-                                        : "audio.ogg";
+                    const name = last.mimeType?.includes("mpeg")
+                        ? "audio.mp3"
+                        : last.mimeType?.includes("wav")
+                            ? "audio.wav"
+                            : last.mimeType?.includes("m4a")
+                                ? "audio.m4a"
+                                : last.mimeType?.includes("webm")
+                                    ? "audio.webm"
+                                    : "audio.ogg";
                     transcript = await transcribeAudioBuffer(audioBuf, name);
                     if (transcript)
                         await prisma.message.update({
@@ -635,8 +650,7 @@ export async function handleEsteticaReply(args: {
                         });
                 }
             } catch (e) {
-                if (process.env.DEBUG_AI === "1")
-                    console.error("[EST] Transcription error:", (e as any)?.message || e);
+                if (process.env.DEBUG_AI === "1") console.error("[EST] Transcription error:", (e as any)?.message || e);
             }
         }
         if (transcript) userText = transcript;
@@ -658,11 +672,10 @@ export async function handleEsteticaReply(args: {
 
     // 4) INTENT + flujo de agenda (draft/confirmaciones)
     let intent = detectIntent(userText || caption || "");
-    // === B: clasificador LLM si quedó en smalltalk ===
     if (intent === "smalltalk") {
         const tag = await classifyIntentLLM(userText || caption || "");
         if (tag === "catalog") intent = "faq";
-        else if (tag === "price") intent = "faq"; // el bloque de precio maneja asksPrice + follow-up
+        else if (tag === "price") intent = "faq";
         else if (tag === "schedule") intent = "agendar";
         else if (tag === "reschedule") intent = "reagendar";
         else if (tag === "cancel") intent = "cancelar";
@@ -699,6 +712,40 @@ export async function handleEsteticaReply(args: {
         intent = "agendar";
     }
 
+    /** ==== Q&A dentro de OFERTA: si pregunta info clínica, responde sin repetir slots ==== */
+    if (draft.stage === "oferta" && (isServiceInfoQuestion(userText) || intent === "faq")) {
+        const svcCtx =
+            (draft.serviceId && kb.services.find((s: any) => s.id === draft.serviceId)) || svc || null;
+
+        let info = "";
+        if ((svcCtx as any)?.prepInstructions) info += `**Indicaciones previas:** ${(svcCtx as any).prepInstructions}\n`;
+        if ((svcCtx as any)?.postCare) info += `**Cuidados posteriores:** ${(svcCtx as any).postCare}\n`;
+        if ((svcCtx as any)?.contraindications)
+            info += `**Contraindicaciones:** ${(svcCtx as any).contraindications}\n`;
+
+        if (!info) {
+            info =
+                "Orientación general: evita exfoliantes fuertes 48–72h antes, llega con piel limpia el día de la cita y usa bloqueador. Si tomas medicación o tienes condiciones de piel, avísanos previamente.";
+        }
+
+        const txt = `Sobre *${svcCtx?.name || "el procedimiento"}*:\n${info.trim()}\n\n¿Retomamos opciones de horario o tienes otra duda?`;
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: txt,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
     /** ==== Preguntas de precio de un servicio específico (con follow-up) ==== */
     if ((asksPrice(userText) || isFollowupPriceAsk(userText, draft)) && svc) {
         const pLabel = serviceDisplayPrice(svc); // “$X.XXX”
@@ -706,7 +753,9 @@ export async function handleEsteticaReply(args: {
         const note = (svc as any).priceNote as string | null | undefined;
         const dur = readSvcDuration(svc, (kb as any)?.rules);
 
-        const priceLine = pLabel ? `tiene un valor *desde ${pLabel}*.` : `no tiene un precio registrado en el sistema.`;
+        const priceLine = pLabel
+            ? `tiene un valor *desde ${pLabel}*.`
+            : `no tiene un precio registrado en el sistema.`;
         const depLine = dep ? ` Requerimos un anticipo de ${dep} para reservar.` : "";
         const noteLine = note ? ` ${note}` : "";
         const durLine = dur ? ` La sesión dura aproximadamente *${dur} min*.` : "";
@@ -832,13 +881,34 @@ export async function handleEsteticaReply(args: {
             };
         }
 
+        // Cooldown anti-loop de slots
+        if (draft.lastOfferAt && Date.now() - draft.lastOfferAt < 90_000) {
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto:
+                    `¿Te sirve alguna de las opciones que te envié recién? ` +
+                    `Si prefieres otra fecha/hora, dímela (ej. "viernes 10:30").`,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return {
+                estado: ConversationEstado.en_proceso,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
+        }
+
         draft.serviceId = svc.id;
         draft.serviceName = svc.name;
         draft.duration = duration;
         draft.stage = "oferta";
-        // memorizar intención
         draft.lastIntent = "schedule";
         draft.lastIntentAt = Date.now();
+        draft.lastOfferAt = Date.now();
         await putDraft(chatId, draft);
 
         const primeros = slots.slice(0, 5).map((s) => `• ${s.label}`).join("\n");
@@ -862,14 +932,7 @@ export async function handleEsteticaReply(args: {
         };
     }
 
-    if (
-        intent === "confirmar" &&
-        draft.stage === "confirm" &&
-        draft.serviceId &&
-        draft.whenUTC &&
-        draft.name &&
-        draft.phone
-    ) {
+    if (intent === "confirmar" && draft.stage === "confirm" && draft.serviceId && draft.whenUTC && draft.name && draft.phone) {
         try {
             await bookAppointment({
                 empresaId,
@@ -989,7 +1052,7 @@ export async function handleEsteticaReply(args: {
         };
     }
 
-    // Si ya estamos en etapa de reagendar y recibimos una nueva fecha/hora → confirmar
+    // Reagendar: confirmación
     if (draft.stage === "reagendar_pedir" && draft.targetApptId) {
         if (rel.ok && hhmm) {
             draft.whenUTC = combineLocalDateTime(rel.localStart, hhmm, kb.timezone).toISOString();
@@ -1177,7 +1240,7 @@ export async function handleEsteticaReply(args: {
         };
     }
 
-    /** ==== FAQ catálogo: detectar con matcher semántico (A) ==== */
+    /** ==== FAQ catálogo ==== */
     if (isCatalogQuery(userText || caption || "")) {
         const serviciosTxt = listEnabledServices(kb);
         const cuerpo = serviciosTxt
@@ -1200,7 +1263,7 @@ export async function handleEsteticaReply(args: {
         };
     }
 
-    /** ==== Saludo sin listar catálogo genérico ==== */
+    /** ==== Saludo ==== */
     if (intent === "saludo" && !svc && !/servicio/i.test(userText)) {
         const saludo =
             `¡Hola! Soy el asistente de la clínica estética. ` +
@@ -1223,9 +1286,7 @@ export async function handleEsteticaReply(args: {
     }
 
     /** ====== SALUDO / FAQ / GENERAL (LLM con imagen) ====== */
-    const baseIntro = kb.empresaNombre
-        ? `Asistente de clínica estética de "${kb.empresaNombre}".`
-        : `Asistente de clínica estética.`;
+    const baseIntro = kb.empresaNombre ? `Asistente de clínica estética de "${kb.empresaNombre}".` : `Asistente de clínica estética.`;
     const system = [
         baseIntro,
         "Habla en primera persona (yo), cercano y profesional. Responde en 2–5 líneas, específico, sin párrafos largos.",
@@ -1296,13 +1357,13 @@ export async function handleEsteticaReply(args: {
     texto = closeNicely(texto);
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI);
 
-    // Blindaje: reemplazar montos solo cuando NO es un intercambio de precio/follow-up
+    // Blindaje: reemplazar montos solo cuando NO es intercambio de precio/follow-up
     const MONEY_RE = /\$?\s?\d{2,3}(?:\.\d{3})*(?:,\d{2})?/g;
     if (!(asksPrice(userText) || isFollowupPriceAsk(userText, draft))) {
         texto = texto.replace(MONEY_RE, "precio según valoración");
     }
 
-    // ⛔️ SIN DELAY: respondemos de inmediato
+    // ⛔️ SIN DELAY
     const saved = await persistBotReply({
         conversationId: chatId,
         empresaId,

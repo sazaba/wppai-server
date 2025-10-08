@@ -21,6 +21,10 @@ export type KBService = {
     currency?: string | null;      // "COP" por defecto si viene vacío
     priceNote?: string | null;     // notas de precio/condiciones
     aliases?: string[];            // palabras/alias para matching
+    // textos clínicos opcionales
+    prepInstructions?: string | null;
+    postCare?: string | null;
+    contraindications?: string | null;
 };
 
 export type KBStaff = {
@@ -99,7 +103,7 @@ function parseJSON<T = any>(v: any): T | null {
 
 function splitAliases(raw?: string | null): string[] {
     if (!raw) return [];
-    const base = raw.split(/[;,/|]/g).map(x => norm(x)).filter(Boolean);
+    const base = raw.split(/[;,/|]/g).map((x) => norm(x)).filter(Boolean);
     const expand: string[] = [];
     for (const a of base) {
         expand.push(a);
@@ -177,15 +181,10 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
     const bufferMin = cfg?.bufferMin ?? cfg?.bookingBufferMin ?? cfg?.defaultBufferMin ?? null;
     const empresaNombre = cfg?.nombre || cfg?.businessName || cfg?.companyName || null;
 
-    const rules =
-        parseJSON<Record<string, any>>(cfg?.rules) ??
-        parseJSON<Record<string, any>>(cfg?.rulesJson) ??
-        null;
+    const rules = parseJSON<Record<string, any>>(cfg?.rules) ?? parseJSON<Record<string, any>>(cfg?.rulesJson) ?? null;
 
     const remindersConfig =
-        parseJSON<Record<string, any>>(cfg?.remindersConfig) ??
-        parseJSON<Record<string, any>>(cfg?.reminders_json) ??
-        null;
+        parseJSON<Record<string, any>>(cfg?.remindersConfig) ?? parseJSON<Record<string, any>>(cfg?.reminders_json) ?? null;
 
     const logistics = {
         locationName: cfg?.locationName || cfg?.clinicName || cfg?.sede || null,
@@ -233,11 +232,7 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
             asNumber(p?.precio_max) ??
             null;
 
-        const deposit =
-            asNumber(p?.deposit) ??
-            asNumber(p?.deposito) ??
-            asNumber(p?.downpayment) ??
-            null;
+        const deposit = asNumber(p?.deposit) ?? asNumber(p?.deposito) ?? asNumber(p?.downpayment) ?? null;
 
         const currency = (p?.currency ?? p?.moneda ?? "COP") as string | null;
         const priceNote = p?.priceNote ?? p?.notaPrecio ?? p?.condicionesPrecio ?? null;
@@ -245,8 +240,13 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
         const enabled = (p?.enabled ?? p?.activo ?? true) !== false;
 
         const aliasesArr: string[] = Array.isArray(p?.aliases)
-            ? (p.aliases as string[]).map(a => norm(String(a)))
+            ? (p.aliases as string[]).map((a) => norm(String(a)))
             : splitAliases(p?.aliases || p?.keywords || p?.etiquetas || null);
+
+        // textos clínicos (opcionales)
+        const prepInstructions = p?.prepInstructions ?? null;
+        const postCare = p?.postCare ?? null;
+        const contraindications = p?.contraindications ?? null;
 
         return {
             id: Number(p?.id),
@@ -261,6 +261,9 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
             currency,
             priceNote,
             aliases: aliasesArr,
+            prepInstructions,
+            postCare,
+            contraindications,
         };
     });
 
@@ -272,8 +275,7 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
         phone: s?.phone ?? s?.telefono ?? null,
         email: s?.email ?? null,
         enabled: (s?.enabled ?? s?.activo ?? true) !== false,
-        specialties:
-            s?.specialties ?? s?.especialidades ?? parseJSON(s?.specialtiesJson) ?? null,
+        specialties: s?.specialties ?? s?.especialidades ?? parseJSON(s?.specialtiesJson) ?? null,
     }));
 
     const kb: EsteticaKB = {
@@ -325,7 +327,7 @@ export function resolveServiceName(kb: EsteticaKB, text: string): KBService | nu
     if (!text || !kb?.services?.length) return null;
 
     const t = text.toLowerCase();
-    const candidates = kb.services.filter(s => s.enabled !== false);
+    const candidates = kb.services.filter((s) => s.enabled !== false);
 
     const ntext = norm(t);
 
@@ -337,7 +339,7 @@ export function resolveServiceName(kb: EsteticaKB, text: string): KBService | nu
         const nn = norm(s.name);
         if (ntext.includes(nn) || nn.startsWith(ntext) || ntext.startsWith(nn)) return s;
 
-        const aliasHit = (s.aliases || []).some(a => {
+        const aliasHit = (s.aliases || []).some((a) => {
             const aa = norm(a);
             return ntext.includes(aa) || aa.startsWith(ntext) || ntext.startsWith(aa);
         });
