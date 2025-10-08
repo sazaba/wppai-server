@@ -18,7 +18,11 @@ import { Logger } from "../../ai/strategies/esteticaModules/log";
 const log = Logger.child("estetica.strategy");
 
 // === Módulos de Estética (KB + Agenda + Fechas) ===
-import { loadEsteticaKB, resolveServiceName } from "./esteticaModules/domain/estetica.kb";
+import {
+    loadEsteticaKB,
+    resolveServiceName,
+    serviceDisplayPrice, // << nuevo helper para formatear “Desde $X”
+} from "./esteticaModules/domain/estetica.kb";
 import {
     findNextSlots,
     bookAppointment,
@@ -149,6 +153,16 @@ function detectIntent(
     if (/(horario|direccion|dónde|servicios|precios|costo|valor)/i.test(t)) return "faq";
     if (/(hola|buen[oa]s|qué tal|como estas|saludo)/i.test(t)) return "saludo";
     return "smalltalk";
+}
+
+/** ==== Nuevo: detectar preguntas de precio robustas (incluye “¿qué vale…?”) ==== */
+function asksPrice(t: string) {
+    const s = (t || "").toLowerCase();
+    return (
+        /\b(precio|costo|valor|tarifa)\b/i.test(s) ||
+        /\bcu[aá]nto\s+(vale|sale)\b/i.test(s) ||
+        /\b(que|qué)\s+vale\b/i.test(s)
+    );
 }
 
 /** ===== Extractores sencillos ===== */
@@ -387,35 +401,6 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     return messages;
 }
 
-/** ===== Core LLM ===== */
-async function runChatWithBudget(opts: {
-    model: string;
-    messages: any[];
-    temperature: number;
-    maxTokens: number;
-}): Promise<string> {
-    const { model, messages, temperature } = opts;
-    const firstMax = opts.maxTokens;
-
-    try {
-        const resp1 = await (openai.chat.completions.create as any)({
-            model,
-            messages,
-            temperature,
-            max_tokens: firstMax,
-        });
-        return resp1?.choices?.[0]?.message?.content?.trim() || "";
-    } catch {
-        const resp2 = await (openai.chat.completions.create as any)({
-            model,
-            messages,
-            temperature,
-            max_tokens: 32,
-        });
-        return resp2?.choices?.[0]?.message?.content?.trim() || "";
-    }
-}
-
 /** ====== Helpers de citas (offset 5h en APPOINTMENT) ====== */
 const APPT_DB_OFFSET_MIN = 300; // 5 horas
 const addMinutes = (d: Date, min: number) => new Date(d.getTime() + min * 60000);
@@ -462,6 +447,29 @@ function listEnabledServices(kb: any, max = 12): string {
         .map((s: any) => s.name);
     return names.slice(0, max).join(", ");
 }
+
+/** ===== Helper: ejecución con control de tokens ===== */
+async function runChatWithBudget({
+    model,
+    messages,
+    temperature,
+    maxTokens,
+}: {
+    model: string;
+    messages: any[];
+    temperature: number;
+    maxTokens: number;
+}) {
+    const resp = await openai.chat.completions.create({
+        model,
+        messages,
+        temperature,
+        max_tokens: maxTokens,
+    });
+
+    return resp?.choices?.[0]?.message?.content?.trim() || "";
+}
+
 
 /** ======= PUBLIC: handleEsteticaReply ======= */
 export async function handleEsteticaReply(args: {
@@ -617,20 +625,14 @@ export async function handleEsteticaReply(args: {
     if (phone) draft.phone = phone;
 
     /** ==== Preguntas de precio de un servicio específico (respuesta estructurada en COP) ==== */
-    if (/(precio|costo|cu[aá]nto\s+(vale|sale)|valor|tarifa)/i.test(userText) && svc) {
-        // ⚠️ Usar EXCLUSIVAMENTE los campos del KB (priceMin/priceMax/deposit/priceNote)
-        const pMin = formatCOP((svc as any).priceMin ?? null);
-        const pMax = formatCOP((svc as any).priceMax ?? null);
+    if (asksPrice(userText) && svc) {
+        // Mostrar SOLO priceMin como “Desde $X”. Sin inventos.
+        const pLabel = serviceDisplayPrice(svc); // viene del KB
         const dep = formatCOP((svc as any).deposit ?? null);
         const note = (svc as any).priceNote as string | null | undefined;
-
-        let priceLine = "";
-        if (pMin && pMax) priceLine = `tiene un costo entre ${pMin} y ${pMax}.`;
-        else if (pMin) priceLine = `tiene un costo desde ${pMin}.`;
-        else if (pMax) priceLine = `puede llegar hasta ${pMax}.`;
-        else priceLine = `no tiene un precio registrado en el sistema.`;
-
         const dur = readSvcDuration(svc, (kb as any)?.rules);
+
+        const priceLine = pLabel ? `tiene un valor *desde ${pLabel}*.` : `no tiene un precio registrado en el sistema.`;
         const depLine = dep ? ` Requerimos un anticipo de ${dep} para reservar.` : "";
         const noteLine = note ? ` ${note}` : "";
         const durLine = dur ? ` La sesión dura aproximadamente *${dur} min*.` : "";
@@ -1151,19 +1153,19 @@ export async function handleEsteticaReply(args: {
         baseIntro,
         "Habla en primera persona (yo), cercano y profesional. Responde en 2–5 líneas, específico, sin párrafos largos.",
         "Puedes usar 1 emoji ocasionalmente.",
-        "Sé full-agent sobre temas de clínica estética; evita salirte del ámbito.",
+        "Mantente en el ámbito de estética (orientación y agenda).",
         // 👇 REGLAS DURAS DE SERVICIOS/PRECIOS
         "Al listar u ofrecer servicios para agendar usa SOLO los que estén en la base de datos (kb.services).",
-        "Si el cliente menciona un tratamiento que NO está en kb.services, puedes dar orientación general, pero NO lo ofrezcas para agendar. En su lugar, sugiere alguno de los servicios disponibles que sea equivalente.",
+        "Si el cliente menciona un tratamiento que NO está en kb.services, puedes dar orientación general, pero NO lo ofrezcas para agendar; sugiere alguno equivalente del catálogo.",
         "Si preguntan por servicios/horarios/dirección/políticas, usa SOLO la información del negocio (KB).",
-        "Para precios usa EXCLUSIVAMENTE los campos del KB (priceMin, priceMax, deposit, priceNote). Si no hay datos, dilo explícitamente y NO inventes valores, zonas ni paquetes.",
-        "Cuando menciones precios, exprésalos en pesos colombianos (COP) sin decimales y con separadores de miles (ej. $60.000).",
+        "NO menciones precios a menos que el usuario lo pida explícitamente.",
+        "Cuando menciones precio usa únicamente el campo priceMin del KB, con el formato: “Desde $X (COP)”. Si no hay priceMin, di: “No tengo precio registrado”. Nunca inventes cifras.",
         kb.kbTexts.businessOverview ? `Contexto negocio: ${softTrim(kb.kbTexts.businessOverview, 220)}` : "",
         kb.logistics?.locationAddress ? `Dirección: ${kb.logistics.locationAddress}` : "",
         kb.logistics?.locationName ? `Sede: ${kb.logistics.locationName}` : "",
         kb.logistics?.locationMapsUrl ? `Maps: ${kb.logistics.locationMapsUrl}` : "",
         kb.kbTexts.disclaimers ? `Avisos: ${softTrim(kb.kbTexts.disclaimers, 220)}` : "",
-        "Si detectas intención de agendar, guía a escoger servicio habilitado y ofrece horarios.",
+        "Si detectas intención de agendar, guía a escoger un servicio habilitado y ofrece horarios.",
     ]
         .filter(Boolean)
         .join("\n");
@@ -1216,6 +1218,12 @@ export async function handleEsteticaReply(args: {
     }
     texto = closeNicely(texto);
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI);
+
+    // Blindaje: si el usuario NO preguntó por precio, elimina posibles montos del LLM
+    const MONEY_RE = /\$?\s?\d{2,3}(?:\.\d{3})*(?:,\d{2})?/g;
+    if (!asksPrice(userText)) {
+        texto = texto.replace(MONEY_RE, "precio según valoración");
+    }
 
     // ⛔️ SIN DELAY: respondemos de inmediato
     const saved = await persistBotReply({

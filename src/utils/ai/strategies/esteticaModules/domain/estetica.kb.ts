@@ -14,7 +14,7 @@ export type KBService = {
     enabled: boolean;
     duration?: number | null;      // minutos (variante 1)
     durationMin?: number | null;   // minutos (variante 2)
-    // 💵 NUEVO: precios estructurados
+    // 💵 precios estructurados desde BD
     priceMin?: number | null;      // precio mínimo (COP)
     priceMax?: number | null;      // precio máximo (COP)
     deposit?: number | null;       // anticipo/deposito (COP)
@@ -67,6 +67,8 @@ export type EsteticaKB = {
 // ———————————————————————————————————————————————————————————————————————
 // Utilidades internas
 // ———————————————————————————————————————————————————————————————————————
+export const MONEY_RE = /\$?\s?\d{2,3}(?:\.\d{3})*(?:,\d{2})?/g;
+
 function norm(s: string) {
     return s
         .normalize("NFD")
@@ -97,7 +99,26 @@ function parseJSON<T = any>(v: any): T | null {
 
 function splitAliases(raw?: string | null): string[] {
     if (!raw) return [];
-    return raw.split(/[;,/|]/g).map(x => x.trim()).filter(Boolean);
+    const base = raw.split(/[;,/|]/g).map(x => norm(x)).filter(Boolean);
+    const expand: string[] = [];
+    for (const a of base) {
+        expand.push(a);
+        // sing/plural simple
+        if (a.endsWith("s")) expand.push(a.replace(/s$/, ""));
+        else expand.push(`${a}s`);
+    }
+    return Array.from(new Set(expand));
+}
+
+function stripPrices(s?: string | null) {
+    if (!s) return s ?? null;
+    return s.replace(MONEY_RE, "precio");
+}
+
+function asNumber(v: any): number | null {
+    if (v == null) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
 }
 
 // ———————————————————————————————————————————————————————————————————————
@@ -177,9 +198,11 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
 
     const policies = cfg?.policies || cfg?.politicas || cfg?.policyText || null;
     const reminders = typeof cfg?.reminders === "boolean" ? cfg.reminders : cfg?.sendReminders ?? null;
-    const businessOverview = cfg?.businessOverview || cfg?.overview || cfg?.about || null;
-    const servicesText = cfg?.servicesText || cfg?.serviciosTexto || null;
-    const disclaimers = cfg?.disclaimers || cfg?.avisos || null;
+
+    // Sanitizar textos libres para evitar montos
+    const businessOverview = stripPrices(cfg?.businessOverview || cfg?.overview || cfg?.about || null);
+    const servicesText = stripPrices(cfg?.servicesText || cfg?.serviciosTexto || null);
+    const disclaimers = stripPrices(cfg?.disclaimers || cfg?.avisos || null);
 
     // ——— mapear procedimientos a KBService[]
     const services: KBService[] = procedures.map((p: any) => {
@@ -194,7 +217,7 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
                     ? p.duracionMin
                     : null;
 
-        // 💵 capturamos variantes de precio
+        // 💵 capturamos variantes de precio SOLO desde campos numéricos
         const priceMin =
             asNumber(p?.priceMin) ??
             asNumber(p?.precioMin) ??
@@ -222,7 +245,7 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
         const enabled = (p?.enabled ?? p?.activo ?? true) !== false;
 
         const aliasesArr: string[] = Array.isArray(p?.aliases)
-            ? p.aliases
+            ? (p.aliases as string[]).map(a => norm(String(a)))
             : splitAliases(p?.aliases || p?.keywords || p?.etiquetas || null);
 
         return {
@@ -282,10 +305,17 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
     return kb;
 }
 
-function asNumber(v: any): number | null {
-    if (v == null) return null;
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+// ———————————————————————————————————————————————————————————————————————
+// Helpers exportables de precio
+// ———————————————————————————————————————————————————————————————————————
+export function serviceDisplayPrice(proc?: { priceMin?: number | null }) {
+    const v = proc?.priceMin != null ? Number(proc.priceMin) : null;
+    if (v == null || !Number.isFinite(v)) return null;
+    return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(v);
+}
+
+export function hasStructuredPrice(svc: KBService) {
+    return typeof svc.priceMin === "number" && Number.isFinite(svc.priceMin);
 }
 
 // ———————————————————————————————————————————————————————————————————————
@@ -298,14 +328,23 @@ export function resolveServiceName(kb: EsteticaKB, text: string): KBService | nu
     const candidates = kb.services.filter(s => s.enabled !== false);
 
     const ntext = norm(t);
+
+    // match exact normalizado
     for (const s of candidates) if (norm(s.name) === ntext) return s;
 
+    // inclusiones y startsWith en nombre/alias
     for (const s of candidates) {
-        const nameHit = ntext.includes(norm(s.name));
-        const aliasHit = (s.aliases || []).some(a => ntext.includes(norm(a)));
-        if (nameHit || aliasHit) return s;
+        const nn = norm(s.name);
+        if (ntext.includes(nn) || nn.startsWith(ntext) || ntext.startsWith(nn)) return s;
+
+        const aliasHit = (s.aliases || []).some(a => {
+            const aa = norm(a);
+            return ntext.includes(aa) || aa.startsWith(ntext) || ntext.startsWith(aa);
+        });
+        if (aliasHit) return s;
     }
 
+    // fuzzy por tokens (umbral conservador)
     let best: { svc: KBService; score: number } | null = null;
     for (const s of candidates) {
         let score = tokenScore(s.name, t);
