@@ -174,7 +174,7 @@ function detectIntent(
     return "smalltalk";
 }
 
-/** ==== Nuevo: detectar preguntas de precio (incluye “¿qué vale…?”) ==== */
+/** ==== Pregunta de precio (incluye “¿qué vale…?”) ==== */
 function asksPrice(t: string) {
     const s = (t || "").toLowerCase();
     return (
@@ -182,6 +182,17 @@ function asksPrice(t: string) {
         /\bcu[aá]nto\s+(vale|sale)\b/i.test(s) ||
         /\b(que|qué)\s+vale\b/i.test(s)
     );
+}
+
+/** ==== Follow-up de precio por contexto reciente (“¿y el peeling?”) ==== */
+type LastIntentTag = "price" | "schedule";
+function isFollowupPriceAsk(text: string, d?: Draft) {
+    const s = (text || "").toLowerCase().trim();
+    const looksLikeFollow =
+        /^y\s+(el|la|los|las)\b/.test(s) ||
+        /\b(peeling|botox|toxina|limpieza|facial|depilaci[oó]n|laser)\b/.test(s);
+    const recent = d?.lastIntent === "price" && (Date.now() - (d.lastIntentAt || 0) < 15 * 60_000);
+    return looksLikeFollow && !!recent;
 }
 
 /** ===== Extractores sencillos ===== */
@@ -224,6 +235,10 @@ type Draft = {
     stage?: DraftStage;
     // Para reagendar/cancelar:
     targetApptId?: number;
+
+    // === Memoria de intención para follow-ups ===
+    lastIntent?: LastIntentTag;
+    lastIntentAt?: number; // Date.now()
 };
 
 async function getDraft(chatId: number): Promise<Draft | undefined> {
@@ -647,7 +662,7 @@ export async function handleEsteticaReply(args: {
     if (intent === "smalltalk") {
         const tag = await classifyIntentLLM(userText || caption || "");
         if (tag === "catalog") intent = "faq";
-        else if (tag === "price") intent = "faq"; // tu rama de precio maneja asksPrice + svc
+        else if (tag === "price") intent = "faq"; // el bloque de precio maneja asksPrice + follow-up
         else if (tag === "schedule") intent = "agendar";
         else if (tag === "reschedule") intent = "reagendar";
         else if (tag === "cancel") intent = "cancelar";
@@ -678,9 +693,15 @@ export async function handleEsteticaReply(args: {
     if (name) draft.name = name;
     if (phone) draft.phone = phone;
 
-    /** ==== Preguntas de precio de un servicio específico (respuesta estructurada en COP) ==== */
-    if (asksPrice(userText) && svc) {
-        const pLabel = serviceDisplayPrice(svc); // desde KB
+    /** ==== Ajuste: si preguntan por horarios y hay servicio en contexto → agendar ==== */
+    const askedForSlots = /\b(horario|horarios|disponibilidad|cupos?)\b/i.test(userText);
+    if (intent === "faq" && askedForSlots && (svc || draft.serviceId)) {
+        intent = "agendar";
+    }
+
+    /** ==== Preguntas de precio de un servicio específico (con follow-up) ==== */
+    if ((asksPrice(userText) || isFollowupPriceAsk(userText, draft)) && svc) {
+        const pLabel = serviceDisplayPrice(svc); // “$X.XXX”
         const dep = formatCOP((svc as any).deposit ?? null);
         const note = (svc as any).priceNote as string | null | undefined;
         const dur = readSvcDuration(svc, (kb as any)?.rules);
@@ -691,6 +712,11 @@ export async function handleEsteticaReply(args: {
         const durLine = dur ? ` La sesión dura aproximadamente *${dur} min*.` : "";
 
         const cuerpo = `El tratamiento de *${svc.name}* ${priceLine}${durLine}${depLine}${noteLine} ¿Te paso opciones de horario?`;
+
+        // Memorizar intención
+        draft.lastIntent = "price";
+        draft.lastIntentAt = Date.now();
+        await putDraft(chatId, draft);
 
         const saved = await persistBotReply({
             conversationId: chatId,
@@ -810,6 +836,9 @@ export async function handleEsteticaReply(args: {
         draft.serviceName = svc.name;
         draft.duration = duration;
         draft.stage = "oferta";
+        // memorizar intención
+        draft.lastIntent = "schedule";
+        draft.lastIntentAt = Date.now();
         await putDraft(chatId, draft);
 
         const primeros = slots.slice(0, 5).map((s) => `• ${s.label}`).join("\n");
@@ -1267,9 +1296,9 @@ export async function handleEsteticaReply(args: {
     texto = closeNicely(texto);
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI);
 
-    // Blindaje: si el usuario NO preguntó por precio, elimina posibles montos del LLM
+    // Blindaje: reemplazar montos solo cuando NO es un intercambio de precio/follow-up
     const MONEY_RE = /\$?\s?\d{2,3}(?:\.\d{3})*(?:,\d{2})?/g;
-    if (!asksPrice(userText)) {
+    if (!(asksPrice(userText) || isFollowupPriceAsk(userText, draft))) {
         texto = texto.replace(MONEY_RE, "precio según valoración");
     }
 
