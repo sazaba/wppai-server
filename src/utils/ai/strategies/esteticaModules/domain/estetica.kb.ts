@@ -212,9 +212,9 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
         const duration = typeof p?.duration === "number" ? p.duration : null;
         const durationMin =
             typeof p?.durationMin === "number"
-                ? p.durationMin
+                ? p?.durationMin
                 : typeof p?.duracionMin === "number"
-                    ? p.duracionMin
+                    ? p?.duracionMin
                     : null;
 
         // 💵 capturamos variantes de precio SOLO desde campos numéricos
@@ -330,7 +330,7 @@ export function resolveServiceName(kb: EsteticaKB, text: string): KBService | nu
     const ntext = norm(t);
 
     // match exact normalizado
-    for (const s of candidates) if (norm(s.name) === ntext) return s;
+    for (const s of candidates) if (ntext === norm(s.name)) return s;
 
     // inclusiones y startsWith en nombre/alias
     for (const s of candidates) {

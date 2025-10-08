@@ -21,7 +21,7 @@ const log = Logger.child("estetica.strategy");
 import {
     loadEsteticaKB,
     resolveServiceName,
-    serviceDisplayPrice, // << nuevo helper para formatear “Desde $X”
+    serviceDisplayPrice,
 } from "./esteticaModules/domain/estetica.kb";
 import {
     findNextSlots,
@@ -140,6 +140,23 @@ async function pickImageForContext(opts: {
     return { url: null, noteToAppend: "" };
 }
 
+/** ====== Normalizador & Matchers semánticos ====== */
+function norm(s: string) {
+    return (s || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase();
+}
+
+function isCatalogQuery(t: string) {
+    const s = ` ${norm(t)} `;
+    const nouns = ["servicio", "servicios", "procedimiento", "procedimientos", "tratamiento", "tratamientos", "catalogo", "catálogo", "catalog"];
+    const intents = ["que ", "qué ", "cuales", "cuáles", "lista", "disponible", "disponibles", "ofreces", "ofrecen", "tienes", "hay", "oferta"];
+    const hitNoun = nouns.some(k => s.includes(` ${k} `));
+    const hitIntent = intents.some(k => s.includes(k));
+    return hitNoun && hitIntent;
+}
+
 /** ===== Intents mínimos (texto) ===== */
 function detectIntent(
     text: string
@@ -150,12 +167,14 @@ function detectIntent(
     if (/(reagendar|cambiar|mover|otra hora|reprogramar)/i.test(t)) return "reagendar";
     if (/(cancelar|anular)/i.test(t)) return "cancelar";
     if (/(cita|agendar|agenda|programar|reservar)/i.test(t)) return "agendar";
-    if (/(horario|direccion|dónde|servicios|precios|costo|valor)/i.test(t)) return "faq";
+    if (/(horario|direccion|dónde|servicios|procedimientos|tratamientos|cat[aá]logo|precios|costo|valor)/i.test(t)) return "faq";
     if (/(hola|buen[oa]s|qué tal|como estas|saludo)/i.test(t)) return "saludo";
+    // señal semántica de catálogo
+    if (isCatalogQuery(text)) return "faq";
     return "smalltalk";
 }
 
-/** ==== Nuevo: detectar preguntas de precio robustas (incluye “¿qué vale…?”) ==== */
+/** ==== Nuevo: detectar preguntas de precio (incluye “¿qué vale…?”) ==== */
 function asksPrice(t: string) {
     const s = (t || "").toLowerCase();
     return (
@@ -315,8 +334,7 @@ function approxTokens(str: string) {
 }
 function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
     let t = String(text || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    if (!t) return t;
-    const lines = t.split("\n").filter(Boolean);
+    const lines = t ? t.split("\n").filter(Boolean) : [];
     if (lines.length > maxLines) {
         t = lines.slice(0, maxLines).join("\n").trim();
         if (!/[.!?…]$/.test(t)) t += "…";
@@ -448,6 +466,24 @@ function listEnabledServices(kb: any, max = 12): string {
     return names.slice(0, max).join(", ");
 }
 
+/** ====== Clasificador LLM de intención (B) ====== */
+async function classifyIntentLLM(text: string): Promise<"catalog" | "price" | "schedule" | "reschedule" | "cancel" | "other"> {
+    const sys = "Clasifica el mensaje del usuario en una sola etiqueta: catalog|price|schedule|reschedule|cancel|other. SOLO responde la etiqueta.";
+    try {
+        const resp = await (openai.chat.completions.create as any)({
+            model: process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini",
+            temperature: 0,
+            max_tokens: 3,
+            messages: [{ role: "system", content: sys }, { role: "user", content: String(text || "").slice(0, 200) }],
+        });
+        const tag = resp?.choices?.[0]?.message?.content?.trim()?.toLowerCase() || "other";
+        if (["catalog", "price", "schedule", "reschedule", "cancel", "other"].includes(tag)) return tag as any;
+        return "other";
+    } catch {
+        return "other";
+    }
+}
+
 /** ===== Helper: ejecución con control de tokens ===== */
 async function runChatWithBudget({
     model,
@@ -460,16 +496,24 @@ async function runChatWithBudget({
     temperature: number;
     maxTokens: number;
 }) {
-    const resp = await openai.chat.completions.create({
-        model,
-        messages,
-        temperature,
-        max_tokens: maxTokens,
-    });
-
-    return resp?.choices?.[0]?.message?.content?.trim() || "";
+    try {
+        const resp = await (openai.chat.completions.create as any)({
+            model,
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+        });
+        return resp?.choices?.[0]?.message?.content?.trim() || "";
+    } catch (e) {
+        const resp2 = await (openai.chat.completions.create as any)({
+            model,
+            messages,
+            temperature,
+            max_tokens: 32,
+        });
+        return resp2?.choices?.[0]?.message?.content?.trim() || "";
+    }
 }
-
 
 /** ======= PUBLIC: handleEsteticaReply ======= */
 export async function handleEsteticaReply(args: {
@@ -598,7 +642,17 @@ export async function handleEsteticaReply(args: {
     }
 
     // 4) INTENT + flujo de agenda (draft/confirmaciones)
-    const intent = detectIntent(userText || caption || "");
+    let intent = detectIntent(userText || caption || "");
+    // === B: clasificador LLM si quedó en smalltalk ===
+    if (intent === "smalltalk") {
+        const tag = await classifyIntentLLM(userText || caption || "");
+        if (tag === "catalog") intent = "faq";
+        else if (tag === "price") intent = "faq"; // tu rama de precio maneja asksPrice + svc
+        else if (tag === "schedule") intent = "agendar";
+        else if (tag === "reschedule") intent = "reagendar";
+        else if (tag === "cancel") intent = "cancelar";
+    }
+
     const draft = (await getDraft(chatId)) ?? ({ empresaId } as Draft);
 
     // Resolver servicio por texto o mantener el previo (solo para agendar)
@@ -626,8 +680,7 @@ export async function handleEsteticaReply(args: {
 
     /** ==== Preguntas de precio de un servicio específico (respuesta estructurada en COP) ==== */
     if (asksPrice(userText) && svc) {
-        // Mostrar SOLO priceMin como “Desde $X”. Sin inventos.
-        const pLabel = serviceDisplayPrice(svc); // viene del KB
+        const pLabel = serviceDisplayPrice(svc); // desde KB
         const dep = formatCOP((svc as any).deposit ?? null);
         const note = (svc as any).priceNote as string | null | undefined;
         const dur = readSvcDuration(svc, (kb as any)?.rules);
@@ -789,7 +842,7 @@ export async function handleEsteticaReply(args: {
         draft.phone
     ) {
         try {
-            const appt = await bookAppointment({
+            await bookAppointment({
                 empresaId,
                 conversationId: chatId,
                 customerName: draft.name!,
@@ -851,7 +904,6 @@ export async function handleEsteticaReply(args: {
 
     /** ====== REAGENDAR ====== */
     if (intent === "reagendar") {
-        // 1) obtener cita futura más cercana ligada a esta conversación
         const appt = await getUpcomingAppointmentForConversation(empresaId, chatId);
         if (!appt) {
             const txt =
@@ -1096,12 +1148,8 @@ export async function handleEsteticaReply(args: {
         };
     }
 
-    /** ==== FAQ directa: "qué servicios tienes" ==== */
-    if (
-        /(qué\s+servicios|que\s+servicios|servicios\s+disponibles|tienes\s+servicios|lista\s+de\s+servicios)/i.test(
-            (userText || caption || "")
-        )
-    ) {
+    /** ==== FAQ catálogo: detectar con matcher semántico (A) ==== */
+    if (isCatalogQuery(userText || caption || "")) {
         const serviciosTxt = listEnabledServices(kb);
         const cuerpo = serviciosTxt
             ? `Estos son nuestros servicios disponibles: ${serviciosTxt}.\n¿Te interesa agendar alguno en particular?`
