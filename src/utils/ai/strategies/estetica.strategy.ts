@@ -213,6 +213,12 @@ function isServiceInfoQuestion(t: string) {
     );
 }
 
+/** ==== “Evaluación/consulta gratuita” ==== */
+function asksFreeEval(t: string) {
+    const s = (t || "").toLowerCase();
+    return /\b(evaluaci[oó]n|valoraci[oó]n|consulta)\s+gratuit[ao]s?\b/.test(s) || /\bvaloraci[oó]n\s+sin\s+costo\b/.test(s);
+}
+
 /** ===== Extractores ===== */
 function extractPhone(text: string): string | undefined {
     const clean = text.replace(/[^\d+]/g, " ");
@@ -684,9 +690,15 @@ export async function handleEsteticaReply(args: {
     const draft = (await getDraft(chatId)) ?? ({ empresaId } as Draft);
 
     // Resolver servicio por texto o mantener el previo (solo para agendar)
-    const svc =
+    let svc =
         resolveServiceName(kb, userText) ??
         (draft.serviceId ? kb.services.find((s: any) => s.id === draft.serviceId) ?? null : null);
+
+    // Guard: si el match fue flojo, mantén el anterior
+    if (!svc && draft.serviceId) {
+        svc = kb.services.find((s: any) => s.id === draft.serviceId) ?? null;
+    }
+
     if (svc && (!draft.serviceId || draft.serviceId !== svc.id)) {
         draft.serviceId = svc.id;
         draft.serviceName = svc.name;
@@ -710,6 +722,40 @@ export async function handleEsteticaReply(args: {
     const askedForSlots = /\b(horario|horarios|disponibilidad|cupos?)\b/i.test(userText);
     if (intent === "faq" && askedForSlots && (svc || draft.serviceId)) {
         intent = "agendar";
+    }
+
+    /** ==== No ofrecemos evaluación/consulta gratuita ==== */
+    if (asksFreeEval(userText || caption || "")) {
+        const svcCtx =
+            (draft.serviceId && kb.services.find((s: any) => s.id === draft.serviceId)) ||
+            resolveServiceName(kb, userText || "") ||
+            null;
+
+        const base =
+            "Por ahora no manejamos evaluaciones gratuitas. Puedo orientarte por aquí y agendar directamente el procedimiento que te interese.";
+        let extra = "";
+        if (svcCtx) {
+            const desde = serviceDisplayPrice(svcCtx);
+            if (desde) extra = ` Para *${svcCtx.name}* el valor es *desde ${desde}*.`;
+        }
+        const tail = " ¿Te comparto horarios o prefieres primero ver precios y duración de un servicio?";
+        const txt = `${base}${extra}${tail}`;
+
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: txt,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return {
+            estado: ConversationEstado.en_proceso,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
     }
 
     /** ==== Q&A dentro de OFERTA: si pregunta info clínica, responde sin repetir slots ==== */
@@ -754,7 +800,7 @@ export async function handleEsteticaReply(args: {
         const dur = readSvcDuration(svc, (kb as any)?.rules);
 
         const priceLine = pLabel
-            ? `tiene un valor *desde ${pLabel}*.`
+            ? `tiene un valor *desde ${pLabel}*.` // SIEMPRE “desde” priceMin
             : `no tiene un precio registrado en el sistema.`;
         const depLine = dep ? ` Requerimos un anticipo de ${dep} para reservar.` : "";
         const noteLine = note ? ` ${note}` : "";
@@ -1296,6 +1342,7 @@ export async function handleEsteticaReply(args: {
         "Al listar u ofrecer servicios para agendar usa SOLO los que estén en la base de datos (kb.services).",
         "Si el cliente menciona un tratamiento que NO está en kb.services, puedes dar orientación general, pero NO lo ofrezcas para agendar; sugiere alguno equivalente del catálogo.",
         "Si preguntan por servicios/horarios/dirección/políticas, usa SOLO la información del negocio (KB).",
+        "No ofrezcas evaluaciones/consultas gratuitas. Si el usuario las pide, indica que no están disponibles y sugiere pasar directo a precios u horarios del procedimiento.",
         "NO menciones precios a menos que el usuario lo pida explícitamente.",
         "Cuando menciones precio usa únicamente el campo priceMin del KB, con el formato: “Desde $X (COP)”. Si no hay priceMin, di: “No tengo precio registrado”. Nunca inventes cifras.",
         kb.kbTexts.businessOverview ? `Contexto negocio: ${softTrim(kb.kbTexts.businessOverview, 220)}` : "",

@@ -107,7 +107,6 @@ function splitAliases(raw?: string | null): string[] {
     const expand: string[] = [];
     for (const a of base) {
         expand.push(a);
-        // sing/plural simple
         if (a.endsWith("s")) expand.push(a.replace(/s$/, ""));
         else expand.push(`${a}s`);
     }
@@ -344,6 +343,12 @@ export function resolveServiceName(kb: EsteticaKB, text: string): KBService | nu
             return ntext.includes(aa) || aa.startsWith(ntext) || ntext.startsWith(aa);
         });
         if (aliasHit) return s;
+    }
+
+    // puente común: “botox” → servicio con “toxina/botul” si existe
+    if (ntext.includes("botox")) {
+        const cand = candidates.find((s) => /toxina|botul/i.test(s.name));
+        if (cand) return cand;
     }
 
     // fuzzy por tokens (umbral conservador)
