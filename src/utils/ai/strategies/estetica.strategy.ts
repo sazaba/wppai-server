@@ -1515,212 +1515,559 @@
 //     };
 // }
 
-// utils/ai/strategies/estetica.strategy.ts
-/**
- * Agente FULL-CHAT para Estética (unificado):
- * - Conversa natural (cero-bot).
- * - Detecta intención (informativa vs. agendar).
- * - Lee KB real (businessconfig_appt, estetica_procedure, staff, appointment_exception).
- * - Consulta disponibilidad (appointmenthour + exception) y evita solapes (appointment).
- * - Crea cita en appointment con campos reales.
- *
- * Expone:
- *  - esteticaAgentReply()  -> usa conversación abierta, ofrece slots, etc.
- *  - bookConfirmedSlot()   -> crea la cita cuando el usuario ya eligió fecha/hora.
- */
+
 
 
 // utils/ai/strategies/estetica.strategy.ts
-// Reescrito sin Luxon, usando date-fns/date-fns-tz para formatear y manejar TZ.
+// Full chat para Estética con WhatsApp send, imagen contextual, transcripción de voz,
+// oferta de horarios y agendamiento seguro. Compatible con TS strict + CommonJS.
 
-// utils/ai/strategies/estetica.strategy.ts
-// Versión CommonJS-friendly (sin Luxon): date-fns v2 + date-fns-tz v1
-
+import axios from "axios";
 import prisma from "../../../lib/prisma";
-import type { AppointmentVertical } from "@prisma/client";
-import { zonedTimeToUtc, utcToZonedTime, format as tzFormat } from "date-fns-tz";
+import { openai } from "../../../lib/openai";
+import type { Prisma, AppointmentVertical } from "@prisma/client";
+import { ConversationEstado, MediaType, MessageFrom } from "@prisma/client";
 
-import { loadEsteticaKB, resolveServiceName } from "./esteticaModules/domain/estetica.kb";
-import { getNextAvailableSlots, createAppointmentSafe } from "./esteticaModules/schedule/estetica.schedule";
+import * as Wam from "../../../services/whatsapp.service";
+import { transcribeAudioBuffer } from "../../../services/transcription.service";
 
-export type EsteticaAgentInput = {
-    empresaId: number;
-    vertical?: AppointmentVertical | "custom";
+// ==== KB (import seguro, con fallback para MONEY_RE) ====
+import * as KB from "./esteticaModules/domain/estetica.kb";
+// Named exports (si existen):
+const loadEsteticaKB = (KB as any).loadEsteticaKB as (args: { empresaId: number; vertical?: AppointmentVertical | "custom" }) => Promise<any>;
+const resolveServiceName = (KB as any).resolveServiceName as (kb: any, text: string) => { procedure?: any } | null;
+const serviceDisplayPrice = (KB as any).serviceDisplayPrice as (p: any) => string | null;
+// Fallback local si el módulo no exporta MONEY_RE
+const KB_MONEY_RE: RegExp = (KB as any).MONEY_RE ?? /\$ ?\d{2,3}(?:\.\d{3})+(?:,\d+)?/g;
+
+// ==== Agenda (schedule) ====
+import {
+    getNextAvailableSlots,
+    createAppointmentSafe,
+    type Slot,
+} from "./esteticaModules/schedule/estetica.schedule";
+
+// ================== Config ==================
+const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000);
+const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000);
+const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000);
+const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000);
+
+const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5);
+const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000);
+const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 180);
+const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? "0") === "1";
+
+// ================== Utils ==================
+const processedInbound = new Map<number, number>(); // messageId -> ts
+function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
+    const now = Date.now();
+    const prev = processedInbound.get(messageId);
+    if (prev && now - prev <= windowMs) return true;
+    processedInbound.set(messageId, now);
+    return false;
+}
+
+function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+
+function softTrim(s: string | null | undefined, max = 220) {
+    const t = (s || "").trim();
+    if (!t) return "";
+    return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
+}
+function approxTokens(str: string) { return Math.ceil((str || "").length / 4); }
+function clampConcise(text: string, maxLines = IA_MAX_LINES): string {
+    let t = String(text || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    const lines = t ? t.split("\n").filter(Boolean) : [];
+    if (lines.length > maxLines) {
+        t = lines.slice(0, maxLines).join("\n").trim();
+        if (!/[.!?…]$/.test(t)) t += "…";
+    }
+    return t;
+}
+function formatConcise(
+    text: string,
+    maxLines = IA_MAX_LINES,
+    _maxChars = IA_MAX_CHARS,
+    allowEmoji = IA_ALLOW_EMOJI
+): string {
+    let t = String(text || "").trim();
+    if (!t) return "Gracias por escribirnos. ¿Cómo puedo ayudarte?";
+    t = t.replace(/^[•\-]\s*/gm, "").replace(/\s+\n/g, "\n").replace(/\n{2,}/g, "\n").trim();
+    t = clampConcise(t, maxLines);
+    if (allowEmoji && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
+        const EMOJIS = ["🙂", "💡", "👌", "✅", "✨", "🧴", "💬", "🫶"];
+        t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`;
+        t = clampConcise(t, maxLines);
+    }
+    return t;
+}
+function closeNicely(raw: string): string {
+    let t = (raw || "").trim();
+    if (!t) return t;
+    if (/[.!?…]\s*$/.test(t)) return t;
+    t = t.replace(/\s+[^\s]*$/, "").trim();
+    if (!t) return raw.trim();
+    return `${t}…`;
+}
+
+function normalizeToE164(n: string) { return String(n || "").replace(/[^\d]/g, ""); }
+function formatCOP(value?: number | null): string | null {
+    if (value == null || isNaN(Number(value))) return null;
+    return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 })
+        .format(Number(value));
+}
+
+// ================== Imagen & Voz ==================
+function mentionsImageExplicitly(t: string) {
+    const s = String(t || "").toLowerCase();
+    return (
+        /\b(foto|imagen|selfie|captura|screenshot)\b/.test(s) ||
+        /(mira|revisa|checa|verifica)\s+la\s+(foto|imagen)/.test(s) ||
+        /(te\s+mand(e|é)|te\s+envi(e|é))\s+(la\s+)?(foto|imagen)/.test(s) ||
+        /\b(de|en)\s+la\s+(foto|imagen)\b/.test(s)
+    );
+}
+
+async function pickImageForContext(opts: {
+    conversationId: number;
+    directUrl?: string | null;
     userText: string;
-    knownName?: string | null;
-    knownPhone?: string | null;
+    caption: string;
+    referenceTs: Date;
+}) {
+    const { conversationId, directUrl, userText, caption, referenceTs } = opts;
+
+    if (directUrl) {
+        return { url: String(directUrl), noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : "" };
+    }
+
+    if (!userText) return { url: null as string | null, noteToAppend: "" };
+
+    // 1) Ventana corta (último minuto aprox.)
+    const veryRecent = await prisma.message.findFirst({
+        where: {
+            conversationId,
+            from: MessageFrom.client,
+            mediaType: MediaType.image,
+            timestamp: { gte: new Date(referenceTs.getTime() - IMAGE_CARRY_MS), lte: referenceTs },
+        },
+        orderBy: { timestamp: "desc" },
+        select: { mediaUrl: true, caption: true },
+    });
+    if (veryRecent?.mediaUrl) {
+        const note = veryRecent.caption ? `\n\nNota de la imagen: ${veryRecent.caption}` : "";
+        return { url: String(veryRecent.mediaUrl), noteToAppend: note };
+    }
+
+    // 2) Mención explícita → lookback más largo
+    if (mentionsImageExplicitly(userText)) {
+        const referenced = await prisma.message.findFirst({
+            where: {
+                conversationId,
+                from: MessageFrom.client,
+                mediaType: MediaType.image,
+                timestamp: { gte: new Date(referenceTs.getTime() - IMAGE_LOOKBACK_MS), lte: referenceTs },
+            },
+            orderBy: { timestamp: "desc" },
+            select: { mediaUrl: true, caption: true },
+        });
+        if (referenced?.mediaUrl) {
+            const note = referenced.caption ? `\n\nNota de la imagen: ${referenced.caption}` : "";
+            return { url: String(referenced.mediaUrl), noteToAppend: note };
+        }
+    }
+
+    return { url: null as string | null, noteToAppend: "" };
+}
+
+// ================== Persistencia + envío WhatsApp ==================
+async function persistBotReply({
+    conversationId,
+    empresaId,
+    texto,
+    nuevoEstado,
+    to,
+    phoneNumberId,
+}: {
+    conversationId: number;
+    empresaId: number;
+    texto: string;
+    nuevoEstado: ConversationEstado;
+    to?: string | null;
+    phoneNumberId?: string | null;
+}) {
+    const msg = await prisma.message.create({
+        data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId },
+    });
+
+    await prisma.conversation.update({
+        where: { id: conversationId },
+        data: { estado: nuevoEstado },
+    });
+
+    let wamid: string | undefined;
+    if (to && String(to).trim()) {
+        try {
+            const resp = await Wam.sendWhatsappMessage({
+                empresaId,
+                to: normalizeToE164(to),
+                body: texto,
+                phoneNumberIdHint: phoneNumberId || undefined,
+            });
+            wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id;
+            if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } });
+        } catch (e) {
+            if (process.env.DEBUG_AI === "1") console.error("[WAM send error]", (e as any)?.message || e);
+        }
+    }
+    return { messageId: msg.id, texto, wamid };
+}
+
+// ================== Conversación compacta para LLM ==================
+async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 8) {
+    const where: Prisma.MessageWhereInput = { conversationId };
+    if (excludeMessageId) where.id = { not: excludeMessageId };
+
+    const rows = await prisma.message.findMany({
+        where,
+        orderBy: { timestamp: "asc" },
+        take,
+        select: { from: true, contenido: true },
+    });
+
+    return rows.map((r) => ({
+        role: r.from === MessageFrom.client ? "user" : "assistant",
+        content: softTrim(r.contenido || "", 200),
+    }));
+}
+
+function budgetMessages(messages: any[], budgetPromptTokens = 120) {
+    const sys = messages.find((m: any) => m.role === "system");
+    const user = messages.find((m: any) => m.role === "user");
+    if (!sys) return messages;
+
+    const sysText = String(sys.content || "");
+    const userText =
+        typeof user?.content === "string"
+            ? user?.content
+            : Array.isArray(user?.content)
+                ? String(user?.content?.[0]?.text || "")
+                : "";
+
+    let total = approxTokens(sysText) + approxTokens(userText);
+    for (const m of messages) {
+        if (m.role !== "system" && m !== user) {
+            const t =
+                typeof m.content === "string"
+                    ? m.content
+                    : Array.isArray(m.content)
+                        ? String(m.content?.[0]?.text || "")
+                        : "";
+            total += approxTokens(t);
+        }
+    }
+    if (total <= budgetPromptTokens) return messages;
+
+    // recorta el system a lo esencial
+    const lines = sysText.split("\n").map((l: string) => l.trim()).filter(Boolean);
+    const keep: string[] = [];
+    for (const l of lines) {
+        if (/clínica estética|agenda|servicios|precios|tono/i.test(l)) keep.push(l);
+        if (keep.length >= 7) break;
+    }
+    (sys as any).content = keep.join("\n") || lines.slice(0, 7).join("\n");
+
+    if (typeof user?.content === "string") {
+        const ut = String(user.content);
+        user.content = ut.length > 240 ? ut.slice(0, 240) : ut;
+    } else if (Array.isArray(user?.content)) {
+        const ut = String(user.content?.[0]?.text || "");
+        (user.content as any[])[0].text = softTrim(ut, 240);
+    }
+    return messages;
+}
+
+// ================== Intents mínimos ==================
+function isCatalogQuery(t: string) {
+    const s = ` ${(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()} `;
+    const nouns = ["servicio", "servicios", "procedimiento", "procedimientos", "tratamiento", "tratamientos", "catalogo", "catálogo"];
+    const intents = ["que ", "qué ", "cuales", "cuáles", "lista", "disponible", "ofrecen", "tienes", "hay", "oferta", "precios", "precio"];
+    const hitNoun = nouns.some((k) => s.includes(` ${k} `));
+    const hitIntent = intents.some((k) => s.includes(k));
+    return hitNoun || hitIntent;
+}
+function asksPrice(t: string) {
+    const s = (t || "").toLowerCase();
+    return /\b(precio|costo|valor|tarifa)\b/i.test(s) || /\bcu[aá]nto\s+(vale|sale)\b/i.test(s);
+}
+
+// ================== Tipos públicos ==================
+export type IAReplyResult = {
+    estado: ConversationEstado;
+    mensaje: string;
+    messageId?: number;
+    wamid?: string;
+    media?: any[];
 };
 
-export type EsteticaAgentResult = {
-    text: string;
-    meta?: {
-        bookedId?: number;
-        shownSlots?: Array<{ date: string; times: string[] }>;
-        detectedService?: string | null;
-    };
-};
+// ================== Agente principal ==================
+export async function handleEsteticaReply(args: {
+    chatId: number;
+    empresaId: number;
+    mensajeArg?: string;
+    toPhone?: string | null;
+    phoneNumberId?: string | null;
+}): Promise<IAReplyResult> {
+    const { chatId, empresaId, mensajeArg = "", toPhone, phoneNumberId } = args;
 
-const money = (n?: number | null) =>
-    typeof n === "number" ? n.toLocaleString("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }) : "";
+    // Conversación + último inbound
+    const conversacion = await prisma.conversation.findUnique({
+        where: { id: chatId },
+        select: { id: true, estado: true, phone: true, empresaId: true },
+    });
+    if (!conversacion) return { estado: ConversationEstado.pendiente, mensaje: "" };
 
-// Helper formato con TZ (usa date-fns-tz v1)
-function formatInTZ(d: Date, tz: string, fmt: string) {
-    const zoned = utcToZonedTime(d, tz);
-    return tzFormat(zoned, fmt, { timeZone: tz });
-}
+    const last = await prisma.message.findFirst({
+        where: { conversationId: chatId, from: MessageFrom.client },
+        orderBy: { timestamp: "desc" },
+        select: {
+            id: true,
+            mediaType: true,
+            mediaUrl: true,
+            caption: true,
+            isVoiceNote: true,
+            transcription: true,
+            contenido: true,
+            mimeType: true,
+            timestamp: true,
+        },
+    });
 
-function extractPhone(text: string): string | null {
-    const m = text.replace(/[^\d+]/g, " ").match(/(\+?\d{7,15})/);
-    return m?.[1] ?? null;
-}
-function extractName(text: string): string | null {
-    const m = text.match(/\b(soy|me llamo|mi nombre es)\s+([A-Za-zÀ-ÿ'\s]+)/i);
-    return m ? m[2].trim() : null;
-}
-function isAskingAvailability(text: string) {
-    const t = text.toLowerCase();
-    return /hora|cita|disponible|agenda|agendar|cuándo|cuando|disponibilidad|turno/.test(t);
-}
-function isAskingServices(text: string) {
-    const t = text.toLowerCase();
-    return /servicios|qué ofrecen|procedimientos|precios|tratamientos|hacen/.test(t);
-}
+    // Idempotencia inbound
+    if (last?.id && seenInboundRecently(last.id)) {
+        return { estado: conversacion.estado, mensaje: "" };
+    }
 
-/** Agente full-chat para Estética */
-export async function esteticaAgentReply(input: EsteticaAgentInput): Promise<EsteticaAgentResult> {
-    const { empresaId, vertical = "estetica", userText, knownName, knownPhone } = input;
-
-    const kb = await loadEsteticaKB({ empresaId, vertical });
+    // KB
+    const kb = await loadEsteticaKB({ empresaId, vertical: "estetica" });
     if (!kb) {
-        return { text: "Hola 👋 Aún no tengo la configuración de agenda. Cuéntame qué servicio buscas y te apoyo mientras tanto." };
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: "Ahora mismo no tengo la configuración completa de la clínica. Te comunico con un asesor humano. 🙏",
+            nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return { estado: ConversationEstado.requiere_agente, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    const name = knownName || extractName(userText);
-    const phone = knownPhone || extractPhone(userText);
-
-    const { procedure } = resolveServiceName(kb, userText);
-
-    // 1) Catálogo de servicios
-    if (!procedure && isAskingServices(userText)) {
-        const list = kb.procedures
-            .slice(0, 20)
-            .map((p) => `• ${p.name}${typeof p.priceMin === "number" ? ` (Desde ${money(p.priceMin)})` : ""}`)
-            .join("\n");
-
-        return {
-            text:
-                `¡Hola${name ? " " + name : ""}! En ${kb.businessName ?? "nuestra clínica"} ofrecemos:\n\n${list}\n\n` +
-                `Dime cuál te interesa y miro agenda. Si prefieres, cuéntame qué quieres mejorar y te recomiendo 😉`,
-            meta: { detectedService: null },
-        };
+    // Texto del usuario (voz → transcripción si hace falta)
+    let userText = (mensajeArg || "").trim();
+    if (!userText && last?.isVoiceNote) {
+        let transcript = (last.transcription || "").trim();
+        if (!transcript) {
+            try {
+                let audioBuf: Buffer | null = null;
+                if (last.mediaUrl && /^https?:\/\//i.test(String(last.mediaUrl))) {
+                    const { data } = await axios.get(String(last.mediaUrl), { responseType: "arraybuffer", timeout: 30000 });
+                    audioBuf = Buffer.from(data);
+                }
+                if (audioBuf) {
+                    const name = last.mimeType?.includes("mpeg")
+                        ? "audio.mp3"
+                        : last.mimeType?.includes("wav")
+                            ? "audio.wav"
+                            : last.mimeType?.includes("m4a")
+                                ? "audio.m4a"
+                                : last.mimeType?.includes("webm")
+                                    ? "audio.webm"
+                                    : "audio.ogg";
+                    transcript = await transcribeAudioBuffer(audioBuf, name);
+                    if (transcript) await prisma.message.update({ where: { id: last.id }, data: { transcription: transcript } });
+                }
+            } catch (e) {
+                if (process.env.DEBUG_AI === "1") console.error("[EST] Transcription error:", (e as any)?.message || e);
+            }
+        }
+        if (transcript) userText = transcript;
     }
 
-    // 2) Disponibilidad: ofrecer primeros cupos del día siguiente
-    if (procedure || isAskingAvailability(userText)) {
-        const durationMin = procedure?.durationMin ?? kb.defaultServiceDurationMin ?? 45;
+    const isImage = last?.mediaType === MediaType.image && !!last?.mediaUrl;
+    const imageUrl = isImage ? String(last?.mediaUrl) : null;
+    const caption = String(last?.caption || "").trim();
+    const referenceTs = last?.timestamp ?? new Date();
+
+    // Si llega solo imagen sin texto, espera breve a que escriban
+    if (isImage && !caption && !userText) {
+        await sleep(IMAGE_WAIT_MS);
+        return { estado: conversacion.estado, mensaje: "" };
+    }
+
+    // ===== Intentos de agenda simples
+    const looksLikeAgenda = /\b(cita|agendar|agenda|horario|disponibilidad|turno)\b/i.test(userText || caption);
+    const serviceMatch = resolveServiceName(kb, userText || caption || "");
+    const service = serviceMatch?.procedure ?? null;
+
+    if (looksLikeAgenda) {
+        const durationMin = service?.durationMin ?? kb.defaultServiceDurationMin ?? 45;
         const tz = kb.timezone || "America/Bogota";
         const bufferMin = kb.bufferMin ?? 10;
 
-        // día siguiente en TZ → "yyyy-MM-dd"
-        const todayLocal = tzFormat(utcToZonedTime(new Date(), tz), "yyyy-MM-dd", { timeZone: tz });
-        const next = new Date(`${todayLocal}T00:00:00`);
-        const d2 = new Date(next.getTime() + 24 * 60 * 60 * 1000);
-        const y = d2.getFullYear();
-        const m = String(d2.getMonth() + 1).padStart(2, "0");
-        const dd = String(d2.getDate()).padStart(2, "0");
-        const startingDate = `${y}-${m}-${dd}`;
+        // día siguiente (yyyy-MM-dd) — simple y robusto
+        const today = new Date();
+        const next = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1));
+        const y = next.getUTCFullYear();
+        const m = String(next.getUTCMonth() + 1).padStart(2, "0");
+        const d = String(next.getUTCDate()).padStart(2, "0");
+        const startingDate = `${y}-${m}-${d}`;
 
-        const nextSlots = await getNextAvailableSlots(
-            { empresaId, vertical, timezone: tz, bufferMin, granularityMin: 15 },
+        const found = await getNextAvailableSlots(
+            { empresaId, vertical: "estetica", timezone: tz, bufferMin, granularityMin: 15 },
             startingDate,
             durationMin,
             14,
             6
         );
 
-        if (!nextSlots.length) {
-            return {
-                text:
-                    `No veo cupos cercanos para ${procedure ? procedure.name : "agendar"}. ` +
-                    `¿Te aviso apenas se libere un espacio o prefieres otra fecha/sede?`,
-                meta: { detectedService: procedure?.name ?? null },
-            };
+        if (found.length) {
+            const pretty = found
+                .map((day) => {
+                    const times = day.slots.slice(0, 3).map((s) => s.startISO.slice(11, 16)).join(", ");
+                    return `• ${day.date}: ${times}${day.slots.length > 3 ? "…" : ""}`;
+                })
+                .join("\n");
+
+            const svcLine = service
+                ? `Perfecto, para *${service.name}*${typeof service.priceMin === "number" ? ` (Desde ${serviceDisplayPrice(service)})` : ""}. `
+                : "";
+
+            const txt = `${svcLine}Puedo ofrecerte estos cupos próximos:\n\n${pretty}\n\n` +
+                `Para reservar, dime cuál te sirve y tu *nombre* y *teléfono* para confirmarla.`;
+
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: txt,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
-
-        const shown = nextSlots.map((day) => ({
-            date: day.date,
-            times: day.slots.map((s) => formatInTZ(new Date(s.startISO), tz, "HH:mm")),
-        }));
-
-        const pretty = shown
-            .map((day) => {
-                const label = tzFormat(utcToZonedTime(new Date(`${day.date}T00:00:00`), tz), "eeee d 'de' LLL", { timeZone: tz });
-                const times = day.times.slice(0, 3).join(", ");
-                return `• ${label}: ${times}${day.times.length > 3 ? "…" : ""}`;
-            })
-            .join("\n");
-
-        const svc = procedure
-            ? `Perfecto, para *${procedure.name}*${typeof procedure.priceMin === "number" ? ` (Desde ${money(procedure.priceMin)})` : ""}. `
-            : "";
-
-        return {
-            text:
-                `${svc}Puedo ofrecerte estos cupos próximos:\n\n${pretty}\n\n` +
-                `Para reservar, dime cuál opción te sirve y tu *nombre* y *teléfono* para confirmarla.` +
-                `${!name || !phone ? " (si ya me los diste, perfecto; si no, compártelos 🙌)" : ""}`,
-            meta: { detectedService: procedure?.name ?? null, shownSlots: shown },
-        };
     }
 
-    // 3) Conversación natural
-    return {
-        text:
-            `¡Hola${name ? " " + name : ""}! Soy tu asistente de ${kb.businessName ?? "nuestra clínica"}. ` +
-            `¿Qué te gustaría mejorar (piel, contorno, manchas, etc.)? Te oriento y, si quieres, miro agenda. 😉`,
-    };
-}
+    // ===== Si preguntan por catálogo o precios: responde con datos concretos
+    if (isCatalogQuery(userText || caption || "")) {
+        const procs = Array.isArray(kb.procedures) ? kb.procedures : [];
+        const list = procs
+            .slice(0, 20)
+            .map((p: any) => `• ${p?.name ?? "Procedimiento"}${typeof p?.priceMin === "number" ? ` (Desde ${serviceDisplayPrice(p)})` : ""}`)
+            .join("\n");
 
-/** Agendar cuando el usuario ya eligió slot (recibe ISO con offset) */
-export async function bookConfirmedSlot(params: {
-    empresaId: number;
-    vertical?: AppointmentVertical | "custom";
-    procedureId: number | null;
-    procedureTitle: string;
-    customerName: string;
-    customerPhone: string;
-    startISO: string; // ej "2025-10-12T10:00:00-05:00"
-    endISO: string;
-    notes?: string | null;
-}): Promise<EsteticaAgentResult> {
-    const { empresaId, vertical = "estetica", procedureId, procedureTitle, customerName, customerPhone, startISO, endISO, notes } = params;
+        const txt = list
+            ? `Ofrecemos:\n\n${list}\n\n¿Quieres ver horarios para alguno?`
+            : `Por ahora no veo servicios configurados para agendar. Si quieres, te doy orientación general.`;
 
-    const cfg = await prisma.businessConfigAppt.findUnique({
-        where: { empresaId },
-        select: { appointmentTimezone: true },
-    });
-    const tz = cfg?.appointmentTimezone || "America/Bogota";
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: txt,
+            nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
 
-    const appt = await createAppointmentSafe({
+    // ===== LLM con imagen contextual (mejora de contexto para evitar “¿más info?”)
+    let effectiveImageUrl = isImage ? imageUrl : null;
+    let textForLLM = (userText || caption || "Hola").trim();
+    if (!effectiveImageUrl && textForLLM) {
+        const picked = await pickImageForContext({
+            conversationId: chatId,
+            directUrl: null,
+            userText: textForLLM,
+            caption,
+            referenceTs,
+        });
+        effectiveImageUrl = picked.url;
+        if (picked.noteToAppend) textForLLM = `${textForLLM}${picked.noteToAppend}`;
+    }
+
+    // ===== System prompt seguro (sin encadenado inseguro)
+    type KBTexts = { businessOverview?: string; disclaimers?: string };
+    type KBLogistics = { locationAddress?: string; locationName?: string };
+    const businessName: string = (kb as any)?.businessName ?? "";
+    const kbTexts: KBTexts | undefined = (kb as any)?.kbTexts ?? undefined;
+    const logistics: KBLogistics | undefined = (kb as any)?.logistics ?? undefined;
+    const isString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+
+    const system = [
+        businessName ? `Agente de clínica estética de "${businessName}".` : `Agente de clínica estética.`,
+        "Tono: humano, cercano y profesional. Nada robótico. Responde breve (2-5 líneas) y específica.",
+        "Foco: orientación de tratamientos y agenda.",
+        "Para *agendar* o *listar* procedimientos usa solo los de la base de datos.",
+        "Si preguntan por precio, usa el formato: \"Desde $X (COP)\" con priceMin.",
+        "Si notas intención de agendar, ofrece 3 a 5 horarios próximos (usa 'Puedo ofrecerte…').",
+        kbTexts?.businessOverview ? `Contexto: ${softTrim(kbTexts.businessOverview, 220)}` : "",
+        logistics?.locationAddress ? `Dirección: ${logistics.locationAddress}` : "",
+        logistics?.locationName ? `Sede: ${logistics.locationName}` : "",
+        kbTexts?.disclaimers ? `Avisos: ${softTrim(kbTexts.disclaimers, 180)}` : "",
+        "Evita pedir 'más información' de forma genérica. Si falta un dato, pregunta 1 cosa concreta.",
+    ].filter(isString).join("\n");
+
+    const history = await getRecentHistory(chatId, last?.id, 8);
+    const messages: any[] = [{ role: "system", content: system }, ...history];
+    if (effectiveImageUrl) {
+        messages.push({
+            role: "user",
+            content: [
+                { type: "text", text: textForLLM || "Hola" },
+                { type: "image_url", image_url: { url: effectiveImageUrl } },
+            ],
+        });
+    } else {
+        messages.push({ role: "user", content: textForLLM || "Hola" });
+    }
+    budgetMessages(messages, 120);
+
+    const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini";
+    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.4);
+
+    let texto = "";
+    try {
+        const resp = await (openai.chat.completions.create as any)({
+            model, temperature, max_tokens: IA_MAX_TOKENS, messages,
+        });
+        texto = resp?.choices?.[0]?.message?.content?.trim() || "";
+    } catch {
+        texto = "Te ayudo con estética y agenda. Si quieres, te paso horarios.";
+    }
+
+    // Blindaje de montos inventados si no pidieron precio
+    if (!asksPrice(userText || caption || "")) {
+        if (KB_MONEY_RE.test(texto)) texto = texto.replace(KB_MONEY_RE, "consulta por precio");
+    }
+
+    texto = closeNicely(texto);
+    texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI);
+
+    const saved = await persistBotReply({
+        conversationId: chatId,
         empresaId,
-        vertical,
-        timezone: tz,
-        procedureId,
-        serviceName: procedureTitle,
-        customerName,
-        customerPhone,
-        startISO,
-        endISO,
-        notes: notes ?? undefined,
-        source: "ai",
+        texto,
+        nuevoEstado: ConversationEstado.respondido,
+        to: toPhone ?? conversacion.phone,
+        phoneNumberId,
     });
 
-    const startText = tzFormat(utcToZonedTime(appt.startAt, tz), "eeee d 'de' LLL, HH:mm", { timeZone: tz });
-
     return {
-        text:
-            `¡Listo! Reservé tu cita para ${startText} (${tz}). ` +
-            `Te enviaré recordatorio antes del día. Si necesitas cambiarla, me avisas por aquí. 🙌`,
-        meta: { bookedId: appt.id },
+        estado: ConversationEstado.respondido,
+        mensaje: saved.texto,
+        messageId: saved.messageId,
+        wamid: saved.wamid,
+        media: [],
     };
 }
