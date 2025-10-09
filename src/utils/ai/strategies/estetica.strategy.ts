@@ -1716,9 +1716,14 @@ async function persistBotReply({
                 phoneNumberIdHint: phoneNumberId || undefined,
             });
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id;
+
+            if (!wamid && process.env.DEBUG_AI === "1") {
+                console.error("[WAM send warning] No WAM ID in response:", JSON.stringify(resp));
+            }
+
             if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } });
-        } catch (e) {
-            if (process.env.DEBUG_AI === "1") console.error("[WAM send error]", (e as any)?.message || e);
+        } catch (e: any) {
+            console.error("[WAM send error]", e?.response?.data || e?.message || e);
         }
     }
     return { messageId: msg.id, texto, wamid };
@@ -1864,7 +1869,11 @@ export async function handleEsteticaReply(args: {
     }
 
     // Texto del usuario (voz → transcripción si hace falta)
-    let userText = (mensajeArg || "").trim();
+    // 1) mensajeArg
+    // 2) si viene vacío, usa el último texto del cliente guardado en BD (last.contenido)
+    // 3) si era nota de voz y no hay texto, transcribe
+    let userText = (mensajeArg || last?.contenido || "").trim();
+
     if (!userText && last?.isVoiceNote) {
         let transcript = (last.transcription || "").trim();
         if (!transcript) {
@@ -1961,14 +1970,26 @@ export async function handleEsteticaReply(args: {
     // ===== Si preguntan por catálogo o precios: responde con datos concretos
     if (isCatalogQuery(userText || caption || "")) {
         const procs = Array.isArray(kb.procedures) ? kb.procedures : [];
+        if (!procs.length) {
+            const savedEmpty = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto:
+                    "Por ahora no veo servicios configurados para agendar. Si quieres, te doy orientación general y te ayudo a elegir. " +
+                    "Si eres administrador, agrega procedimientos en *estetica_procedure* para que pueda listarlos aquí.",
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return { estado: ConversationEstado.en_proceso, mensaje: savedEmpty.texto, messageId: savedEmpty.messageId, wamid: savedEmpty.wamid, media: [] };
+        }
+
         const list = procs
             .slice(0, 20)
             .map((p: any) => `• ${p?.name ?? "Procedimiento"}${typeof p?.priceMin === "number" ? ` (Desde ${serviceDisplayPrice(p)})` : ""}`)
             .join("\n");
 
-        const txt = list
-            ? `Ofrecemos:\n\n${list}\n\n¿Quieres ver horarios para alguno?`
-            : `Por ahora no veo servicios configurados para agendar. Si quieres, te doy orientación general.`;
+        const txt = `Ofrecemos:\n\n${list}\n\n¿Quieres ver horarios para alguno?`;
 
         const saved = await persistBotReply({
             conversationId: chatId,
