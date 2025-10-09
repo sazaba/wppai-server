@@ -359,12 +359,24 @@
 //     return null;
 // }
 
+
+
 // utils/ai/strategies/esteticaModules/domain/estetica.kb.ts
 import prisma from "../../../../../lib/prisma";
-import type {
-    AppointmentVertical,
-    StaffRole,
-} from "@prisma/client";
+import type { AppointmentVertical, StaffRole } from "@prisma/client";
+
+/** ==== Util precio COP ==== */
+export function formatCOP(value?: number | null): string | null {
+    if (value == null || isNaN(Number(value))) return null;
+    return new Intl.NumberFormat("es-CO", {
+        style: "currency",
+        currency: "COP",
+        maximumFractionDigits: 0,
+    }).format(Number(value));
+}
+
+/** Regex robusto para montos en COP tipo $120.000 / 120.000 COP / $ 1.200.000 */
+export const MONEY_RE = /\b(?:COP\s*)?\$?\s?\d{1,3}(?:\.\d{3})+(?:,\d+)?\s?(?:COP)?\b/gi;
 
 /** KB del negocio para la vertical de estética (con info operativa y catálogo) */
 export type EsteticaKB = {
@@ -434,9 +446,7 @@ type LoadKBInput = {
     vertical?: AppointmentVertical | "custom";
 };
 
-export async function loadEsteticaKB(
-    params: LoadKBInput
-): Promise<EsteticaKB | null> {
+export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | null> {
     const { empresaId, vertical = "estetica" as AppointmentVertical } = params;
 
     const [empresa, apptCfg, procedures, staff, exceptions] = await Promise.all([
@@ -520,10 +530,10 @@ export async function loadEsteticaKB(
             aliases: Array.isArray(p.aliases) ? (p.aliases as string[]) : [],
             durationMin: p.durationMin ?? null,
             requiresAssessment: p.requiresAssessment ?? false,
-            priceMin: p.priceMin ? Number(p.priceMin) : null,
-            priceMax: p.priceMax ? Number(p.priceMax) : null,
+            priceMin: p.priceMin != null ? Number(p.priceMin) : null, // <- Decimal a number
+            priceMax: p.priceMax != null ? Number(p.priceMax) : null,
             depositRequired: p.depositRequired ?? false,
-            depositAmount: p.depositAmount ? Number(p.depositAmount) : null,
+            depositAmount: p.depositAmount != null ? Number(p.depositAmount) : null,
             prepInstructions: p.prepInstructions ?? null,
             postCare: p.postCare ?? null,
             contraindications: p.contraindications ?? null,
@@ -557,4 +567,10 @@ export function resolveServiceName(
         }
     }
     return { procedure: null, matched: null };
+}
+
+/** Etiqueta “Desde $X (COP)” usando priceMin */
+export function serviceDisplayPrice(proc: { priceMin?: number | null }): string | null {
+    const f = formatCOP(proc?.priceMin ?? null);
+    return f ? `${f} (COP)` : null;
 }

@@ -1519,8 +1519,6 @@
 
 
 // utils/ai/strategies/estetica.strategy.ts
-// Full chat para Estética con WhatsApp send, imagen contextual, transcripción de voz,
-// oferta de horarios y agendamiento seguro. Compatible con TS strict + CommonJS.
 
 import axios from "axios";
 import prisma from "../../../lib/prisma";
@@ -1531,16 +1529,15 @@ import { ConversationEstado, MediaType, MessageFrom } from "@prisma/client";
 import * as Wam from "../../../services/whatsapp.service";
 import { transcribeAudioBuffer } from "../../../services/transcription.service";
 
-// ==== KB (import seguro, con fallback para MONEY_RE) ====
-import * as KB from "./esteticaModules/domain/estetica.kb";
-// Named exports (si existen):
-const loadEsteticaKB = (KB as any).loadEsteticaKB as (args: { empresaId: number; vertical?: AppointmentVertical | "custom" }) => Promise<any>;
-const resolveServiceName = (KB as any).resolveServiceName as (kb: any, text: string) => { procedure?: any } | null;
-const serviceDisplayPrice = (KB as any).serviceDisplayPrice as (p: any) => string | null;
-// Fallback local si el módulo no exporta MONEY_RE
-const KB_MONEY_RE: RegExp = (KB as any).MONEY_RE ?? /\$ ?\d{2,3}(?:\.\d{3})+(?:,\d+)?/g;
+import {
+    loadEsteticaKB,
+    resolveServiceName,
+    serviceDisplayPrice,
+    MONEY_RE as KB_MONEY_RE,
+    type EsteticaKB,
+    formatCOP,
+} from "./esteticaModules/domain/estetica.kb";
 
-// ==== Agenda (schedule) ====
 import {
     getNextAvailableSlots,
     createAppointmentSafe,
@@ -1612,11 +1609,6 @@ function closeNicely(raw: string): string {
 }
 
 function normalizeToE164(n: string) { return String(n || "").replace(/[^\d]/g, ""); }
-function formatCOP(value?: number | null): string | null {
-    if (value == null || isNaN(Number(value))) return null;
-    return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 })
-        .format(Number(value));
-}
 
 // ================== Imagen & Voz ==================
 function mentionsImageExplicitly(t: string) {
@@ -1644,7 +1636,7 @@ async function pickImageForContext(opts: {
 
     if (!userText) return { url: null as string | null, noteToAppend: "" };
 
-    // 1) Ventana corta (último minuto aprox.)
+    // 1) Ventana corta
     const veryRecent = await prisma.message.findFirst({
         where: {
             conversationId,
@@ -1677,7 +1669,6 @@ async function pickImageForContext(opts: {
             return { url: String(referenced.mediaUrl), noteToAppend: note };
         }
     }
-
     return { url: null as string | null, noteToAppend: "" };
 }
 
@@ -1729,7 +1720,7 @@ async function persistBotReply({
     return { messageId: msg.id, texto, wamid };
 }
 
-// ================== Conversación compacta para LLM ==================
+// ================== Historial compacto ==================
 async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 8) {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
@@ -1855,7 +1846,7 @@ export async function handleEsteticaReply(args: {
     }
 
     // KB
-    const kb = await loadEsteticaKB({ empresaId, vertical: "estetica" });
+    const kb = (await loadEsteticaKB({ empresaId, vertical: "estetica" })) as EsteticaKB | null;
     if (!kb) {
         const saved = await persistBotReply({
             conversationId: chatId,
@@ -1868,10 +1859,7 @@ export async function handleEsteticaReply(args: {
         return { estado: ConversationEstado.requiere_agente, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // Texto del usuario (voz → transcripción si hace falta)
-    // 1) mensajeArg
-    // 2) si viene vacío, usa el último texto del cliente guardado en BD (last.contenido)
-    // 3) si era nota de voz y no hay texto, transcribe
+    // Texto del usuario: 1) mensajeArg 2) último texto guardado 3) transcripción si era voz
     let userText = (mensajeArg || last?.contenido || "").trim();
 
     if (!userText && last?.isVoiceNote) {
@@ -1924,7 +1912,7 @@ export async function handleEsteticaReply(args: {
         const tz = kb.timezone || "America/Bogota";
         const bufferMin = kb.bufferMin ?? 10;
 
-        // día siguiente (yyyy-MM-dd) — simple y robusto
+        // día siguiente (yyyy-MM-dd)
         const today = new Date();
         const next = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1));
         const y = next.getUTCFullYear();
@@ -1948,8 +1936,9 @@ export async function handleEsteticaReply(args: {
                 })
                 .join("\n");
 
+            const fromLabel = service ? serviceDisplayPrice(service) : null;
             const svcLine = service
-                ? `Perfecto, para *${service.name}*${typeof service.priceMin === "number" ? ` (Desde ${serviceDisplayPrice(service)})` : ""}. `
+                ? `Perfecto, para *${service.name}*${fromLabel ? ` (Desde ${fromLabel})` : ""}. `
                 : "";
 
             const txt = `${svcLine}Puedo ofrecerte estos cupos próximos:\n\n${pretty}\n\n` +
@@ -1967,7 +1956,7 @@ export async function handleEsteticaReply(args: {
         }
     }
 
-    // ===== Si preguntan por catálogo o precios: responde con datos concretos
+    // ===== Catálogo / Precios
     if (isCatalogQuery(userText || caption || "")) {
         const procs = Array.isArray(kb.procedures) ? kb.procedures : [];
         if (!procs.length) {
@@ -1986,7 +1975,10 @@ export async function handleEsteticaReply(args: {
 
         const list = procs
             .slice(0, 20)
-            .map((p: any) => `• ${p?.name ?? "Procedimiento"}${typeof p?.priceMin === "number" ? ` (Desde ${serviceDisplayPrice(p)})` : ""}`)
+            .map((p) => {
+                const from = serviceDisplayPrice(p);
+                return `• ${p.name}${from ? ` (Desde ${from})` : ""}`;
+            })
             .join("\n");
 
         const txt = `Ofrecemos:\n\n${list}\n\n¿Quieres ver horarios para alguno?`;
@@ -2002,7 +1994,7 @@ export async function handleEsteticaReply(args: {
         return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // ===== LLM con imagen contextual (mejora de contexto para evitar “¿más info?”)
+    // ===== LLM con imagen contextual
     let effectiveImageUrl = isImage ? imageUrl : null;
     let textForLLM = (userText || caption || "Hola").trim();
     if (!effectiveImageUrl && textForLLM) {
@@ -2017,7 +2009,7 @@ export async function handleEsteticaReply(args: {
         if (picked.noteToAppend) textForLLM = `${textForLLM}${picked.noteToAppend}`;
     }
 
-    // ===== System prompt seguro (sin encadenado inseguro)
+    // ===== System prompt seguro
     type KBTexts = { businessOverview?: string; disclaimers?: string };
     type KBLogistics = { locationAddress?: string; locationName?: string };
     const businessName: string = (kb as any)?.businessName ?? "";
