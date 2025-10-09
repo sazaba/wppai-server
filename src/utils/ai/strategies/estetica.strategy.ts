@@ -22,6 +22,7 @@ import {
     loadEsteticaKB,
     resolveServiceName,
     serviceDisplayPrice,
+    MONEY_RE as KB_MONEY_RE,
 } from "./esteticaModules/domain/estetica.kb";
 import {
     findNextSlots,
@@ -35,7 +36,7 @@ import {
     fromLocalTZToUTC,
     fromUTCtoLocalTZ,
     combineLocalDateTime,
-    parseHHMM, // keep import (no-op safe)
+    parseHHMM,
 } from "./esteticaModules/datetime";
 
 /** ===== Config imagen/texto ===== */
@@ -47,7 +48,7 @@ const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_00
 /** ===== Respuesta breve ===== */
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5);
 const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000);
-const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 100);
+const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 160);
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? "0") === "1";
 
 /** ===== Idempotencia por inbound (sin DB) ===== */
@@ -63,7 +64,53 @@ function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS
 /** ===== Utils ===== */
 function sleep(ms: number) {
     return new Promise((res) => setTimeout(res, ms));
-} // no se usa para delay de respuesta
+}
+
+function softTrim(s: string | null | undefined, max = 140) {
+    const t = (s || "").trim();
+    if (!t) return "";
+    return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
+}
+function approxTokens(str: string) {
+    return Math.ceil((str || "").length / 4);
+}
+function clampConcise(text: string, maxLines = IA_MAX_LINES): string {
+    let t = String(text || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    const lines = t ? t.split("\n").filter(Boolean) : [];
+    if (lines.length > maxLines) {
+        t = lines.slice(0, maxLines).join("\n").trim();
+        if (!/[.!?…]$/.test(t)) t += "…";
+    }
+    return t;
+}
+function formatConcise(
+    text: string,
+    maxLines = IA_MAX_LINES,
+    _maxChars = IA_MAX_CHARS,
+    allowEmoji = IA_ALLOW_EMOJI
+): string {
+    let t = String(text || "").trim();
+    if (!t) return "Gracias por escribirnos. ¿Cómo puedo ayudarte?";
+    t = t.replace(/^[•\-]\s*/gm, "").replace(/\s+\n/g, "\n").replace(/\n{2,}/g, "\n").trim();
+    t = clampConcise(t, maxLines);
+    if (allowEmoji && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
+        const EMOJIS = ["🙂", "💡", "👌", "✅", "✨", "🧴", "💬", "🫶"];
+        t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`;
+        t = clampConcise(t, maxLines);
+    }
+    return t;
+}
+function endsWithPunctuation(t: string) {
+    return /[.!?…]\s*$/.test((t || "").trim());
+}
+function closeNicely(raw: string): string {
+    let t = (raw || "").trim();
+    if (!t) return t;
+    if (endsWithPunctuation(t)) return t;
+    t = t.replace(/\s+[^\s]*$/, "").trim();
+    if (!t) return raw.trim();
+    return `${t}…`;
+}
 
 /** Moneda: COP */
 function formatCOP(value?: number | null): string | null {
@@ -167,15 +214,14 @@ function isCatalogQuery(t: string) {
 /** ===== Intents mínimos (texto) ===== */
 function detectIntent(
     text: string
-): "saludo" | "faq" | "agendar" | "reagendar" | "cancelar" | "confirmar" | "smalltalk" {
+): "saludo" | "faq" | "agendar" | "reagendar" | "cancelar" | "confirmar" | "smalltalk" | "recomendar" {
     const t = text.toLowerCase();
-    if (/(confirmo|confirmar|sí,?\s*correcto|si,?\s*correcto|correcto|dale|listo|agéndala|agendala)/i.test(t))
-        return "confirmar";
+    if (/(confirmo|confirmar|sí,?\s*correcto|si,?\s*correcto|correcto|dale|listo|agéndala|agendala)/i.test(t)) return "confirmar";
     if (/(reagendar|cambiar|mover|otra hora|reprogramar)/i.test(t)) return "reagendar";
     if (/(cancelar|anular)/i.test(t)) return "cancelar";
     if (/(cita|agendar|agenda|programar|reservar)/i.test(t)) return "agendar";
-    if (/(horario|direccion|dónde|servicios|procedimientos|tratamientos|cat[aá]logo|precios|costo|valor)/i.test(t))
-        return "faq";
+    if (isRecoAsk(text)) return "recomendar";
+    if (/(horario|direccion|dónde|servicios|procedimientos|tratamientos|cat[aá]logo|precios|costo|valor)/i.test(t)) return "faq";
     if (/(hola|buen[oa]s|qué tal|como estas|saludo)/i.test(t)) return "saludo";
     if (isCatalogQuery(text)) return "faq";
     return "smalltalk";
@@ -193,6 +239,24 @@ function asksPrice(t: string) {
 
 /** ==== Follow-up de precio (“¿y el peeling?”) ==== */
 type LastIntentTag = "price" | "schedule";
+type DraftStage = "oferta" | "confirm" | "reagendar_pedir" | "reagendar_confirm" | "cancel_confirm";
+type Draft = {
+    empresaId: number;
+    serviceId?: number;
+    serviceName?: string;
+    duration?: number;
+    whenUTC?: string; // ISO
+    name?: string;
+    phone?: string;
+    stage?: DraftStage;
+    targetApptId?: number;
+
+    // Memoria de intención y cooldown
+    lastIntent?: LastIntentTag;
+    lastIntentAt?: number; // Date.now()
+    lastOfferAt?: number; // Date.now() cuando enviamos slots
+};
+
 function isFollowupPriceAsk(text: string, d?: Draft) {
     const s = (text || "").toLowerCase().trim();
     const looksLikeFollow =
@@ -202,7 +266,7 @@ function isFollowupPriceAsk(text: string, d?: Draft) {
     return looksLikeFollow && !!recent;
 }
 
-/** ==== Q&A de información de procedimiento (escape durante oferta) ==== */
+/** ==== Q&A clínica ==== */
 function isServiceInfoQuestion(t: string) {
     const s = (t || "").toLowerCase();
     return (
@@ -242,25 +306,6 @@ function readSvcDuration(svc: any, kbRules?: any): number | undefined {
 }
 
 /** ===== Estado temporal (borrador) ===== */
-type DraftStage = "oferta" | "confirm" | "reagendar_pedir" | "reagendar_confirm" | "cancel_confirm";
-type Draft = {
-    empresaId: number;
-    serviceId?: number;
-    serviceName?: string;
-    duration?: number;
-    whenUTC?: string; // ISO
-    name?: string;
-    phone?: string;
-    stage?: DraftStage;
-    // Para reagendar/cancelar:
-    targetApptId?: number;
-
-    // Memoria de intención y cooldown
-    lastIntent?: LastIntentTag;
-    lastIntentAt?: number; // Date.now()
-    lastOfferAt?: number; // Date.now() cuando enviamos slots
-};
-
 async function getDraft(chatId: number): Promise<Draft | undefined> {
     const last = await prisma.message.findFirst({
         where: {
@@ -279,11 +324,9 @@ async function getDraft(chatId: number): Promise<Draft | undefined> {
     }
 }
 async function putDraft(chatId: number, d: Draft) {
-    // Log a consola
     if (process.env.DEBUG_AI === "1") {
         console.debug("[EST][DRAFT]", { chatId, ...d });
     }
-    // Solo persistir como mensaje visible si se habilita explícitamente
     if (process.env.IA_DEBUG_DRAFT_TO_CHAT === "1") {
         await prisma.message.create({
             data: {
@@ -361,52 +404,7 @@ async function persistBotReply({
     return { messageId: msg.id, texto, wamid };
 }
 
-/** ===== prompt budgeting / formato breve ===== */
-function softTrim(s: string | null | undefined, max = 140) {
-    const t = (s || "").trim();
-    if (!t) return "";
-    return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
-}
-function approxTokens(str: string) {
-    return Math.ceil((str || "").length / 4);
-}
-function clampConcise(text: string, maxLines = IA_MAX_LINES, _maxChars = IA_MAX_CHARS): string {
-    let t = String(text || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    const lines = t ? t.split("\n").filter(Boolean) : [];
-    if (lines.length > maxLines) {
-        t = lines.slice(0, maxLines).join("\n").trim();
-        if (!/[.!?…]$/.test(t)) t += "…";
-    }
-    return t;
-}
-function formatConcise(
-    text: string,
-    maxLines = IA_MAX_LINES,
-    maxChars = IA_MAX_CHARS,
-    allowEmoji = IA_ALLOW_EMOJI
-): string {
-    let t = String(text || "").trim();
-    if (!t) return "Gracias por escribirnos. ¿Cómo puedo ayudarte?";
-    t = t.replace(/^[•\-]\s*/gm, "").replace(/\s+\n/g, "\n").replace(/\n{2,}/g, "\n").trim();
-    t = clampConcise(t, maxLines, maxChars);
-    if (allowEmoji && !/[^\w\s.,;:()¿?¡!…]/.test(t)) {
-        const EMOJIS = ["🙂", "💡", "👌", "✅", "✨", "🧴", "💬", "🫶"];
-        t = `${t} ${EMOJIS[Math.floor(Math.random() * EMOJIS.length)]}`;
-        t = clampConcise(t, maxLines, maxChars);
-    }
-    return t;
-}
-function endsWithPunctuation(t: string) {
-    return /[.!?…]\s*$/.test((t || "").trim());
-}
-function closeNicely(raw: string): string {
-    let t = (raw || "").trim();
-    if (!t) return t;
-    if (endsWithPunctuation(t)) return t;
-    t = t.replace(/\s+[^\s]*$/, "").trim();
-    if (!t) return raw.trim();
-    return `${t}…`;
-}
+/** ===== Prompt budgeting ===== */
 function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     const sys = messages.find((m: any) => m.role === "system");
     const user = messages.find((m: any) => m.role === "user");
@@ -437,20 +435,18 @@ function budgetMessages(messages: any[], budgetPromptTokens = 110) {
     const lines = sysText.split("\n").map((l: string) => l.trim()).filter(Boolean);
     const keep: string[] = [];
     for (const l of lines) {
-        if (
-            /Asistente de clínica estética|Responde en|Puedes usar|Mantente|Ámbito:|Incluye cuando|Sigue estas/i.test(l)
-        )
+        if (/Agente de clínica estética|Escritura: humana|Mantén el foco|Para \*agendar\*|Si mencionan|Menciona precios/i.test(l))
             keep.push(l);
-        if (keep.length >= 6) break;
+        if (keep.length >= 7) break;
     }
-    (sys as any).content = keep.join("\n") || lines.slice(0, 6).join("\n");
+    (sys as any).content = keep.join("\n") || lines.slice(0, 7).join("\n");
 
     if (typeof user?.content === "string") {
         const ut = String(user.content);
-        user.content = ut.length > 200 ? ut.slice(0, 200) : ut;
+        user.content = ut.length > 240 ? ut.slice(0, 240) : ut;
     } else if (Array.isArray(user?.content)) {
         const ut = String(user.content?.[0]?.text || "");
-        user.content[0].text = softTrim(ut, 200);
+        user.content[0].text = softTrim(ut, 240);
     }
     return messages;
 }
@@ -480,7 +476,7 @@ async function runChatWithBudget({
             model,
             messages,
             temperature,
-            max_tokens: 32,
+            max_tokens: 48,
         });
         return resp2?.choices?.[0]?.message?.content?.trim() || "";
     }
@@ -552,6 +548,66 @@ async function classifyIntentLLM(
     } catch {
         return "other";
     }
+}
+
+/** —— Saludo humano y variable —— */
+const GREET_VARIANTS = [
+    (n?: string) => (n ? `¡Hola ${n}! ¿En qué te ayudo hoy?` : `¡Hola! ¿En qué te ayudo hoy?`),
+    (n?: string) => (n ? `Hola ${n}, cuéntame qué tienes en mente.` : `Hola, cuéntame qué tienes en mente.`),
+    (n?: string) => (n ? `Qué gusto leerte, ${n}. Dime qué buscas y te guío.` : `Qué gusto leerte. Dime qué buscas y te guío.`),
+];
+function humanGreet(name?: string) {
+    const pick = GREET_VARIANTS[Math.floor(Math.random() * GREET_VARIANTS.length)];
+    return pick(name?.trim() || undefined);
+}
+
+/** —— Bolsita: pedir faltantes de forma natural —— */
+function askMissingFields(d: Draft) {
+    const missing: string[] = [];
+    if (!d.serviceId) missing.push("el *procedimiento* que te interesa");
+    if (!d.whenUTC) missing.push("la *fecha y hora* que prefieres");
+    if (!d.name) missing.push("tu *nombre*");
+    if (!d.phone) missing.push("tu *teléfono*");
+
+    if (!missing.length) return null;
+
+    if (missing.length === 1) return `Perfecto. Solo me falta ${missing[0]} para reservar.`;
+    if (missing.length === 2) return `Genial. Me faltan ${missing[0]} y ${missing[1]} para dejarte la reserva lista.`;
+    return `Te voy ayudando: dime ${missing.slice(0, -1).join(", ")} y ${missing.slice(-1)[0]} para reservar.`;
+}
+
+/** —— Intención “recomendar” —— */
+function isRecoAsk(t: string) {
+    const s = (t || "").toLowerCase();
+    return /\b(recomiend(a|as|e)|qué me recomiendas|no sé qué hacer|que me sirve|qué me puede(n)? servir|cuál conviene)\b/.test(s);
+}
+
+/** —— Recomendador simple desde KB —— */
+type RecoInput = { text: string; kb: any };
+function recommendServices({ text, kb }: RecoInput) {
+    const s = norm(text);
+    const goals = [
+        { key: /acne|acn[eé]|espinilla|grano/, tag: /limpieza|facial|peeling|acn/i },
+        { key: /mancha|melasma|hiperpig/, tag: /peeling|facial|mancha|laser/i },
+        { key: /arruga|linea|línea|flacidez|antiage|anti-edad/, tag: /toxina|botul|relleno|hilo|radio/i },
+        { key: /vello|depilacion|depilación/, tag: /depilaci|laser/i },
+        { key: /poros|textura|brillo/, tag: /limpieza|peeling|facial/i },
+    ];
+    const enabled = (kb?.services ?? []).filter((x: any) => x && x.enabled !== false);
+    const hits: any[] = [];
+
+    for (const g of goals) {
+        if (g.key.test(s)) {
+            for (const svc of enabled) {
+                const name = String(svc.name || "");
+                const al = (svc.aliases || []).join(" ");
+                if (g.tag.test(name) || g.tag.test(al)) hits.push(svc);
+            }
+        }
+    }
+    const base = hits.length ? hits : enabled;
+    const unique = Array.from(new Map(base.map((x: any) => [x.id, x])).values());
+    return unique.slice(0, 3);
 }
 
 /** ======= PUBLIC: handleEsteticaReply ======= */
@@ -794,13 +850,13 @@ export async function handleEsteticaReply(args: {
 
     /** ==== Preguntas de precio de un servicio específico (con follow-up) ==== */
     if ((asksPrice(userText) || isFollowupPriceAsk(userText, draft)) && svc) {
-        const pLabel = serviceDisplayPrice(svc); // “$X.XXX”
+        const pLabel = serviceDisplayPrice(svc); // “Desde $X”
         const dep = formatCOP((svc as any).deposit ?? null);
         const note = (svc as any).priceNote as string | null | undefined;
         const dur = readSvcDuration(svc, (kb as any)?.rules);
 
         const priceLine = pLabel
-            ? `tiene un valor *desde ${pLabel}*.` // SIEMPRE “desde” priceMin
+            ? `tiene un valor *desde ${pLabel}*.`
             : `no tiene un precio registrado en el sistema.`;
         const depLine = dep ? ` Requerimos un anticipo de ${dep} para reservar.` : "";
         const noteLine = note ? ` ${note}` : "";
@@ -830,8 +886,43 @@ export async function handleEsteticaReply(args: {
         };
     }
 
+    /** ====== RECOMENDAR ====== */
+    if (intent === "recomendar") {
+        const picks = recommendServices({ text: userText, kb });
+        if (!picks.length) {
+            const txt = "Puedo orientarte según lo que quieres mejorar (manchas, acné, líneas finas, depilación láser, etc.). ¿Qué objetivo tienes?";
+            const saved = await persistBotReply({
+                conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone, phoneNumberId
+            });
+            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        }
+        const names = picks.map((p: any) => p.name).join(", ");
+        const tail = askMissingFields(draft) ?? "¿Te comparto horarios para alguno?";
+        const txt = `Por lo que me cuentas, te podrían servir: ${names}. ${tail}`;
+        const saved = await persistBotReply({
+            conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone, phoneNumberId
+        });
+        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+
     /** ====== AGENDAR ====== */
     if (intent === "agendar") {
+        // Bolsita: si faltan datos clave, pídelos humano
+        const need = askMissingFields(draft);
+        if (need && !(draft.serviceId && draft.whenUTC && draft.name && draft.phone)) {
+            const saved = await persistBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: need,
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        }
+
         if (draft.serviceId && draft.whenUTC && draft.name && draft.phone && draft.stage !== "confirm") {
             draft.stage = "confirm";
             await putDraft(chatId, draft);
@@ -1309,48 +1400,41 @@ export async function handleEsteticaReply(args: {
         };
     }
 
-    /** ==== Saludo ==== */
+    /** ==== Saludo humano (solo si es inicio) ==== */
     if (intent === "saludo" && !svc && !/servicio/i.test(userText)) {
-        const saludo =
-            `¡Hola! Soy el asistente de la clínica estética. ` +
-            `Puedo ayudarte con orientación y agendar tu cita. ¿Qué procedimiento te interesa?`;
+        const human = humanGreet(draft?.name);
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId,
-            texto: saludo,
+            texto: human,
             nuevoEstado: ConversationEstado.en_proceso,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
         });
-        return {
-            estado: ConversationEstado.en_proceso,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        };
+        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
     /** ====== SALUDO / FAQ / GENERAL (LLM con imagen) ====== */
-    const baseIntro = kb.empresaNombre ? `Asistente de clínica estética de "${kb.empresaNombre}".` : `Asistente de clínica estética.`;
+    const baseIntro = kb.empresaNombre
+        ? `Agente de clínica estética de "${kb.empresaNombre}".`
+        : `Agente de clínica estética.`;
     const system = [
         baseIntro,
-        "Habla en primera persona (yo), cercano y profesional. Responde en 2–5 líneas, específico, sin párrafos largos.",
-        "Puedes usar 1 emoji ocasionalmente.",
-        "Mantente en el ámbito de estética (orientación y agenda).",
-        // 👇 REGLAS DURAS DE SERVICIOS/PRECIOS
-        "Al listar u ofrecer servicios para agendar usa SOLO los que estén en la base de datos (kb.services).",
-        "Si el cliente menciona un tratamiento que NO está en kb.services, puedes dar orientación general, pero NO lo ofrezcas para agendar; sugiere alguno equivalente del catálogo.",
-        "Si preguntan por servicios/horarios/dirección/políticas, usa SOLO la información del negocio (KB).",
-        "No ofrezcas evaluaciones/consultas gratuitas. Si el usuario las pide, indica que no están disponibles y sugiere pasar directo a precios u horarios del procedimiento.",
-        "NO menciones precios a menos que el usuario lo pida explícitamente.",
-        "Cuando menciones precio usa únicamente el campo priceMin del KB, con el formato: “Desde $X (COP)”. Si no hay priceMin, di: “No tengo precio registrado”. Nunca inventes cifras.",
+        "Escritura: humana, cercana y profesional. Nada robótico. Respuestas breves (2–5 líneas) y específicas.",
+        "Habla en primera persona (yo). Evita presentarte como bot o asistente.",
+        "Mantén el foco en estética: orientación y agenda.",
+        "Para *agendar* o *listar* procedimientos usa *solo* los de la base de datos (kb.services).",
+        "Si mencionan un tratamiento fuera del catálogo: orienta y sugiere el equivalente del catálogo para agendar.",
+        "No ofrezcas evaluaciones/consultas gratuitas.",
+        "Menciona precios solo si te lo piden. Cuando lo hagas, usa *priceMin* con: “Desde $X (COP)”.",
         kb.kbTexts.businessOverview ? `Contexto negocio: ${softTrim(kb.kbTexts.businessOverview, 220)}` : "",
         kb.logistics?.locationAddress ? `Dirección: ${kb.logistics.locationAddress}` : "",
         kb.logistics?.locationName ? `Sede: ${kb.logistics.locationName}` : "",
         kb.logistics?.locationMapsUrl ? `Maps: ${kb.logistics.locationMapsUrl}` : "",
         kb.kbTexts.disclaimers ? `Avisos: ${softTrim(kb.kbTexts.disclaimers, 220)}` : "",
-        "Si detectas intención de agendar, guía a escoger un servicio habilitado y ofrece horarios.",
+        "Si notas intención de agendar, guía a escoger servicio habilitado y ofrece horarios concretos.",
+        "Ejemplo tono:\nUsuario: ¿Qué me recomiendas para manchas?\nAgente: Para manchas suele funcionar muy bien un *peeling químico* o una *limpieza profunda* si buscas algo suave. Si quieres, te paso horarios. Si prefieres precio, te digo el “Desde $X”.",
+        "Ejemplo agenda:\nUsuario: Mañana 10:30 limpieza facial, me llamo Ana, 3001234567.\nAgente: Perfecto, Ana. Te confirmo: Limpieza facial, mañana 10:30. ¿Confirmas para agendar?",
     ]
         .filter(Boolean)
         .join("\n");
@@ -1387,7 +1471,8 @@ export async function handleEsteticaReply(args: {
     budgetMessages(messages, Number(process.env.IA_PROMPT_BUDGET ?? 110));
 
     const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini";
-    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.35);
+    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.5); // un poco más libre
+    const MAX_OUT = Math.min(IA_MAX_TOKENS, 180);
 
     let texto = "";
     try {
@@ -1395,19 +1480,20 @@ export async function handleEsteticaReply(args: {
             model,
             messages,
             temperature,
-            maxTokens: IA_MAX_TOKENS,
+            maxTokens: MAX_OUT,
         });
     } catch (err: any) {
         console.error("[EST] OpenAI error (final):", err?.response?.data || err?.message || err);
-        texto = "Gracias por escribirnos. Te puedo orientar sobre procedimientos y agendar tu cita.";
+        texto = "Gracias por escribirme. Te oriento y si quieres agendamos.";
     }
     texto = closeNicely(texto);
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI);
 
-    // Blindaje: reemplazar montos solo cuando NO es intercambio de precio/follow-up
-    const MONEY_RE = /\$?\s?\d{2,3}(?:\.\d{3})*(?:,\d{2})?/g;
-    if (!(asksPrice(userText) || isFollowupPriceAsk(userText, draft))) {
-        texto = texto.replace(MONEY_RE, "precio según valoración");
+    // Blindaje de montos: SOLO si no están preguntando por precio y el LLM inventó montos explícitos.
+    const asked = asksPrice(userText) || isFollowupPriceAsk(userText, draft);
+    if (!asked) {
+        const hasMoney = KB_MONEY_RE.test(texto);
+        if (hasMoney) texto = texto.replace(KB_MONEY_RE, "consulta por precio");
     }
 
     // ⛔️ SIN DELAY

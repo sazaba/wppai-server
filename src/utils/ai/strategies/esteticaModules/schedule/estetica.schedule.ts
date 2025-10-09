@@ -191,7 +191,7 @@ export async function bookAppointment(args: BookArgs) {
     return appt;
 }
 
-// ================= NUEVO: Reagendar y Cancelar =================
+// ================= Reagendar y Cancelar =================
 
 export type RescheduleArgs = {
     empresaId: number;
@@ -257,7 +257,7 @@ export async function rescheduleAppointment(args: RescheduleArgs) {
         },
     });
 
-    // Devolvemos tiempos corregidos a UTC real para consumo de capas superiores
+    // Devolvemos tiempos corregidos a UTC real
     return {
         ...updated,
         startAt: applyApptOffsetRead(updated.startAt),

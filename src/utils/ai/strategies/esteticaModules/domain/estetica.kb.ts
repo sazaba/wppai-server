@@ -73,7 +73,7 @@ export type EsteticaKB = {
 // ———————————————————————————————————————————————————————————————————————
 export const MONEY_RE = /\$?\s?\d{2,3}(?:\.\d{3})*(?:,\d{2})?/g;
 
-function norm(s: string) {
+function normBasic(s: string) {
     return s
         .normalize("NFD")
         .replace(/[\u0300-\u036f]/g, "")
@@ -84,8 +84,8 @@ function norm(s: string) {
 }
 
 function tokenScore(a: string, b: string) {
-    const ta = new Set(norm(a).split(" ").filter(Boolean));
-    const tb = new Set(norm(b).split(" ").filter(Boolean));
+    const ta = new Set(normBasic(a).split(" ").filter(Boolean));
+    const tb = new Set(normBasic(b).split(" ").filter(Boolean));
     let hit = 0;
     for (const t of ta) if (tb.has(t)) hit++;
     return hit / Math.max(1, ta.size);
@@ -103,7 +103,7 @@ function parseJSON<T = any>(v: any): T | null {
 
 function splitAliases(raw?: string | null): string[] {
     if (!raw) return [];
-    const base = raw.split(/[;,/|]/g).map((x) => norm(x)).filter(Boolean);
+    const base = raw.split(/[;,/|]/g).map((x) => normBasic(String(x))).filter(Boolean);
     const expand: string[] = [];
     for (const a of base) {
         expand.push(a);
@@ -125,13 +125,11 @@ function asNumber(v: any): number | null {
 }
 
 // ———————————————————————————————————————————————————————————————————————
-// Carga KB
-// ———————————————————————————————————————————————————————————————————————
 export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | null> {
     // 1) businessconfig_appt
     const cfg =
         (await (prisma as any)["businessconfig_appt"]?.findFirst?.({ where: { empresaId } } as any)) ??
-        (await (prisma as any).businessConfigAppt?.findFirst?.({ where: { empresaId } }));
+        (await (prisma as any).businessConfigAppt?.findFirst?.({ where: { empresaId } } as any));
 
     // 2) procedimientos
     const procedures =
@@ -181,7 +179,6 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
     const empresaNombre = cfg?.nombre || cfg?.businessName || cfg?.companyName || null;
 
     const rules = parseJSON<Record<string, any>>(cfg?.rules) ?? parseJSON<Record<string, any>>(cfg?.rulesJson) ?? null;
-
     const remindersConfig =
         parseJSON<Record<string, any>>(cfg?.remindersConfig) ?? parseJSON<Record<string, any>>(cfg?.reminders_json) ?? null;
 
@@ -215,7 +212,7 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
                     ? p?.duracionMin
                     : null;
 
-        // 💵 capturamos variantes de precio SOLO desde campos numéricos
+        // 💵 precios SOLO desde campos numéricos
         const priceMin =
             asNumber(p?.priceMin) ??
             asNumber(p?.precioMin) ??
@@ -239,7 +236,7 @@ export async function loadEsteticaKB(empresaId: number): Promise<EsteticaKB | nu
         const enabled = (p?.enabled ?? p?.activo ?? true) !== false;
 
         const aliasesArr: string[] = Array.isArray(p?.aliases)
-            ? (p.aliases as string[]).map((a) => norm(String(a)))
+            ? (p.aliases as string[]).map((a) => normBasic(String(a)))
             : splitAliases(p?.aliases || p?.keywords || p?.etiquetas || null);
 
         // textos clínicos (opcionales)
@@ -328,18 +325,18 @@ export function resolveServiceName(kb: EsteticaKB, text: string): KBService | nu
     const t = text.toLowerCase();
     const candidates = kb.services.filter((s) => s.enabled !== false);
 
-    const ntext = norm(t);
+    const ntext = normBasic(t);
 
     // match exact normalizado
-    for (const s of candidates) if (ntext === norm(s.name)) return s;
+    for (const s of candidates) if (ntext === normBasic(s.name)) return s;
 
-    // inclusiones y startsWith en nombre/alias
+    // inclusiones / startsWith en nombre/alias
     for (const s of candidates) {
-        const nn = norm(s.name);
+        const nn = normBasic(s.name);
         if (ntext.includes(nn) || nn.startsWith(ntext) || ntext.startsWith(nn)) return s;
 
         const aliasHit = (s.aliases || []).some((a) => {
-            const aa = norm(a);
+            const aa = normBasic(a);
             return ntext.includes(aa) || aa.startsWith(ntext) || ntext.startsWith(aa);
         });
         if (aliasHit) return s;
