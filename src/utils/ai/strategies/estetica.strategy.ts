@@ -23,20 +23,25 @@ import {
     type Slot,
 } from "./esteticaModules/schedule/estetica.schedule";
 
-import { formatInTimeZone, utcToZonedTime, format as tzFormat } from "date-fns-tz";
+import { formatInTimeZone } from "date-fns-tz";
 
-// ================= Config =================
+/* -------------------------------------------------------
+   Config (estilo, dedup, etc.)
+-------------------------------------------------------- */
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000);
 const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000);
 const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000);
 const IMAGE_LOOKBACK_MS = Number(process.env.IA_IMAGE_LOOKBACK_MS ?? 5 * 60 * 1000);
 
-// Estilo
 const IA_MAX_LINES = Number(process.env.IA_MAX_LINES ?? 5);
-const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000);
 const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 180);
 
-// ================= Utils =================
+const LLM_MODEL = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini";
+const LLM_TEMP = Number(process.env.IA_TEMPERATURE ?? 0.5);
+
+/* -------------------------------------------------------
+   Helpers base
+-------------------------------------------------------- */
 const processedInbound = new Map<number, number>();
 function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
     const now = Date.now();
@@ -45,20 +50,22 @@ function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS
     processedInbound.set(messageId, now);
     return false;
 }
-const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 const rand = <T>(arr: T[], fallback?: T) => (arr.length ? arr[Math.floor(Math.random() * arr.length)] : (fallback as T));
+
 const EMOJI_WARM = ["🙂", "✨", "😊", "👌", "💬", "🫶", "💡"];
 const EMOJI_TIME = ["⏰", "🗓️", "📅"];
 const EMOJI_OK = ["✅", "👌", "👍"];
 
-// ——— Text helpers ———
-const softTrim = (s: string | null | undefined, max = 220) => {
-    const t = (s || "").trim();
-    if (!t) return "";
-    return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
-};
-const approxTokens = (str: string) => Math.ceil((str || "").length / 4);
-function clampConcise(text: string, maxLines = IA_MAX_LINES): string {
+function closeNicely(raw: string) {
+    let t = (raw || "").trim();
+    if (!t) return t;
+    if (/[.!?…]\s*$/.test(t)) return t;
+    t = t.replace(/\s+[^\s]*$/, "").trim();
+    if (!t) return raw.trim();
+    return `${t}…`;
+}
+function clampConcise(text: string, maxLines = IA_MAX_LINES) {
     let t = String(text || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
     const lines = t ? t.split("\n").filter(Boolean) : [];
     if (lines.length > maxLines) {
@@ -67,23 +74,17 @@ function clampConcise(text: string, maxLines = IA_MAX_LINES): string {
     }
     return t;
 }
-function formatConcise(text: string, maxLines = IA_MAX_LINES) {
+function formatConcise(text: string) {
     let t = String(text || "").trim();
     if (!t) return "¿En qué te ayudo?";
     t = t.replace(/^[•\-]\s*/gm, "").replace(/\s+\n/g, "\n").replace(/\n{2,}/g, "\n").trim();
-    return clampConcise(t, maxLines);
+    return clampConcise(t, IA_MAX_LINES);
 }
-const closeNicely = (raw: string) => {
-    let t = (raw || "").trim();
-    if (!t) return t;
-    if (/[.!?…]\s*$/.test(t)) return t;
-    t = t.replace(/\s+[^\s]*$/, "").trim();
-    if (!t) return raw.trim();
-    return `${t}…`;
-};
 const normalizeToE164 = (n: string) => String(n || "").replace(/[^\d]/g, "");
 
-// ===== Imagen & Voz =====
+/* -------------------------------------------------------
+   Imagen & voz
+-------------------------------------------------------- */
 function mentionsImageExplicitly(t: string) {
     const s = String(t || "").toLowerCase();
     return (
@@ -128,7 +129,9 @@ async function pickImageForContext(opts: {
     return { url: null as string | null, noteToAppend: "" };
 }
 
-// ===== Persistencia + WhatsApp =====
+/* -------------------------------------------------------
+   Persistencia + WhatsApp
+-------------------------------------------------------- */
 async function persistBotReply({
     conversationId, empresaId, texto, nuevoEstado, to, phoneNumberId,
 }: {
@@ -155,47 +158,24 @@ async function persistBotReply({
     return { messageId: msg.id, texto, wamid };
 }
 
-// ===== Historial compacto =====
-async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 8) {
+/* -------------------------------------------------------
+   Historial compacto
+-------------------------------------------------------- */
+async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = 10) {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({
         where, orderBy: { timestamp: "asc" }, take, select: { from: true, contenido: true },
     });
-    return rows.map((r) => ({ role: r.from === MessageFrom.client ? "user" : "assistant", content: softTrim(r.contenido || "", 200) }));
-}
-function budgetMessages(messages: any[], budgetPromptTokens = 120) {
-    const sys = messages.find((m: any) => m.role === "system");
-    const user = messages.find((m: any) => m.role === "user");
-    if (!sys) return messages;
-
-    const sysText = String(sys.content || "");
-    const userText = typeof user?.content === "string" ? user?.content :
-        Array.isArray(user?.content) ? String(user?.content?.[0]?.text || "") : "";
-
-    let total = approxTokens(sysText) + approxTokens(userText);
-    for (const m of messages) {
-        if (m.role !== "system" && m !== user) {
-            const t = typeof m.content === "string" ? m.content : Array.isArray(m.content) ? String(m.content?.[0]?.text || "") : "";
-            total += approxTokens(t);
-        }
-    }
-    if (total <= budgetPromptTokens) return messages;
-
-    const lines = sysText.split("\n").map((l: string) => l.trim()).filter(Boolean);
-    const keep: string[] = [];
-    for (const l of lines) { if (/clínica estética|agenda|servicios|precios|tono/i.test(l)) keep.push(l); if (keep.length >= 7) break; }
-    (sys as any).content = keep.join("\n") || lines.slice(0, 7).join("\n");
-
-    if (typeof user?.content === "string") {
-        const ut = String(user.content); user.content = ut.length > 240 ? ut.slice(0, 240) : ut;
-    } else if (Array.isArray(user?.content)) {
-        const ut = String(user.content?.[0]?.text || ""); (user.content as any[])[0].text = softTrim(ut, 240);
-    }
-    return messages;
+    return rows.map((r) => ({
+        role: r.from === MessageFrom.client ? "user" : "assistant",
+        content: (r.contenido || "").slice(0, 220),
+    }));
 }
 
-// ===== Intents =====
+/* -------------------------------------------------------
+   Intents suaves
+-------------------------------------------------------- */
 const isCatalogQuery = (t: string) => {
     const s = ` ${(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()} `;
     const nouns = ["servicio", "servicios", "procedimiento", "procedimientos", "tratamiento", "tratamientos", "catalogo", "catálogo"];
@@ -210,8 +190,10 @@ const isServiceInfoQuestion = (t: string) =>
     /\b(contraindicaciones?|riesgos?|efectos?\s+secundarios?)\b/i.test(t) ||
     /\b(cuidados?|post\s*cuidado|despu[eé]s|postoperatorio)\b/i.test(t);
 
-// ===== Memoria corta de servicio (solo marca) =====
-const CTX_TAG_RE = /\[CTX svc:(\d+)\]/; // añadimos esto a la última respuesta del bot
+/* -------------------------------------------------------
+   Memoria corta de servicio (tag en el último mensaje del bot)
+-------------------------------------------------------- */
+const CTX_TAG_RE = /\[CTX svc:(\d+)\]/;
 async function getLastCtxService(conversationId: number): Promise<number | null> {
     const lastBot = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
@@ -230,10 +212,90 @@ async function attachCtxTag(messageId: number, serviceId?: number | null) {
     await prisma.message.update({ where: { id: messageId }, data: { contenido: next } });
 }
 
-// ===== Tipos públicos =====
+/* -------------------------------------------------------
+   HÍBRIDO INTELIGENTE: cache de KB → prompt libre
+-------------------------------------------------------- */
+type KBContext = { text: string; kb: EsteticaKB; builtAt: number; hash: string };
+const KB_CACHE = new Map<number, KBContext>(); // empresaId → contexto
+const KB_TTL_MS = Number(process.env.IA_KB_TTL_MS ?? 5 * 60 * 1000); // 5 min
+
+function hashKB(kb: EsteticaKB) {
+    // hash simple y determinístico para invalidar cuando cambie lo relevante
+    const payload = JSON.stringify({
+        empresaId: kb.empresaId,
+        timezone: kb.timezone,
+        bufferMin: kb.bufferMin,
+        policies: kb.policies ?? "",
+        staff: (kb.staff || []).map(s => [s.id, s.name, s.role, s.active]),
+        exceptions: (kb.exceptions || []).map(e => [e.dateISO, e.isOpen, e.start1, e.end1, e.start2, e.end2]),
+        procedures: (kb.procedures || []).map(p => [p.id, p.name, p.enabled, p.durationMin, p.priceMin, p.priceMax, p.depositRequired]),
+        location: kb.location ?? {},
+    });
+    let h = 0;
+    for (let i = 0; i < payload.length; i++) {
+        h = (h * 31 + payload.charCodeAt(i)) | 0;
+    }
+    return String(h);
+}
+
+function buildKBText(kb: EsteticaKB) {
+    const procs = (kb.procedures || [])
+        .filter(p => p && p.enabled !== false)
+        .map(p => {
+            const from = serviceDisplayPrice(p as any);
+            const dur = p.durationMin ? ` | Duración aprox: ${p.durationMin} min` : "";
+            return `- ${p.name}${from ? ` (Desde ${from})` : ""}${dur}${p.prepInstructions ? `\n  • Indicaciones: ${p.prepInstructions}` : ""
+                }${p.postCare ? `\n  • Cuidados: ${p.postCare}` : ""}${p.contraindications ? `\n  • Contraindicaciones: ${p.contraindications}` : ""
+                }`;
+        })
+        .join("\n");
+
+    const staff = (kb.staff || [])
+        .map(s => `- ${s.name} (${s.role}${!s.active ? ", inactivo" : ""})`).join("\n");
+
+    const ex = (kb.exceptions || [])
+        .slice(0, 6)
+        .map(e => `- ${e.dateISO}: ${e.isOpen === false ? "Cerrado" : [e.start1, e.end1, e.start2 && ` / ${e.start2}-${e.end2}`].filter(Boolean).join("-")}`)
+        .join("\n");
+
+    const loc = kb.location ? [
+        kb.location.name ? `Sede: ${kb.location.name}` : "",
+        kb.location.address ? `Dirección: ${kb.location.address}` : "",
+        kb.location.mapsUrl ? `Maps: ${kb.location.mapsUrl}` : "",
+        kb.location.parkingInfo ? `Parqueo: ${kb.location.parkingInfo}` : "",
+        kb.location.arrivalInstructions ? `Llegada: ${kb.location.arrivalInstructions}` : "",
+    ].filter(Boolean).join(" | ") : "";
+
+    return [
+        `EmpresaId: ${kb.empresaId}`,
+        `Zona horaria: ${kb.timezone} | Buffer: ${kb.bufferMin} min`,
+        kb.policies ? `Políticas: ${kb.policies}` : "",
+        loc ? `Ubicación: ${loc}` : "",
+        staff ? `\nStaff:\n${staff}` : "",
+        procs ? `\nProcedimientos:\n${procs}` : "",
+        ex ? `\nExcepciones (muestras):\n${ex}` : "",
+    ].filter(Boolean).join("\n");
+}
+
+async function getOrBuildKBContext(empresaId: number): Promise<KBContext | null> {
+    const now = Date.now();
+    const cached = KB_CACHE.get(empresaId);
+    if (cached && now - cached.builtAt <= KB_TTL_MS) return cached;
+
+    const kb = await loadEsteticaKB({ empresaId, vertical: "estetica" });
+    if (!kb) return null;
+
+    const text = buildKBText(kb);
+    const ctx: KBContext = { text, kb, builtAt: now, hash: hashKB(kb) };
+    KB_CACHE.set(empresaId, ctx);
+    return ctx;
+}
+
+/* -------------------------------------------------------
+   API pública
+-------------------------------------------------------- */
 export type IAReplyResult = { estado: ConversationEstado; mensaje: string; messageId?: number; wamid?: string; media?: any[]; };
 
-// ===== Agente =====
 export async function handleEsteticaReply(args: {
     chatId: number; empresaId: number; mensajeArg?: string; toPhone?: string | null; phoneNumberId?: string | null;
 }): Promise<IAReplyResult> {
@@ -250,17 +312,19 @@ export async function handleEsteticaReply(args: {
 
     if (last?.id && seenInboundRecently(last.id)) return { estado: conversacion.estado, mensaje: "" };
 
-    const kb = (await loadEsteticaKB({ empresaId, vertical: "estetica" })) as EsteticaKB | null;
-    if (!kb) {
+    // === HÍBRIDO: construir/leer contexto KB (cacheado)
+    const kbCtx = await getOrBuildKBContext(empresaId);
+    if (!kbCtx) {
         const saved = await persistBotReply({
             conversationId: chatId, empresaId,
-            texto: "Ahora mismo no tengo la configuración completa de la clínica. Te comunico con un asesor humano. 🙏",
+            texto: "No tengo la configuración completa de la clínica. Te comunico con un asesor humano. 🙏",
             nuevoEstado: ConversationEstado.requiere_agente, to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         return { estado: ConversationEstado.requiere_agente, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
+    const kb = kbCtx.kb;
 
-    // Texto usuario (mensajeArg || último texto || transcripción)
+    // ===== Texto usuario (directo / transcripción)
     let userText = (mensajeArg || last?.contenido || "").trim();
     if (!userText && last?.isVoiceNote) {
         let transcript = (last.transcription || "").trim();
@@ -280,7 +344,7 @@ export async function handleEsteticaReply(args: {
                     transcript = await transcribeAudioBuffer(audioBuf, name);
                     if (transcript) await prisma.message.update({ where: { id: last.id }, data: { transcription: transcript } });
                 }
-            } catch (e) { }
+            } catch { }
         }
         if (transcript) userText = transcript;
     }
@@ -291,32 +355,22 @@ export async function handleEsteticaReply(args: {
     const referenceTs = last?.timestamp ?? new Date();
     if (isImage && !caption && !userText) { await sleep(IMAGE_WAIT_MS); return { estado: conversacion.estado, mensaje: "" }; }
 
-    // ===== Resolver servicio por texto o por contexto previo
+    // ===== Servicio en texto o en contexto
     const explicit = resolveServiceName(kb, userText || caption || "");
     let svc = explicit?.procedure ?? null;
     if (!svc) {
-        const lastId = await getLastCtxService(chatId);
-        if (lastId) svc = (kb.procedures || []).find(p => p.id === lastId) || null;
+        const lastSvcId = await getLastCtxService(chatId);
+        if (lastSvcId) svc = (kb.procedures || []).find(p => p.id === lastSvcId) || null;
     }
 
-    // ===== Prioridad de intents (suave):
-    // 1) Precios → lista libre con COP (sale de cualquier flujo)
+    // ===== Prioridad suave de intents
     if (asksPrice(userText || caption || "")) {
-        const procs = Array.isArray(kb.procedures) ? kb.procedures : [];
-        if (!procs.length) {
-            const savedEmpty = await persistBotReply({
-                conversationId: chatId, empresaId,
-                texto: `Te cuento ${rand(EMOJI_WARM)}: aún no veo servicios configurados. Si quieres, te oriento y luego agendamos.`,
-                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
-            });
-            return { estado: ConversationEstado.en_proceso, mensaje: savedEmpty.texto, messageId: savedEmpty.messageId, wamid: savedEmpty.wamid, media: [] };
-        }
-        const list = procs.slice(0, 20).map((p) => {
-            const from = serviceDisplayPrice(p);
+        const procs = (kb.procedures || []).filter(p => p.enabled !== false);
+        const list = procs.slice(0, 24).map(p => {
+            const from = serviceDisplayPrice(p as any);
             return `• ${p.name}${from ? ` (Desde ${from})` : ""}`;
         }).join("\n");
-
-        const txt = `Estos son nuestros valores *en COP* ${rand(EMOJI_WARM)}:\n\n${list}\n\n¿Te comparto horarios para alguno ${rand(EMOJI_TIME)}?`;
+        const txt = `Te comparto precios *en COP* ${rand(EMOJI_WARM)}:\n\n${list}\n\n¿Quieres opciones de horario ${rand(EMOJI_TIME)} para alguno?`;
         const saved = await persistBotReply({
             conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
             to: toPhone ?? conversacion.phone, phoneNumberId,
@@ -324,40 +378,29 @@ export async function handleEsteticaReply(args: {
         return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // 2) Info de un procedimiento (beneficios / consiste / preparación / contraindicaciones / cuidados)
     if (svc && isServiceInfoQuestion(userText || caption || "")) {
-        const bullets: string[] = [];
-        if (svc.prepInstructions) bullets.push(`• *Indicaciones previas:* ${svc.prepInstructions}`);
-        if (svc.postCare) bullets.push(`• *Cuidados posteriores:* ${svc.postCare}`);
-        if (svc.contraindications) bullets.push(`• *Contraindicaciones:* ${svc.contraindications}`);
-        if (svc.notes) bullets.push(`• *Nota:* ${svc.notes}`);
-        if (!bullets.length) bullets.push("• Recomendación general: llega con la piel limpia, evita exfoliantes fuertes 48–72 h antes y usa protector solar.");
+        const bits: string[] = [];
+        if (svc.prepInstructions) bits.push(`• *Indicaciones previas:* ${svc.prepInstructions}`);
+        if (svc.postCare) bits.push(`• *Cuidados posteriores:* ${svc.postCare}`);
+        if (svc.contraindications) bits.push(`• *Contraindicaciones:* ${svc.contraindications}`);
+        if (svc.notes) bits.push(`• *Nota:* ${svc.notes}`);
+        if (!bits.length) bits.push("• Recomendación general: llega con la piel limpia, evita exfoliantes fuertes 48–72 h antes y usa protector solar.");
 
         const from = serviceDisplayPrice(svc);
-        const openers = [
-            `Te cuento sobre *${svc.name}*`,
-            `Resumen de *${svc.name}*`,
-            `Sobre *${svc.name}*`,
-        ];
-        const tail = `\n\nSi te sirve, te paso horarios ${rand(EMOJI_TIME)}.`;
-
-        const txt = `${rand(openers)}${from ? ` (Desde ${from})` : ""} ${rand(EMOJI_WARM)}:\n${bullets.join("\n")}${tail}`;
-
+        const txt = `${rand(["Sobre", "Resumen de", "Te cuento de"])} *${svc.name}*${from ? ` (Desde ${from})` : ""} ${rand(EMOJI_WARM)}:\n${bits.join("\n")}\n\nSi te sirve, te paso horarios ${rand(EMOJI_TIME)}.`;
         const saved = await persistBotReply({
             conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
             to: toPhone ?? conversacion.phone, phoneNumberId,
         });
-        await attachCtxTag(saved.messageId!, svc.id); // guardar contexto de servicio
+        await attachCtxTag(saved.messageId!, svc.id);
         return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // 3) Agendamiento (en cualquier momento)
     if (wantsSchedule(userText || caption || "")) {
         const tz = kb.timezone || "America/Bogota";
         const bufferMin = kb.bufferMin ?? 10;
         const durationMin = svc?.durationMin ?? kb.defaultServiceDurationMin ?? 45;
 
-        // HOY (YYYY-MM-DD) en tz del negocio
         const nowLocalISO = formatInTimeZone(new Date(), tz, "yyyy-MM-dd");
 
         const found = await getNextAvailableSlots(
@@ -370,20 +413,11 @@ export async function handleEsteticaReply(args: {
                 .map((day) => {
                     const times = day.slots.slice(0, 3).map((s) => s.startISO.slice(11, 16)).join(", ");
                     return `• ${day.date}: ${times}${day.slots.length > 3 ? "…" : ""}`;
-                })
-                .join("\n");
+                }).join("\n");
 
             const fromLabel = svc ? serviceDisplayPrice(svc) : null;
-            const head = svc
-                ? `Para *${svc.name}*${fromLabel ? ` (Desde ${fromLabel})` : ""}, estas son opciones cercanas:`
-                : `Tengo estas opciones próximas:`;
-
-            const endings = [
-                `Elige una y dime tu *nombre* y *teléfono* para reservar ${rand(EMOJI_OK)}.`,
-                `¿Cuál te funciona? Te tomo datos y la dejo confirmada ${rand(EMOJI_OK)}.`,
-            ];
-
-            const txt = `${head}\n\n${pretty}\n\n${rand(endings)}`;
+            const head = svc ? `Para *${svc.name}*${fromLabel ? ` (Desde ${fromLabel})` : ""}, tengo:` : "Tengo disponibilidad cercana:";
+            const txt = `${head}\n\n${pretty}\n\nElige una y dime tu *nombre* y *teléfono* para reservar ${rand(EMOJI_OK)}.`;
 
             const saved = await persistBotReply({
                 conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
@@ -392,34 +426,21 @@ export async function handleEsteticaReply(args: {
             if (svc) await attachCtxTag(saved.messageId!, svc.id);
             return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
-
         const savedNo = await persistBotReply({
             conversationId: chatId, empresaId,
-            texto: `No veo cupos cercanos por ahora. Si quieres, te contacto con un asesor para coordinar un horario que te sirva ${rand(EMOJI_WARM)}.`,
+            texto: `Por ahora no veo cupos cercanos. Si quieres, te contacto con un asesor para coordinar un horario que te sirva ${rand(EMOJI_WARM)}.`,
             nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         return { estado: ConversationEstado.en_proceso, mensaje: savedNo.texto, messageId: savedNo.messageId, wamid: savedNo.wamid, media: [] };
     }
 
-    // 4) Catálogo general (si no pidieron precio explícito)
     if (isCatalogQuery(userText || caption || "")) {
-        const procs = Array.isArray(kb.procedures) ? kb.procedures : [];
-        if (!procs.length) {
-            const savedEmpty = await persistBotReply({
-                conversationId: chatId, empresaId,
-                texto: `Aún no tengo servicios cargados. Puedo orientarte igual y cuando quieras agendamos ${rand(EMOJI_WARM)}.`,
-                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
-            });
-            return { estado: ConversationEstado.en_proceso, mensaje: savedEmpty.texto, messageId: savedEmpty.messageId, wamid: savedEmpty.wamid, media: [] };
-        }
-
-        const list = procs.slice(0, 20).map((p) => {
-            const from = serviceDisplayPrice(p);
+        const procs = (kb.procedures || []).filter(p => p.enabled !== false);
+        const list = procs.slice(0, 24).map(p => {
+            const from = serviceDisplayPrice(p as any);
             return `• ${p.name}${from ? ` (Desde ${from})` : ""}`;
         }).join("\n");
-
         const txt = `Ofrecemos ${rand(EMOJI_WARM)}:\n\n${list}\n\n¿Quieres ver horarios para alguno ${rand(EMOJI_TIME)}?`;
-
         const saved = await persistBotReply({
             conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
             to: toPhone ?? conversacion.phone, phoneNumberId,
@@ -427,12 +448,21 @@ export async function handleEsteticaReply(args: {
         return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // ===== Conversación libre (LLM) con imagen contextual (fallback)
-    const businessName: string = (kb as any)?.businessName ?? "";
-    const kbTexts: { businessOverview?: string; disclaimers?: string } | undefined = (kb as any)?.kbTexts ?? undefined;
-    const logistics: { locationAddress?: string; locationName?: string } | undefined = (kb as any)?.logistics ?? undefined;
-    const isString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+    /* ---------- Conversación libre con HÍBRIDO (KB completo cacheado) ---------- */
+    const system = [
+        "Actúa como un asesor humano de clínica estética.",
+        "Tono natural, cercano y profesional; usa emojis con moderación y varía la redacción.",
+        "Responde breve (2–5 líneas), concreta y empática. Evita sonar a bot.",
+        "Usa únicamente la información real de la clínica que verás a continuación.",
+        "Si hablan de precios, usa el formato “Desde $X (COP)” cuando exista priceMin.",
+        "Si detectas intención clara de agendar, ofrece horarios concretos.",
+        "",
+        "=== INFORMACIÓN DE LA CLÍNICA (CONOCIMIENTO) ===",
+        kbCtx.text,
+        "=== FIN DEL CONOCIMIENTO ===",
+    ].join("\n");
 
+    // Imagen contextual opcional
     let effectiveImageUrl = isImage ? imageUrl : null;
     let textForLLM = (userText || caption || "Hola").trim();
     if (!effectiveImageUrl && textForLLM) {
@@ -441,52 +471,47 @@ export async function handleEsteticaReply(args: {
         if (picked.noteToAppend) textForLLM = `${textForLLM}${picked.noteToAppend}`;
     }
 
-    const system = [
-        businessName ? `Agente de clínica estética de "${businessName}".` : `Agente de clínica estética.`,
-        "Tono natural, cercano y profesional. Habla como humano (no te presentes como bot).",
-        "Respuestas breves (2–5 líneas) y concretas. Varía la redacción y usa emojis con moderación.",
-        "Foco: orientación de tratamientos y agenda.",
-        "Usa solo servicios de la BD; si preguntan precio: formato “Desde $X (COP)”.",
-        kbTexts?.businessOverview ? `Contexto: ${softTrim(kbTexts.businessOverview, 220)}` : "",
-        logistics?.locationAddress ? `Dirección: ${logistics.locationAddress}` : "",
-        logistics?.locationName ? `Sede: ${logistics.locationName}` : "",
-        kbTexts?.disclaimers ? `Avisos: ${softTrim(kbTexts.disclaimers, 180)}` : "",
-    ].filter(isString).join("\n");
-
     const history = await getRecentHistory(chatId, last?.id, 10);
     const messages: any[] = [{ role: "system", content: system }, ...history];
 
     if (effectiveImageUrl) {
-        messages.push({ role: "user", content: [{ type: "text", text: textForLLM || "Hola" }, { type: "image_url", image_url: { url: effectiveImageUrl } }] });
+        messages.push({
+            role: "user",
+            content: [
+                { type: "text", text: textForLLM || "Hola" },
+                { type: "image_url", image_url: { url: effectiveImageUrl } },
+            ],
+        });
     } else {
         messages.push({ role: "user", content: textForLLM || "Hola" });
     }
-    budgetMessages(messages, 120);
-
-    const model = process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini";
-    const temperature = Number(process.env.IA_TEMPERATURE ?? 0.5);
 
     let texto = "";
     try {
-        const resp = await (openai.chat.completions.create as any)({ model, temperature, max_tokens: IA_MAX_TOKENS, messages });
+        const resp = await (openai.chat.completions.create as any)({
+            model: LLM_MODEL,
+            temperature: LLM_TEMP,
+            max_tokens: IA_MAX_TOKENS,
+            messages,
+        });
         texto = resp?.choices?.[0]?.message?.content?.trim() || "";
     } catch {
-        texto = `Te oriento sobre tratamientos y, si quieres, te paso horarios ${rand(EMOJI_WARM)}.`;
+        texto = `Puedo orientarte y, si quieres, te paso horarios ${rand(EMOJI_WARM)}.`;
     }
 
-    // Quitar montos inventados si no pidieron precio explícito
+    // blindaje: si NO pidieron precio, borra montos que el modelo pueda inventar
     if (!asksPrice(userText || caption || "")) {
         if (KB_MONEY_RE.test(texto)) texto = texto.replace(KB_MONEY_RE, "consulta por precio");
     }
 
     texto = closeNicely(texto);
-    texto = formatConcise(texto, IA_MAX_LINES);
+    texto = formatConcise(texto);
 
     const saved = await persistBotReply({
         conversationId: chatId, empresaId, texto, nuevoEstado: ConversationEstado.respondido,
         to: toPhone ?? conversacion.phone, phoneNumberId,
     });
-    if (svc) await attachCtxTag(saved.messageId!, svc.id); // mantener contexto si lo había
+    if (svc) await attachCtxTag(saved.messageId!, svc.id);
 
     return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
 }
