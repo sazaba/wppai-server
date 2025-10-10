@@ -1,12 +1,12 @@
 // utils/ai/strategies/estetica.strategy.ts
 /**
  * Agente Estética – Híbrido inteligente (con envío directo a WhatsApp)
- * - Memoria corta en conversation_state (TTL 5 min).
- * - Resumen embebido para bajar tokens.
- * - Tono humano + emojis + variedad.
- * - Sale/entra del flujo de agenda de forma suave (intención).
- * - Lee catálogo real (estetica.kb) + agenda real (estetica.schedule).
- * - Envía por WhatsApp Cloud API y persiste con externalId (wamid).
+ * - Memoria corta en conversation_state (TTL 5 min) + flag hasGreeted
+ * - Resumen embebido para bajar tokens
+ * - Tono humano + emojis + variedad
+ * - Sale/entra del flujo de agenda de forma suave (intención)
+ * - Lee catálogo real (estetica.kb) + agenda real (estetica.schedule)
+ * - Envía por WhatsApp Cloud API y persiste con externalId (wamid)
  */
 
 import prisma from "../../../lib/prisma";
@@ -71,6 +71,8 @@ function formatCOP(value?: number | null): string | null {
         maximumFractionDigits: 0,
     }).format(Number(value));
 }
+const IS_SERVICES_QUESTION = /(qué|que)\s+(servicios?|tratamientos?)\s+(ofre(?:ce|cen|s)|disponibles?|tienen?)/i;
+const IS_GREETING = /^(hola|buenas|qué tal|que tal|buen d[ií]a|buenas tardes|buenas noches)[\s!.,¡¿?]*$/i;
 
 /* ======== WhatsApp Cloud API (envío directo) ======== */
 async function waSendText(params: {
@@ -81,18 +83,14 @@ async function waSendText(params: {
 }): Promise<string | null> {
     const { empresaId, phoneNumberId, to, body } = params;
 
-    // 1) Obtener credenciales
     const wa = await prisma.whatsappAccount.findFirst({
-        where: phoneNumberId
-            ? { phoneNumberId }
-            : { empresaId },
+        where: phoneNumberId ? { phoneNumberId } : { empresaId },
         select: { accessToken: true, phoneNumberId: true },
     });
     const pnid = phoneNumberId || wa?.phoneNumberId;
     const token = wa?.accessToken;
     if (!pnid || !token) return null;
 
-    // 2) Llamar Graph API
     const url = `https://graph.facebook.com/v20.0/${encodeURIComponent(pnid)}/messages`;
     const resp = await fetch(url, {
         method: "POST",
@@ -107,14 +105,9 @@ async function waSendText(params: {
             text: { body },
         }),
     });
-
-    if (!resp.ok) {
-        // No hacemos throw para no romper la conversación; solo no devolvemos wamid
-        return null;
-    }
+    if (!resp.ok) return null;
     const json: any = await resp.json();
-    const wamid: string | null = json?.messages?.[0]?.id ?? null;
-    return wamid;
+    return json?.messages?.[0]?.id ?? null;
 }
 
 async function sendAndPersist(params: {
@@ -126,31 +119,14 @@ async function sendAndPersist(params: {
     estado: "pendiente" | "respondido" | "en_proceso" | "requiere_agente";
 }) {
     const { conversationId, empresaId, toPhone, phoneNumberId, texto, estado } = params;
-
-    // enviar primero
     let wamid: string | null = null;
     if (toPhone) {
-        try {
-            wamid = await waSendText({ empresaId, phoneNumberId, to: toPhone, body: texto });
-        } catch { /* silencioso */ }
+        try { wamid = await waSendText({ empresaId, phoneNumberId, to: toPhone, body: texto }); } catch { }
     }
-
-    // persistir mensaje
     const msg = await prisma.message.create({
-        data: {
-            conversationId,
-            empresaId,
-            from: "bot",
-            contenido: texto,
-            externalId: wamid || undefined,
-        },
+        data: { conversationId, empresaId, from: "bot", contenido: texto, externalId: wamid || undefined },
     });
-
-    await prisma.conversation.update({
-        where: { id: conversationId },
-        data: { estado },
-    });
-
+    await prisma.conversation.update({ where: { id: conversationId }, data: { estado } });
     return { messageId: msg.id, wamid: wamid || undefined };
 }
 
@@ -160,6 +136,7 @@ type AgentState = {
     lastIntent?: "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
     lastServiceId?: number | null;
     lastServiceName?: string | null;
+    hasGreeted?: boolean;
     draft?: {
         name?: string;
         phone?: string;
@@ -208,10 +185,7 @@ async function getRecentHistory(conversationId: number, excludeMessageId?: numbe
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({
-        where,
-        orderBy: { timestamp: "desc" },
-        take,
-        select: { from: true, contenido: true },
+        where, orderBy: { timestamp: "desc" }, take, select: { from: true, contenido: true },
     });
     return rows.reverse().map((r) => ({
         role: (r.from === "client" ? "user" : "assistant") as "user" | "assistant",
@@ -269,8 +243,7 @@ async function buildOrReuseSummary(args: {
             ],
         });
         compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
-    } catch { /* fallback = base */ }
-
+    } catch { }
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
 }
@@ -289,13 +262,27 @@ function detectIntent(text: string): "price" | "schedule" | "reschedule" | "canc
 /* ======== Variantes de tono ======== */
 function varyPrefix(kind: "greet" | "offer" | "ask" | "ok"): string {
     const sets = {
-        greet: ["¡Hola! 👋", "¡Qué gusto tenerte por aquí! 😊", "¡Hola, bienvenid@! ✨"],
+        greet: ["¡Hola! 👋", "¡Qué gusto verte! 😊", "¡Hola, bienvenid@! ✨"],
         offer: ["Te cuento rápido:", "Mira, te resumo:", "Va súper corto:"],
         ask: ["¿Te parece si…?", "¿Te paso opciones…?", "¿Seguimos con…?"],
         ok: ["Perfecto ✅", "¡Listo! 🙌", "Genial ✨"],
     } as const;
     const arr = sets[kind];
     return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/* ======== Catálogo → texto corto ======== */
+function servicesOverview(kb: EsteticaKB, max = 4): string {
+    const items = (kb.procedures ?? [])
+        .filter(p => p.enabled)
+        .slice(0, max)
+        .map(p => {
+            const price = p.priceMin ? ` (Desde ${formatCOP(p.priceMin)} (COP))` : "";
+            return `• ${p.name}${price}`;
+        })
+        .join("\n");
+    const tail = "¿Quieres horarios de alguno? 🗓️";
+    return `${varyPrefix("offer")} Estos son algunos servicios:\n${items}\n\n${tail}`;
 }
 
 /* ======== CORE (export) ======== */
@@ -353,8 +340,19 @@ export async function handleEsteticaReply(args: {
         return { estado: "requiere_agente", mensaje: txt, messageId, wamid, media: [] };
     }
 
-    // 3) Estado persistente
+    // 3) Estado
     let state = await loadState(convId);
+
+    // 3.a Primera interacción: saludo una sola vez
+    if (IS_GREETING.test(contenido.trim())) {
+        const greetText = "¡Hola! 😊 ¿En qué puedo ayudarte hoy? Si tienes preguntas sobre nuestros tratamientos o quieres agendar, aquí estoy.";
+        const { messageId, wamid } = await sendAndPersist({
+            conversationId: convId, empresaId, toPhone, phoneNumberId, texto: greetText, estado: "respondido",
+        });
+        state.hasGreeted = true;
+        await saveState(convId, state);
+        return { estado: "respondido", mensaje: greetText, messageId, wamid, media: [] };
+    }
 
     // 4) Historial + resumen embebido
     const history = await getRecentHistory(convId, undefined, CONF.MAX_HISTORY);
@@ -368,6 +366,15 @@ export async function handleEsteticaReply(args: {
 
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
+
+    // 5.a Pregunta explícita por "servicios"
+    if (IS_SERVICES_QUESTION.test(contenido)) {
+        const texto = servicesOverview(kb, 4);
+        const { messageId, wamid } = await sendAndPersist({
+            conversationId: convId, empresaId, toPhone, phoneNumberId, texto, estado: "respondido",
+        });
+        return { estado: "respondido", mensaje: texto, messageId, wamid, media: [] };
+    }
 
     // 6) Precio
     if (intent === "price") {
@@ -533,7 +540,11 @@ export async function handleEsteticaReply(args: {
         }
     }
 
-    // 9) Respuesta libre
+    // 9) Respuesta libre (evitar segundo saludo si ya saludamos)
+    const noRepeatGreet = state.hasGreeted
+        ? "\nMuy importante: ya saludaste antes, evita saludar de nuevo y ve directo al punto."
+        : "";
+
     const system = [
         `Eres un asesor de clínica estética en ${kb.timezone}. Tono humano, cálido, breve, con 1–3 emojis. Respuestas únicas (evita plantillas).`,
         `Si el usuario pide *precios*, usa únicamente los valores reales del catálogo (priceMin/priceMax). Formato: "Desde $X (COP)".`,
@@ -541,6 +552,7 @@ export async function handleEsteticaReply(args: {
         `Si detectas intención clara de agendar, pide nombre y teléfono y haz una confirmación final antes de reservar.`,
         `Si el modelo inventa montos no presentes, reemplázalos por "consulta por precio".`,
         `Resumen operativo + catálogo:\n${compactContext}`,
+        noRepeatGreet,
     ].join("\n");
 
     const svcLine = service
