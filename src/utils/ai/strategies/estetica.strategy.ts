@@ -1,14 +1,14 @@
+// utils/ai/strategies/estetica.strategy.ts
 import axios from "axios";
 import prisma from "../../../lib/prisma";
 import { openai } from "../../../lib/openai";
 import type { Prisma } from "@prisma/client";
 import { ConversationEstado, MediaType, MessageFrom } from "@prisma/client";
-import { formatInTimeZone } from "date-fns-tz";
-
 
 import * as Wam from "../../../services/whatsapp.service";
 import { transcribeAudioBuffer } from "../../../services/transcription.service";
 
+// === Estética (KB + Agenda) ===
 import {
     loadEsteticaKB,
     resolveServiceName,
@@ -24,7 +24,9 @@ import {
     type Slot,
 } from "./esteticaModules/schedule/estetica.schedule";
 
-// ===== Config =====
+import { formatInTimeZone, utcToZonedTime, format as tzFormat } from "date-fns-tz";
+
+// ================= Config =================
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000);
 const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000);
 const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000);
@@ -35,7 +37,7 @@ const IA_MAX_CHARS = Number(process.env.IA_MAX_CHARS ?? 1000);
 const IA_MAX_TOKENS = Number(process.env.IA_MAX_TOKENS ?? 180);
 const IA_ALLOW_EMOJI = (process.env.IA_ALLOW_EMOJI ?? "0") === "1";
 
-// ===== Utils =====
+// ================ Utils ================
 const processedInbound = new Map<number, number>();
 function seenInboundRecently(messageId: number, windowMs = REPLY_DEDUP_WINDOW_MS): boolean {
     const now = Date.now();
@@ -195,19 +197,20 @@ function budgetMessages(messages: any[], budgetPromptTokens = 120) {
     return messages;
 }
 
-// ===== Intents mínimos =====
+// ===== Intents =====
 const isCatalogQuery = (t: string) => {
     const s = ` ${(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()} `;
     const nouns = ["servicio", "servicios", "procedimiento", "procedimientos", "tratamiento", "tratamientos", "catalogo", "catálogo"];
-    const intents = ["que ", "qué ", "cuales", "cuáles", "lista", "disponible", "ofrecen", "tienes", "hay", "oferta", "precios", "precio"];
+    const intents = ["que ", "qué ", "cuales", "cuáles", "lista", "disponible", "ofrecen", "tienes", "hay", "oferta", "precios", "precio", "costos", "tarifas"];
     return nouns.some(k => s.includes(` ${k} `)) || intents.some(k => s.includes(k));
 };
-const asksPrice = (t: string) => /\b(precio|costo|valor|tarifa)\b/i.test((t || "").toLowerCase());
+const asksPrice = (t: string) => /\b(precio|precios|costo|costos|valor|tarifa|tarifas)\b/i.test((t || "").toLowerCase());
+const wantsSchedule = (t: string) => /\b(horario|horarios|disponibilidad|agenda|agendar|agéndame|cita|turno|reservar|programar)\b/i.test(t || "");
 const isServiceInfoQuestion = (t: string) =>
     /\b(beneficios?|ventajas?|resultados?)\b/i.test(t) ||
-    /\b(preparaci[oó]n|indicaciones|antes de|previo)\b/i.test(t) ||
+    /\b(preparaci[oó]n|indicaciones|antes de|previo|en que consiste|en qué consiste)\b/i.test(t) ||
     /\b(contraindicaciones?|riesgos?|efectos?\s+secundarios?)\b/i.test(t) ||
-    /\b(cuidados?|post\s*cuidado|despu[eé]s)\b/i.test(t);
+    /\b(cuidados?|post\s*cuidado|despu[eé]s|postoperatorio)\b/i.test(t);
 
 // ===== Tipos públicos =====
 export type IAReplyResult = { estado: ConversationEstado; mensaje: string; messageId?: number; wamid?: string; media?: any[]; };
@@ -269,21 +272,43 @@ export async function handleEsteticaReply(args: {
     const referenceTs = last?.timestamp ?? new Date();
     if (isImage && !caption && !userText) { await sleep(IMAGE_WAIT_MS); return { estado: conversacion.estado, mensaje: "" }; }
 
-    // ===== Reconocer servicio y necesidades
+    // ===== Resolver servicio por texto
     const svcMatch = resolveServiceName(kb, userText || caption || "");
     const svc = svcMatch?.procedure ?? null;
 
-    // —— (A) Preguntan info/beneficios del servicio
+    // ===== Prioridad de intents (suave):
+    // 1) Precios → SIEMPRE sale del flujo y responde lista de precios (full-asistente)
+    if (asksPrice(userText || caption || "") || (isCatalogQuery(userText || caption || "") && /\b(precio|precios)\b/i.test(userText || ""))) {
+        const procs = Array.isArray(kb.procedures) ? kb.procedures : [];
+        if (!procs.length) {
+            const savedEmpty = await persistBotReply({
+                conversationId: chatId, empresaId,
+                texto: "No veo servicios configurados aún. Si quieres, te oriento y después agendamos.",
+                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
+            });
+            return { estado: ConversationEstado.en_proceso, mensaje: savedEmpty.texto, messageId: savedEmpty.messageId, wamid: savedEmpty.wamid, media: [] };
+        }
+        const list = procs.slice(0, 20).map((p) => {
+            const from = serviceDisplayPrice(p);
+            return `• ${p.name}${from ? ` (Desde ${from})` : ""}`;
+        }).join("\n");
+
+        const txt = `Nuestros precios (COP):\n\n${list}\n\n¿Quieres que te comparta horarios para alguno?`;
+        const saved = await persistBotReply({
+            conversationId: chatId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone, phoneNumberId,
+        });
+        return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+
+    // 2) Info de un procedimiento (beneficios / consiste / preparación / contraindicaciones / cuidados)
     if (svc && isServiceInfoQuestion(userText || caption || "")) {
         const lines: string[] = [];
         if (svc.prepInstructions) lines.push(`• Indicaciones previas: ${svc.prepInstructions}`);
         if (svc.postCare) lines.push(`• Cuidados posteriores: ${svc.postCare}`);
         if (svc.contraindications) lines.push(`• Contraindicaciones: ${svc.contraindications}`);
         if (svc.notes) lines.push(`• Nota: ${svc.notes}`);
-
-        if (!lines.length) {
-            lines.push("• Recomendación general: llega con la piel limpia, evita exfoliantes fuertes 48–72 h antes y usa protector solar.");
-        }
+        if (!lines.length) lines.push("• Recomendación general: llega con la piel limpia, evita exfoliantes fuertes 48–72 h antes y usa protector solar.");
 
         const from = serviceDisplayPrice(svc);
         const txt = `Sobre *${svc.name}*${from ? ` (Desde ${from})` : ""}:\n${lines.join("\n")}\n\n¿Te comparto horarios disponibles?`;
@@ -295,17 +320,14 @@ export async function handleEsteticaReply(args: {
         return { estado: ConversationEstado.en_proceso, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // —— (B) Piden horarios / disponibilidad
-    const wantsSchedule = /\b(horario|horarios|disponibilidad|agenda|cita|turno)\b/i.test(userText || caption);
-    if (wantsSchedule) {
+    // 3) Agendamiento (en cualquier momento que lo mencionen)
+    if (wantsSchedule(userText || caption || "")) {
         const durationMin = svc?.durationMin ?? kb.defaultServiceDurationMin ?? 45;
         const tz = kb.timezone || "America/Bogota";
         const bufferMin = kb.bufferMin ?? 10;
 
-        // fecha ancla = HOY en tz del negocio
-        // fecha ancla = HOY en tz del negocio
+        // Hoy en tz del negocio
         const nowLocalISO = formatInTimeZone(new Date(), tz, "yyyy-MM-dd");
-
 
         const found = await getNextAvailableSlots(
             { empresaId, vertical: "estetica", timezone: tz, bufferMin, granularityMin: 15 },
@@ -339,7 +361,7 @@ export async function handleEsteticaReply(args: {
         return { estado: ConversationEstado.en_proceso, mensaje: savedNo.texto, messageId: savedNo.messageId, wamid: savedNo.wamid, media: [] };
     }
 
-    // —— (C) Catálogo / precios
+    // 4) Catálogo general (sin precios explícitos pedidos)
     if (isCatalogQuery(userText || caption || "")) {
         const procs = Array.isArray(kb.procedures) ? kb.procedures : [];
         if (!procs.length) {
@@ -366,6 +388,11 @@ export async function handleEsteticaReply(args: {
     }
 
     // ===== LLM libre con imagen contextual (fallback conversacional)
+    const businessName: string = (kb as any)?.businessName ?? "";
+    const kbTexts: { businessOverview?: string; disclaimers?: string } | undefined = (kb as any)?.kbTexts ?? undefined;
+    const logistics: { locationAddress?: string; locationName?: string } | undefined = (kb as any)?.logistics ?? undefined;
+    const isString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+
     let effectiveImageUrl = isImage ? imageUrl : null;
     let textForLLM = (userText || caption || "Hola").trim();
     if (!effectiveImageUrl && textForLLM) {
@@ -373,13 +400,6 @@ export async function handleEsteticaReply(args: {
         effectiveImageUrl = picked.url;
         if (picked.noteToAppend) textForLLM = `${textForLLM}${picked.noteToAppend}`;
     }
-
-    type KBTexts = { businessOverview?: string; disclaimers?: string };
-    type KBLogistics = { locationAddress?: string; locationName?: string };
-    const businessName: string = (kb as any)?.businessName ?? "";
-    const kbTexts: KBTexts | undefined = (kb as any)?.kbTexts ?? undefined;
-    const logistics: KBLogistics | undefined = (kb as any)?.logistics ?? undefined;
-    const isString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 
     const system = [
         businessName ? `Agente de clínica estética de "${businessName}".` : `Agente de clínica estética.`,
@@ -413,7 +433,7 @@ export async function handleEsteticaReply(args: {
         texto = "Te oriento sobre tratamientos y, si quieres, te paso horarios.";
     }
 
-    // Blindar montos inventados si no pidieron precio
+    // Blindar montos inventados si no pidieron precio explícitamente
     if (!asksPrice(userText || caption || "")) {
         if (KB_MONEY_RE.test(texto)) texto = texto.replace(KB_MONEY_RE, "consulta por precio");
     }
