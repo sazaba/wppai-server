@@ -224,8 +224,9 @@ model Conversation {
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
-  orders      Order[] // pedidos creados desde esta conversación
-  Appointment Appointment[]
+  orders            Order[] // pedidos creados desde esta conversación
+  Appointment       Appointment[]
+  ConversationState ConversationState?
 
   // 🔎 Índices útiles para dashboard/IA
   @@index([empresaId, estado, createdAt])
@@ -744,4 +745,17 @@ model AppointmentException {
 
   @@index([empresaId, date])
   @@map("appointment_exception")
+}
+
+model ConversationState {
+  id             Int      @id @default(autoincrement())
+  conversationId Int      @unique
+  data           Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([updatedAt])
+  @@map("conversation_state")
 }
