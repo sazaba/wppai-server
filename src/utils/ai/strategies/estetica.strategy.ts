@@ -1,16 +1,18 @@
 // utils/ai/strategies/estetica.strategy.ts
 /**
  * Estética – Strategy con envío/recepción WhatsApp alineado a agent.strategy
- * - Idempotencia por inbound (ventana corta)
+ * - Acepta chatId o conversationId (hotfix id undefined)
  * - Persistencia + envío centralizado (persistBotReply → Wam.sendWhatsappMessage)
- * - Mantiene summary en conversation_state (TTL 5 min)
- * - Reutiliza estetica.kb y estetica.schedule
+ * - Idempotencia/debounce como agent.strategy
+ * - Summary/estado en conversation_state (TTL 5 min)
+ * - Integra estetica.kb y estetica.schedule
  */
 
 import prisma from "../../../lib/prisma";
-import type { Prisma, AppointmentVertical, ConversationEstado, MediaType, MessageFrom } from "@prisma/client";
+import type { Prisma, AppointmentVertical } from "@prisma/client";
+import { MessageFrom, ConversationEstado } from "@prisma/client";
 import { openai } from "../../../lib/openai";
-import * as Wam from "../../../services/whatsapp.service"; // 👈 igual que agent.strategy
+import * as Wam from "../../../services/whatsapp.service";
 
 import {
     loadEsteticaKB,
@@ -25,7 +27,7 @@ import {
 } from "./esteticaModules/schedule/estetica.schedule";
 
 import { addMinutes } from "date-fns";
-import { zonedTimeToUtc, utcToZonedTime, format as tzFormat } from "date-fns-tz";
+import { utcToZonedTime, format as tzFormat } from "date-fns-tz";
 
 /* ===========================
    Config / ventanas
@@ -42,7 +44,7 @@ const CONF = {
     MODEL: process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini",
 };
 
-// Idempotencia y delays (tomado de agent.strategy)
+// Idempotencia y delays (alineado a agent.strategy)
 const REPLY_DEDUP_WINDOW_MS = Number(process.env.REPLY_DEDUP_WINDOW_MS ?? 120_000); // 120s
 const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000);   // 3 min
 const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000);   // 2 min
@@ -70,7 +72,7 @@ function markActuallyReplied(conversationId: number, clientTs: Date) {
 }
 async function computeReplyDelayMs(conversationId: number) {
     const prevBot = await prisma.message.findFirst({
-        where: { conversationId, from: "bot" },
+        where: { conversationId, from: MessageFrom.bot },
         select: { id: true },
     });
     return prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS;
@@ -106,7 +108,7 @@ function formatCOP(value?: number | null): string | null {
 }
 
 /* ===========================
-   conversation_state (igual a tu versión)
+   conversation_state
    =========================== */
 type DraftStage = "idle" | "offer" | "confirm";
 type AgentState = {
@@ -140,17 +142,18 @@ async function patchState(conversationId: number, patch: Partial<AgentState>) {
 }
 
 /* ===========================
-   Historial y resumen embebido (igual a tu versión)
+   Historial y resumen embebido
    =========================== */
 type ChatHistoryItem = { role: "user" | "assistant"; content: string };
 async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = CONF.MAX_HISTORY): Promise<ChatHistoryItem[]> {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({ where, orderBy: { timestamp: "desc" }, take, select: { from: true, contenido: true } });
-    return rows.reverse().map((r) => ({ role: r.from === "client" ? "user" : "assistant", content: softTrim(r.contenido || "", 220) })) as ChatHistoryItem[];
+    return rows.reverse().map((r) => ({ role: r.from === MessageFrom.client ? "user" : "assistant", content: softTrim(r.contenido || "", 220) })) as ChatHistoryItem[];
 }
 async function buildOrReuseSummary(args: { conversationId: number; kb: EsteticaKB; history: ChatHistoryItem[]; }): Promise<string> {
     const { conversationId, kb, history } = args;
+
     const state = await loadState(conversationId);
     const fresh = state.summary && Date.now() < Date.parse(state.summary.expiresAt);
     if (fresh) return state.summary!.text;
@@ -185,21 +188,28 @@ async function buildOrReuseSummary(args: { conversationId: number; kb: EsteticaK
             (openai as any).chat?.completions?.create
                 ? await (openai as any).chat.completions.create({
                     model: CONF.MODEL, temperature: 0.1, max_tokens: 220,
-                    messages: [{ role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. Español neutro." }, { role: "user", content: base.slice(0, 4000) }],
+                    messages: [
+                        { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. Español neutro." },
+                        { role: "user", content: base.slice(0, 4000) }
+                    ],
                 })
                 : await (openai as any).createChatCompletion({
                     model: CONF.MODEL, temperature: 0.1, max_tokens: 220,
-                    messages: [{ role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. Español neutro." }, { role: "user", content: base.slice(0, 4000) }],
+                    messages: [
+                        { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. Español neutro." },
+                        { role: "user", content: base.slice(0, 4000) }
+                    ],
                 });
         compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
     } catch { /* fallback base */ }
 
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
+    console.log("[ESTETICA] summary.ok", { saved: true });
     return compact;
 }
 
 /* ===========================
-   Intención y tono (igual)
+   Intención / tono
    =========================== */
 function detectIntent(text: string): "price" | "schedule" | "reschedule" | "cancel" | "info" | "other" {
     const t = (text || "").toLowerCase();
@@ -222,13 +232,13 @@ function varyPrefix(kind: "greet" | "offer" | "ask" | "ok"): string {
 }
 
 /* ===========================
-   Persistencia + envío (idéntico a agent.strategy)
+   Persistencia + envío
    =========================== */
 async function persistBotReply(opts: {
     conversationId: number; empresaId: number; texto: string; nuevoEstado: ConversationEstado; to?: string; phoneNumberId?: string;
 }) {
     const { conversationId, empresaId, texto, nuevoEstado, to, phoneNumberId } = opts;
-    const msg = await prisma.message.create({ data: { conversationId, from: "bot", contenido: texto, empresaId } });
+    const msg = await prisma.message.create({ data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId } });
     await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
 
     let wamid: string | undefined;
@@ -242,7 +252,10 @@ async function persistBotReply(opts: {
             });
             wamid = (resp as any)?.data?.messages?.[0]?.id || (resp as any)?.messages?.[0]?.id;
             if (wamid) await prisma.message.update({ where: { id: msg.id }, data: { externalId: wamid } });
-        } catch { /* noop */ }
+            console.log("[ESTETICA] sent WA", { wamid, to });
+        } catch (e) {
+            console.error("[ESTETICA] WA send error:", (e as any)?.message || e);
+        }
     }
     return { messageId: msg.id, texto, wamid };
 }
@@ -251,11 +264,13 @@ async function persistBotReply(opts: {
    Núcleo
    =========================== */
 export async function handleEsteticaReply(args: {
-    conversationId: number;
+    // acepta ambos nombres para compatibilidad con otros módulos
+    chatId?: number;
+    conversationId?: number;
     empresaId: number;
-    contenido?: string;       // texto recibido (si ya lo tienes limpio)
-    toPhone?: string;         // para enviar respuesta
-    phoneNumberId?: string;   // hint para WABA
+    contenido?: string;       // texto recibido limpio
+    toPhone?: string;         // destino WhatsApp
+    phoneNumberId?: string;   // WABA emisor (hint)
 }): Promise<{
     estado: "pendiente" | "respondido" | "en_proceso" | "requiere_agente";
     mensaje: string;
@@ -263,50 +278,61 @@ export async function handleEsteticaReply(args: {
     wamid?: string;
     media?: any[];
 }> {
-    const { conversationId, empresaId, contenido = "", toPhone, phoneNumberId } = args;
+    const {
+        chatId,
+        conversationId: conversationIdArg,
+        empresaId,
+        contenido = "",
+        toPhone,
+        phoneNumberId,
+    } = args;
 
-    // 0) Conversación + último inbound del cliente
+    const conversationId = conversationIdArg ?? chatId;
+    if (!conversationId) return { estado: "pendiente", mensaje: "" };
+
+    console.log("[ESTETICA] enter", { conversationId, empresaId, toPhone, phoneNumberId, hasContenido: !!contenido });
+
+    // Conversación + último inbound del cliente
     const conversacion = await prisma.conversation.findUnique({
         where: { id: conversationId }, select: { id: true, phone: true, estado: true },
     });
     if (!conversacion) return { estado: "pendiente", mensaje: "" };
 
     const last = await prisma.message.findFirst({
-        where: { conversationId, from: "client" },
+        where: { conversationId, from: MessageFrom.client },
         orderBy: { timestamp: "desc" },
-        select: { id: true, mediaType: true, mediaUrl: true, caption: true, contenido: true, timestamp: true },
+        select: { id: true, timestamp: true },
     });
 
-    // Idempotencia: evita doble respuesta a mismo inbound
+    // Idempotencia/ventana
     if (last?.id && seenInboundRecently(last.id)) return { estado: "pendiente", mensaje: "" };
     if (last?.timestamp && shouldSkipDoubleReply(conversationId, last.timestamp, REPLY_DEDUP_WINDOW_MS)) {
         return { estado: "pendiente", mensaje: "" };
     }
 
-    // 1) Cargar KB
+    // KB
     const kb = await loadEsteticaKB({ empresaId });
     if (!kb) {
         const txt = "Por ahora no tengo la configuración de la clínica. Te comunico con un asesor humano. 🙏";
         const saved = await persistBotReply({
-            conversationId, empresaId, texto: txt, nuevoEstado: "requiere_agente",
+            conversationId, empresaId, texto: txt, nuevoEstado: ConversationEstado.requiere_agente,
             to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // 2) Estado + Historial + Summary
+    // Estado + Historial + Summary
     let state = await loadState(conversationId);
     const history = await getRecentHistory(conversationId, undefined, CONF.MAX_HISTORY);
     const compactContext = await buildOrReuseSummary({ conversationId, kb, history });
 
-    // 3) Servicio + Intención
+    // Servicio + Intención
     const match = resolveServiceName(kb, contenido || "");
     const service = match.procedure ?? (state.lastServiceId ? kb.procedures.find(p => p.id === state.lastServiceId) ?? null : null);
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
-    // 4) Ramas principales (cuando haya respuesta, usar persistBotReply para enviar/guardar)
-    // ===== Precio
+    /* ===== Precio ===== */
     if (intent === "price") {
         if (service) {
             const priceLabel = service.priceMin ? `Desde ${formatCOP(service.priceMin)} (COP)` : null;
@@ -319,18 +345,16 @@ export async function handleEsteticaReply(args: {
                 dep ? `🔐 Anticipo de ${dep}` : "",
             ].filter(Boolean);
             const tail = `${varyPrefix("ask")} ¿quieres ver horarios cercanos? 🗓️`;
-            let texto = clampLines(closeNicely(`${piezas.join(" · ")}\n\n${tail}`));
+            const texto = clampLines(closeNicely(`${piezas.join(" · ")}\n\n${tail}`));
 
             state.lastIntent = "price";
             state.lastServiceId = service.id;
             state.lastServiceName = service.name;
             await saveState(conversationId, state);
 
-            // delay humano leve (como agent.strategy)
             await sleep(await computeReplyDelayMs(conversationId));
-
             const saved = await persistBotReply({
-                conversationId, empresaId, texto, nuevoEstado: "en_proceso",
+                conversationId, empresaId, texto, nuevoEstado: ConversationEstado.en_proceso,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
@@ -341,7 +365,7 @@ export async function handleEsteticaReply(args: {
 
             await sleep(await computeReplyDelayMs(conversationId));
             const saved = await persistBotReply({
-                conversationId, empresaId, texto: ask, nuevoEstado: "en_proceso",
+                conversationId, empresaId, texto: ask, nuevoEstado: ConversationEstado.en_proceso,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
@@ -349,7 +373,7 @@ export async function handleEsteticaReply(args: {
         }
     }
 
-    // ===== Horarios
+    /* ===== Horarios ===== */
     if (intent === "schedule" && (service || state.draft?.procedureId)) {
         const svc = service || kb.procedures.find((p) => p.id === state.draft?.procedureId)!;
         const duration = svc?.durationMin ?? kb.defaultServiceDurationMin ?? 60;
@@ -367,7 +391,7 @@ export async function handleEsteticaReply(args: {
             const txt = "No veo cupos cercanos por ahora. ¿Quieres que te contacte un asesor para coordinar? 🤝";
             await sleep(await computeReplyDelayMs(conversationId));
             const saved = await persistBotReply({
-                conversationId, empresaId, texto: txt, nuevoEstado: "en_proceso",
+                conversationId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
@@ -390,14 +414,14 @@ export async function handleEsteticaReply(args: {
 
         await sleep(await computeReplyDelayMs(conversationId));
         const saved = await persistBotReply({
-            conversationId, empresaId, texto, nuevoEstado: "en_proceso",
+            conversationId, empresaId, texto, nuevoEstado: ConversationEstado.en_proceso,
             to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // ===== Captura → confirmación
+    /* ===== Captura → confirmación ===== */
     const nameMatch = /(soy|me llamo)\s+([a-záéíóúñ\s]{2,40})/i.exec(contenido);
     const phoneMatch = /(\+?57)?\s?(\d{10})\b/.exec(contenido.replace(/[^\d+]/g, " "));
     const hhmm = /\b([01]?\d|2[0-3]):([0-5]\d)\b/.exec(contenido);
@@ -442,14 +466,14 @@ export async function handleEsteticaReply(args: {
 
         await sleep(await computeReplyDelayMs(conversationId));
         const saved = await persistBotReply({
-            conversationId, empresaId, texto: resumen, nuevoEstado: "en_proceso",
+            conversationId, empresaId, texto: resumen, nuevoEstado: ConversationEstado.en_proceso,
             to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // ===== Confirmación final
+    /* ===== Confirmación final ===== */
     if (/^confirmo\b/i.test(contenido.trim()) && state.draft?.stage === "confirm" && state.draft.whenISO) {
         try {
             const svc = kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0));
@@ -468,7 +492,7 @@ export async function handleEsteticaReply(args: {
 
             await sleep(await computeReplyDelayMs(conversationId));
             const saved = await persistBotReply({
-                conversationId, empresaId, texto: ok, nuevoEstado: "respondido",
+                conversationId, empresaId, texto: ok, nuevoEstado: ConversationEstado.respondido,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
@@ -477,7 +501,7 @@ export async function handleEsteticaReply(args: {
             const fail = `Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?`;
             await sleep(await computeReplyDelayMs(conversationId));
             const saved = await persistBotReply({
-                conversationId, empresaId, texto: fail, nuevoEstado: "en_proceso",
+                conversationId, empresaId, texto: fail, nuevoEstado: ConversationEstado.en_proceso,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
@@ -485,7 +509,7 @@ export async function handleEsteticaReply(args: {
         }
     }
 
-    // ===== Respuesta libre guiada por summary/kb
+    /* ===== Respuesta libre guiada por summary/kb ===== */
     const system = [
         `Eres un asesor de clínica estética en ${kb.timezone}. Tono humano, cálido, breve, con 1–3 emojis. Respuestas únicas (evita plantillas).`,
         `Si el usuario pide *precios*, usa solo los del catálogo. Formato: "Desde $X (COP)".`,
@@ -494,14 +518,23 @@ export async function handleEsteticaReply(args: {
         `Resumen operativo + catálogo:\n${compactContext}`,
     ].join("\n");
 
-    const userCtx = [service ? `Servicio en contexto: ${service.name}` : (state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : ""), contenido].filter(Boolean).join("\n");
+    const userCtx = [
+        service ? `Servicio en contexto: ${service.name}` : (state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : ""),
+        contenido,
+    ].filter(Boolean).join("\n");
 
     let texto = "";
     try {
         const resp: any =
             (openai as any).chat?.completions?.create
-                ? await (openai as any).chat.completions.create({ model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 180, messages: [{ role: "system", content: system }, { role: "user", content: userCtx }] })
-                : await (openai as any).createChatCompletion({ model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 180, messages: [{ role: "system", content: system }, { role: "user", content: userCtx }] });
+                ? await (openai as any).chat.completions.create({
+                    model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 180,
+                    messages: [{ role: "system", content: system }, { role: "user", content: userCtx }],
+                })
+                : await (openai as any).createChatCompletion({
+                    model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 180,
+                    messages: [{ role: "system", content: system }, { role: "user", content: userCtx }],
+                });
         texto = (resp?.choices?.[0]?.message?.content || "").trim();
     } catch {
         texto = "Te ayudo con información de los tratamientos y, si quieres, revisamos horarios para agendar. 🙂";
@@ -515,7 +548,7 @@ export async function handleEsteticaReply(args: {
 
     await sleep(await computeReplyDelayMs(conversationId));
     const saved = await persistBotReply({
-        conversationId, empresaId, texto, nuevoEstado: "respondido",
+        conversationId, empresaId, texto, nuevoEstado: ConversationEstado.respondido,
         to: toPhone ?? conversacion.phone, phoneNumberId,
     });
     if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
