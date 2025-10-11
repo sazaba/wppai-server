@@ -1,16 +1,15 @@
 // utils/ai/strategies/estetica.strategy.ts
 /**
- * Agente Estética – Híbrido inteligente (con envío directo a WhatsApp)
- * - Memoria corta en conversation_state (TTL 5 min) + flag hasGreeted
- * - Resumen embebido para bajar tokens
- * - Tono humano + emojis + variedad
- * - Sale/entra del flujo de agenda de forma suave (intención)
- * - Lee catálogo real (estetica.kb) + agenda real (estetica.schedule)
- * - Envía por WhatsApp Cloud API y persiste con externalId (wamid)
+ * Agente Estética – Híbrido inteligente
+ * - Memoria corta persistente (conversation_state) con TTL 5 min.
+ * - Resumen embebido (compactado con LLM) para bajar tokens.
+ * - Tono humano + emojis + variedad.
+ * - Sale/entra del flujo de agenda de forma suave (intención).
+ * - Lee catálogo/KB real y agenda real (horarios/solapes).
  */
 
 import prisma from "../../../lib/prisma";
-import type { Prisma } from "@prisma/client";
+import type { Prisma, AppointmentVertical } from "@prisma/client";
 import { openai } from "../../../lib/openai";
 
 import {
@@ -27,21 +26,26 @@ import {
 } from "./esteticaModules/schedule/estetica.schedule";
 
 import { addMinutes } from "date-fns";
-import { utcToZonedTime, format as tzFormat } from "date-fns-tz";
+import { zonedTimeToUtc, utcToZonedTime, format as tzFormat } from "date-fns-tz";
 
-/* ======== Defaults (sin ENV) ======== */
+/* ===========================
+   Defaults (sin ENV)
+   =========================== */
 const CONF = {
-    MEM_TTL_MIN: 5,
-    GRAN_MIN: 15,
-    MAX_SLOTS: 6,
-    DAYS_HORIZON: 14,
-    MAX_HISTORY: 10,
+    MEM_TTL_MIN: 5,            // memoria activa por conversación
+    GRAN_MIN: 15,              // granularidad para buscar slots (min)
+    MAX_SLOTS: 6,              // cuántos slots ofrecemos a la vez
+    DAYS_HORIZON: 14,          // días hacia adelante
+    MAX_HISTORY: 10,           // mensajes previos que compactamos
     REPLY_MAX_LINES: 5,
+    REPLY_MAX_CHARS: 900,
     TEMPERATURE: 0.6,
-    MODEL: "gpt-4o-mini",
+    MODEL: process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini",
 };
 
-/* ======== Helpers ======== */
+/* ===========================
+   Utils de formato
+   =========================== */
 function softTrim(s: string | null | undefined, max = 240) {
     const t = (s || "").trim();
     if (!t) return "";
@@ -71,92 +75,44 @@ function formatCOP(value?: number | null): string | null {
         maximumFractionDigits: 0,
     }).format(Number(value));
 }
-const IS_SERVICES_QUESTION = /(qué|que)\s+(servicios?|tratamientos?)\s+(ofre(?:ce|cen|s)|disponibles?|tienen?)/i;
-const IS_GREETING = /^(hola|buenas|qué tal|que tal|buen d[ií]a|buenas tardes|buenas noches)[\s!.,¡¿?]*$/i;
 
-/* ======== WhatsApp Cloud API (envío directo) ======== */
-async function waSendText(params: {
-    empresaId: number;
-    phoneNumberId?: string;
-    to: string;
-    body: string;
-}): Promise<string | null> {
-    const { empresaId, phoneNumberId, to, body } = params;
-
-    const wa = await prisma.whatsappAccount.findFirst({
-        where: phoneNumberId ? { phoneNumberId } : { empresaId },
-        select: { accessToken: true, phoneNumberId: true },
-    });
-    const pnid = phoneNumberId || wa?.phoneNumberId;
-    const token = wa?.accessToken;
-    if (!pnid || !token) return null;
-
-    const url = `https://graph.facebook.com/v20.0/${encodeURIComponent(pnid)}/messages`;
-    const resp = await fetch(url, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            messaging_product: "whatsapp",
-            to,
-            type: "text",
-            text: { body },
-        }),
-    });
-    if (!resp.ok) return null;
-    const json: any = await resp.json();
-    return json?.messages?.[0]?.id ?? null;
-}
-
-async function sendAndPersist(params: {
-    conversationId: number;
-    empresaId: number;
-    toPhone?: string;
-    phoneNumberId?: string;
-    texto: string;
-    estado: "pendiente" | "respondido" | "en_proceso" | "requiere_agente";
-}) {
-    const { conversationId, empresaId, toPhone, phoneNumberId, texto, estado } = params;
-    let wamid: string | null = null;
-    if (toPhone) {
-        try { wamid = await waSendText({ empresaId, phoneNumberId, to: toPhone, body: texto }); } catch { }
-    }
-    const msg = await prisma.message.create({
-        data: { conversationId, empresaId, from: "bot", contenido: texto, externalId: wamid || undefined },
-    });
-    await prisma.conversation.update({ where: { id: conversationId }, data: { estado } });
-    return { messageId: msg.id, wamid: wamid || undefined };
-}
-
-/* ======== Memoria (conversation_state) ======== */
+/* ===========================
+   Estado persistente (conversation_state)
+   =========================== */
 type DraftStage = "idle" | "offer" | "confirm";
 type AgentState = {
     lastIntent?: "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
     lastServiceId?: number | null;
     lastServiceName?: string | null;
-    hasGreeted?: boolean;
+
     draft?: {
         name?: string;
         phone?: string;
         procedureId?: number;
         procedureName?: string;
-        whenISO?: string;
+        whenISO?: string;      // si ya eligió
         durationMin?: number;
         stage?: DraftStage;
     };
+
     slotsCache?: {
         items: Array<{ startISO: string; endISO: string; label: string }>;
         expiresAt: string;
     };
-    summary?: { text: string; expiresAt: string };
+
+    // resumen embebido (ahorra tokens)
+    summary?: {
+        text: string;
+        expiresAt: string;
+    };
+
     expireAt?: string;
 };
 
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
+
 async function loadState(conversationId: number): Promise<AgentState> {
     const row = await prisma.conversationState.findUnique({
         where: { conversationId },
@@ -167,43 +123,90 @@ async function loadState(conversationId: number): Promise<AgentState> {
     if (expired) return { expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
     return data;
 }
+
 async function saveState(conversationId: number, data: AgentState) {
-    const next = { ...data, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
+    const prev = await loadState(conversationId);
+
+    // 🔒 merge tipado y seguro (evita errores de spreading sobre undefined)
+    const merged: AgentState = {
+        lastIntent:
+            data.lastIntent !== undefined ? data.lastIntent : prev.lastIntent,
+        lastServiceId:
+            data.lastServiceId !== undefined ? data.lastServiceId : prev.lastServiceId,
+        lastServiceName:
+            data.lastServiceName !== undefined ? data.lastServiceName : prev.lastServiceName,
+
+        draft: {
+            ...(prev.draft ? prev.draft : {}),
+            ...(data.draft ? data.draft : {}),
+        },
+
+        slotsCache: (() => {
+            if (data.slotsCache) return { ...data.slotsCache };
+            if (prev.slotsCache) return { ...prev.slotsCache };
+            return undefined;
+        })(),
+
+        summary: (() => {
+            if (data.summary) return { ...data.summary };
+            if (prev.summary) return { ...prev.summary };
+            return undefined;
+        })(),
+
+        expireAt: nowPlusMin(CONF.MEM_TTL_MIN),
+    };
+
     await prisma.conversationState.upsert({
         where: { conversationId },
-        create: { conversationId, data: next },
-        update: { data: next },
+        create: { conversationId, data: merged },
+        update: { data: merged },
     });
 }
+
 async function patchState(conversationId: number, patch: Partial<AgentState>) {
     const prev = await loadState(conversationId);
     await saveState(conversationId, { ...prev, ...patch });
 }
 
-/* ======== Historial compacto ======== */
-async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = CONF.MAX_HISTORY) {
+/* ===========================
+   Lectura de historial compacto
+   =========================== */
+type ChatRole = "system" | "user" | "assistant";
+async function getRecentHistory(
+    conversationId: number,
+    excludeMessageId?: number,
+    take = CONF.MAX_HISTORY
+) {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({
-        where, orderBy: { timestamp: "desc" }, take, select: { from: true, contenido: true },
+        where,
+        orderBy: { timestamp: "desc" },
+        take,
+        select: { from: true, contenido: true },
     });
     return rows.reverse().map((r) => ({
-        role: (r.from === "client" ? "user" : "assistant") as "user" | "assistant",
+        role: (r.from === "client" ? "user" : "assistant") as ChatRole,
         content: softTrim(r.contenido || "", 220),
     }));
 }
 
-/* ======== Resumen embebido ======== */
+/* ===========================
+   Compactador (resumen embebido)
+   =========================== */
 async function buildOrReuseSummary(args: {
     conversationId: number;
     kb: EsteticaKB;
-    history: Array<{ role: "user" | "assistant"; content: string }>;
+    history: Array<{ role: ChatRole; content: string }>;
 }): Promise<string> {
     const { conversationId, kb, history } = args;
+
+    // 1) Reusar si está fresco
     const state = await loadState(conversationId);
     const fresh = state.summary && Date.now() < Date.parse(state.summary.expiresAt);
     if (fresh) return state.summary!.text;
 
+    // 2) Construir texto base (sin llamar al modelo aún)
     const services = (kb.procedures ?? [])
         .filter((s) => s.enabled !== false)
         .map((s) => {
@@ -215,7 +218,6 @@ async function buildOrReuseSummary(args: {
     const rules: string[] = [];
     if (kb.bufferMin) rules.push(`Buffer ${kb.bufferMin} min`);
     if (kb.defaultServiceDurationMin) rules.push(`Duración por defecto ${kb.defaultServiceDurationMin} min`);
-
     const logistics: string[] = [];
     if (kb.location?.name) logistics.push(`Sede: ${kb.location.name}`);
     if (kb.location?.address) logistics.push(`Dirección: ${kb.location.address}`);
@@ -228,9 +230,10 @@ async function buildOrReuseSummary(args: {
         services ? `Servicios: ${services}` : "",
         kb.policies ? `Políticas: ${softTrim(kb.policies, 240)}` : "",
         kb.exceptions?.length ? `Excepciones próximas: ${kb.exceptions.slice(0, 2).map(e => `${e.dateISO}${e.isOpen === false ? " cerrado" : ""}`).join(", ")}` : "",
-        `Historial: ${history.map(h => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 110)).join(" | ")}`,
+        `Historial Rápido: ${history.map(h => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 110)).join(" | ")}`,
     ].filter(Boolean).join("\n");
 
+    // 3) Comprimir con LLM para ahorrar tokens (400–700 chars)
     let compact = base;
     try {
         const resp = await (openai.chat.completions.create as any)({
@@ -242,13 +245,22 @@ async function buildOrReuseSummary(args: {
                 { role: "user", content: base.slice(0, 4000) },
             ],
         });
-        compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
-    } catch { }
-    await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
+        compact = (resp?.choices?.[0]?.message?.content || base).trim();
+        compact = compact.replace(/\n{3,}/g, "\n\n");
+    } catch {
+        // si falla, usamos base
+    }
+
+    await patchState(conversationId, {
+        summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) },
+    });
+
     return compact;
 }
 
-/* ======== Intención ======== */
+/* ===========================
+   Detección de intención básica
+   =========================== */
 function detectIntent(text: string): "price" | "schedule" | "reschedule" | "cancel" | "info" | "other" {
     const t = (text || "").toLowerCase();
     if (/\b(precio|costo|valor|tarifa|cu[aá]nto)\b/.test(t)) return "price";
@@ -259,10 +271,12 @@ function detectIntent(text: string): "price" | "schedule" | "reschedule" | "canc
     return "other";
 }
 
-/* ======== Variantes de tono ======== */
+/* ===========================
+   Variantes de tono
+   =========================== */
 function varyPrefix(kind: "greet" | "offer" | "ask" | "ok"): string {
     const sets = {
-        greet: ["¡Hola! 👋", "¡Qué gusto verte! 😊", "¡Hola, bienvenid@! ✨"],
+        greet: ["¡Hola! 👋", "¡Qué gusto tenerte por aquí! 😊", "¡Hola, bienvenid@! ✨"],
         offer: ["Te cuento rápido:", "Mira, te resumo:", "Va súper corto:"],
         ask: ["¿Te parece si…?", "¿Te paso opciones…?", "¿Seguimos con…?"],
         ok: ["Perfecto ✅", "¡Listo! 🙌", "Genial ✨"],
@@ -271,23 +285,11 @@ function varyPrefix(kind: "greet" | "offer" | "ask" | "ok"): string {
     return arr[Math.floor(Math.random() * arr.length)];
 }
 
-/* ======== Catálogo → texto corto ======== */
-function servicesOverview(kb: EsteticaKB, max = 4): string {
-    const items = (kb.procedures ?? [])
-        .filter(p => p.enabled)
-        .slice(0, max)
-        .map(p => {
-            const price = p.priceMin ? ` (Desde ${formatCOP(p.priceMin)} (COP))` : "";
-            return `• ${p.name}${price}`;
-        })
-        .join("\n");
-    const tail = "¿Quieres horarios de alguno? 🗓️";
-    return `${varyPrefix("offer")} Estos son algunos servicios:\n${items}\n\n${tail}`;
-}
-
-/* ======== CORE (export) ======== */
+/* ===========================
+   Core de respuesta
+   =========================== */
 export async function handleEsteticaReply(args: {
-    conversationId?: number;
+    conversationId: number;
     empresaId: number;
     contenido?: string;
     toPhone?: string;
@@ -299,84 +301,46 @@ export async function handleEsteticaReply(args: {
     wamid?: string;
     media?: any[];
 }> {
-    const { empresaId, contenido = "", toPhone, phoneNumberId } = args;
+    const { conversationId, empresaId, contenido = "" } = args;
 
-    // 1) Resolver conversación robustamente
-    let convId: number | null =
-        typeof args.conversationId === "number" && Number.isFinite(args.conversationId)
-            ? Number(args.conversationId)
-            : null;
+    // Cargar conversación
+    const conversacion = await prisma.conversation.findUnique({
+        where: { id: conversationId },
+        select: { id: true, phone: true, estado: true },
+    });
+    if (!conversacion) return { estado: "pendiente", mensaje: "" };
 
-    let conversacion: { id: number; phone: string; estado: string } | null = null;
-
-    if (convId) {
-        conversacion = await prisma.conversation.findUnique({
-            where: { id: convId },
-            select: { id: true, phone: true, estado: true },
-        });
-    }
-    if (!conversacion && toPhone) {
-        conversacion = await prisma.conversation.findFirst({
-            where: { empresaId, phone: toPhone },
-            select: { id: true, phone: true, estado: true },
-            orderBy: { id: "desc" },
-        });
-    }
-    if (!conversacion) {
-        conversacion = await prisma.conversation.create({
-            data: { empresaId, phone: toPhone || "", estado: "pendiente" },
-            select: { id: true, phone: true, estado: true },
-        });
-    }
-    convId = conversacion.id;
-
-    // 2) KB
+    // KB
     const kb = await loadEsteticaKB({ empresaId });
     if (!kb) {
         const txt = "Por ahora no tengo la configuración de la clínica. Te comunico con un asesor humano. 🙏";
-        const { messageId, wamid } = await sendAndPersist({
-            conversationId: convId, empresaId, toPhone, phoneNumberId, texto: txt, estado: "requiere_agente",
+        await prisma.message.create({
+            data: { conversationId, empresaId, from: "bot", contenido: txt },
         });
-        return { estado: "requiere_agente", mensaje: txt, messageId, wamid, media: [] };
+        await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "requiere_agente" } });
+        return { estado: "requiere_agente", mensaje: txt, media: [] };
     }
 
-    // 3) Estado
-    let state = await loadState(convId);
+    // Estado persistente
+    let state = await loadState(conversationId);
 
-    // 3.a Primera interacción: saludo una sola vez
-    if (IS_GREETING.test(contenido.trim())) {
-        const greetText = "¡Hola! 😊 ¿En qué puedo ayudarte hoy? Si tienes preguntas sobre nuestros tratamientos o quieres agendar, aquí estoy.";
-        const { messageId, wamid } = await sendAndPersist({
-            conversationId: convId, empresaId, toPhone, phoneNumberId, texto: greetText, estado: "respondido",
-        });
-        state.hasGreeted = true;
-        await saveState(convId, state);
-        return { estado: "respondido", mensaje: greetText, messageId, wamid, media: [] };
-    }
+    // Historial + resumen embebido
+    const history = await getRecentHistory(conversationId, undefined, CONF.MAX_HISTORY);
+    const compactContext = await buildOrReuseSummary({ conversationId, kb, history });
 
-    // 4) Historial + resumen embebido
-    const history = await getRecentHistory(convId, undefined, CONF.MAX_HISTORY);
-    const compactContext = await buildOrReuseSummary({ conversationId: convId, kb, history });
-
-    // 5) Servicio + intención
+    // Resolver servicio por texto o usar el que ya venía en contexto
     const match = resolveServiceName(kb, contenido || "");
     const service =
         match.procedure ??
         (state.lastServiceId ? kb.procedures.find((p) => p.id === state.lastServiceId) ?? null : null);
 
+    // Intención
     let intent = detectIntent(contenido);
-    if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
-
-    // 5.a Pregunta explícita por "servicios"
-    if (IS_SERVICES_QUESTION.test(contenido)) {
-        const texto = servicesOverview(kb, 4);
-        const { messageId, wamid } = await sendAndPersist({
-            conversationId: convId, empresaId, toPhone, phoneNumberId, texto, estado: "respondido",
-        });
-        return { estado: "respondido", mensaje: texto, messageId, wamid, media: [] };
+    if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) {
+        intent = "info";
     }
 
-    // 6) Precio
+    // Si preguntan por precio, sal del flujo y responde natural
     if (intent === "price") {
         if (service) {
             const priceLabel = serviceDisplayPrice(service) || (service.priceMin ? `Desde ${formatCOP(service.priceMin)} (COP)` : null);
@@ -389,38 +353,39 @@ export async function handleEsteticaReply(args: {
                 `⏱️ Aprox. ${dur} min`,
                 dep ? `🔐 Anticipo de ${dep}` : "",
             ].filter(Boolean);
+
             const tail = `${varyPrefix("ask")} ¿quieres ver horarios cercanos? 🗓️`;
             const texto = clampLines(closeNicely(`${piezas.join(" · ")}\n\n${tail}`));
 
-            const { messageId, wamid } = await sendAndPersist({
-                conversationId: convId, empresaId, toPhone, phoneNumberId, texto, estado: "en_proceso",
-            });
+            await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: texto } });
+            await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "en_proceso" } });
 
             state.lastIntent = "price";
             state.lastServiceId = service.id;
             state.lastServiceName = service.name;
-            await saveState(convId, state);
+            await saveState(conversationId, state);
 
-            return { estado: "en_proceso", mensaje: texto, messageId, wamid, media: [] };
+            return { estado: "en_proceso", mensaje: texto, media: [] };
         } else {
             const nombres = kb.procedures.slice(0, 3).map((s) => s.name).join(", ");
             const ask = `¿Sobre cuál? (Ej.: ${nombres}) 😊`;
-            const { messageId, wamid } = await sendAndPersist({
-                conversationId: convId, empresaId, toPhone, phoneNumberId, texto: ask, estado: "en_proceso",
-            });
-            return { estado: "en_proceso", mensaje: ask, messageId, wamid, media: [] };
+            await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: ask } });
+            await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "en_proceso" } });
+            return { estado: "en_proceso", mensaje: ask, media: [] };
         }
     }
 
-    // 7) Horarios
+    // Si piden horarios → oferta rápida con buffer/granularidad
     if (intent === "schedule" && (service || state.draft?.procedureId)) {
         const svc = service || kb.procedures.find((p) => p.id === state.draft?.procedureId)!;
         const duration = svc?.durationMin ?? kb.defaultServiceDurationMin ?? 60;
+
+        // fecha ancla = HOY en tz del negocio
         const tz = kb.timezone;
         const todayISO = tzFormat(utcToZonedTime(new Date(), tz), "yyyy-MM-dd", { timeZone: tz });
 
         const slotsByDay = await getNextAvailableSlots(
-            { empresaId, timezone: tz, vertical: kb.vertical, bufferMin: kb.bufferMin, granularityMin: CONF.GRAN_MIN },
+            { empresaId, timezone: tz, vertical: kb.vertical as AppointmentVertical | "custom", bufferMin: kb.bufferMin, granularityMin: CONF.GRAN_MIN },
             todayISO,
             duration,
             CONF.DAYS_HORIZON,
@@ -430,10 +395,9 @@ export async function handleEsteticaReply(args: {
         const flat = slotsByDay.flatMap(d => d.slots).slice(0, CONF.MAX_SLOTS);
         if (!flat.length) {
             const txt = "No veo cupos cercanos por ahora. ¿Quieres que te contacte un asesor para coordinar? 🤝";
-            const { messageId, wamid } = await sendAndPersist({
-                conversationId: convId, empresaId, toPhone, phoneNumberId, texto: txt, estado: "en_proceso",
-            });
-            return { estado: "en_proceso", mensaje: txt, messageId, wamid, media: [] };
+            await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: txt } });
+            await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "en_proceso" } });
+            return { estado: "en_proceso", mensaje: txt, media: [] };
         }
 
         const labeled = flat.map(s => {
@@ -442,27 +406,38 @@ export async function handleEsteticaReply(args: {
             return { startISO: s.startISO, endISO: s.endISO, label: f };
         });
 
-        state.draft = { ...state.draft, procedureId: svc.id, procedureName: svc.name, durationMin: duration, stage: "offer" };
+        state.draft = {
+            ...state.draft,
+            procedureId: svc.id,
+            procedureName: svc.name,
+            durationMin: duration,
+            stage: "offer",
+        };
         state.lastIntent = "schedule";
         state.lastServiceId = svc.id;
         state.lastServiceName = svc.name;
         state.slotsCache = { items: labeled, expiresAt: nowPlusMin(10) };
-        await saveState(convId, state);
+        await saveState(conversationId, state);
 
         const bullets = labeled.map(l => `• ${l.label}`).join("\n");
-        const texto = `Tengo disponibilidad cercana para *${svc.name}*:\n${bullets}\n\nElige una y dime tu *nombre* y *teléfono* para reservar ✅`;
-        const { messageId, wamid } = await sendAndPersist({
-            conversationId: convId, empresaId, toPhone, phoneNumberId, texto, estado: "en_proceso",
-        });
-        return { estado: "en_proceso", mensaje: texto, messageId, wamid, media: [] };
+        const texto =
+            `Tengo disponibilidad cercana para *${svc.name}*:\n${bullets}\n\n` +
+            `Elige una y dime tu *nombre* y *teléfono* para reservar ✅`;
+
+        await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: texto } });
+        await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "en_proceso" } });
+
+        return { estado: "en_proceso", mensaje: texto, media: [] };
     }
 
-    // 8) Doble confirmación
+    // Confirmación de datos para agendar (doble confirmación)
+    // (Detectamos nombre/teléfono/hora simple en el mensaje)
     const nameMatch = /(soy|me llamo)\s+([a-záéíóúñ\s]{2,40})/i.exec(contenido);
     const phoneMatch = /(\+?57)?\s?(\d{10})\b/.exec(contenido.replace(/[^\d+]/g, " "));
     const hhmm = /\b([01]?\d|2[0-3]):([0-5]\d)\b/.exec(contenido);
 
     if ((nameMatch || phoneMatch || hhmm) && state.draft?.stage === "offer" && (state.draft.procedureId || service?.id)) {
+        // Si el usuario escribió una hora, tomamos la primera del cache si coincide por día, o la primera de la lista
         let chosen = state.slotsCache?.items?.[0];
         if (hhmm && state.slotsCache?.items?.length) {
             const hh = `${hhmm[1].padStart(2, "0")}:${hhmm[2]}`;
@@ -473,13 +448,13 @@ export async function handleEsteticaReply(args: {
 
         const draft = {
             ...state.draft,
-            name: state.draft.name ?? (nameMatch ? nameMatch[2].trim().replace(/\s+/g, " ").replace(/^\p{L}/u, (c) => c.toUpperCase()) : undefined),
+            name: state.draft.name ?? (nameMatch ? nameMatch[2].trim().replace(/\s+/g, " ").replace(/^(.)(.*)$/u, (_m, a, b) => a.toUpperCase() + b) : undefined),
             phone: state.draft.phone ?? (phoneMatch ? phoneMatch[2] : undefined),
             whenISO: state.draft.whenISO ?? chosen?.startISO,
             stage: "confirm" as DraftStage,
         };
         state.draft = draft;
-        await saveState(convId, state);
+        await saveState(conversationId, state);
 
         const local = draft.whenISO ? new Date(draft.whenISO) : null;
         const fecha = local
@@ -496,11 +471,9 @@ export async function handleEsteticaReply(args: {
             `• Nombre: ${draft.name ?? "—"}\n` +
             `• Teléfono: ${draft.phone ?? "—"}\n\n` +
             `Responde *"confirmo"* y hago la reserva 📅`;
-
-        const { messageId, wamid } = await sendAndPersist({
-            conversationId: convId, empresaId, toPhone, phoneNumberId, texto: resumen, estado: "en_proceso",
-        });
-        return { estado: "en_proceso", mensaje: resumen, messageId, wamid, media: [] };
+        await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: resumen } });
+        await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "en_proceso" } });
+        return { estado: "en_proceso", mensaje: resumen, media: [] };
     }
 
     if (/^confirmo\b/i.test(contenido.trim()) && state.draft?.stage === "confirm" && state.draft.whenISO) {
@@ -510,7 +483,7 @@ export async function handleEsteticaReply(args: {
 
             await createAppointmentSafe({
                 empresaId,
-                vertical: kb.vertical,
+                vertical: kb.vertical as AppointmentVertical | "custom",
                 timezone: kb.timezone,
                 procedureId: state.draft.procedureId ?? null,
                 serviceName: state.draft.procedureName || (svc?.name ?? "Procedimiento"),
@@ -523,42 +496,37 @@ export async function handleEsteticaReply(args: {
             });
 
             const ok = `¡Hecho! Tu cita quedó confirmada ✅. Te llegará un recordatorio.`;
-            const { messageId, wamid } = await sendAndPersist({
-                conversationId: convId, empresaId, toPhone, phoneNumberId, texto: ok, estado: "respondido",
-            });
+            await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: ok } });
+            await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "respondido" } });
 
+            // limpiar draft
             state.draft = { stage: "idle" };
-            await saveState(convId, state);
+            await saveState(conversationId, state);
 
-            return { estado: "respondido", mensaje: ok, messageId, wamid, media: [] };
+            return { estado: "respondido", mensaje: ok, media: [] };
         } catch {
             const fail = `Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?`;
-            const { messageId, wamid } = await sendAndPersist({
-                conversationId: convId, empresaId, toPhone, phoneNumberId, texto: fail, estado: "en_proceso",
-            });
-            return { estado: "en_proceso", mensaje: fail, messageId, wamid, media: [] };
+            await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: fail } });
+            await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "en_proceso" } });
+            return { estado: "en_proceso", mensaje: fail, media: [] };
         }
     }
 
-    // 9) Respuesta libre (evitar segundo saludo si ya saludamos)
-    const noRepeatGreet = state.hasGreeted
-        ? "\nMuy importante: ya saludaste antes, evita saludar de nuevo y ve directo al punto."
-        : "";
-
+    // === Respuesta libre (informativa o general) usando el resumen embebido ===
     const system = [
         `Eres un asesor de clínica estética en ${kb.timezone}. Tono humano, cálido, breve, con 1–3 emojis. Respuestas únicas (evita plantillas).`,
         `Si el usuario pide *precios*, usa únicamente los valores reales del catálogo (priceMin/priceMax). Formato: "Desde $X (COP)".`,
-        `Si pide *horarios*, ofrece slots cercanos (la función interna ya se ejecuta según intención).`,
+        `Si pide *horarios*, ofrece slots cercanos llamando a la función interna (ya se ejecutó según intención).`,
         `Si detectas intención clara de agendar, pide nombre y teléfono y haz una confirmación final antes de reservar.`,
         `Si el modelo inventa montos no presentes, reemplázalos por "consulta por precio".`,
         `Resumen operativo + catálogo:\n${compactContext}`,
-        noRepeatGreet,
     ].join("\n");
 
-    const svcLine = service
-        ? `Servicio en contexto: ${service.name}`
-        : (state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : "");
-    const userCtx = [svcLine, contenido].filter(Boolean).join("\n");
+    // prompt user
+    const userCtx = (() => {
+        const svcLine = service ? `Servicio en contexto: ${service.name}` : (state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : "");
+        return [svcLine, contenido].filter(Boolean).join("\n");
+    })();
 
     let texto = "";
     try {
@@ -570,7 +538,7 @@ export async function handleEsteticaReply(args: {
         });
         texto = (resp?.choices?.[0]?.message?.content || "").trim();
     } catch {
-        texto = "Te ayudo con info de los tratamientos y, si quieres, vemos horarios para agendar. 🙂";
+        texto = "Te ayudo con información de los tratamientos y, si quieres, vemos horarios para agendar. 🙂";
     }
     texto = closeNicely(texto);
     texto = clampLines(texto, CONF.REPLY_MAX_LINES);
@@ -578,16 +546,19 @@ export async function handleEsteticaReply(args: {
         if (KB_MONEY_RE.test(texto)) texto = texto.replace(KB_MONEY_RE, "consulta por precio");
     }
 
-    const { messageId, wamid } = await sendAndPersist({
-        conversationId: convId, empresaId, toPhone, phoneNumberId, texto, estado: "respondido",
-    });
+    await prisma.message.create({ data: { conversationId, empresaId, from: "bot", contenido: texto } });
+    await prisma.conversation.update({ where: { id: conversationId }, data: { estado: "respondido" } });
 
+    // memoria ligera (último servicio/intención)
     if (service) {
         state.lastServiceId = service.id;
         state.lastServiceName = service.name;
     }
     state.lastIntent = intent === "other" ? state.lastIntent : intent;
-    await saveState(convId, state);
+    await saveState(conversationId, state);
 
-    return { estado: "respondido", mensaje: texto, messageId, wamid, media: [] };
+    return { estado: "respondido", mensaje: texto, media: [] };
 }
+
+// Export dual (para evitar "is not a function" según cómo importes)
+export default handleEsteticaReply;
