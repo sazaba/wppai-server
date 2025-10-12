@@ -1,15 +1,15 @@
 // utils/ai/strategies/estetica.strategy.ts
 /**
- * Estética – Strategy con envío/recepción WhatsApp
- * - Responde INMEDIATO (sin delays simulados)
- * - Idempotencia/debounce ligera (sin bloquear)
- * - Persistencia + envío WhatsApp vía Wam.sendWhatsappMessage
- * - Memoria en conversation_state (summary, intent, draft…)
- * - Integra estetica.kb y estetica.schedule
+ * Estética – Strategy WhatsApp
+ * - Responde INMEDIATO (sin delays)
+ * - Sin “Hola” automático
+ * - Usa staff según requiredStaffIds o rol
+ * - Contexto = historial reciente + summary en conversation_state
+ * - Booking con doble confirmación (sin meter Appointment/AppointmentHour al summary)
  */
 
 import prisma from "../../../lib/prisma";
-import type { Prisma, AppointmentVertical } from "@prisma/client";
+import type { Prisma, AppointmentVertical, StaffRole } from "@prisma/client";
 import { MessageFrom, ConversationEstado, MediaType } from "@prisma/client";
 import { openai } from "../../../lib/openai";
 import * as Wam from "../../../services/whatsapp.service";
@@ -37,10 +37,10 @@ const CONF = {
     GRAN_MIN: 15,
     MAX_SLOTS: 6,
     DAYS_HORIZON: 14,
-    MAX_HISTORY: 10,
+    MAX_HISTORY: 12, // más contexto
     REPLY_MAX_LINES: 5,
     REPLY_MAX_CHARS: 900,
-    TEMPERATURE: 0.6,
+    TEMPERATURE: 0.55,
     MODEL: process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini",
 };
 
@@ -141,15 +141,16 @@ async function patchState(conversationId: number, patch: Partial<AgentState>) {
 }
 
 /* ===========================
-   Historial y resumen embebido
+   Historial y summary
    =========================== */
 type ChatHistoryItem = { role: "user" | "assistant"; content: string };
 async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = CONF.MAX_HISTORY): Promise<ChatHistoryItem[]> {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({ where, orderBy: { timestamp: "desc" }, take, select: { from: true, contenido: true } });
-    return rows.reverse().map((r) => ({ role: r.from === MessageFrom.client ? "user" : "assistant", content: softTrim(r.contenido || "", 220) })) as ChatHistoryItem[];
+    return rows.reverse().map((r) => ({ role: r.from === MessageFrom.client ? "user" : "assistant", content: softTrim(r.contenido || "", 280) })) as ChatHistoryItem[];
 }
+
 async function buildOrReuseSummary(args: { conversationId: number; kb: EsteticaKB; history: ChatHistoryItem[]; }): Promise<string> {
     const { conversationId, kb, history } = args;
 
@@ -158,14 +159,16 @@ async function buildOrReuseSummary(args: { conversationId: number; kb: EsteticaK
     const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
     if (fresh) return cached.summary!.text;
 
-    // construir base
+    // ===== construir resumen (incluye staff, pero NO slots ni citas) =====
     const services = (kb.procedures ?? [])
         .filter((s) => s.enabled !== false)
         .map((s) => {
             const desde = s.priceMin ? formatCOP(s.priceMin) : null;
             return desde ? `${s.name} (Desde ${desde} COP)` : s.name;
-        })
-        .join(" • ");
+        }).join(" • ");
+
+    const staffByRole: Record<StaffRole, string[]> = { esteticista: [], medico: [], profesional: [] } as any;
+    (kb.staff || []).forEach(s => { if (s.active) (staffByRole[s.role] ||= []).push(s.name); });
 
     const rules: string[] = [];
     if (kb.bufferMin) rules.push(`Buffer ${kb.bufferMin} min`);
@@ -181,11 +184,17 @@ async function buildOrReuseSummary(args: { conversationId: number; kb: EsteticaK
         logistics.length ? logistics.join(" | ") : "",
         rules.length ? rules.join(" | ") : "",
         services ? `Servicios: ${services}` : "",
+        Object.entries(staffByRole).some(([_, arr]) => (arr?.length ?? 0) > 0)
+            ? `Staff: ${[
+                staffByRole.medico?.length ? `Médicos: ${staffByRole.medico.join(", ")}` : "",
+                staffByRole.esteticista?.length ? `Esteticistas: ${staffByRole.esteticista.join(", ")}` : "",
+                staffByRole.profesional?.length ? `Profesionales: ${staffByRole.profesional.join(", ")}` : "",
+            ].filter(Boolean).join(" | ")}`
+            : "",
         kb.policies ? `Políticas: ${softTrim(kb.policies, 240)}` : "",
         kb.exceptions?.length
-            ? `Excepciones próximas: ${kb.exceptions.slice(0, 2).map(e => `${e.dateISO}${e.isOpen === false ? " cerrado" : ""}`).join(", ")}`
-            : "",
-        `Historial: ${history.map(h => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 110)).join(" | ")}`,
+            ? `Excepciones próximas: ${kb.exceptions.slice(0, 2).map(e => `${e.dateISO}${e.isOpen === false ? " cerrado" : ""}`).join(", ")}` : "",
+        `Historial breve: ${history.slice(-6).map(h => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 100)).join(" | ")}`,
     ].filter(Boolean).join("\n");
 
     let compact = base;
@@ -209,7 +218,6 @@ async function buildOrReuseSummary(args: { conversationId: number; kb: EsteticaK
         compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
     } catch { /* fallback base */ }
 
-    // guardar SOLO el resumen (merge)
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     console.log("[ESTETICA] summary.ok", { saved: true });
     return compact;
@@ -227,15 +235,36 @@ function detectIntent(text: string): "price" | "schedule" | "reschedule" | "canc
     if (/\b(beneficios?|indicaciones|cuidados|contraindicaciones|en qu[eé] consiste|como funciona)\b/.test(t)) return "info";
     return "other";
 }
-function varyPrefix(kind: "greet" | "offer" | "ask" | "ok"): string {
+function varyPrefix(kind: "offer" | "ask" | "ok"): string {
     const sets = {
-        greet: ["¡Hola! 👋", "¡Qué gusto verte! 😊", "¡Hola, bienvenid@! ✨"],
-        offer: ["Te cuento rápido:", "Mira, te resumo:", "Va muy corto:"],
+        offer: ["Te cuento rápido:", "Resumen:", "Puntos clave:"],
         ask: ["¿Te paso opciones…?", "¿Seguimos con…?", "¿Quieres ver horarios?"],
-        ok: ["Perfecto ✅", "¡Listo! 🙌", "Genial ✨"],
+        ok: ["Perfecto ✅", "¡Listo! ✨", "Genial 🙌"],
     } as const;
     const arr = sets[kind];
     return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/* ===========================
+   Staff helper
+   =========================== */
+function pickStaffForProcedure(kb: EsteticaKB, proc?: EsteticaKB["procedures"][number] | null) {
+    const active = (kb.staff || []).filter(s => s.active);
+    if (!active.length) return null;
+
+    if (proc?.requiredStaffIds?.length) {
+        const byId = active.find(s => proc.requiredStaffIds!.includes(s.id));
+        if (byId) return byId;
+    }
+    // Heurística por rol
+    if (proc?.requiresAssessment) {
+        const medico = active.find(s => s.role === "medico");
+        if (medico) return medico;
+    }
+    const esteticista = active.find(s => s.role === "esteticista");
+    if (esteticista) return esteticista;
+
+    return active[0];
 }
 
 /* ===========================
@@ -314,7 +343,7 @@ export async function handleEsteticaReply(args: {
     if (!contenido) {
         if (last?.contenido && last.contenido.trim()) contenido = last.contenido.trim();
         else if (last?.mediaType === MediaType.image && last?.caption) contenido = String(last.caption).trim();
-        else contenido = "Hola";
+        else contenido = "…";
     }
 
     // KB
@@ -332,8 +361,7 @@ export async function handleEsteticaReply(args: {
     let state = await loadState(conversationId);
     const history = await getRecentHistory(conversationId, undefined, CONF.MAX_HISTORY);
     const compactContext = await buildOrReuseSummary({ conversationId, kb, history });
-    // ⚠️ re-cargar state para asegurarnos de traer el summary recién escrito
-    state = await loadState(conversationId);
+    state = await loadState(conversationId); // refrescar summary guardado
 
     // Servicio + Intención
     const match = resolveServiceName(kb, contenido || "");
@@ -341,7 +369,25 @@ export async function handleEsteticaReply(args: {
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
-    /* ===== Respuesta “¿Qué servicios…?” genérica ===== */
+    /* ===== Pregunta por quién realiza / profesional ===== */
+    if (/\b(qu[ié]n|quien|persona|profesional|doctor|doctora|m[eé]dico|esteticista).*(hace|realiza|atiende|me va a hacer)\b/i.test(contenido)) {
+        const whoProc = service || (state.lastServiceId ? kb.procedures.find(p => p.id === state.lastServiceId) : null);
+        const staff = pickStaffForProcedure(kb, whoProc || undefined);
+        const labelSvc = whoProc?.name ? `*${whoProc.name}* ` : "";
+        const texto = staff
+            ? `${labelSvc}lo realiza ${staff.role === "medico" ? "la/el Dr(a)." : ""} *${staff.name}*. Antes hacemos una valoración breve para personalizar el tratamiento. ¿Quieres ver horarios?`
+            : `${labelSvc}lo realiza un profesional de nuestro equipo. Antes hacemos una valoración breve para personalizar el tratamiento. ¿Te paso horarios?`;
+
+        await patchState(conversationId, { lastIntent: "info", ...(whoProc ? { lastServiceId: whoProc.id, lastServiceName: whoProc.name } : {}) });
+        const saved = await persistBotReply({
+            conversationId, empresaId, texto: clampLines(closeNicely(texto)), nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone, phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+        return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+
+    /* ===== Respuesta “¿Qué servicios…?” ===== */
     if (/que\s+servicios|qué\s+servicios|servicios\s+ofreces?/i.test(contenido)) {
         const items = kb.procedures.slice(0, 6).map(p => {
             const desde = p.priceMin ? ` (desde ${formatCOP(p.priceMin)})` : "";
@@ -365,10 +411,12 @@ export async function handleEsteticaReply(args: {
             const priceLabel = service.priceMin ? `Desde ${formatCOP(service.priceMin)} (COP)` : null;
             const dur = service.durationMin ?? kb.defaultServiceDurationMin ?? 60;
             const dep = service.depositRequired ? formatCOP(service.depositAmount ?? null) : null;
+            const staff = pickStaffForProcedure(kb, service);
             const piezas = [
                 `${varyPrefix("offer")} *${service.name}*`,
                 priceLabel ? `💵 ${priceLabel}` : "",
                 `⏱️ Aprox. ${dur} min`,
+                staff ? `👩‍⚕️ Profesional: ${staff.name}` : "",
                 dep ? `🔐 Anticipo de ${dep}` : "",
             ].filter(Boolean);
             const tail = `${varyPrefix("ask")} ¿quieres ver horarios cercanos? 🗓️`;
@@ -383,7 +431,7 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         } else {
             const nombres = kb.procedures.slice(0, 3).map((s) => s.name).join(", ");
-            const ask = `¿De cuál tratamiento te paso precio? (Ej.: ${nombres}) 😊`;
+            const ask = `¿De cuál tratamiento te paso precio? (Ej.: ${nombres})`;
 
             await patchState(conversationId, { lastIntent: "price" });
             const saved = await persistBotReply({
@@ -410,7 +458,7 @@ export async function handleEsteticaReply(args: {
 
         const flat = slotsByDay.flatMap(d => d.slots).slice(0, CONF.MAX_SLOTS);
         if (!flat.length) {
-            const txt = "No veo cupos cercanos por ahora. ¿Quieres que te contacte un asesor para coordinar? 🤝";
+            const txt = "No veo cupos cercanos por ahora. ¿Quieres que te contacte un asesor para coordinar?";
             const saved = await persistBotReply({
                 conversationId, empresaId, texto: txt, nuevoEstado: ConversationEstado.en_proceso,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
@@ -432,7 +480,7 @@ export async function handleEsteticaReply(args: {
         });
 
         const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
-        const texto = `Tengo disponibilidad cercana para *${svc.name}*:\n${bullets}\n\nElige una y dime tu *nombre* y *teléfono* para reservar ✅`;
+        const texto = `Disponibilidad cercana para *${svc.name}*:\n${bullets}\n\nElige una y dime tu *nombre* y *teléfono* para reservar.`;
 
         const saved = await persistBotReply({
             conversationId, empresaId, texto, nuevoEstado: ConversationEstado.en_proceso,
@@ -480,12 +528,12 @@ export async function handleEsteticaReply(args: {
             : "hora por confirmar";
 
         const resumen =
-            `${varyPrefix("ok")} Estoy listo para reservar. ¿Confirmas?\n` +
+            `${varyPrefix("ok")} ¿confirmas la reserva?\n` +
             `• Procedimiento: ${draft.procedureName ?? "—"}\n` +
             `• Fecha/Hora: ${fecha} ${local ? `a las ${hora}` : ""}\n` +
             `• Nombre: ${draft.name ?? "—"}\n` +
             `• Teléfono: ${draft.phone ?? "—"}\n\n` +
-            `Responde *"confirmo"* y hago la reserva 📅`;
+            `Responde *"confirmo"* y creo la cita.`;
 
         const saved = await persistBotReply({
             conversationId, empresaId, texto: resumen, nuevoEstado: ConversationEstado.en_proceso,
@@ -495,7 +543,7 @@ export async function handleEsteticaReply(args: {
         return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    /* ===== Confirmación final ===== */
+    /* ===== Confirmación final (revalidación) ===== */
     const latestState = await loadState(conversationId);
     if (/^confirmo\b/i.test(contenido.trim()) && latestState.draft?.stage === "confirm" && latestState.draft.whenISO) {
         try {
@@ -509,7 +557,7 @@ export async function handleEsteticaReply(args: {
                 startISO: latestState.draft.whenISO, endISO, notes: "Agendado por IA", source: "ai",
             });
 
-            const ok = `¡Hecho! Tu cita quedó confirmada ✅. Te llegará un recordatorio.`;
+            const ok = `¡Hecho! Tu cita quedó confirmada ✅. Te enviaremos recordatorio antes de la fecha.`;
             await patchState(conversationId, { draft: { stage: "idle" } });
 
             const saved = await persistBotReply({
@@ -529,37 +577,43 @@ export async function handleEsteticaReply(args: {
         }
     }
 
-    /* ===== Respuesta libre con summary/kb ===== */
+    /* ===== Respuesta libre con contexto (sin “Hola”) ===== */
     const system = [
-        `Eres un asesor de clínica estética en ${kb.timezone}. Tono humano, cálido, breve, con 1–3 emojis. Respuestas únicas (evita plantillas).`,
-        `Si el usuario pide *precios*, usa solo los del catálogo. Formato: "Desde $X (COP)".`,
-        `Si pide *horarios*, ofrece slots y solicita nombre/teléfono solo si hay intención real.`,
-        `Si hay intención de agendar, pide datos y confirma antes de reservar.`,
-        `Resumen operativo + catálogo:\n${compactContext}`,
+        `Eres asesor de una clínica estética (${kb.timezone}).`,
+        `Responde directo, **no inicies con saludos** ni despedidas; evita “Hola”.`,
+        `Sé breve (2–5 líneas máx), natural, y usa emojis solo si aportan (0–2).`,
+        `Si piden *precios*, usa solo los del catálogo y el formato: "Desde $X (COP)".`,
+        `Si piden *horarios*, ofrece slots y solicita nombre/teléfono sólo si hay intención real.`,
+        `Si hay intención de agendar, pide datos mínimos y confirma antes de reservar.`,
+        `Resumen operativo + catálogo (contexto):\n${compactContext}`,
     ].join("\n");
 
     const userCtx = [
         service ? `Servicio en contexto: ${service.name}` : (state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : ""),
-        contenido,
+        `Usuario: ${contenido}`,
     ].filter(Boolean).join("\n");
+
+    // ➕ historial real al modelo (mantiene el hilo)
+    const dialogMsgs = history.slice(-6).map(h => ({ role: h.role, content: h.content }));
 
     let texto = "";
     try {
         const resp: any =
             (openai as any).chat?.completions?.create
                 ? await (openai as any).chat.completions.create({
-                    model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 180,
-                    messages: [{ role: "system", content: system }, { role: "user", content: userCtx }],
+                    model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 190,
+                    messages: [{ role: "system", content: system }, ...dialogMsgs, { role: "user", content: userCtx }],
                 })
                 : await (openai as any).createChatCompletion({
-                    model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 180,
-                    messages: [{ role: "system", content: system }, { role: "user", content: userCtx }],
+                    model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 190,
+                    messages: [{ role: "system", content: system }, ...dialogMsgs as any, { role: "user", content: userCtx }],
                 });
         texto = (resp?.choices?.[0]?.message?.content || "").trim();
     } catch {
-        texto = "Te ayudo con información de los tratamientos y, si quieres, revisamos horarios para agendar. 🙂";
+        texto = "Te ayudo con información de los tratamientos y, si quieres, revisamos horarios para agendar.";
     }
 
+    // limpieza & guardado de estado
     texto = clampLines(closeNicely(texto));
     await patchState(conversationId, {
         lastIntent: intent === "other" ? state.lastIntent : intent,
