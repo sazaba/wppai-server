@@ -537,6 +537,67 @@ export async function handleEsteticaReply(args: {
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
+    // ==== Scheduling Engine (ofrece, captura, confirma, cancela y reprograma)
+    {
+        const kbMinimal = {
+            vertical: kb.vertical,
+            timezone: kb.timezone,
+            bufferMin: kb.bufferMin ?? null,
+            defaultServiceDurationMin: kb.defaultServiceDurationMin ?? null,
+            procedures: (kb.procedures ?? []).map(p => ({
+                id: p.id,
+                name: p.name,
+                durationMin: p.durationMin ?? null,
+            })),
+        } as const;
+
+        const sched = await handleSchedulingTurn({
+            text: contenido,
+            state: {
+                draft: state.draft,
+                lastIntent: state.lastIntent,
+                lastServiceId: state.lastServiceId,
+                lastServiceName: state.lastServiceName,
+                slotsCache: state.slotsCache,
+                lastPhoneSeen: (state as any).lastPhoneSeen ?? null,
+            },
+            ctx: {
+                empresaId,
+                kb: kbMinimal,
+                granularityMin: CONF.GRAN_MIN,
+                daysHorizon: CONF.DAYS_HORIZON,
+                maxSlots: CONF.MAX_SLOTS,
+                toCOP: formatCOP,
+            },
+            serviceInContext: service ? { id: service.id, name: service.name, durationMin: service.durationMin ?? null } : null,
+            intent, // "schedule" | "reschedule" | "cancel" | etc.
+        });
+
+        if (sched.patch) await patchState(conversationId, sched.patch as any);
+
+        if (sched.handled) {
+            const reply = (sched.reply || "").trim();
+            if (reply) {
+                const saved = await persistBotReply({
+                    conversationId,
+                    empresaId,
+                    texto: reply,
+                    nuevoEstado: sched.createOk ? ConversationEstado.respondido : ConversationEstado.en_proceso,
+                    to: toPhone ?? conversacion.phone,
+                    phoneNumberId,
+                });
+                if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+            }
+            return {
+                estado: sched.createOk ? "respondido" : "en_proceso",
+                mensaje: sched.reply || "",
+                media: [],
+            };
+        }
+    }
+    // ==== Fin Scheduling Engine
+
+
     /* ===== UBICACIÓN (manejo dedicado y tipado seguro) ===== */
     const isLocation =
         /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde\s+est[áa]n|mapa|c[oó]mo\s+llego|como\s+llego|sede|ubicados?)\b/i.test(contenido);

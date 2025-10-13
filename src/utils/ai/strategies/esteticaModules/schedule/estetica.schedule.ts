@@ -1,4 +1,3 @@
-// utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
 import prisma from "../../../../../lib/prisma";
 import {
     addDays,
@@ -85,20 +84,12 @@ export type SchedulingResult = {
    Utils de TZ y tiempo
 ============================================================ */
 const WEEKDAY_ORDER: Record<Weekday, number> = {
-    mon: 1,
-    tue: 2,
-    wed: 3,
-    thu: 4,
-    fri: 5,
-    sat: 6,
-    sun: 0,
+    mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 0,
 };
 
 function getWeekdayFromDate(dLocal: Date): Weekday {
-    // 0 dom ... 6 sáb
-    const dow = dLocal.getDay();
-    return (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dow] ||
-        "mon") as Weekday;
+    const dow = dLocal.getDay(); // 0..6
+    return (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dow] || "mon") as Weekday;
 }
 
 function hhmmToUtc(dayLocalISO: string, hhmm: string, tz: string): Date {
@@ -114,15 +105,13 @@ function roundUpToGranularity(date: Date, granMin: number): Date {
 }
 
 const iso = (d: Date) => new Date(d.getTime()).toISOString();
-const intervalsOverlap = (aS: Date, aE: Date, bS: Date, bE: Date) =>
-    aS < bE && bS < aE;
+const intervalsOverlap = (aS: Date, aE: Date, bS: Date, bE: Date) => aS < bE && bS < aE;
 
 function formatAmPm(d: Date) {
     let h = d.getHours();
     const m = d.getMinutes();
     const ampm = h >= 12 ? "pm" : "am";
-    h = h % 12;
-    h = h ? h : 12;
+    h = h % 12; h = h ? h : 12;
     const mm = m.toString().padStart(2, "0");
     return `${h}:${mm} ${ampm}`;
 }
@@ -146,14 +135,11 @@ async function getOpenWindowsForDate(params: {
         where: { empresaId_day: { empresaId, day: weekday } },
     });
 
-    // excepción del día (en rango 00:00–23:59 local)
+    // excepción del día (rango local 00:00–23:59)
     const dayISO = tzFormat(dateLocal, "yyyy-MM-dd'T'00:00:00", { timeZone: tz });
     const startLocal = utcToZonedTime(zonedTimeToUtc(dayISO, tz), tz);
     const endLocal = utcToZonedTime(
-        zonedTimeToUtc(
-            tzFormat(dateLocal, "yyyy-MM-dd'T'23:59:59", { timeZone: tz }),
-            tz
-        ),
+        zonedTimeToUtc(tzFormat(dateLocal, "yyyy-MM-dd'T'23:59:59", { timeZone: tz }), tz),
         tz
     );
 
@@ -171,14 +157,8 @@ async function getOpenWindowsForDate(params: {
         exception?.isOpen === false
             ? []
             : [
-                {
-                    start: exception?.start1 ?? base?.start1 ?? null,
-                    end: exception?.end1 ?? base?.end1 ?? null,
-                },
-                {
-                    start: exception?.start2 ?? base?.start2 ?? null,
-                    end: exception?.end2 ?? base?.end2 ?? null,
-                },
+                { start: exception?.start1 ?? base?.start1 ?? null, end: exception?.end1 ?? base?.end1 ?? null },
+                { start: exception?.start2 ?? base?.start2 ?? null, end: exception?.end2 ?? base?.end2 ?? null },
             ].filter((w) => w.start && w.end) as Array<{ start: string; end: string }>;
 
     return open.map(({ start, end }) => {
@@ -211,7 +191,7 @@ async function getBusyIntervalsUTC(params: {
 }
 
 /* ============================================================
-   Generación de slots a partir de ventanas y ocupados
+   Generación de slots
 ============================================================ */
 function carveSlotsFromWindows(params: {
     windowsUtc: Array<{ startUtc: Date; endUtc: Date }>;
@@ -221,28 +201,16 @@ function carveSlotsFromWindows(params: {
     earliestAllowedUtc: Date;
     maxPerDay: number;
 }): Slot[] {
-    const {
-        windowsUtc,
-        busyUtc,
-        durationMin,
-        granMin,
-        earliestAllowedUtc,
-        maxPerDay,
-    } = params;
+    const { windowsUtc, busyUtc, durationMin, granMin, earliestAllowedUtc, maxPerDay } = params;
 
     const slots: Slot[] = [];
     for (const w of windowsUtc) {
-        let cursor = roundUpToGranularity(
-            dfMax([w.startUtc, earliestAllowedUtc]),
-            granMin
-        );
+        let cursor = roundUpToGranularity(dfMax([w.startUtc, earliestAllowedUtc]), granMin);
         while (true) {
             const end = addMinutes(cursor, durationMin);
             if (end > w.endUtc) break;
 
-            const overlaps = busyUtc.some((b) =>
-                intervalsOverlap(cursor, end, b.startUtc, b.endUtc)
-            );
+            const overlaps = busyUtc.some((b) => intervalsOverlap(cursor, end, b.startUtc, b.endUtc));
             if (!overlaps) {
                 slots.push({ startISO: iso(cursor), endISO: iso(end) });
                 if (slots.length >= maxPerDay) break;
@@ -283,25 +251,14 @@ export async function getNextAvailableSlots(
         const dayStartUtc = zonedTimeToUtc(startOfDay(dayLocal), tz);
         const dayEndUtc = zonedTimeToUtc(endOfDay(dayLocal), tz);
 
-        const windowsUtc = await getOpenWindowsForDate({
-            empresaId,
-            dateLocal: dayLocal,
-            tz,
-        });
+        const windowsUtc = await getOpenWindowsForDate({ empresaId, dateLocal: dayLocal, tz });
 
         if (!windowsUtc.length) {
-            results.push({
-                dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }),
-                slots: [],
-            });
+            results.push({ dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }), slots: [] });
             continue;
         }
 
-        const busyUtc = await getBusyIntervalsUTC({
-            empresaId,
-            dayStartUtc,
-            dayEndUtc,
-        });
+        const busyUtc = await getBusyIntervalsUTC({ empresaId, dayStartUtc, dayEndUtc });
 
         const slots = carveSlotsFromWindows({
             windowsUtc,
@@ -312,17 +269,14 @@ export async function getNextAvailableSlots(
             maxPerDay,
         });
 
-        results.push({
-            dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }),
-            slots,
-        });
+        results.push({ dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }), slots });
     }
 
     return results;
 }
 
 /* ============================================================
-   Crear cita segura (directo con Prisma)
+   Crear cita segura (Prisma directo)
 ============================================================ */
 export async function createAppointmentSafe(args: {
     empresaId: number;
@@ -333,7 +287,7 @@ export async function createAppointmentSafe(args: {
     customerName: string;
     customerPhone: string;
     startISO: string; // UTC ISO
-    endISO: string; // UTC ISO
+    endISO: string;   // UTC ISO
     notes?: string;
     source?: "ai" | "web" | "manual";
 }) {
@@ -375,13 +329,11 @@ export async function createAppointmentSafe(args: {
             startAt,
             endAt,
             status: "confirmed",
-            source: (source ?? "ai") as AppointmentSource, // enum correcto
+            source: (source ?? "ai") as AppointmentSource,
             notas: notes ?? null,
             timezone: args.timezone || "America/Bogota",
             customerDisplayName: customerName,
-            serviceDurationMin: Math.round(
-                (endAt.getTime() - startAt.getTime()) / 60000
-            ),
+            serviceDurationMin: Math.round((endAt.getTime() - startAt.getTime()) / 60000),
             locationNameCache: null,
         },
     });
@@ -408,12 +360,9 @@ function labelSlotsForTZ(slots: Slot[], tz: string) {
 
 // Capturas
 const NAME_RE = /(mi\s+nombre\s+es|soy|me\s+llamo)\s+([a-záéíóúñ\s]{2,60})/i;
-// 7–12 dígitos; nos quedamos con los últimos 10 si hay más
-const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/;
-// 24h
-const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/;
-// 12h con am/pm (2 pm, 2:30 pm)
-const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i;
+const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/;   // 7–12 dígitos
+const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/; // 24h
+const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i; // 12h
 
 function properCase(v?: string) {
     return (v || "")
@@ -430,7 +379,7 @@ function normalizePhone(raw?: string): string | undefined {
     return digits.length >= 10 ? digits.slice(-10) : digits;
 }
 
-/** Extrae de texto una hora local en minutos desde 00:00 (acepta 14:30 o 2:30 pm). */
+/** Extrae HH:MM local en minutos desde 00:00 (acepta 14:30 o 2:30 pm). */
 function extractLocalMinutesFromText(text: string): number | null {
     const m12 = AMPM_RE.exec(text);
     if (m12) {
@@ -450,8 +399,8 @@ function extractLocalMinutesFromText(text: string): number | null {
     return null;
 }
 
-/** Busca en slotsCache un slot cuyo inicio (hora local) coincida con los minutos dados. */
-// ✅ Genérico para que respete el tipo de los elementos (con o sin label)
+/** Match en slotsCache por minutos locales del inicio. */
+// genérico para respetar el tipo (con/sin label)
 function findSlotByLocalMinutes<T extends { startISO: string; endISO: string }>(
     items: T[],
     tz: string,
@@ -484,9 +433,7 @@ export async function handleSchedulingTurn(params: {
     text: string;
     state: StateShape;
     ctx: SchedulingCtx;
-    serviceInContext?:
-    | { id: number; name: string; durationMin?: number | null }
-    | null;
+    serviceInContext?: { id: number; name: string; durationMin?: number | null } | null;
     intent: "price" | "schedule" | "reschedule" | "cancel" | "info" | "other";
 }): Promise<SchedulingResult> {
     const { text, state, ctx, serviceInContext, intent } = params;
@@ -494,199 +441,90 @@ export async function handleSchedulingTurn(params: {
     const tz = kb.timezone;
 
     // señales de intención
-    const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(
-        text
-    );
-    const wantsReschedule =
-        /\b(reagendar|reprogramar|cambiar\s+hora|otro\s+horario|mover\s+cita)\b/i.test(
-            text
-        );
+    const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(text);
+    const wantsReschedule = /\b(reagendar|reprogramar|cambiar\s+hora|otro\s+horario|mover\s+cita)\b/i.test(text);
 
-    // Capturas de nombre/teléfono
+    // capturas
+    const NAME_RE = /(mi\s+nombre\s+es|soy|me\s+llamo)\s+([a-záéíóúñ\s]{2,60})/i;
+    const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/;
+
     const nameMatch = NAME_RE.exec(text);
     const phoneMatch = PHONE_ANY_RE.exec(text);
     const capturedName = nameMatch ? properCase(nameMatch[2]) : undefined;
     const capturedPhone = normalizePhone(phoneMatch?.[2]);
 
-    // memoria corta de teléfono
     const basePatch: Partial<StateShape> = {};
     if (capturedPhone) basePatch.lastPhoneSeen = capturedPhone;
 
-    const inDraft =
-        state.draft?.stage === "offer" || state.draft?.stage === "confirm";
+    const inDraft = state.draft?.stage === "offer" || state.draft?.stage === "confirm";
     const isConfirm = /^confirmo\b/i.test(text.trim());
 
-    // === Cancelación por teléfono
+    // === Cancelar
     if (intent === "cancel" || wantsCancel) {
         const phone = state.draft?.phone || capturedPhone || state.lastPhoneSeen;
-        if (!phone) {
-            return {
-                handled: true,
-                reply:
-                    "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).",
-                patch: basePatch,
-            };
-        }
+        if (!phone) return { handled: true, reply: "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).", patch: basePatch };
+
         const appt = await findUpcomingApptByPhone(empresaId, phone);
-        if (!appt) {
-            return {
-                handled: true,
-                reply:
-                    "No encuentro una cita próxima con ese teléfono. ¿Podrías verificar el número?",
-                patch: basePatch,
-            };
-        }
-        await prisma.appointment.update({
-            where: { id: appt.id },
-            data: { status: "cancelled" },
-        });
-        return {
-            handled: true,
-            reply:
-                "Listo, tu cita fue *cancelada*. Si deseas, puedo ofrecerte nuevos horarios para agendar nuevamente.",
-            patch: { draft: { stage: "idle" }, lastIntent: "cancel", ...basePatch },
-        };
+        if (!appt) return { handled: true, reply: "No encuentro una cita próxima con ese teléfono. ¿Podrías verificar el número?", patch: basePatch };
+
+        await prisma.appointment.update({ where: { id: appt.id }, data: { status: "cancelled" } });
+        return { handled: true, reply: "Listo, tu cita fue *cancelada*.", patch: { draft: { stage: "idle" }, lastIntent: "cancel", ...basePatch } };
     }
 
-    // === Reagendar por teléfono
+    // === Reagendar
     if (intent === "reschedule" || wantsReschedule) {
         const phone = state.draft?.phone || capturedPhone || state.lastPhoneSeen;
-        if (!phone) {
-            return {
-                handled: true,
-                reply:
-                    "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).",
-                patch: basePatch,
-            };
-        }
+        if (!phone) return { handled: true, reply: "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).", patch: basePatch };
+
         const appt = await findUpcomingApptByPhone(empresaId, phone);
-        if (!appt) {
-            return {
-                handled: true,
-                reply:
-                    "No encuentro una cita próxima con ese teléfono. ¿Podrías verificar el número?",
-                patch: basePatch,
-            };
-        }
+        if (!appt) return { handled: true, reply: "No encuentro una cita próxima con ese teléfono. ¿Podrías verificar el número?", patch: basePatch };
 
-        const duration = Math.max(
-            15,
-            Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000)
-        );
+        const duration = Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000));
 
-        const todayLocalISO = tzFormat(
-            utcToZonedTime(params.ctx.now ?? new Date(), tz),
-            "yyyy-MM-dd",
-            { timeZone: tz }
-        );
+        const todayLocalISO = tzFormat(utcToZonedTime(params.ctx.now ?? new Date(), tz), "yyyy-MM-dd", { timeZone: tz });
 
         const byDay = await getNextAvailableSlots(
-            {
-                empresaId,
-                timezone: tz,
-                vertical: kb.vertical,
-                bufferMin: kb.bufferMin,
-                granularityMin,
-            },
-            todayLocalISO,
-            duration,
-            daysHorizon,
-            maxSlots
+            { empresaId, timezone: tz, vertical: kb.vertical, bufferMin: kb.bufferMin, granularityMin },
+            todayLocalISO, duration, daysHorizon, maxSlots
         );
 
         const flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
-        if (!flat.length) {
-            return {
-                handled: true,
-                reply:
-                    "No veo cupos cercanos para reagendar. ¿Quieres que te contacte un asesor?",
-                patch: basePatch,
-            };
-        }
+        if (!flat.length) return { handled: true, reply: "No veo cupos cercanos para reagendar. ¿Quieres que te contacte un asesor?", patch: basePatch };
 
         const labeled = labelSlotsForTZ(flat, tz).slice(0, Math.min(3, flat.length));
         const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
 
         return {
             handled: true,
-            reply:
-                `Puedo mover tu cita. Horarios cercanos:\n${bullets}\n\n` +
-                `Elige uno y escribe la hora (ej.: *2:30 pm* o *14:30*).`,
+            reply: `Puedo mover tu cita. Horarios cercanos:\n${bullets}\n\nElige uno y escribe la hora (ej.: *2:30 pm* o *14:30*).`,
             patch: {
                 lastIntent: "reschedule",
-                draft: {
-                    stage: "offer",
-                    name: appt.customerName ?? undefined,
-                    phone,
-                    procedureName: appt.serviceName,
-                    durationMin: duration,
-                    rescheduleApptId: appt.id,
-                },
+                draft: { stage: "offer", name: appt.customerName ?? undefined, phone, procedureName: appt.serviceName, durationMin: duration, rescheduleApptId: appt.id },
                 slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
                 ...basePatch,
             },
         };
     }
 
-    // === Si no es agenda y no estamos en captura/confirmación → no manejado
-    const isCapture =
-        Boolean(capturedName || capturedPhone) ||
-        HHMM_RE.test(text) ||
-        AMPM_RE.test(text);
-    if (!(intent === "schedule" || inDraft || isConfirm || isCapture)) {
-        return { handled: false, patch: basePatch };
-    }
+    // si no es agenda (ni captura/confirmación), no lo manejo
+    const isCapture = Boolean(capturedName || capturedPhone) || HHMM_RE.test(text) || AMPM_RE.test(text);
+    if (!(intent === "schedule" || inDraft || isConfirm || isCapture)) return { handled: false, patch: basePatch };
 
-    // === Si piden horarios pero no hay servicio → pedirlo
-    if (intent === "schedule" && !serviceInContext && !state.draft?.procedureId) {
-        const ejemplos = ctx.kb.procedures.slice(0, 3).map((s) => s.name).join(", ");
-        return {
-            handled: true,
-            reply: `Para ver horarios necesito el procedimiento. ¿Cuál deseas? (Ej.: ${ejemplos})`,
-            patch: { lastIntent: "schedule", ...basePatch },
-        };
-    }
+    // servicio + duración
+    const svc = serviceInContext || ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) || null;
+    const duration = (svc?.durationMin ?? ctx.kb.defaultServiceDurationMin ?? 60) as number;
 
-    // Servicio y duración
-    const svc =
-        serviceInContext ||
-        ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) ||
-        null;
-    const duration = (svc?.durationMin ??
-        ctx.kb.defaultServiceDurationMin ??
-        60) as number;
-
-    // === Ofrecer slots (inicio de flujo)
+    // === Ofrecer slots
     if (intent === "schedule" && svc) {
-        const todayISO = tzFormat(
-            utcToZonedTime(params.ctx.now ?? new Date(), tz),
-            "yyyy-MM-dd",
-            { timeZone: tz }
-        );
+        const todayISO = tzFormat(utcToZonedTime(params.ctx.now ?? new Date(), tz), "yyyy-MM-dd", { timeZone: tz });
 
         const byDay = await getNextAvailableSlots(
-            {
-                empresaId,
-                timezone: tz,
-                vertical: ctx.kb.vertical,
-                bufferMin: ctx.kb.bufferMin,
-                granularityMin,
-            },
-            todayISO,
-            duration,
-            daysHorizon,
-            maxSlots
+            { empresaId, timezone: tz, vertical: ctx.kb.vertical, bufferMin: ctx.kb.bufferMin, granularityMin },
+            todayISO, duration, daysHorizon, maxSlots
         );
 
         const flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
-        if (!flat.length) {
-            return {
-                handled: true,
-                reply:
-                    "No veo cupos cercanos por ahora. ¿Quieres que te contacte un asesor para coordinar?",
-                patch: { lastIntent: "schedule", ...basePatch },
-            };
-        }
+        if (!flat.length) return { handled: true, reply: "No veo cupos cercanos por ahora. ¿Quieres que te contacte un asesor para coordinar?", patch: { lastIntent: "schedule", ...basePatch } };
 
         const labeled = labelSlotsForTZ(flat, tz).slice(0, Math.min(3, flat.length));
         const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
@@ -703,24 +541,17 @@ export async function handleSchedulingTurn(params: {
                 lastIntent: "schedule",
                 lastServiceId: svc.id,
                 lastServiceName: svc.name,
-                draft: {
-                    ...(state.draft ?? {}),
-                    procedureId: svc.id,
-                    procedureName: svc.name,
-                    durationMin: duration,
-                    stage: "offer",
-                },
+                draft: { ...(state.draft ?? {}), procedureId: svc.id, procedureName: svc.name, durationMin: duration, stage: "offer" },
                 slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
                 ...basePatch,
             },
         };
     }
 
-    // === Captura de datos → Confirmación (sirve para schedule y reschedule)
+    // === Captura → confirmación
     if (state.draft?.stage === "offer" && (isCapture || svc)) {
         const currentCache = state.slotsCache;
 
-        // Intento de match con hora local (admite 2:30 pm o 14:30)
         let chosen = currentCache?.items?.[0];
         const wantedMin = extractLocalMinutesFromText(text);
         if (wantedMin != null && currentCache?.items?.length) {
@@ -740,18 +571,9 @@ export async function handleSchedulingTurn(params: {
             rescheduleApptId: state.draft?.rescheduleApptId,
         };
 
-
-        const local = nextDraft.whenISO
-            ? utcToZonedTime(new Date(nextDraft.whenISO), tz)
-            : null;
+        const local = nextDraft.whenISO ? utcToZonedTime(new Date(nextDraft.whenISO), tz) : null;
         const fecha = local
-            ? local.toLocaleDateString("es-CO", {
-                weekday: "long",
-                year: "numeric",
-                month: "long",
-                day: "2-digit",
-                timeZone: tz,
-            })
+            ? local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit", timeZone: tz })
             : "fecha por confirmar";
         const hora = local ? formatAmPm(local) : "hora por confirmar";
 
@@ -769,26 +591,18 @@ export async function handleSchedulingTurn(params: {
     // === Confirmación final → crear o actualizar
     if (state.draft?.stage === "confirm" && isConfirm && state.draft.whenISO) {
         try {
-            const endISO = addMinutes(
-                new Date(state.draft.whenISO),
-                state.draft.durationMin ?? 60
-            ).toISOString();
+            const endISO = addMinutes(new Date(state.draft.whenISO), state.draft.durationMin ?? 60).toISOString();
 
             // Reagendar
             if (state.draft.rescheduleApptId) {
                 await prisma.appointment.update({
                     where: { id: state.draft.rescheduleApptId },
-                    data: {
-                        startAt: new Date(state.draft.whenISO),
-                        endAt: new Date(endISO),
-                        status: "confirmed",
-                    },
+                    data: { startAt: new Date(state.draft.whenISO), endAt: new Date(endISO), status: "confirmed" },
                 });
                 return {
                     handled: true,
                     createOk: true,
-                    reply:
-                        "¡Hecho! Tu cita fue reprogramada ✅. Te enviaremos recordatorio antes de la fecha.",
+                    reply: "¡Hecho! Tu cita fue reprogramada ✅. Te enviaremos recordatorio antes de la fecha.",
                     patch: { draft: { stage: "idle" } },
                 };
             }
@@ -796,8 +610,7 @@ export async function handleSchedulingTurn(params: {
             // Crear nueva
             const serviceName =
                 state.draft.procedureName ||
-                (ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0))
-                    ?.name ?? "Procedimiento");
+                (ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0))?.name ?? "Procedimiento");
 
             await createAppointmentSafe({
                 empresaId,
@@ -816,20 +629,13 @@ export async function handleSchedulingTurn(params: {
             return {
                 handled: true,
                 createOk: true,
-                reply:
-                    "¡Hecho! Tu cita quedó confirmada ✅. Te enviaremos recordatorio antes de la fecha.",
+                reply: "¡Hecho! Tu cita quedó confirmada ✅. Te enviaremos recordatorio antes de la fecha.",
                 patch: { draft: { stage: "idle" } },
             };
         } catch (_e) {
-            return {
-                handled: true,
-                createOk: false,
-                reply:
-                    "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
-            };
+            return { handled: true, createOk: false, reply: "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?" };
         }
     }
 
-    // Nada más que hacer
     return { handled: false, patch: basePatch };
 }
