@@ -22,9 +22,10 @@ import {
 
 import {
     getNextAvailableSlots,
-    createAppointmentSafe,
-    type Slot,
+    createAppointmentSafe,               // o createAppointmentSafeViaApi si vas por controller
+    handleSchedulingTurn
 } from "./esteticaModules/schedule/estetica.schedule";
+
 
 import { addMinutes } from "date-fns";
 import { utcToZonedTime, format as tzFormat } from "date-fns-tz";
@@ -737,18 +738,29 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        const labeled = flat.map((s: Slot) => {
-            const d = new Date(s.startISO);
-            const f = d.toLocaleString("es-CO", {
+        // Helper local (AM/PM)
+        function formatAmPm(d: Date) {
+            let h = d.getHours();
+            const m = d.getMinutes();
+            const ampm = h >= 12 ? "pm" : "am";
+            h = h % 12; h = h ? h : 12;
+            const mm = String(m).padStart(2, "0");
+            return `${h}:${mm} ${ampm}`;
+        }
+
+        const labeled = flat.map((s) => {
+            // Mostrar la hora en la TZ del negocio, no en UTC
+            const d = utcToZonedTime(new Date(s.startISO), tz);
+            const fecha = d.toLocaleDateString("es-CO", {
                 weekday: "long",
                 day: "2-digit",
                 month: "short",
-                hour: "2-digit",
-                minute: "2-digit",
-                hour12: false,
+                timeZone: tz,
             });
+            const f = `${fecha}, ${formatAmPm(d)}`;
             return { startISO: s.startISO, endISO: s.endISO, label: f };
         });
+
 
         await patchState(conversationId, {
             draft: { ...(state.draft ?? {}), procedureId: svc.id, procedureName: svc.name, durationMin: duration, stage: "offer" },
