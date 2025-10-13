@@ -289,7 +289,7 @@ export async function createAppointmentSafe(args: {
     startISO: string; // UTC ISO
     endISO: string;   // UTC ISO
     notes?: string;
-    source?: "ai" | "web" | "manual";
+    source?: "ai" | "web" | "manual" | "client";
 }) {
     const {
         empresaId,
@@ -301,12 +301,13 @@ export async function createAppointmentSafe(args: {
         endISO,
         notes,
         source,
+        timezone,
     } = args;
 
     const startAt = new Date(startISO);
     const endAt = new Date(endISO);
 
-    // Chequeo de solapamiento atómico
+    // 1) overlap rápido
     const blocking: AppointmentStatus[] = ["pending", "confirmed", "rescheduled"];
     const overlap = await prisma.appointment.findFirst({
         where: {
@@ -319,26 +320,43 @@ export async function createAppointmentSafe(args: {
     });
     if (overlap) throw new Error("OVERLAP");
 
-    const created = await prisma.appointment.create({
-        data: {
-            empresaId,
-            procedureId: procedureId ?? null,
-            serviceName,
-            customerName,
-            customerPhone,
-            startAt,
-            endAt,
-            status: "confirmed",
-            source: (source ?? "ai") as AppointmentSource,
-            notas: notes ?? null,
-            timezone: args.timezone || "America/Bogota",
-            customerDisplayName: customerName,
-            serviceDurationMin: Math.round((endAt.getTime() - startAt.getTime()) / 60000),
-            locationNameCache: null,
-        },
-    });
+    // 2) fuente segura (evita crash si enum no tiene "ai")
+    const SOURCE_MAP: Record<string, AppointmentSource> = {
+        ai: "client" as AppointmentSource, // ⇐ si tu enum no trae "ai", úsalo como "client"
+        web: "web" as AppointmentSource,
+        manual: "manual" as AppointmentSource,
+        client: "client" as AppointmentSource,
+    };
+    const safeSource: AppointmentSource = SOURCE_MAP[source || "client"];
 
-    return { ok: true, id: created.id };
+    // 3) create alineado al controller
+    try {
+        const created = await prisma.appointment.create({
+            data: {
+                empresaId,
+                procedureId: procedureId ?? null,
+                serviceName,
+                customerName,
+                customerPhone,
+                startAt,
+                endAt,
+                status: "confirmed",
+                source: safeSource,
+                notas: notes ?? null,
+                timezone: timezone || "America/Bogota",
+                customerDisplayName: customerName,
+                serviceDurationMin: Math.max(
+                    1,
+                    Math.round((endAt.getTime() - startAt.getTime()) / 60000)
+                ),
+                locationNameCache: null,
+            },
+        });
+        return { ok: true, id: created.id };
+    } catch (e) {
+        console.error("[createAppointmentSafe] ❌", e);
+        throw e;
+    }
 }
 
 /* ============================================================
