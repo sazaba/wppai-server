@@ -748,6 +748,9 @@
 
 
 
+
+
+
 // utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
 import prisma from "../../../../../lib/prisma";
 import {
@@ -756,6 +759,7 @@ import {
     endOfDay,
     max as dfMax,
     startOfDay,
+    differenceInMinutes,
 } from "date-fns";
 import {
     format as tzFormat,
@@ -837,17 +841,26 @@ export type SchedulingResult = {
 /* ============================================================
    Utils de TZ y tiempo
 ============================================================ */
-const WEEKDAY_ORDER: Record<Weekday, number> = {
-    mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 0,
-};
 const DOW_MAP: Record<string, Weekday> = {
-    "domingo": "sun", "dom": "sun",
-    "lunes": "mon", "lun": "mon",
-    "martes": "tue", "mar": "tue",
-    "miercoles": "wed", "miércoles": "wed", "mie": "wed", "mié": "wed",
-    "jueves": "thu", "jue": "thu",
-    "viernes": "fri", "vie": "fri",
-    "sabado": "sat", "sábado": "sat", "sab": "sat", "sáb": "sat",
+    domingo: "sun",
+    dom: "sun",
+    lunes: "mon",
+    lun: "mon",
+    martes: "tue",
+    mar: "tue",
+    miercoles: "wed",
+    miércoles: "wed",
+    miercoles2: "wed",
+    mie: "wed",
+    mié: "wed",
+    jueves: "thu",
+    jue: "thu",
+    viernes: "fri",
+    vie: "fri",
+    sabado: "sat",
+    sábado: "sat",
+    sab: "sat",
+    sáb: "sat",
 };
 
 function getWeekdayFromDate(dLocal: Date): Weekday {
@@ -874,7 +887,8 @@ function formatAmPm(d: Date) {
     let h = d.getHours();
     const m = d.getMinutes();
     const ampm = h >= 12 ? "pm" : "am";
-    h = h % 12; h = h ? h : 12;
+    h = h % 12;
+    h = h ? h : 12;
     const mm = m.toString().padStart(2, "0");
     return `${h}:${mm} ${ampm}`;
 }
@@ -954,7 +968,7 @@ async function getBusyIntervalsUTC(params: {
 }
 
 /* ============================================================
-   Generación de slots
+   Generación de slots (día puntual)
 ============================================================ */
 function carveSlotsFromWindows(params: {
     windowsUtc: Array<{ startUtc: Date; endUtc: Date }>;
@@ -987,8 +1001,36 @@ function carveSlotsFromWindows(params: {
     return slots;
 }
 
+async function getSlotsForLocalDate(
+    empresaId: number,
+    tz: string,
+    localDate: Date,
+    durationMin: number,
+    granularityMin: number,
+    bufferMin: number | null | undefined,
+    maxPerDay: number
+): Promise<Slot[]> {
+    const dayStartUtc = zonedTimeToUtc(startOfDay(localDate), tz);
+    const dayEndUtc = zonedTimeToUtc(endOfDay(localDate), tz);
+    const earliestAllowedUtc = addMinutes(new Date(), Math.max(bufferMin ?? 0, 0));
+
+    const windowsUtc = await getOpenWindowsForDate({ empresaId, dateLocal: localDate, tz });
+    if (!windowsUtc.length) return [];
+
+    const busyUtc = await getBusyIntervalsUTC({ empresaId, dayStartUtc, dayEndUtc });
+
+    return carveSlotsFromWindows({
+        windowsUtc,
+        busyUtc,
+        durationMin,
+        granMin: granularityMin,
+        earliestAllowedUtc,
+        maxPerDay,
+    });
+}
+
 /* ============================================================
-   API pública: slots disponibles
+   API pública original (se conserva para compatibilidad)
 ============================================================ */
 export async function getNextAvailableSlots(
     env: {
@@ -1039,7 +1081,7 @@ export async function getNextAvailableSlots(
 }
 
 /* ============================================================
-   Crear cita segura (Prisma directo)
+   Crear cita segura (Prisma directo) – CONFIRMED
 ============================================================ */
 export async function createAppointmentSafe(args: {
     empresaId: number;
@@ -1123,7 +1165,7 @@ export async function createAppointmentSafe(args: {
 }
 
 /* ============================================================
-   Helpers de UX (labels y parsing de hora / fecha / nombre)
+   Helpers de UX (labels y parsing)
 ============================================================ */
 function labelSlotsForTZ(slots: Slot[], tz: string) {
     return slots.map((s) => {
@@ -1149,7 +1191,7 @@ function properCase(v?: string) {
     return (v || "")
         .trim()
         .replace(/\s+/g, " ")
-        // @ts-ignore: Unicode property escapes
+        // @ts-ignore
         .replace(/\b\p{L}/gu, (c) => c.toUpperCase());
 }
 
@@ -1202,51 +1244,78 @@ function inPeriod(d: Date, period: DayPeriod): boolean {
     return h >= 18 && h <= 21;
 }
 
-/** Día de semana o número de día solicitado en el texto (ej: "viernes 17"). */
-function parseRequestedDate(text: string): { weekday?: Weekday; dayNumber?: number } | null {
+/** Día de semana o número de día solicitado en el texto (ej: "jueves 15") */
+function parseRequestedDate(text: string, tz: string, now: Date): { targetLocalDate: Date | null; period?: DayPeriod; exactMinutes?: number } {
     const t = text.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    const period = parseDayPeriod(text);
+    const mNum = t.match(/\b(\d{1,2})\b/);
+    const dayNumber = mNum ? parseInt(mNum[1], 10) : undefined;
+
     let weekday: Weekday | undefined;
     for (const key of Object.keys(DOW_MAP)) {
         const k = key.normalize("NFD").replace(/\p{Diacritic}/gu, "");
-        if (new RegExp(`\\b${k}\\b`).test(t)) { weekday = DOW_MAP[key]; break; }
+        if (new RegExp(`\\b${k}\\b`).test(t)) {
+            weekday = DOW_MAP[key];
+            break;
+        }
     }
-    const numMatch = t.match(/\b(\d{1,2})\b/);
-    const dayNumber = numMatch ? parseInt(numMatch[1], 10) : undefined;
-    if (weekday || dayNumber) return { weekday, dayNumber };
-    return null;
+
+    // Base: hoy en zona
+    const todayLocal = utcToZonedTime(now, tz);
+    const baseYear = todayLocal.getFullYear();
+    const baseMonth = todayLocal.getMonth();
+
+    let candidate = new Date(todayLocal);
+    candidate.setHours(0, 0, 0, 0);
+
+    if (dayNumber !== undefined) {
+        // preferimos el del mes actual si aún no pasó; sino, siguiente mes
+        const inThisMonth = new Date(baseYear, baseMonth, dayNumber, 0, 0, 0, 0);
+        const inNextMonth = new Date(baseYear, baseMonth + 1, Math.min(dayNumber, 28), 0, 0, 0, 0); // safe bound
+
+        if (inThisMonth >= todayLocal) candidate = inThisMonth;
+        else candidate = inNextMonth;
+    }
+
+    if (weekday) {
+        // mover candidate al próximo weekday solicitado (si no se dio dayNumber, parte desde hoy)
+        let tries = 0;
+        while (getWeekdayFromDate(candidate) !== weekday && tries < 7) {
+            candidate = addDays(candidate, 1);
+            tries++;
+        }
+    }
+
+    const exactMinutes = extractLocalMinutesFromText(text); // puede venir “3:00 pm”
+    return {
+        targetLocalDate: candidate || null,
+        period: period ?? undefined,              // <- normaliza null -> undefined
+        exactMinutes: exactMinutes ?? undefined,
+    };
+
 }
 
-/** Match en slotsCache por minutos locales del inicio. */
-function findSlotByLocalMinutes<T extends { startISO: string; endISO: string }>(
-    items: T[],
-    tz: string,
-    targetMin: number
-): T | undefined {
-    return items.find((s) => {
-        const d = utcToZonedTime(new Date(s.startISO), tz);
-        const mm = d.getHours() * 60 + d.getMinutes();
-        return mm === targetMin;
-    });
-}
-
-async function findUpcomingApptByPhone(empresaId: number, phone: string) {
-    const blocking: AppointmentStatus[] = ["pending", "confirmed", "rescheduled"];
-    return prisma.appointment.findFirst({
-        where: {
-            empresaId,
-            customerPhone: { contains: phone },
-            status: { in: blocking },
-            startAt: { gte: new Date() },
-        },
-        orderBy: { startAt: "asc" },
-    });
+/** Busca el slot más cercano a una fecha/hora objetivo dentro del horizonte */
+function findNearestSlot(slotsMatrix: SlotsByDay[], tz: string, wished: Date): Slot | null {
+    const all = slotsMatrix.flatMap((d) => d.slots);
+    if (!all.length) return null;
+    let best: Slot | null = null;
+    let bestDiff = Number.POSITIVE_INFINITY;
+    for (const s of all) {
+        const diff = Math.abs(differenceInMinutes(utcToZonedTime(new Date(s.startISO), tz), wished));
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = s;
+        }
+    }
+    return best;
 }
 
 /* ============================================================
-   Helpers internos para autoconfirmación
+   Autoconfirmación
 ============================================================ */
 function hasAllDataForBooking(d: SchedulingDraft): boolean {
-    // Autoconfirmamos con teléfono + hora. El nombre es opcional.
+    // Autoconfirmamos con teléfono + hora + servicio (nombre o id). El nombre del cliente es opcional.
     return Boolean(d.whenISO && d.phone && (d.procedureName || d.procedureId));
 }
 
@@ -1269,7 +1338,7 @@ async function finalizeBookingAuto(
         const h = formatAmPm(local);
         return {
             ok: true,
-            msg: `¡Listo! Tu cita fue *reprogramada y confirmada* ✅\n• ${draft.procedureName ?? "Procedimiento"}\n• ${f} a las ${h}\nSi necesitas *cambiar* la hora o *cancelar*, escríbelo y lo gestiono.`,
+            msg: `¡Listo! Tu cita fue *reprogramada y confirmada* ✅\n• ${draft.procedureName ?? "Procedimiento"}\n• ${f} a las ${h}\nSi necesitas *cambiar* la hora o *cancelar*, me dices.`,
         };
     }
 
@@ -1298,12 +1367,12 @@ async function finalizeBookingAuto(
 
     return {
         ok: true,
-        msg: `¡Hecho! Tu cita quedó *confirmada* ✅\n• ${serviceName}\n• ${f} a las ${h}\nSi quieres *cambiar* el horario o *cancelar*, dime y lo ajusto al toque.`,
+        msg: `¡Hecho! Tu cita quedó *confirmada* ✅\n• ${serviceName}\n• ${f} a las ${h}\nSi deseas *cambiar* o *cancelar*, dime y lo ajusto.`,
     };
 }
 
 /* ============================================================
-   Orquestador de turno (schedule + cancel + reschedule)
+   Orquestador: ahora el cliente PROPONE fecha/hora
 ============================================================ */
 export async function handleSchedulingTurn(params: {
     text: string;
@@ -1316,248 +1385,264 @@ export async function handleSchedulingTurn(params: {
     const { kb, empresaId, granularityMin, daysHorizon, maxSlots } = ctx;
     const tz = kb.timezone;
 
-    // señales de intención
+    // Señales base
     const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(text);
     const wantsReschedule = /\b(reagendar|reprogramar|cambiar\s+hora|otro\s+horario|mover\s+cita)\b/i.test(text);
 
-    // capturas
+    // Capturas
     const nameMatch = NAME_RE.exec(text);
     const phoneMatch = PHONE_ANY_RE.exec(text);
     const capturedName = nameMatch ? properCase(nameMatch[2]) : fallbackNameFromText(text);
     const capturedPhone = normalizePhone(phoneMatch?.[2]);
 
-    // memoria corta de teléfono
     const basePatch: Partial<StateShape> = {};
     if (capturedPhone) basePatch.lastPhoneSeen = capturedPhone;
-
-    const inDraft = state.draft?.stage === "offer" || state.draft?.stage === "confirm";
 
     // === Cancelar
     if (intent === "cancel" || wantsCancel) {
         const phone = state.draft?.phone || capturedPhone || state.lastPhoneSeen;
         if (!phone) return { handled: true, reply: "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).", patch: basePatch };
 
-        const appt = await findUpcomingApptByPhone(empresaId, phone);
+        const appt = await prisma.appointment.findFirst({
+            where: {
+                empresaId,
+                customerPhone: { contains: phone },
+                status: { in: ["pending", "confirmed", "rescheduled"] },
+                startAt: { gte: new Date() },
+            },
+            orderBy: { startAt: "asc" },
+        });
         if (!appt) return { handled: true, reply: "No encuentro una cita próxima con ese teléfono. ¿Podrías verificar el número?", patch: basePatch };
 
         await prisma.appointment.update({ where: { id: appt.id }, data: { status: "cancelled" } });
-        return { handled: true, reply: "Listo, tu cita fue *cancelada*. Si deseas, te muestro nuevos horarios.", patch: { draft: { stage: "idle" }, lastIntent: "cancel", ...basePatch } };
+        return { handled: true, reply: "Listo, tu cita fue *cancelada*. Si deseas, te muestro otros horarios.", patch: { draft: { stage: "idle" }, lastIntent: "cancel", ...basePatch } };
     }
 
-    // === Reagendar
+    // === Reagendar (el cliente seguirá proponiendo fecha/hora)
     if (intent === "reschedule" || wantsReschedule) {
+        // caemos al mismo flujo de propuesta, pero guardando rescheduleApptId
         const phone = state.draft?.phone || capturedPhone || state.lastPhoneSeen;
         if (!phone) return { handled: true, reply: "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).", patch: basePatch };
 
-        const appt = await findUpcomingApptByPhone(empresaId, phone);
+        const appt = await prisma.appointment.findFirst({
+            where: {
+                empresaId,
+                customerPhone: { contains: phone },
+                status: { in: ["pending", "confirmed", "rescheduled"] },
+                startAt: { gte: new Date() },
+            },
+            orderBy: { startAt: "asc" },
+        });
         if (!appt) return { handled: true, reply: "No encuentro una cita próxima con ese teléfono. ¿Podrías verificar el número?", patch: basePatch };
 
-        const duration = Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000));
-
-        const todayLocalISO = tzFormat(utcToZonedTime(params.ctx.now ?? new Date(), tz), "yyyy-MM-dd", { timeZone: tz });
-
-        const byDay = await getNextAvailableSlots(
-            { empresaId, timezone: tz, vertical: kb.vertical, bufferMin: kb.bufferMin, granularityMin },
-            todayLocalISO, duration, daysHorizon, maxSlots
-        );
-
-        const flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
-        if (!flat.length) return { handled: true, reply: "No veo cupos cercanos para reagendar. ¿Quieres que te contacte un asesor?", patch: basePatch };
-
-        const labeled = labelSlotsForTZ(flat, tz).slice(0, Math.min(3, flat.length));
-        const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
-
-        const reply =
-            `Puedo mover tu cita. Horarios cercanos:\n${bullets}\n\n` +
-            `Elige uno y escribe la hora (ej.: *2:30 pm* o *14:30*).`;
-
-        const key = `resched:${(appt.id || 0)}:${labeled.map(l => l.startISO).join(",")}`;
-        if (state.lastMsgKey === key) return { handled: false, patch: basePatch };
-
+        // seteamos draft para que al confirmar fecha/hora se actualice esa cita
         return {
             handled: true,
-            reply,
+            reply: "Claro, dime *qué fecha y hora* te gustaría para mover tu cita (ej.: *jueves 15 a las 4:00 pm*).",
             patch: {
-                lastMsgKey: key,
-                lastIntent: "reschedule",
-                draft: { stage: "offer", name: appt.customerName ?? undefined, phone, procedureName: appt.serviceName, durationMin: duration, rescheduleApptId: appt.id },
-                slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                draft: {
+                    stage: "offer",
+                    name: appt.customerName ?? undefined,
+                    phone,
+                    procedureName: appt.serviceName,
+                    durationMin: Math.max(15, Math.round((appt.endAt.getTime() - appt.startAt.getTime()) / 60000)),
+                    rescheduleApptId: appt.id,
+                },
                 ...basePatch,
             },
         };
     }
 
-    // si no es agenda (ni captura/confirmación), no lo manejo
-    const isCapture = Boolean(capturedName || capturedPhone) || HHMM_RE.test(text) || AMPM_RE.test(text) || parseRequestedDate(text);
-    const isConfirmWord = /^(1\b|confirmo\b|confirmar\b|si\b|sí\b|ok\b|dale\b|listo\b)/i.test(text.trim());
-    const wantsChange = /^(2\b|cambiar|otra|modificar|reprogramar)/i.test(text.trim());
-    const wantsAbort = /^(3\b|cancelar|anular)/i.test(text.trim());
-
-    if (!(intent === "schedule" || inDraft || isCapture || isConfirmWord || wantsChange || wantsAbort)) {
+    // Si no estamos en agenda, salir
+    if (!(intent === "schedule" || state.draft?.stage === "offer" || state.draft?.stage === "confirm" || PHONE_ANY_RE.test(text))) {
         return { handled: false, patch: basePatch };
     }
 
-    // servicio + duración
-    const svc = serviceInContext || ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) || null;
-    const duration = (svc?.durationMin ?? ctx.kb.defaultServiceDurationMin ?? 60) as number;
+    // Servicio + duración
+    const svc = serviceInContext ||
+        ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) || null;
+    const duration = (svc?.durationMin ?? kb.defaultServiceDurationMin ?? 60) as number;
 
-    // === Ofrecer slots (filtro por franja y por día solicitado: “viernes”, “viernes 17”)
-    if (intent === "schedule" && svc) {
-        const todayISO = tzFormat(utcToZonedTime(params.ctx.now ?? new Date(), tz), "yyyy-MM-dd", { timeZone: tz });
+    // === Cliente propone fecha/hora (núcleo del nuevo flujo)
+    if (intent === "schedule" || state.draft?.stage === "offer" || PHONE_ANY_RE.test(text)) {
+        // Parsear fecha/hora deseada
+        const now = params.ctx.now ?? new Date();
+        const parsed = parseRequestedDate(text, tz, now);
 
-        const byDay = await getNextAvailableSlots(
-            { empresaId, timezone: tz, vertical: ctx.kb.vertical, bufferMin: ctx.kb.bufferMin, granularityMin },
-            todayISO, duration, daysHorizon, maxSlots
-        );
-
-        let flat = byDay.flatMap((d) => d.slots);
-        const period = parseDayPeriod(text);
-        const dateReq = parseRequestedDate(text);
-
-        if (dateReq?.weekday) {
-            flat = flat.filter(s => getWeekdayFromDate(utcToZonedTime(new Date(s.startISO), tz)) === dateReq.weekday);
-        }
-        if (dateReq?.dayNumber) {
-            flat = flat.filter(s => utcToZonedTime(new Date(s.startISO), tz).getDate() === dateReq.dayNumber);
-        }
-        if (period) {
-            flat = flat.filter((s) => inPeriod(utcToZonedTime(new Date(s.startISO), tz), period));
-        }
-        flat = flat.slice(0, maxSlots);
-
-        if (!flat.length) {
+        // si no detectamos fecha, pedirla (no ofrecer lista)
+        if (!parsed.targetLocalDate) {
+            const ask = "¿Qué *fecha y hora* te gustaría? Ejemplos: *jueves 15 a las 3:00 pm* o *viernes en la tarde*.";
             return {
                 handled: true,
-                reply: "No veo cupos cercanos por ahora en esa franja/fecha. ¿Quieres que te muestre otros horarios u otra fecha?",
-                patch: { lastIntent: "schedule", ...basePatch },
+                reply: ask,
+                patch: {
+                    lastIntent: "schedule",
+                    draft: {
+                        ...(state.draft ?? {}),
+                        stage: "offer",
+                        name: state.draft?.name ?? capturedName ?? undefined,
+                        phone: state.draft?.phone ?? (capturedPhone || state.lastPhoneSeen) ?? undefined,
+                        procedureName: state.draft?.procedureName ?? (svc ? svc.name : undefined),
+                        procedureId: state.draft?.procedureId ?? (svc ? svc.id : undefined),
+                        durationMin: state.draft?.durationMin ?? duration,
+                    },
+                    ...basePatch,
+                },
             };
         }
 
-        const labeled = labelSlotsForTZ(flat, tz).slice(0, Math.min(3, flat.length));
-        const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
-        const reply =
-            `Disponibilidad cercana para *${svc.name}*:\n${bullets}\n\n` +
-            `Elige una y dime tu *nombre* y *teléfono* para reservar.\n` +
-            `Si prefieres otra fecha u otra franja (mañana/tarde/noche), dímelo.`;
+        // Slots del día solicitado
+        const daySlots = await getSlotsForLocalDate(
+            empresaId,
+            tz,
+            parsed.targetLocalDate,
+            duration,
+            granularityMin,
+            kb.bufferMin,
+            Math.max(maxSlots, 8)
+        );
 
-        const key = `offer:${svc.id}:${labeled.map(l => l.startISO).join(",")}`;
-        if (state.lastMsgKey === key) return { handled: false, patch: basePatch };
+        // Si el cliente dijo “en la tarde/mañana/noche”, filtramos
+        const filtered = parsed.period
+            ? daySlots.filter((s) => inPeriod(utcToZonedTime(new Date(s.startISO), tz), parsed.period!))
+            : daySlots;
 
+        // Si dio hora exacta, intentamos casar exactamente esa hora
+        if (parsed.exactMinutes !== undefined) {
+            const exact = filtered.find((s) => {
+                const d = utcToZonedTime(new Date(s.startISO), tz);
+                return d.getHours() * 60 + d.getMinutes() === parsed.exactMinutes;
+            });
+
+            if (exact) {
+                // Tenemos match exacto → Guardar y autoconfirmar si hay teléfono
+                const nextDraft: SchedulingDraft = {
+                    ...(state.draft ?? {}),
+                    name: state.draft?.name ?? capturedName ?? undefined,
+                    phone: state.draft?.phone ?? (capturedPhone || state.lastPhoneSeen) ?? undefined,
+                    whenISO: exact.startISO,
+                    stage: "confirm",
+                    procedureName: state.draft?.procedureName ?? (svc ? svc.name : undefined),
+                    procedureId: state.draft?.procedureId ?? (svc ? svc.id : undefined),
+                    durationMin: state.draft?.durationMin ?? duration,
+                    rescheduleApptId: state.draft?.rescheduleApptId,
+                };
+
+                if (hasAllDataForBooking(nextDraft)) {
+                    try {
+                        const result = await finalizeBookingAuto(nextDraft, ctx);
+                        return { handled: true, createOk: result.ok, reply: result.msg, patch: { draft: { stage: "idle" }, ...basePatch } };
+                    } catch {
+                        // Buscar alternativa más cercana
+                        const startISO = tzFormat(parsed.targetLocalDate, "yyyy-MM-dd", { timeZone: tz });
+                        const matrix = await getNextAvailableSlots(
+                            { empresaId, timezone: tz, vertical: kb.vertical, bufferMin: kb.bufferMin, granularityMin },
+                            startISO, duration, Math.max(3, daysHorizon), Math.max(maxSlots, 8)
+                        );
+                        const nearest = findNearestSlot(matrix, tz, parsed.targetLocalDate);
+                        if (!nearest) return { handled: true, reply: "Ese horario se ocupó justo ahora. No veo cercanos disponibles.", patch: basePatch };
+                        const d = utcToZonedTime(new Date(nearest.startISO), tz);
+                        const alt = `${d.toLocaleDateString("es-CO", { weekday: "long", day: "2-digit", month: "short", timeZone: tz })} a las ${formatAmPm(d)}`;
+                        return {
+                            handled: true,
+                            reply: `Esa hora no está disponible. La más cercana es *${alt}*. Si te sirve, dime tu *teléfono* y nombre para reservar.`,
+                            patch: { ...basePatch, draft: { ...nextDraft, whenISO: nearest.startISO } },
+                        };
+                    }
+                } else {
+                    // Falta teléfono (o servicio) → pedir mínimo teléfono; nombre opcional
+                    const dloc = utcToZonedTime(new Date(exact.startISO), tz);
+                    const fecha = dloc.toLocaleDateString("es-CO", { weekday: "long", day: "2-digit", month: "short", timeZone: tz });
+                    const hora = formatAmPm(dloc);
+                    const missing: string[] = [];
+                    if (!nextDraft.phone) missing.push("*teléfono*");
+                    if (!nextDraft.procedureName && !nextDraft.procedureId) missing.push("*servicio*");
+
+                    return {
+                        handled: true,
+                        reply: `Perfecto, *${fecha} a las ${hora}* está disponible. Para fijarla necesito ${missing.join(" y ")}. (El *nombre* es opcional).`,
+                        patch: { ...basePatch, draft: nextDraft },
+                    };
+                }
+            } else {
+                // No hay ese exacto → buscar la más cercana (en día solicitado primero)
+                const wishedLocal = new Date(parsed.targetLocalDate);
+                const hh = Math.floor(parsed.exactMinutes / 60);
+                const mm = parsed.exactMinutes % 60;
+                wishedLocal.setHours(hh, mm, 0, 0);
+
+                const labeled = labelSlotsForTZ(filtered, tz);
+                if (labeled.length) {
+                    // devolver 2–3 alternativas del mismo día
+                    const bullets = labeled.slice(0, 3).map((l) => `• ${l.label}`).join("\n");
+                    return {
+                        handled: true,
+                        reply: `No tengo exactamente esa hora, pero ese día están libres:\n${bullets}\nDime cuál prefieres y tu *teléfono* para reservar.`,
+                        patch: { ...basePatch, slotsCache: { items: labeled, expiresAt: nowPlusMin(10) }, draft: { ...(state.draft ?? {}), stage: "offer", durationMin: duration, procedureId: svc?.id, procedureName: svc?.name } },
+                    };
+                }
+
+                // Ningún slot ese día → buscar el más cercano en el horizonte
+                const startISO = tzFormat(parsed.targetLocalDate, "yyyy-MM-dd", { timeZone: tz });
+                const matrix = await getNextAvailableSlots(
+                    { empresaId, timezone: tz, vertical: kb.vertical, bufferMin: kb.bufferMin, granularityMin },
+                    startISO, duration, Math.max(3, daysHorizon), Math.max(maxSlots, 8)
+                );
+                const nearest = findNearestSlot(matrix, tz, wishedLocal);
+                if (!nearest) {
+                    return { handled: true, reply: "No veo cupos cercanos a esa hora. ¿Quieres proponer otra hora o día?", patch: basePatch };
+                }
+                const d = utcToZonedTime(new Date(nearest.startISO), tz);
+                const alt = `${d.toLocaleDateString("es-CO", { weekday: "long", day: "2-digit", month: "short", timeZone: tz })} a las ${formatAmPm(d)}`;
+                return {
+                    handled: true,
+                    reply: `Esa hora no está disponible. La más cercana es *${alt}*. Si te sirve, dime tu *teléfono* para reservar.`,
+                    patch: { ...basePatch, draft: { ...(state.draft ?? {}), stage: "offer", whenISO: nearest.startISO, durationMin: duration, procedureId: svc?.id, procedureName: svc?.name } },
+                };
+            }
+        }
+
+        // No hubo hora exacta, solo día/franja → listar slots de ese día (no más de 3)
+        const dayList = labelSlotsForTZ(filtered, tz);
+        if (dayList.length) {
+            const bullets = dayList.slice(0, 3).map((l) => `• ${l.label}`).join("\n");
+            return {
+                handled: true,
+                reply: `Ese día puedo agendar en:\n${bullets}\nResponde con la *hora* elegida (ej.: 3:00 pm) y tu *teléfono* para reservar.`,
+                patch: { ...basePatch, slotsCache: { items: dayList, expiresAt: nowPlusMin(10) }, draft: { ...(state.draft ?? {}), stage: "offer", durationMin: duration, procedureId: svc?.id, procedureName: svc?.name } },
+            };
+        }
+
+        // Ese día no hay → buscar el más cercano
+        const startISO = tzFormat(parsed.targetLocalDate, "yyyy-MM-dd", { timeZone: tz });
+        const matrix = await getNextAvailableSlots(
+            { empresaId, timezone: tz, vertical: kb.vertical, bufferMin: kb.bufferMin, granularityMin },
+            startISO, duration, Math.max(3, daysHorizon), Math.max(maxSlots, 8)
+        );
+        const wishedLocal = parsed.targetLocalDate;
+        const nearest = findNearestSlot(matrix, tz, wishedLocal);
+        if (!nearest) {
+            return { handled: true, reply: "No veo cupos cercanos a esa fecha. ¿Quieres proponer otra fecha u horario?", patch: basePatch };
+        }
+        const d = utcToZonedTime(new Date(nearest.startISO), tz);
+        const alt = `${d.toLocaleDateString("es-CO", { weekday: "long", day: "2-digit", month: "short", timeZone: tz })} a las ${formatAmPm(d)}`;
         return {
             handled: true,
-            reply,
-            patch: {
-                lastMsgKey: key,
-                lastIntent: "schedule",
-                lastServiceId: svc.id,
-                lastServiceName: svc.name,
-                draft: { ...(state.draft ?? {}), procedureId: svc.id, procedureName: svc.name, durationMin: duration, stage: "offer" },
-                slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
-                ...basePatch,
-            },
+            reply: `Ese día no tengo disponibilidad. La opción más cercana es *${alt}*. Si te sirve, dime tu *teléfono* para reservar.`,
+            patch: { ...basePatch, draft: { ...(state.draft ?? {}), stage: "offer", whenISO: nearest.startISO, durationMin: duration, procedureId: svc?.id, procedureName: svc?.name } },
         };
     }
 
-    // === Captura → AUTOCONFIRMACIÓN si ya hay datos (sin pedir "confirmo")
-    if (state.draft?.stage === "offer" && (isCapture || svc || parseDayPeriod(text))) {
-        const currentCache = state.slotsCache;
-
-        // Intento de match con hora local o franja/weekday
-        let chosen = currentCache?.items?.[0];
-        const wantedMin = extractLocalMinutesFromText(text);
-        const periodAsked = parseDayPeriod(text);
-        const dateReq = parseRequestedDate(text);
-
-        if (wantedMin != null && currentCache?.items?.length) {
-            const hit = findSlotByLocalMinutes(currentCache.items, tz, wantedMin);
-            if (hit) chosen = hit;
-        } else if ((periodAsked || dateReq) && currentCache?.items?.length) {
-            const hits = currentCache.items.filter(s => {
-                const d = utcToZonedTime(new Date(s.startISO), tz);
-                const dowOk = dateReq?.weekday ? getWeekdayFromDate(d) === dateReq.weekday : true;
-                const dayOk = dateReq?.dayNumber ? d.getDate() === dateReq.dayNumber : true;
-                const perOk = periodAsked ? inPeriod(d, periodAsked) : true;
-                return dowOk && dayOk && perOk;
-            });
-            if (hits[0]) chosen = hits[0];
-        }
-
-        const nextDraft: SchedulingDraft = {
-            ...(state.draft ?? {}),
-            name: state.draft?.name ?? capturedName ?? undefined,
-            phone: state.draft?.phone ?? (capturedPhone || state.lastPhoneSeen) ?? undefined,
-            whenISO: state.draft?.whenISO ?? chosen?.startISO ?? undefined,
-            stage: "confirm", // mantenemos por compatibilidad; autoconfirmamos si completo
-            procedureName: state.draft?.procedureName ?? (svc ? svc.name : undefined),
-            procedureId: state.draft?.procedureId ?? (svc ? svc.id : undefined),
-            durationMin: state.draft?.durationMin ?? (svc?.durationMin ?? kb.defaultServiceDurationMin ?? 60),
-            rescheduleApptId: state.draft?.rescheduleApptId,
-        };
-
-        // *** AUTOCONFIRMAR ***
-        if (hasAllDataForBooking(nextDraft)) {
-            try {
-                const result = await finalizeBookingAuto(nextDraft, ctx);
-                return { handled: true, createOk: result.ok, reply: result.msg, patch: { draft: { stage: "idle" }, ...basePatch } };
-            } catch (_e) {
-                return { handled: true, createOk: false, reply: "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?", patch: { ...basePatch, draft: { ...(nextDraft ?? {}), whenISO: undefined, stage: "offer" } } };
-            }
-        }
-
-        // Si faltan datos, pedir solo lo que falta (sin “confirmo”)
-        const needs: string[] = [];
-        if (!nextDraft.phone) needs.push("tu *teléfono*");
-        if (!nextDraft.whenISO) needs.push("la *hora* (ej.: 2:30 pm o 14:30)");
-        // nombre opcional — si falta, autofill con “Cliente” al confirmar
-
-        const local = nextDraft.whenISO ? utcToZonedTime(new Date(nextDraft.whenISO), tz) : null;
-        const fecha = local ? local.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "2-digit", timeZone: tz }) : "fecha por confirmar";
-        const hora = local ? formatAmPm(local) : "hora por confirmar";
-
-        const resumen =
-            `Voy a reservar *${nextDraft.procedureName ?? "Procedimiento"}* para ${fecha}${local ? ` a las ${hora}` : ""}.\n` +
-            `• Nombre: ${nextDraft.name ?? "—"}\n` +
-            `• Teléfono: ${nextDraft.phone ?? "—"}\n\n` +
-            (needs.length ? `Para finalizar la reserva, necesito ${needs.join(" y ")}. ` : "Apenas tenga esos datos, reservo automáticamente ✅. ") +
-            `Si quieres *cambiar* la hora, indícame otra.`;
-
-        const key = `preconfirm:${nextDraft.procedureId ?? nextDraft.procedureName}:${nextDraft.whenISO ?? "?"}:${nextDraft.phone ?? "?"}`;
-        if (state.lastMsgKey === key) return { handled: false, patch: basePatch };
-
-        return { handled: true, reply: resumen, patch: { lastMsgKey: key, draft: nextDraft, ...basePatch } };
-    }
-
-    // === Confirmación (compatibilidad si igual escribe “confirmo”)
-    if (state.draft?.stage === "confirm") {
-        if (wantsChange) {
-            const todayISO = tzFormat(utcToZonedTime(params.ctx.now ?? new Date(), tz), "yyyy-MM-dd", { timeZone: tz });
-            const byDay = await getNextAvailableSlots(
-                { empresaId, timezone: tz, vertical: ctx.kb.vertical, bufferMin: ctx.kb.bufferMin, granularityMin },
-                todayISO, state.draft.durationMin ?? 60, daysHorizon, maxSlots
-            );
-            const flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
-            if (!flat.length) return { handled: true, reply: "No veo cupos cercanos. ¿Quieres que te contacte un asesor?", patch: { ...basePatch, draft: { ...(state.draft ?? {}), stage: "offer" } } };
-            const labeled = labelSlotsForTZ(flat, tz).slice(0, Math.min(3, flat.length));
-            const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
-            return { handled: true, reply: `Horarios disponibles cercanos:\n${bullets}\n\nElige uno y escribe la hora (ej.: *2:30 pm* o *14:30*).`, patch: { ...basePatch, draft: { ...(state.draft ?? {}), stage: "offer" }, slotsCache: { items: labeled, expiresAt: nowPlusMin(10) } } };
-        }
-        if (wantsAbort) {
-            return { handled: true, reply: "Listo, no reservo. Si quieres, te muestro otros horarios.", patch: { ...basePatch, draft: { stage: "idle" } } };
-        }
-        if (isConfirmWord && state.draft.whenISO) {
-            try {
-                const res = await finalizeBookingAuto(state.draft, ctx);
-                return { handled: true, createOk: res.ok, reply: res.msg, patch: { draft: { stage: "idle" } } };
-            } catch (_e) {
-                return { handled: true, createOk: false, reply: "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?" };
-            }
+    // === Confirmación/edición por compatibilidad (si el usuario termina escribiendo "confirmo")
+    if (state.draft?.stage === "confirm" && state.draft.whenISO) {
+        try {
+            const res = await finalizeBookingAuto(state.draft, ctx);
+            return { handled: true, createOk: res.ok, reply: res.msg, patch: { draft: { stage: "idle" } } };
+        } catch {
+            return { handled: true, createOk: false, reply: "Ese horario acaba de ocuparse. ¿Quieres que te muestre otra opción cercana?" };
         }
     }
 
-    // Nada más que hacer
     return { handled: false, patch: basePatch };
 }
-
-
-
 
