@@ -743,6 +743,13 @@
 // }
 
 
+
+
+
+
+
+
+// utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
 import prisma from "../../../../../lib/prisma";
 import {
     addDays,
@@ -762,11 +769,6 @@ import type {
     AppointmentVertical,
     Weekday,
 } from "@prisma/client";
-
-/* ============================================================
-   Config “de comportamiento”
-============================================================ */
-const AUTO_BOOK_ON_FILLED = true; // ⇐ si hay hora+nombre+telefono, agenda de una.
 
 /* ============================================================
    Tipos públicos (consumidos por estetica.strategy)
@@ -851,10 +853,9 @@ function getWeekdayFromDate(dLocal: Date): Weekday {
 
 function hhmmToUtc(dayLocalISO: string, hhmm: string, tz: string): Date {
     const [h, m] = hhmm.split(":").map((v) => parseInt(v, 10));
-    // “dayLocalISO” es un YYYY-MM-DDT00:00:00 en la zona; lo normalizamos y fijamos hora local
-    const localMidnight = utcToZonedTime(zonedTimeToUtc(dayLocalISO, tz), tz);
-    localMidnight.setHours(h, m, 0, 0);
-    return zonedTimeToUtc(localMidnight, tz);
+    const localBase = utcToZonedTime(zonedTimeToUtc(dayLocalISO, tz), tz);
+    localBase.setHours(h, m, 0, 0);
+    return zonedTimeToUtc(localBase, tz);
 }
 
 function roundUpToGranularity(date: Date, granMin: number): Date {
@@ -863,12 +864,8 @@ function roundUpToGranularity(date: Date, granMin: number): Date {
 }
 
 const iso = (d: Date) => new Date(d.getTime()).toISOString();
-const intervalsOverlap = (
-    aS: Date,
-    aE: Date,
-    bS: Date,
-    bE: Date
-): boolean => aS < bE && bS < aE;
+const intervalsOverlap = (aS: Date, aE: Date, bS: Date, bE: Date) =>
+    aS < bE && bS < aE;
 
 function formatAmPm(d: Date) {
     let h = d.getHours();
@@ -876,7 +873,7 @@ function formatAmPm(d: Date) {
     const ampm = h >= 12 ? "pm" : "am";
     h = h % 12;
     h = h ? h : 12;
-    const mm = String(m).padStart(2, "0");
+    const mm = m.toString().padStart(2, "0");
     return `${h}:${mm} ${ampm}`;
 }
 
@@ -891,7 +888,7 @@ async function getOpenWindowsForDate(params: {
     empresaId: number;
     dateLocal: Date;
     tz: string;
-}): Promise<Array<{ startUtc: Date; endUtc: Date }>> {
+}) {
     const { empresaId, dateLocal, tz } = params;
     const weekday = getWeekdayFromDate(dateLocal);
 
@@ -900,7 +897,9 @@ async function getOpenWindowsForDate(params: {
     });
 
     // excepción del día (rango local 00:00–23:59)
-    const dayISO = tzFormat(dateLocal, "yyyy-MM-dd'T'00:00:00", { timeZone: tz });
+    const dayISO = tzFormat(dateLocal, "yyyy-MM-dd'T'00:00:00", {
+        timeZone: tz,
+    });
     const startLocal = utcToZonedTime(zonedTimeToUtc(dayISO, tz), tz);
     const endLocal = utcToZonedTime(
         zonedTimeToUtc(
@@ -923,7 +922,7 @@ async function getOpenWindowsForDate(params: {
     const open =
         exception?.isOpen === false
             ? []
-            : ([
+            : [
                 {
                     start: exception?.start1 ?? base?.start1 ?? null,
                     end: exception?.end1 ?? base?.end1 ?? null,
@@ -932,9 +931,7 @@ async function getOpenWindowsForDate(params: {
                     start: exception?.start2 ?? base?.start2 ?? null,
                     end: exception?.end2 ?? base?.end2 ?? null,
                 },
-            ].filter(
-                (w) => w.start && w.end
-            ) as Array<{ start: string; end: string }>);
+            ].filter((w) => w.start && w.end) as Array<{ start: string; end: string }>;
 
     return open.map(({ start, end }) => {
         const s = hhmmToUtc(dayISO, start, tz);
@@ -950,13 +947,9 @@ async function getBusyIntervalsUTC(params: {
     empresaId: number;
     dayStartUtc: Date;
     dayEndUtc: Date;
-}): Promise<Array<{ startUtc: Date; endUtc: Date }>> {
+}) {
     const { empresaId, dayStartUtc, dayEndUtc } = params;
-    const blocking: AppointmentStatus[] = [
-        "pending",
-        "confirmed",
-        "rescheduled",
-    ];
+    const blocking: AppointmentStatus[] = ["pending", "confirmed", "rescheduled"];
     const appts = await prisma.appointment.findMany({
         where: {
             empresaId,
@@ -1037,10 +1030,7 @@ export async function getNextAvailableSlots(
         new Date(fromDateISO + "T00:00:00Z"),
         tz
     );
-    const earliestAllowedUtc = addMinutes(
-        new Date(),
-        Math.max(bufferMin ?? 0, 0)
-    );
+    const earliestAllowedUtc = addMinutes(new Date(), Math.max(bufferMin ?? 0, 0));
 
     const results: SlotsByDay[] = [];
     for (let i = 0; i < daysHorizon; i++) {
@@ -1131,9 +1121,9 @@ export async function createAppointmentSafe(args: {
     });
     if (overlap) throw new Error("OVERLAP");
 
-    // 2) fuente segura
+    // 2) fuente segura (evita crash si enum no tiene "ai")
     const SOURCE_MAP: Record<string, AppointmentSource> = {
-        ai: "client" as AppointmentSource, // si enum no trae "ai", usamos "client"
+        ai: "client" as AppointmentSource,
         web: "web" as AppointmentSource,
         manual: "manual" as AppointmentSource,
         client: "client" as AppointmentSource,
@@ -1141,37 +1131,39 @@ export async function createAppointmentSafe(args: {
     const safeSource: AppointmentSource = SOURCE_MAP[source || "client"];
 
     // 3) create alineado al controller
-    const created = await prisma.appointment.create({
-        data: {
-            empresaId,
-            procedureId: procedureId ?? null,
-            serviceName,
-            customerName,
-            customerPhone,
-            startAt,
-            endAt,
-            status: "confirmed",
-            source: safeSource,
-            notas: notes ?? null,
-            timezone: timezone || "America/Bogota",
-            customerDisplayName: customerName,
-            serviceDurationMin: Math.max(
-                1,
-                Math.round((endAt.getTime() - startAt.getTime()) / 60000)
-            ),
-            locationNameCache: null,
-        },
-    });
-    return { ok: true, id: created.id };
+    try {
+        const created = await prisma.appointment.create({
+            data: {
+                empresaId,
+                procedureId: procedureId ?? null,
+                serviceName,
+                customerName,
+                customerPhone,
+                startAt,
+                endAt,
+                status: "confirmed",
+                source: safeSource,
+                notas: notes ?? null,
+                timezone: timezone || "America/Bogota",
+                customerDisplayName: customerName,
+                serviceDurationMin: Math.max(
+                    1,
+                    Math.round((endAt.getTime() - startAt.getTime()) / 60000)
+                ),
+                locationNameCache: null,
+            },
+        });
+        return { ok: true, id: created.id };
+    } catch (e) {
+        console.error("[createAppointmentSafe] ❌", e);
+        throw e;
+    }
 }
 
 /* ============================================================
    Helpers de UX (labels y parsing de hora)
 ============================================================ */
-function labelSlotsForTZ(
-    slots: Slot[],
-    tz: string
-): Array<{ startISO: string; endISO: string; label: string }> {
+function labelSlotsForTZ(slots: Slot[], tz: string) {
     return slots.map((s) => {
         const d = utcToZonedTime(new Date(s.startISO), tz);
         const dia = d.toLocaleDateString("es-CO", {
@@ -1185,9 +1177,10 @@ function labelSlotsForTZ(
     });
 }
 
-// Capturas (reutilizadas también dentro de handleSchedulingTurn)
-const NAME_RE = /(mi\s+nombre\s+es|soy|me\s+llamo)\s+([a-záéíóúñ\s]{2,60})/i;
-const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/;
+// Capturas
+const NAME_RE =
+    /(mi\s+nombre\s+es|soy|me\s+llamo)\s+([a-záéíóúñ\s]{2,60})/i;
+const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/; // 7–12 dígitos
 const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/; // 24h
 const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i; // 12h
 
@@ -1195,7 +1188,7 @@ function properCase(v?: string) {
     return (v || "")
         .trim()
         .replace(/\s+/g, " ")
-        // @ts-ignore unicode property escapes
+        // @ts-ignore: Unicode property escapes
         .replace(/\b\p{L}/gu, (c) => c.toUpperCase());
 }
 
@@ -1226,12 +1219,27 @@ function extractLocalMinutesFromText(text: string): number | null {
     return null;
 }
 
+/** Franja del día pedida por texto. */
+type DayPeriod = "morning" | "afternoon" | "evening";
+function parseDayPeriod(text: string): DayPeriod | null {
+    const t = text.toLowerCase();
+    if (/\b(mañana|manana|temprano|a primera hora)\b/.test(t)) return "morning";
+    if (/\b(tarde|after\s*noon)\b/.test(t)) return "afternoon";
+    if (/\b(noche|tarde-noche|tarde noche|evening)\b/.test(t)) return "evening";
+    return null;
+}
+function inPeriod(d: Date, period: DayPeriod): boolean {
+    const h = d.getHours();
+    if (period === "morning") return h >= 6 && h < 12;
+    if (period === "afternoon") return h >= 12 && h < 18;
+    return h >= 18 && h <= 21;
+}
+
 /** Match en slotsCache por minutos locales del inicio. */
-function findSlotByLocalMinutes<T extends { startISO: string; endISO: string }>(
-    items: T[],
-    tz: string,
-    targetMin: number
-): T | undefined {
+// genérico para respetar el tipo (con/sin label)
+function findSlotByLocalMinutes<
+    T extends { startISO: string; endISO: string }
+>(items: T[], tz: string, targetMin: number): T | undefined {
     return items.find((s) => {
         const d = utcToZonedTime(new Date(s.startISO), tz);
         const mm = d.getHours() * 60 + d.getMinutes();
@@ -1253,17 +1261,97 @@ async function findUpcomingApptByPhone(empresaId: number, phone: string) {
 }
 
 /* ============================================================
+   Helpers internos para autoconfirmación
+============================================================ */
+function hasAllDataForBooking(d: SchedulingDraft): boolean {
+    return Boolean(d.whenISO && (d.procedureName || d.procedureId) && d.name && d.phone);
+}
+
+async function finalizeBookingAuto(
+    draft: SchedulingDraft,
+    ctx: SchedulingCtx
+): Promise<{ ok: boolean; msg: string }> {
+    const tz = ctx.kb.timezone;
+    const duration = draft.durationMin ?? ctx.kb.defaultServiceDurationMin ?? 60;
+    const endISO = addMinutes(new Date(draft.whenISO!), duration).toISOString();
+
+    // Reagendar
+    if (draft.rescheduleApptId) {
+        await prisma.appointment.update({
+            where: { id: draft.rescheduleApptId },
+            data: {
+                startAt: new Date(draft.whenISO!),
+                endAt: new Date(endISO),
+                status: "confirmed",
+            },
+        });
+        const local = utcToZonedTime(new Date(draft.whenISO!), tz);
+        const f = local.toLocaleDateString("es-CO", {
+            weekday: "long",
+            year: "numeric",
+            month: "long",
+            day: "2-digit",
+            timeZone: tz,
+        });
+        const h = formatAmPm(local);
+        return {
+            ok: true,
+            msg:
+                `¡Listo! Tu cita fue *reprogramada y confirmada* ✅\n` +
+                `• ${draft.procedureName ?? "Procedimiento"}\n` +
+                `• ${f} a las ${h}\n` +
+                `Si necesitas *cambiar* la hora o *cancelar*, escríbelo y lo gestiono.`,
+        };
+    }
+
+    // Crear nueva
+    const serviceName =
+        draft.procedureName ||
+        (ctx.kb.procedures.find((p) => p.id === (draft.procedureId ?? 0))?.name ??
+            "Procedimiento");
+
+    await createAppointmentSafe({
+        empresaId: ctx.empresaId,
+        vertical: ctx.kb.vertical,
+        timezone: ctx.kb.timezone,
+        procedureId: draft.procedureId ?? null,
+        serviceName,
+        customerName: draft.name || "Cliente",
+        customerPhone: draft.phone || "",
+        startISO: draft.whenISO!,
+        endISO,
+        notes: "Agendado automáticamente por IA",
+        source: "ai",
+    });
+
+    const local = utcToZonedTime(new Date(draft.whenISO!), tz);
+    const f = local.toLocaleDateString("es-CO", {
+        weekday: "long",
+        year: "numeric",
+        month: "long",
+        day: "2-digit",
+        timeZone: tz,
+    });
+    const h = formatAmPm(local);
+
+    return {
+        ok: true,
+        msg:
+            `¡Hecho! Tu cita quedó *confirmada* ✅\n` +
+            `• ${serviceName}\n` +
+            `• ${f} a las ${h}\n` +
+            `Si quieres *cambiar* el horario o *cancelar*, dime y lo ajusto al toque.`,
+    };
+}
+
+/* ============================================================
    Orquestador de turno (schedule + cancel + reschedule)
 ============================================================ */
 export async function handleSchedulingTurn(params: {
     text: string;
     state: StateShape;
     ctx: SchedulingCtx;
-    serviceInContext?: {
-        id: number;
-        name: string;
-        durationMin?: number | null;
-    } | null;
+    serviceInContext?: { id: number; name: string; durationMin?: number | null } | null;
     intent: "price" | "schedule" | "reschedule" | "cancel" | "info" | "other";
 }): Promise<SchedulingResult> {
     const { text, state, ctx, serviceInContext, intent } = params;
@@ -1271,20 +1359,8 @@ export async function handleSchedulingTurn(params: {
     const tz = kb.timezone;
 
     // señales de intención
-    const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(
-        text
-    );
-    const wantsReschedule =
-        /\b(reagendar|reprogramar|cambiar\s+hora|otro\s+horario|mover\s+cita)\b/i.test(
-            text
-        ) ||
-        /\b(tarde|mañana|manana)\b/i.test(text);
-
-    // “ventanas” preferidas si pide mañana/tarde
-    const askMorning = /\b(mañana|manana|temprano)\b/i.test(text);
-    const askAfternoon = /\b(tarde|después de mediodía|despues de mediodia)\b/i.test(
-        text
-    );
+    const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(text);
+    const wantsReschedule = /\b(reagendar|reprogramar|cambiar\s+hora|otro\s+horario|mover\s+cita)\b/i.test(text);
 
     // capturas
     const nameMatch = NAME_RE.exec(text);
@@ -1292,11 +1368,11 @@ export async function handleSchedulingTurn(params: {
     const capturedName = nameMatch ? properCase(nameMatch[2]) : undefined;
     const capturedPhone = normalizePhone(phoneMatch?.[2]);
 
+    // memoria corta de teléfono
     const basePatch: Partial<StateShape> = {};
     if (capturedPhone) basePatch.lastPhoneSeen = capturedPhone;
 
     const inDraft = state.draft?.stage === "offer" || state.draft?.stage === "confirm";
-    const isConfirm = /^confirmo\b/i.test(text.trim());
 
     // === Cancelar
     if (intent === "cancel" || wantsCancel) {
@@ -1322,7 +1398,7 @@ export async function handleSchedulingTurn(params: {
         });
         return {
             handled: true,
-            reply: "Listo, tu cita fue *cancelada*.",
+            reply: "Listo, tu cita fue *cancelada*. Si deseas, te muestro nuevos horarios.",
             patch: { draft: { stage: "idle" }, lastIntent: "cancel", ...basePatch },
         };
     }
@@ -1370,16 +1446,7 @@ export async function handleSchedulingTurn(params: {
             maxSlots
         );
 
-        let flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
-
-        // filtro por mañana/tarde si lo pidió
-        if (askMorning || askAfternoon) {
-            flat = flat.filter((s) => {
-                const d = utcToZonedTime(new Date(s.startISO), tz);
-                return askMorning ? d.getHours() < 12 : d.getHours() >= 12;
-            });
-        }
-
+        const flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
         if (!flat.length)
             return {
                 handled: true,
@@ -1414,9 +1481,29 @@ export async function handleSchedulingTurn(params: {
 
     // si no es agenda (ni captura/confirmación), no lo manejo
     const isCapture =
-        Boolean(capturedName || capturedPhone) || HHMM_RE.test(text) || AMPM_RE.test(text);
-    if (!(intent === "schedule" || inDraft || isConfirm || isCapture))
+        Boolean(capturedName || capturedPhone) ||
+        HHMM_RE.test(text) ||
+        AMPM_RE.test(text);
+    const isConfirmWord =
+        /^(1\b|confirmo\b|confirmar\b|si\b|sí\b|ok\b|dale\b|listo\b)/i.test(
+            text.trim()
+        );
+    const wantsChange =
+        /^(2\b|cambiar|otra|modificar|reprogramar)/i.test(text.trim());
+    const wantsAbort = /^(3\b|cancelar|anular)/i.test(text.trim());
+
+    if (
+        !(
+            intent === "schedule" ||
+            inDraft ||
+            isCapture ||
+            isConfirmWord ||
+            wantsChange ||
+            wantsAbort
+        )
+    ) {
         return { handled: false, patch: basePatch };
+    }
 
     // servicio + duración
     const svc =
@@ -1427,7 +1514,7 @@ export async function handleSchedulingTurn(params: {
         ctx.kb.defaultServiceDurationMin ??
         60) as number;
 
-    // === Ofrecer slots
+    // === Ofrecer slots (con filtro por franja si el usuario lo pidió)
     if (intent === "schedule" && svc) {
         const todayISO = tzFormat(
             utcToZonedTime(params.ctx.now ?? new Date(), tz),
@@ -1449,23 +1536,23 @@ export async function handleSchedulingTurn(params: {
             maxSlots
         );
 
-        let flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
-
-        // filtro por mañana/tarde si el usuario lo pide
-        if (askMorning || askAfternoon) {
-            flat = flat.filter((s) => {
-                const d = utcToZonedTime(new Date(s.startISO), tz);
-                return askMorning ? d.getHours() < 12 : d.getHours() >= 12;
-            });
+        let flat = byDay.flatMap((d) => d.slots);
+        const period = parseDayPeriod(text);
+        if (period) {
+            flat = flat.filter((s) =>
+                inPeriod(utcToZonedTime(new Date(s.startISO), tz), period)
+            );
         }
+        flat = flat.slice(0, maxSlots);
 
-        if (!flat.length)
+        if (!flat.length) {
             return {
                 handled: true,
                 reply:
-                    "No veo cupos cercanos por ahora. ¿Quieres que te contacte un asesor para coordinar?",
+                    "No veo cupos cercanos por ahora en esa franja. ¿Quieres que te muestre otros horarios u otra fecha?",
                 patch: { lastIntent: "schedule", ...basePatch },
             };
+        }
 
         const labeled = labelSlotsForTZ(flat, tz).slice(0, Math.min(3, flat.length));
         const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
@@ -1473,11 +1560,11 @@ export async function handleSchedulingTurn(params: {
         const reply =
             `Disponibilidad cercana para *${svc.name}*:\n${bullets}\n\n` +
             `Elige una y dime tu *nombre* y *teléfono* para reservar.\n` +
-            `Si prefieres otra fecha u horario (p. ej. *tarde*), dímelo.`;
+            `Si prefieres otra fecha u otra franja (mañana/tarde/noche), dímelo.`;
 
         return {
             handled: true,
-            reply,
+            reply, // ← SIN precios aquí (endurecido)
             patch: {
                 lastIntent: "schedule",
                 lastServiceId: svc.id,
@@ -1495,14 +1582,21 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
-    // === Captura → confirmación (o auto-agendado si está completo)
-    if (state.draft?.stage === "offer" && (isCapture || svc)) {
+    // === Captura → AUTOCONFIRMACIÓN si ya hay datos completos; si no, seguir pidiendo datos
+    if (state.draft?.stage === "offer" && (isCapture || svc || parseDayPeriod(text))) {
         const currentCache = state.slotsCache;
 
+        // Intento de match con hora local (admite 2:30 pm o 14:30)
         let chosen = currentCache?.items?.[0];
         const wantedMin = extractLocalMinutesFromText(text);
+        const periodAsked = parseDayPeriod(text);
         if (wantedMin != null && currentCache?.items?.length) {
             const hit = findSlotByLocalMinutes(currentCache.items, tz, wantedMin);
+            if (hit) chosen = hit;
+        } else if (periodAsked && currentCache?.items?.length) {
+            const hit = currentCache.items.find((s) =>
+                inPeriod(utcToZonedTime(new Date(s.startISO), tz), periodAsked)
+            );
             if (hit) chosen = hit;
         }
 
@@ -1511,69 +1605,46 @@ export async function handleSchedulingTurn(params: {
             name: state.draft?.name ?? capturedName ?? undefined,
             phone: state.draft?.phone ?? (capturedPhone || state.lastPhoneSeen) ?? undefined,
             whenISO: state.draft?.whenISO ?? chosen?.startISO ?? undefined,
-            stage: "confirm",
+            stage: "confirm", // mantenemos por compatibilidad, pero autoconfirmamos si hay datos
             procedureName: state.draft?.procedureName ?? (svc ? svc.name : undefined),
             procedureId: state.draft?.procedureId ?? (svc ? svc.id : undefined),
             durationMin: state.draft?.durationMin ?? duration,
             rescheduleApptId: state.draft?.rescheduleApptId,
         };
 
-        // === AUTO BOOK (si está todo lleno) ===
-        if (
-            AUTO_BOOK_ON_FILLED &&
-            nextDraft.whenISO &&
-            nextDraft.name &&
-            nextDraft.phone &&
-            !nextDraft.rescheduleApptId
-        ) {
+        // *** AUTOCONFIRMAR si todo está completo ***
+        if (hasAllDataForBooking(nextDraft)) {
             try {
-                const endISO = addMinutes(
-                    new Date(nextDraft.whenISO),
-                    nextDraft.durationMin ?? 60
-                ).toISOString();
-
-                const serviceName =
-                    nextDraft.procedureName ||
-                    (ctx.kb.procedures.find((p) => p.id === (nextDraft.procedureId ?? 0))
-                        ?.name ?? "Procedimiento");
-
-                await createAppointmentSafe({
-                    empresaId,
-                    vertical: ctx.kb.vertical,
-                    timezone: ctx.kb.timezone,
-                    procedureId: nextDraft.procedureId ?? null,
-                    serviceName,
-                    customerName: nextDraft.name,
-                    customerPhone: nextDraft.phone,
-                    startISO: nextDraft.whenISO,
-                    endISO,
-                    notes: "Agendado por IA (auto)",
-                    source: "ai",
-                });
-
+                const result = await finalizeBookingAuto(nextDraft, ctx);
                 return {
                     handled: true,
-                    createOk: true,
-                    reply:
-                        "¡Perfecto! Tu cita quedó *agendada* ✅. Te enviaremos recordatorio antes de la fecha. " +
-                        'Si prefieres cambiar la hora, escribe *"cambiar hora"*.',
+                    createOk: result.ok,
+                    reply: result.msg,
                     patch: { draft: { stage: "idle" }, ...basePatch },
                 };
             } catch (_e) {
+                // Puede haberse ocupado el cupo
                 return {
                     handled: true,
                     createOk: false,
                     reply:
-                        "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas o prefieres *tarde*/*mañana*?",
-                    patch: basePatch,
+                        "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
+                    patch: {
+                        ...basePatch,
+                        draft: { ...(nextDraft ?? {}), whenISO: undefined, stage: "offer" },
+                    },
                 };
             }
         }
 
-        // === Flujo con confirmación explícita
-        const local = nextDraft.whenISO
-            ? utcToZonedTime(new Date(nextDraft.whenISO), tz)
-            : null;
+        // Si faltan datos, NO pedimos "confirmo". Pedimos lo que falta.
+        const needs: string[] = [];
+        if (!nextDraft.name) needs.push("tu *nombre*");
+        if (!nextDraft.phone) needs.push("tu *teléfono*");
+        if (!nextDraft.whenISO) needs.push("la *hora* (ej.: 2:30 pm o 14:30)");
+
+        const local =
+            nextDraft.whenISO ? utcToZonedTime(new Date(nextDraft.whenISO), tz) : null;
         const fecha = local
             ? local.toLocaleDateString("es-CO", {
                 weekday: "long",
@@ -1586,80 +1657,104 @@ export async function handleSchedulingTurn(params: {
         const hora = local ? formatAmPm(local) : "hora por confirmar";
 
         const resumen =
-            `Para cerrar, ¿confirmas la ${nextDraft.rescheduleApptId ? "reprogramación" : "reserva"}?\n` +
-            `• Procedimiento: ${nextDraft.procedureName ?? "—"}\n` +
-            `• Fecha/Hora: ${fecha} ${local ? `a las ${hora}` : ""}\n` +
+            `Voy a reservar *${nextDraft.procedureName ?? "Procedimiento"}* para ` +
+            `${fecha}${local ? ` a las ${hora}` : ""}.\n` +
             `• Nombre: ${nextDraft.name ?? "—"}\n` +
             `• Teléfono: ${nextDraft.phone ?? "—"}\n\n` +
-            `Escribe *"confirmo"* para agendar. ` +
-            `Si deseas otro horario, escribe *"cambiar hora"* (puedes decir *mañana* o *tarde*).`;
+            (needs.length
+                ? `Para finalizar la reserva, necesito ${needs.join(" y ")}. `
+                : "") +
+            `Si quieres *cambiar* la hora, indícame otra.`;
 
-        return { handled: true, reply: resumen, patch: { draft: nextDraft, ...basePatch } };
+        return {
+            handled: true,
+            reply: resumen,
+            patch: { draft: nextDraft, ...basePatch },
+        };
     }
 
-    // === Confirmación final → crear o actualizar
-    if (state.draft?.stage === "confirm" && isConfirm && state.draft.whenISO) {
-        try {
-            const endISO = addMinutes(
-                new Date(state.draft.whenISO),
-                state.draft.durationMin ?? 60
-            ).toISOString();
-
-            // Reagendar
-            if (state.draft.rescheduleApptId) {
-                await prisma.appointment.update({
-                    where: { id: state.draft.rescheduleApptId },
-                    data: {
-                        startAt: new Date(state.draft.whenISO),
-                        endAt: new Date(endISO),
-                        status: "confirmed",
-                    },
-                });
+    // === Confirmación / cambiar / cancelar (compatibilidad). Mantener por si llega aquí.
+    if (state.draft?.stage === "confirm") {
+        // 2) cambiar
+        if (wantsChange) {
+            const todayISO = tzFormat(
+                utcToZonedTime(params.ctx.now ?? new Date(), tz),
+                "yyyy-MM-dd",
+                { timeZone: tz }
+            );
+            const byDay = await getNextAvailableSlots(
+                {
+                    empresaId,
+                    timezone: tz,
+                    vertical: ctx.kb.vertical,
+                    bufferMin: ctx.kb.bufferMin,
+                    granularityMin,
+                },
+                todayISO,
+                state.draft.durationMin ?? 60,
+                daysHorizon,
+                maxSlots
+            );
+            const flat = byDay.flatMap((d) => d.slots).slice(0, maxSlots);
+            if (!flat.length) {
                 return {
                     handled: true,
-                    createOk: true,
-                    reply:
-                        "¡Hecho! Tu cita fue reprogramada ✅. Te enviaremos recordatorio antes de la fecha.",
-                    patch: { draft: { stage: "idle" } },
+                    reply: "No veo cupos cercanos. ¿Quieres que te contacte un asesor?",
+                    patch: {
+                        ...basePatch,
+                        draft: { ...(state.draft ?? {}), stage: "offer" },
+                    },
                 };
             }
-
-            // Crear nueva
-            const serviceName =
-                state.draft.procedureName ||
-                (ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0))
-                    ?.name ?? "Procedimiento");
-
-            await createAppointmentSafe({
-                empresaId,
-                vertical: ctx.kb.vertical,
-                timezone: ctx.kb.timezone,
-                procedureId: state.draft.procedureId ?? null,
-                serviceName,
-                customerName: state.draft.name || "Cliente",
-                customerPhone: state.draft.phone || "",
-                startISO: state.draft.whenISO,
-                endISO,
-                notes: "Agendado por IA",
-                source: "ai",
-            });
-
+            const labeled = labelSlotsForTZ(flat, tz).slice(
+                0,
+                Math.min(3, flat.length)
+            );
+            const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
             return {
                 handled: true,
-                createOk: true,
                 reply:
-                    "¡Hecho! Tu cita quedó confirmada ✅. Te enviaremos recordatorio antes de la fecha.",
-                patch: { draft: { stage: "idle" } },
+                    `Horarios disponibles cercanos:\n${bullets}\n\n` +
+                    `Elige uno y escribe la hora (ej.: *2:30 pm* o *14:30*).`,
+                patch: {
+                    ...basePatch,
+                    draft: { ...(state.draft ?? {}), stage: "offer" },
+                    slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                },
             };
-        } catch (_e) {
+        }
+
+        // 3) cancelar
+        if (wantsAbort) {
             return {
                 handled: true,
-                createOk: false,
                 reply:
-                    "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
+                    "Listo, no reservo. Si quieres, te muestro otros horarios.",
+                patch: { ...basePatch, draft: { stage: "idle" } },
             };
+        }
+
+        // 1) confirmar (compatibilidad: si el usuario aún escribe "confirmo")
+        if (isConfirmWord && state.draft.whenISO) {
+            try {
+                const res = await finalizeBookingAuto(state.draft, ctx);
+                return {
+                    handled: true,
+                    createOk: res.ok,
+                    reply: res.msg,
+                    patch: { draft: { stage: "idle" } },
+                };
+            } catch (_e) {
+                return {
+                    handled: true,
+                    createOk: false,
+                    reply:
+                        "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
+                };
+            }
         }
     }
 
+    // Nada más que hacer
     return { handled: false, patch: basePatch };
 }
