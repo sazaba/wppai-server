@@ -1056,6 +1056,16 @@
 // }
 
 
+
+
+
+
+
+
+
+
+
+
 // utils/ai/strategies/estetica.strategy.ts
 /**
  * Estética – Strategy WhatsApp
@@ -1476,7 +1486,6 @@ async function persistBotReply(opts: {
         const sameText = (prevBot.contenido || "").trim() === (texto || "").trim();
         const recent = Date.now() - new Date(prevBot.timestamp as any).getTime() <= 15_000;
         if (sameText && recent) {
-            // Asegura estado actualizado pero sin duplicar mensaje
             await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
             return { messageId: prevBot.id, texto: prevBot.contenido, wamid: prevBot.externalId as any };
         }
