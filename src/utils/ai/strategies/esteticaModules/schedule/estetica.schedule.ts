@@ -116,9 +116,7 @@ function getWeekdayFromDate(dLocal: Date): Weekday {
         "mon") as Weekday;
 }
 
-function periodToLocalRange(
-    period: DayPeriod
-): { from: number; to: number } {
+function periodToLocalRange(period: DayPeriod): { from: number; to: number } {
     if (period === "morning") return { from: 6 * 60, to: 12 * 60 };
     if (period === "afternoon") return { from: 12 * 60, to: 18 * 60 };
     return { from: 18 * 60, to: 21 * 60 };
@@ -188,9 +186,7 @@ async function getOpenWindowsForDate(params: {
     });
 
     // excepción del día (00:00–23:59 local)
-    const dayISO = tzFormat(dateLocal, "yyyy-MM-dd'T'00:00:00", {
-        timeZone: tz,
-    });
+    const dayISO = tzFormat(dateLocal, "yyyy-MM-dd'T'00:00:00", { timeZone: tz });
     const startLocal = utcToZonedTime(zonedTimeToUtc(dayISO, tz), tz);
     const endLocal = utcToZonedTime(
         zonedTimeToUtc(
@@ -315,7 +311,7 @@ function carveSlotsFromWindows(params: {
 }
 
 /* ============================================================
-   NL → fecha/franja en TZ negocio
+   NLP → fecha/franja en TZ negocio
    Casos: "miércoles", "jueves de la próxima semana",
    "próxima disponible", "15 de octubre", "15/10", "jueves 15"
 ============================================================ */
@@ -372,7 +368,7 @@ export function interpretNaturalWhen(
         };
     }
 
-    // “la más próxima / próxima disponible / lo más pronto” (NO confundir con “próxima semana”)
+    // “la más próxima / próxima disponible” (NO confundir con “próxima semana”)
     if (
         /\b(la\s+m[aá]s\s+pr[oó]xima|m[aá]s\s+cercana|inmediata|lo\s+m[aá]s\s+pronto|pr[oó]xima\s+disponible)\b/.test(
             t
@@ -626,7 +622,7 @@ function labelSlotsForTZ(slots: Slot[], tz: string): LabeledSlot[] {
             month: "short",
             timeZone: tz,
         });
-        const label = `${dia}, ${formatAmPmLocal(d)}`; // ej: miércoles, 15 oct, 2:30 pm
+        const label = `${dia}, ${formatAmPmLocal(d)}`;
         return { startISO: s.startISO, endISO: s.endISO, label };
     });
 }
@@ -635,12 +631,27 @@ const NAME_RE = /(mi\s+nombre\s+es|soy|me\s+llamo)\s+([a-záéíóúñ\s]{2,60})
 const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/; // 7–12 dígitos
 const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/; // 24h
 const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i; // 12h
+const ACCEPT_RE =
+    /\b(ok(ay)?|perfecto|genial|listo|va|dale|sirve|me\s+sirve|me\s+va\s+bien|ag[eé]nd[ao]|reserv[ao]|vamos\s+con|tomemos|ese|esa)\b/i;
+
+const ORDINAL_RE =
+    /\b(primera|1(?:ra|era)?|segunda|2(?:da)?|tercera|3(?:ra)?)\b/i;
+
+function ordinalIndex(text: string): number | null {
+    const m = ORDINAL_RE.exec(text);
+    if (!m) return null;
+    const w = m[1].toLowerCase();
+    if (w.startsWith("primera") || w.startsWith("1")) return 0;
+    if (w.startsWith("segunda") || w.startsWith("2")) return 1;
+    if (w.startsWith("tercera") || w.startsWith("3")) return 2;
+    return null;
+}
 
 function properCase(v?: string) {
     return (v || "")
         .trim()
         .replace(/\s+/g, " ")
-        // @ts-ignore: Unicode property escapes
+        // @ts-ignore Unicode property escapes
         .replace(/\b\p{L}/gu, (c) => c.toUpperCase());
 }
 function normalizePhone(raw?: string): string | undefined {
@@ -684,6 +695,16 @@ function findSlotByLocalMinutes<T extends { startISO: string }>(
         return mm === targetMin;
     });
 }
+function findSlotsByWeekday<T extends { startISO: string }>(
+    items: T[],
+    tz: string,
+    weekday: Weekday
+): T[] {
+    return items.filter((s) => {
+        const d = utcToZonedTime(new Date(s.startISO), tz);
+        return getWeekdayFromDate(d) === weekday;
+    });
+}
 
 /* ============================================================
    Motor principal – flujo estandarizado
@@ -702,7 +723,6 @@ async function findUpcomingApptByPhone(empresaId: number, phone: string) {
 }
 
 function nextWeekPivot(localNow: Date): Date {
-    // lunes de la próxima semana como pivote simple
     const dow = localNow.getDay(); // 0..6
     const daysToNextMonday = ((8 - dow) % 7) || 7;
     return addDays(startOfDay(localNow), daysToNextMonday);
@@ -723,7 +743,7 @@ export async function handleSchedulingTurn(params: {
     const { kb, empresaId, granularityMin, daysHorizon, maxSlots } = ctx;
     const tz = kb.timezone;
 
-    // trabajar sobre copia de estado (y validar expiración de cache)
+    // copiar estado y limpiar cache vencida
     const state: StateShape = { ...stateArg };
     if (state.slotsCache && !cacheIsValid(state.slotsCache.expiresAt)) {
         state.slotsCache = undefined;
@@ -746,7 +766,7 @@ export async function handleSchedulingTurn(params: {
         ctx.kb.defaultServiceDurationMin ??
         60) as number;
 
-    // === Cancelar / Reagendar (compatibilidad básica)
+    /* ===== Cancelar / Reagendar ===== */
     const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(
         text
     );
@@ -779,7 +799,7 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
-    // === Paso 1: si la intención es schedule y no hay procedimiento, pedirlo
+    /* ===== Paso 1: pedir procedimiento si falta ===== */
     if (intent === "schedule" && !svc) {
         return {
             handled: true,
@@ -789,7 +809,7 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
-    // === Paso 2: preguntar si tiene un día en mente (si aún no lo dijo)
+    /* ===== Paso 2: pedir día si aún no hay pista ===== */
     const nl = interpretNaturalWhen(text, tz, ctx.now ?? new Date());
     const askedForDay =
         !!nl ||
@@ -812,7 +832,7 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
-    // === Paso 3: generar propuestas según lo que pidió
+    /* ===== Paso 3: generar propuestas ===== */
     const localNow = utcToZonedTime(ctx.now ?? new Date(), tz);
 
     async function offerFromPivot(
@@ -822,7 +842,6 @@ export async function handleSchedulingTurn(params: {
     ): Promise<{
         reply: string;
         labeledAll: LabeledSlot[];
-        labeledDisplay: LabeledSlot[];
     }> {
         const byDay = await getNextAvailableSlots(
             {
@@ -860,23 +879,21 @@ export async function handleSchedulingTurn(params: {
         flat = flat.slice(0, maxSlots);
 
         const labeledAll = labelSlotsForTZ(flat, tz);
-        const labeledDisplay = labeledAll.slice(0, Math.min(3, labeledAll.length));
 
         if (!labeledAll.length) {
             return {
                 reply: `No veo cupos cercanos ${labelHint ? `para ${labelHint}` : ""}. ¿Te muestro otras fechas o franja?`,
                 labeledAll: [],
-                labeledDisplay: [],
             };
         }
-        const bullets = labeledDisplay.map((l) => `• ${l.label}`).join("\n");
+        const bullets = labeledAll.slice(0, 3).map((l) => `• ${l.label}`).join("\n");
         const reply =
             `Disponibilidad cercana para *${svc!.name}*${labelHint ? ` (${labelHint})` : ""}:\n${bullets}\n\n` +
             `Elige una y dime tu *nombre* y *teléfono* para reservar.`;
-        return { reply, labeledAll, labeledDisplay };
+        return { reply, labeledAll };
     }
 
-    // Si solo cambian la franja (mañana/tarde/noche), refrescar usando el mismo pivote del cache
+    // Solo cambia franja con cache vigente
     const periodOnly = !nl && !!parseDayPeriod(text);
     if (svc && periodOnly && state.slotsCache?.items?.length) {
         const pivotISO = localDayISOFromSlot(state.slotsCache.items[0].startISO, tz);
@@ -903,7 +920,7 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
-    // === Si el usuario pide explícitamente una nueva ventana (nl) y HAY cache → invalidar y regenerar
+    // Si pide nueva fecha/franja explícita y ya había cache → regenerar
     const askedNewRange = Boolean(nl);
     if (svc && askedNewRange && state.slotsCache?.items?.length) {
         let pivotISO = tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
@@ -944,21 +961,98 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
+    // NL → directamente intentar reservar si trae hora clara (date/weekday + hora)
     if (svc && nl) {
-        if (nl.kind === "nearest") {
-            const pivotISO = tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
+        const wantedMin = extractLocalMinutesFromText(text);
+
+        const finalizeWith = (slotISO: string): SchedulingResult => {
+            const nextDraft: SchedulingDraft = {
+                ...(state.draft ?? {}),
+                whenISO: slotISO,
+                procedureId: svc.id,
+                procedureName: svc.name,
+                durationMin: duration,
+                name: state.draft?.name ?? capturedName ?? undefined,
+                phone: state.draft?.phone ?? (capturedPhone || state.lastPhoneSeen) ?? undefined,
+                stage: "confirm",
+            };
+            const local = utcToZonedTime(new Date(slotISO), tz);
+            const fecha = local.toLocaleDateString("es-CO", {
+                weekday: "long",
+                year: "numeric",
+                month: "long",
+                day: "2-digit",
+                timeZone: tz,
+            });
+            const hora = formatAmPmLocal(local);
+
+            const hasAll = Boolean(nextDraft.whenISO && nextDraft.name && nextDraft.phone);
+            if (hasAll) {
+                return {
+                    handled: true,
+                    reply: `¡Perfecto! Reservando *${svc.name}* para *${fecha} a las ${hora}*…`,
+                    patch: { draft: nextDraft }, // la inserción real sucederá abajo en Paso 5 (misma rama)
+                };
+            }
+            return {
+                handled: true,
+                reply:
+                    `Perfecto. Te reservo *${svc.name}* para *${fecha} a las ${hora}*.\n` +
+                    `Para confirmar, envíame tu ${!nextDraft.name && !nextDraft.phone ? "*nombre* y *teléfono*" : !nextDraft.name ? "*nombre*" : "*teléfono*"
+                    }.`,
+                patch: {
+                    draft: nextDraft,
+                    ...basePatch,
+                },
+            };
+        };
+
+        const pivotAndOffer = async (pivotISO: string, labelHint: string) => {
             const { reply, labeledAll } = await offerFromPivot(
                 pivotISO,
-                nl.period,
-                "la más próxima"
+                nl.period ?? null,
+                labelHint
             );
+
+            // si el usuario dio hora exacta, buscarla y confirmar
+            if (wantedMin != null && labeledAll.length) {
+                let pool = labeledAll;
+                if (nl.kind === "weekday") {
+                    pool = findSlotsByWeekday(labeledAll, tz, nl.weekday);
+                }
+                const hit = findSlotByLocalMinutes(pool, tz, wantedMin);
+                if (hit) {
+                    return {
+                        handled: true,
+                        reply: finalizeWith(hit.startISO).reply,
+                        patch: {
+                            lastIntent: "schedule",
+                            draft: {
+                                ...(state.draft ?? {}),
+                                whenISO: hit.startISO,
+                                procedureId: svc.id,
+                                procedureName: svc.name,
+                                durationMin: duration,
+                                name: state.draft?.name ?? capturedName ?? undefined,
+                                phone:
+                                    state.draft?.phone ??
+                                    (capturedPhone || state.lastPhoneSeen) ??
+                                    undefined,
+                                stage: "confirm",
+                            },
+                            slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
+                            ...basePatch,
+                        },
+                    } as SchedulingResult;
+                }
+            }
+
+            // si no dio hora o no existe exacta → mostrar opciones
             return {
                 handled: true,
                 reply,
                 patch: {
                     lastIntent: "schedule",
-                    lastServiceId: svc.id,
-                    lastServiceName: svc.name,
                     draft: {
                         ...(state.draft ?? {}),
                         procedureId: svc.id,
@@ -969,53 +1063,33 @@ export async function handleSchedulingTurn(params: {
                     slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
                     ...basePatch,
                 },
-            };
+            } as SchedulingResult;
+        };
+
+        if (nl.kind === "nearest") {
+            const pivotISO = tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
+            return await pivotAndOffer(pivotISO, "la más próxima");
         }
 
         if (nl.kind === "date") {
-            const { reply, labeledAll } = await offerFromPivot(
+            return await pivotAndOffer(
                 nl.localDateISO,
-                nl.period,
                 utcToZonedTime(zonedTimeToUtc(`${nl.localDateISO}T00:00:00`, tz), tz).toLocaleDateString(
                     "es-CO",
                     { weekday: "short", day: "numeric", month: "short", timeZone: tz }
                 )
             );
-            return {
-                handled: true,
-                reply,
-                patch: {
-                    lastIntent: "schedule",
-                    lastServiceId: svc.id,
-                    lastServiceName: svc.name,
-                    draft: {
-                        ...(state.draft ?? {}),
-                        procedureId: svc.id,
-                        procedureName: svc.name,
-                        durationMin: duration,
-                        stage: "offer",
-                    },
-                    slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
-                    ...basePatch,
-                },
-            };
         }
 
         if (nl.kind === "weekday") {
-            const todayWd = getWeekdayFromDate(localNow);
             let pivot = localNow;
-
             if (nl.which === "this_or_next") {
-                const want = nl.weekday;
-                if (want !== todayWd) {
-                    let tries = 0;
-                    while (getWeekdayFromDate(pivot) !== want && tries < 7) {
-                        pivot = addDays(pivot, 1);
-                        tries++;
-                    }
+                let tries = 0;
+                while (getWeekdayFromDate(pivot) !== nl.weekday && tries < 7) {
+                    pivot = addDays(pivot, 1);
+                    tries++;
                 }
             } else {
-                // next_week
                 pivot = nextWeekPivot(localNow);
                 let tries = 0;
                 while (getWeekdayFromDate(pivot) !== nl.weekday && tries < 7) {
@@ -1023,43 +1097,14 @@ export async function handleSchedulingTurn(params: {
                     tries++;
                 }
             }
-
             const pivotISO = tzFormat(pivot, "yyyy-MM-dd", { timeZone: tz });
-            const label = `${tzFormat(pivot, "eeee", {
-                timeZone: tz,
-            })}${nl.which === "next_week" ? " (próx. semana)" : ""}${nl.period
-                    ? ` – ${nl.period === "morning"
-                        ? "mañana"
-                        : nl.period === "afternoon"
-                            ? "tarde"
-                            : "noche"
-                    }`
-                    : ""
-                }`;
-            const { reply, labeledAll } = await offerFromPivot(pivotISO, nl.period, label);
-
-            return {
-                handled: true,
-                reply,
-                patch: {
-                    lastIntent: "schedule",
-                    lastServiceId: svc.id,
-                    lastServiceName: svc.name,
-                    draft: {
-                        ...(state.draft ?? {}),
-                        procedureId: svc.id,
-                        procedureName: svc.name,
-                        durationMin: duration,
-                        stage: "offer",
-                    },
-                    slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
-                    ...basePatch,
-                },
-            };
+            const label = `${tzFormat(pivot, "eeee", { timeZone: tz })}${nl.which === "next_week" ? " (próx. semana)" : ""
+                }${nl.period ? ` – ${nl.period === "morning" ? "mañana" : nl.period === "afternoon" ? "tarde" : "noche"}` : ""}`;
+            return await pivotAndOffer(pivotISO, label);
         }
     }
 
-    // === Paso 4: Captura / cambio de idea → regenerar slotsCache automáticamente
+    /* ===== Paso 4: regenerar slots automáticamente si capturamos algo ===== */
     const isCapture =
         Boolean(capturedName || capturedPhone) ||
         HHMM_RE.test(text) ||
@@ -1096,21 +1141,37 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
-    // === Paso 5: Con cache, permitir elegir y auto-confirmar al tener nombre+tel
+    /* ===== Paso 5: Selección/aceptación con cache → confirmar ===== */
     if (svc && state.slotsCache?.items?.length) {
         const wantedMin = extractLocalMinutesFromText(text);
         const periodAsked = parseDayPeriod(text);
+        const ordIdx = ordinalIndex(text);
 
-        let chosen = state.slotsCache.items[0];
+        // preferir si el usuario mencionó un weekday ahora (ej. "ese martes")
+        const wdWord = Object.keys(DAY_WORDS).find((w) =>
+            new RegExp(`\\b${w}\\b`, "i").test(text)
+        );
+        const mentionWd = wdWord ? DAY_WORDS[wdWord] : null;
+
+        let pool = state.slotsCache.items.slice();
+        if (mentionWd) pool = findSlotsByWeekday(pool, tz, mentionWd);
+
+        let chosen = pool[0] || state.slotsCache.items[0];
+
         if (wantedMin != null) {
-            const hit = findSlotByLocalMinutes(state.slotsCache.items, tz, wantedMin);
+            const hit = findSlotByLocalMinutes(pool, tz, wantedMin) ??
+                findSlotByLocalMinutes(state.slotsCache.items, tz, wantedMin);
             if (hit) chosen = hit;
         } else if (periodAsked) {
-            const hit = state.slotsCache.items.find((s) =>
+            const hit = pool.find((s) =>
                 inPeriodLocal(utcToZonedTime(new Date(s.startISO), tz), periodAsked)
             );
             if (hit) chosen = hit;
+        } else if (ordIdx != null && pool[ordIdx]) {
+            chosen = pool[ordIdx];
         }
+
+        const accepting = ACCEPT_RE.test(text) || wantedMin != null || ordIdx != null || periodAsked != null;
 
         const nextDraft: SchedulingDraft = {
             ...(state.draft ?? {}),
@@ -1139,9 +1200,9 @@ export async function handleSchedulingTurn(params: {
             : "fecha por confirmar";
         const hora = local ? formatAmPmLocal(local) : "hora por confirmar";
 
-        // Auto-insert
+        // Auto-insert si ya tenemos todo y el usuario aceptó
         const hasAll = Boolean(nextDraft.whenISO && nextDraft.name && nextDraft.phone);
-        if (hasAll) {
+        if (accepting && hasAll) {
             try {
                 const endISO = addMinutes(
                     new Date(nextDraft.whenISO!),
@@ -1195,7 +1256,7 @@ export async function handleSchedulingTurn(params: {
             }
         }
 
-        // Falta nombre o teléfono → pedir lo que falta
+        // Falta nombre o teléfono → pedir lo que falta (pero ya sin volver a proponer)
         const missingPieces: string[] = [];
         if (!nextDraft.name) missingPieces.push("tu *nombre*");
         if (!nextDraft.phone) missingPieces.push("tu *teléfono*");
