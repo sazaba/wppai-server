@@ -831,16 +831,6 @@ export type SchedulingResult = {
 ============================================================ */
 export type DayPeriod = "morning" | "afternoon" | "evening";
 
-const WEEKDAY_ORDER: Record<Weekday, number> = {
-    mon: 1,
-    tue: 2,
-    wed: 3,
-    thu: 4,
-    fri: 5,
-    sat: 6,
-    sun: 0,
-};
-
 const DAY_WORDS: Record<string, Weekday> = {
     domingo: "sun",
     lunes: "mon",
@@ -921,6 +911,16 @@ function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
 
+function cacheIsValid(expiresAt?: string | null) {
+    if (!expiresAt) return false;
+    return Date.now() < Date.parse(expiresAt);
+}
+
+function localDayISOFromSlot(slotISO: string, tz: string) {
+    const d = utcToZonedTime(new Date(slotISO), tz);
+    return tzFormat(d, "yyyy-MM-dd", { timeZone: tz });
+}
+
 /* ============================================================
    Ventanas (AppointmentHour + Exception)
 ============================================================ */
@@ -989,11 +989,7 @@ async function getBusyIntervalsUTC(params: {
     dayEndUtc: Date;
 }) {
     const { empresaId, dayStartUtc, dayEndUtc } = params;
-    const blocking: AppointmentStatus[] = [
-        "pending",
-        "confirmed",
-        "rescheduled",
-    ];
+    const blocking: AppointmentStatus[] = ["pending", "confirmed", "rescheduled"];
     const appts = await prisma.appointment.findMany({
         where: {
             empresaId,
@@ -1070,7 +1066,7 @@ function carveSlotsFromWindows(params: {
 /* ============================================================
    NL → fecha/franja en TZ negocio
    Casos: "miércoles", "jueves de la próxima semana",
-   "próxima disponible", "15 de octubre", "15/10"
+   "próxima disponible", "15 de octubre", "15/10", "jueves 15"
 ============================================================ */
 type NaturalWhen =
     | { kind: "nearest"; period: DayPeriod | null }
@@ -1100,8 +1096,7 @@ export function interpretNaturalWhen(
 
     // "jueves de la próxima semana / semana que viene / la otra semana"
     const nextWeekWd = new RegExp(
-        `(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo).{0,30}` +
-        `(pr[oó]xima\\s+semana|semana\\s+que\\s+viene|otra\\s+semana)`,
+        `(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo).{0,30}(pr[oó]xima\\s+semana|semana\\s+que\\s+viene|otra\\s+semana)`,
         "i"
     ).exec(t);
     if (nextWeekWd) {
@@ -1187,6 +1182,33 @@ export function interpretNaturalWhen(
         };
     }
 
+    // Día de semana + día del mes: "jueves 15", "miércoles 3 de noviembre"
+    const wdDm =
+        /(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s+(\d{1,2})(?:\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre))?/i.exec(
+            t
+        );
+    if (wdDm) {
+        const wd =
+            DAY_WORDS[
+            wdDm[1].normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase()
+            ];
+        const day = parseInt(wdDm[2], 10);
+        const baseLocal = utcToZonedTime(now, tz);
+        const year = baseLocal.getFullYear();
+        const month = wdDm[3] ? MONTHS[wdDm[3].toLowerCase()] : baseLocal.getMonth();
+        let candidate = new Date(year, month, day, 0, 0, 0, 0);
+        const localCandidate = utcToZonedTime(zonedTimeToUtc(candidate, tz), tz);
+        if (!isAfter(localCandidate, baseLocal) && !isSameDay(localCandidate, baseLocal)) {
+            const next = new Date(year, month + 1, day, 0, 0, 0, 0);
+            candidate = next;
+        }
+        return {
+            kind: "date",
+            localDateISO: tzFormat(candidate, "yyyy-MM-dd", { timeZone: tz }),
+            period: parseDayPeriod(t),
+        };
+    }
+
     return null;
 }
 
@@ -1213,10 +1235,7 @@ export async function getNextAvailableSlots(
         zonedTimeToUtc(`${fromLocalDayISO}T00:00:00`, tz),
         tz
     );
-    const earliestAllowedUtc = addMinutes(
-        new Date(),
-        Math.max(bufferMin ?? 0, 0)
-    );
+    const earliestAllowedUtc = addMinutes(new Date(), Math.max(bufferMin ?? 0, 0));
 
     const periodRange = period ? periodToLocalRange(period) : null;
 
@@ -1419,11 +1438,7 @@ function findSlotByLocalMinutes<T extends { startISO: string }>(
    Motor principal – flujo estandarizado
 ============================================================ */
 async function findUpcomingApptByPhone(empresaId: number, phone: string) {
-    const blocking: AppointmentStatus[] = [
-        "pending",
-        "confirmed",
-        "rescheduled",
-    ];
+    const blocking: AppointmentStatus[] = ["pending", "confirmed", "rescheduled"];
     return prisma.appointment.findFirst({
         where: {
             empresaId,
@@ -1453,9 +1468,15 @@ export async function handleSchedulingTurn(params: {
     } | null;
     intent: "price" | "schedule" | "reschedule" | "cancel" | "info" | "other";
 }): Promise<SchedulingResult> {
-    const { text, state, ctx, serviceInContext, intent } = params;
+    const { text, state: stateArg, ctx, serviceInContext, intent } = params;
     const { kb, empresaId, granularityMin, daysHorizon, maxSlots } = ctx;
     const tz = kb.timezone;
+
+    // trabajar sobre copia de estado (y validar expiración de cache)
+    const state: StateShape = { ...stateArg };
+    if (state.slotsCache && !cacheIsValid(state.slotsCache.expiresAt)) {
+        state.slotsCache = undefined;
+    }
 
     // capturas
     const nameMatch = NAME_RE.exec(text);
@@ -1547,7 +1568,11 @@ export async function handleSchedulingTurn(params: {
         localPivotISO: string,
         period: DayPeriod | null,
         labelHint?: string
-    ) {
+    ): Promise<{
+        reply: string;
+        labeledAll: LabeledSlot[];
+        labeledDisplay: LabeledSlot[];
+    }> {
         const byDay = await getNextAvailableSlots(
             {
                 empresaId,
@@ -1583,20 +1608,48 @@ export async function handleSchedulingTurn(params: {
 
         flat = flat.slice(0, maxSlots);
 
-        if (!flat.length) {
+        const labeledAll = labelSlotsForTZ(flat, tz);
+        const labeledDisplay = labeledAll.slice(0, Math.min(3, labeledAll.length));
+
+        if (!labeledAll.length) {
             return {
-                reply: `No veo cupos cercanos ${labelHint ? `para ${labelHint}` : ""
-                    }. ¿Te muestro otras fechas o franja?`,
-                labeled: [] as LabeledSlot[],
+                reply: `No veo cupos cercanos ${labelHint ? `para ${labelHint}` : ""}. ¿Te muestro otras fechas o franja?`,
+                labeledAll: [],
+                labeledDisplay: [],
             };
         }
-        const labeled = labelSlotsForTZ(flat, tz).slice(0, Math.min(3, flat.length));
-        const bullets = labeled.map((l) => `• ${l.label}`).join("\n");
+        const bullets = labeledDisplay.map((l) => `• ${l.label}`).join("\n");
         const reply =
-            `Disponibilidad cercana para *${svc!.name}*${labelHint ? ` (${labelHint})` : ""
-            }:\n${bullets}\n\n` +
+            `Disponibilidad cercana para *${svc!.name}*${labelHint ? ` (${labelHint})` : ""}:\n${bullets}\n\n` +
             `Elige una y dime tu *nombre* y *teléfono* para reservar.`;
-        return { reply, labeled };
+        return { reply, labeledAll, labeledDisplay };
+    }
+
+    // Si solo cambian la franja (mañana/tarde/noche), refrescar usando el mismo pivote del cache
+    const periodOnly = !nl && !!parseDayPeriod(text);
+    if (svc && periodOnly && state.slotsCache?.items?.length) {
+        const pivotISO = localDayISOFromSlot(state.slotsCache.items[0].startISO, tz);
+        const { reply, labeledAll } = await offerFromPivot(
+            pivotISO,
+            parseDayPeriod(text),
+            "ajuste de franja"
+        );
+        return {
+            handled: true,
+            reply,
+            patch: {
+                lastIntent: "schedule",
+                draft: {
+                    ...(state.draft ?? {}),
+                    procedureId: svc.id,
+                    procedureName: svc.name,
+                    durationMin: duration,
+                    stage: "offer",
+                },
+                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
+                ...basePatch,
+            },
+        };
     }
 
     // === Si el usuario pide explícitamente una nueva ventana (nl) y HAY cache → invalidar y regenerar
@@ -1608,8 +1661,7 @@ export async function handleSchedulingTurn(params: {
         if (nl!.kind === "date") {
             pivotISO = nl!.localDateISO;
         } else if (nl!.kind === "weekday") {
-            let pivot =
-                nl!.which === "next_week" ? nextWeekPivot(localNow) : localNow;
+            let pivot = nl!.which === "next_week" ? nextWeekPivot(localNow) : localNow;
             let tries = 0;
             while (getWeekdayFromDate(pivot) !== nl!.weekday && tries < 7) {
                 pivot = addDays(pivot, 1);
@@ -1618,7 +1670,7 @@ export async function handleSchedulingTurn(params: {
             pivotISO = tzFormat(pivot, "yyyy-MM-dd", { timeZone: tz });
         }
 
-        const { reply, labeled } = await offerFromPivot(
+        const { reply, labeledAll } = await offerFromPivot(
             pivotISO,
             period,
             "ajuste de fecha"
@@ -1635,7 +1687,7 @@ export async function handleSchedulingTurn(params: {
                     durationMin: duration,
                     stage: "offer",
                 },
-                slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
                 ...basePatch,
             },
         };
@@ -1644,7 +1696,7 @@ export async function handleSchedulingTurn(params: {
     if (svc && nl) {
         if (nl.kind === "nearest") {
             const pivotISO = tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
-            const { reply, labeled } = await offerFromPivot(
+            const { reply, labeledAll } = await offerFromPivot(
                 pivotISO,
                 nl.period,
                 "la más próxima"
@@ -1663,25 +1715,20 @@ export async function handleSchedulingTurn(params: {
                         durationMin: duration,
                         stage: "offer",
                     },
-                    slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                    slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
                     ...basePatch,
                 },
             };
         }
 
         if (nl.kind === "date") {
-            const { reply, labeled } = await offerFromPivot(
+            const { reply, labeledAll } = await offerFromPivot(
                 nl.localDateISO,
                 nl.period,
-                utcToZonedTime(
-                    zonedTimeToUtc(`${nl.localDateISO}T00:00:00`, tz),
-                    tz
-                ).toLocaleDateString("es-CO", {
-                    weekday: "short",
-                    day: "numeric",
-                    month: "short",
-                    timeZone: tz,
-                })
+                utcToZonedTime(zonedTimeToUtc(`${nl.localDateISO}T00:00:00`, tz), tz).toLocaleDateString(
+                    "es-CO",
+                    { weekday: "short", day: "numeric", month: "short", timeZone: tz }
+                )
             );
             return {
                 handled: true,
@@ -1697,7 +1744,7 @@ export async function handleSchedulingTurn(params: {
                         durationMin: duration,
                         stage: "offer",
                     },
-                    slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                    slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
                     ...basePatch,
                 },
             };
@@ -1738,7 +1785,7 @@ export async function handleSchedulingTurn(params: {
                     }`
                     : ""
                 }`;
-            const { reply, labeled } = await offerFromPivot(pivotISO, nl.period, label);
+            const { reply, labeledAll } = await offerFromPivot(pivotISO, nl.period, label);
 
             return {
                 handled: true,
@@ -1754,7 +1801,7 @@ export async function handleSchedulingTurn(params: {
                         durationMin: duration,
                         stage: "offer",
                     },
-                    slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                    slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
                     ...basePatch,
                 },
             };
@@ -1777,7 +1824,7 @@ export async function handleSchedulingTurn(params: {
                 : tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz })
             : tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
 
-        const { reply, labeled } = await offerFromPivot(plan, nl?.period ?? null);
+        const { reply, labeledAll } = await offerFromPivot(plan, nl?.period ?? null);
         return {
             handled: true,
             reply,
@@ -1792,7 +1839,7 @@ export async function handleSchedulingTurn(params: {
                     durationMin: duration,
                     stage: "offer",
                 },
-                slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
                 ...basePatch,
             },
         };
@@ -1805,11 +1852,7 @@ export async function handleSchedulingTurn(params: {
 
         let chosen = state.slotsCache.items[0];
         if (wantedMin != null) {
-            const hit = findSlotByLocalMinutes(
-                state.slotsCache.items,
-                tz,
-                wantedMin
-            );
+            const hit = findSlotByLocalMinutes(state.slotsCache.items, tz, wantedMin);
             if (hit) chosen = hit;
         } else if (periodAsked) {
             const hit = state.slotsCache.items.find((s) =>
