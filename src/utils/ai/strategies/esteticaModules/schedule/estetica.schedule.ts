@@ -748,7 +748,6 @@
 
 
 // utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
-// utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
 import prisma from "../../../../../lib/prisma";
 import {
     addDays,
@@ -814,7 +813,7 @@ export type SchedulingCtx = {
     granularityMin: number;
     daysHorizon: number;
     maxSlots: number;
-    now?: Date;
+    now?: Date; // Ideal: fijar en el orquestador y pasarlo siempre para estabilidad
     toCOP?: (v?: number | null) => string | null;
 };
 
@@ -1099,11 +1098,12 @@ export function interpretNaturalWhen(
         return { kind: "nearest", period: parseDayPeriod(t) };
     }
 
-    // "jueves de la próxima semana"
-    const nextWeekWd =
-        /(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo).{0,20}pr[oó]xima\s+semana/i.exec(
-            t
-        );
+    // "jueves de la próxima semana / semana que viene / la otra semana"
+    const nextWeekWd = new RegExp(
+        `(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo).{0,30}` +
+        `(pr[oó]xima\\s+semana|semana\\s+que\\s+viene|otra\\s+semana)`,
+        "i"
+    ).exec(t);
     if (nextWeekWd) {
         const wd =
             DAY_WORDS[
@@ -1483,7 +1483,8 @@ export async function handleSchedulingTurn(params: {
         if (!phone)
             return {
                 handled: true,
-                reply: "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).",
+                reply:
+                    "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).",
                 patch: basePatch,
             };
         const appt = await findUpcomingApptByPhone(empresaId, phone);
@@ -1563,11 +1564,23 @@ export async function handleSchedulingTurn(params: {
         );
 
         let flat = byDay.flatMap((d) => d.slots);
+
+        // Si se pidió un weekday específico, filtramos a ese día.
+        if (nl?.kind === "weekday") {
+            flat = flat.filter(
+                (s) =>
+                    getWeekdayFromDate(utcToZonedTime(new Date(s.startISO), tz)) ===
+                    nl.weekday
+            );
+        }
+
+        // Filtrar por franja si aplica
         const periodAsked = period ?? parseDayPeriod(text);
         if (periodAsked)
             flat = flat.filter((s) =>
                 inPeriodLocal(utcToZonedTime(new Date(s.startISO), tz), periodAsked)
             );
+
         flat = flat.slice(0, maxSlots);
 
         if (!flat.length) {
@@ -1584,6 +1597,48 @@ export async function handleSchedulingTurn(params: {
             }:\n${bullets}\n\n` +
             `Elige una y dime tu *nombre* y *teléfono* para reservar.`;
         return { reply, labeled };
+    }
+
+    // === Si el usuario pide explícitamente una nueva ventana (nl) y HAY cache → invalidar y regenerar
+    const askedNewRange = Boolean(nl);
+    if (svc && askedNewRange && state.slotsCache?.items?.length) {
+        let pivotISO = tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
+        let period = nl?.period ?? null;
+
+        if (nl!.kind === "date") {
+            pivotISO = nl!.localDateISO;
+        } else if (nl!.kind === "weekday") {
+            let pivot =
+                nl!.which === "next_week" ? nextWeekPivot(localNow) : localNow;
+            let tries = 0;
+            while (getWeekdayFromDate(pivot) !== nl!.weekday && tries < 7) {
+                pivot = addDays(pivot, 1);
+                tries++;
+            }
+            pivotISO = tzFormat(pivot, "yyyy-MM-dd", { timeZone: tz });
+        }
+
+        const { reply, labeled } = await offerFromPivot(
+            pivotISO,
+            period,
+            "ajuste de fecha"
+        );
+        return {
+            handled: true,
+            reply,
+            patch: {
+                lastIntent: "schedule",
+                draft: {
+                    ...(state.draft ?? {}),
+                    procedureId: svc.id,
+                    procedureName: svc.name,
+                    durationMin: duration,
+                    stage: "offer",
+                },
+                slotsCache: { items: labeled, expiresAt: nowPlusMin(10) },
+                ...basePatch,
+            },
+        };
     }
 
     if (svc && nl) {
@@ -1618,14 +1673,15 @@ export async function handleSchedulingTurn(params: {
             const { reply, labeled } = await offerFromPivot(
                 nl.localDateISO,
                 nl.period,
-                tzFormat(
-                    utcToZonedTime(
-                        zonedTimeToUtc(`${nl.localDateISO}T00:00:00`, tz),
-                        tz
-                    ),
-                    "eee d 'de' MMM",
-                    { timeZone: tz }
-                )
+                utcToZonedTime(
+                    zonedTimeToUtc(`${nl.localDateISO}T00:00:00`, tz),
+                    tz
+                ).toLocaleDateString("es-CO", {
+                    weekday: "short",
+                    day: "numeric",
+                    month: "short",
+                    timeZone: tz,
+                })
             );
             return {
                 handled: true,
@@ -1649,7 +1705,7 @@ export async function handleSchedulingTurn(params: {
 
         if (nl.kind === "weekday") {
             const todayWd = getWeekdayFromDate(localNow);
-            let pivot = utcToZonedTime(ctx.now ?? new Date(), tz);
+            let pivot = localNow;
 
             if (nl.which === "this_or_next") {
                 const want = nl.weekday;
@@ -1710,7 +1766,7 @@ export async function handleSchedulingTurn(params: {
         Boolean(capturedName || capturedPhone) ||
         HHMM_RE.test(text) ||
         AMPM_RE.test(text) ||
-        /\b(mañana|manana|tarde|noche|lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo|pr[oó]xima\s+semana|hoy)\b/i.test(
+        /\b(mañana|manana|tarde|noche|lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo|pr[oó]xima\s+semana|semana\s+que\s+viene|otra\s+semana|hoy)\b/i.test(
             text
         );
 
