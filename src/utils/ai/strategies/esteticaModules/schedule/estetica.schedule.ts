@@ -77,6 +77,24 @@ export type SchedulingResult = {
     failMessage?: string;
 };
 
+// al inicio del archivo (o junto con otros tipos)
+export type InterpreterNLU = {
+    intent: "ASK_SLOTS" | "BOOK" | "CHOOSE" | "RESCHEDULE" | "CANCEL" | "INFO" | "GREET" | "UNSURE";
+    confidence: number;
+    missing?: Array<"date" | "time" | "service" | "name" | "phone">;
+    slots: {
+        date?: string | null;
+        time?: string | null;               // "HH:mm" en la TZ del negocio
+        time_of_day?: "morning" | "afternoon" | "evening" | null;
+        serviceId?: number | null;
+        serviceName?: string | null;
+        choice_index?: number | null;       // 1..n
+        name?: string | null;
+        phone?: string | null;
+    };
+};
+
+
 /* ============================================================
    Constantes y utils de tiempo/TZ
 ============================================================ */
@@ -306,9 +324,6 @@ function carveSlotsFromWindows(params: {
 
 /* ============================================================
    NLP → fecha/franja/hora (en TZ negocio)
-   Casos: "miércoles", "jueves de la próxima semana",
-   "próxima disponible", "15 de octubre", "15/10",
-   "jueves 15", "sábado 25 de octubre a las 3 pm"
 ============================================================ */
 type NaturalWhen =
     | { kind: "nearest"; period: DayPeriod | null }
@@ -362,7 +377,7 @@ export function interpretNaturalWhen(
         };
     }
 
-    // “la más próxima / próxima disponible” (NO confundir con “próxima semana”)
+    // “la más próxima / próxima disponible”
     if (
         /\b(la\s+m[aá]s\s+pr[oó]xima|m[aá]s\s+cercana|inmediata|lo\s+m[aá]s\s+pronto|pr[oó]xima\s+disponible)\b/.test(
             t
@@ -737,6 +752,42 @@ function extractFromUtterance(text: string, tz: string, now: Date): Extracted {
     return { when, period, timeMin, ordinal, accept, name, phone, mentionWeekday };
 }
 
+/* ===== Helpers de integración NLU ===== */
+function hhmmToMin(hhmm: string): number {
+    const [h, m] = hhmm.split(":").map((x) => parseInt(x, 10));
+    return h * 60 + m;
+}
+
+function nluToExtracted(nlu: InterpreterNLU, _tz: string, _now: Date): Extracted {
+    const period = nlu.slots.time_of_day ?? null;
+
+    let when: NaturalWhen | null = null;
+    if (nlu.slots.date) {
+        when = { kind: "date", localDateISO: nlu.slots.date!, period };
+    } else if (period) {
+        // si solo hay franja, buscamos “nearest”
+        when = { kind: "nearest", period };
+    }
+
+    const timeMin = nlu.slots.time ? hhmmToMin(nlu.slots.time) : null;
+    const ordinal = nlu.slots.choice_index ? Math.max(0, nlu.slots.choice_index - 1) : null;
+    const accept = nlu.intent === "BOOK" || nlu.intent === "CHOOSE";
+
+    const name = nlu.slots.name || undefined;
+    const phone = nlu.slots.phone || undefined;
+
+    return {
+        when,
+        period,
+        timeMin,
+        ordinal,
+        accept,
+        name,
+        phone,
+        mentionWeekday: null,
+    };
+}
+
 /* ============================================================
    Motor principal – flujo estandarizado
 ============================================================ */
@@ -769,8 +820,9 @@ export async function handleSchedulingTurn(params: {
         durationMin?: number | null;
     } | null;
     intent: "price" | "schedule" | "reschedule" | "cancel" | "info" | "other";
+    nlu?: InterpreterNLU; // <-- integración NLU (opcional)
 }): Promise<SchedulingResult> {
-    const { text, state: stateArg, ctx, serviceInContext, intent } = params;
+    const { text, state: stateArg, ctx, serviceInContext, intent, nlu } = params;
     const { kb, empresaId, granularityMin, daysHorizon, maxSlots } = ctx;
     const tz = kb.timezone;
 
@@ -781,22 +833,42 @@ export async function handleSchedulingTurn(params: {
     }
 
     const localNow = utcToZonedTime(ctx.now ?? new Date(), tz);
-    const ex = extractFromUtterance(text, tz, localNow);
+    // Usar NLU si viene; fallback al extractor nativo
+    const ex = nlu ? nluToExtracted(nlu, tz, localNow) : extractFromUtterance(text, tz, localNow);
 
     const basePatch: Partial<StateShape> = {};
     if (ex.phone) basePatch.lastPhoneSeen = ex.phone;
 
+    // Resolver servicio con prioridad NLU
     const svc =
         serviceInContext ||
-        ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) ||
-        null;
+        (nlu?.slots.serviceId
+            ? ctx.kb.procedures.find((p) => p.id === nlu!.slots.serviceId!) || null
+            : nlu?.slots.serviceName
+                ? (ctx.kb.procedures.find(
+                    (p) => p.name.toLowerCase() === (nlu!.slots.serviceName || "").toLowerCase()
+                ) || null)
+                : ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) || null);
+
     const duration = (svc?.durationMin ??
         ctx.kb.defaultServiceDurationMin ??
         60) as number;
 
+    // Derivar intent interno desde NLU si llegó
+    const derivedIntent =
+        nlu
+            ? (
+                nlu.intent === "CANCEL" ? "cancel" :
+                    nlu.intent === "RESCHEDULE" ? "reschedule" :
+                        nlu.intent === "INFO" ? "info" :
+                            // ASK_SLOTS, BOOK, CHOOSE, GREET, UNSURE → tratar como "schedule"
+                            "schedule"
+            )
+            : intent;
+
     /* ===== Cancelar / Reagendar ===== */
     const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(text);
-    if (intent === "cancel" || wantsCancel) {
+    if (derivedIntent === "cancel" || wantsCancel) {
         const phone = state.draft?.phone || ex.phone || state.lastPhoneSeen;
         if (!phone)
             return {
@@ -823,7 +895,7 @@ export async function handleSchedulingTurn(params: {
     }
 
     /* ===== Paso 1: pedir procedimiento si falta ===== */
-    if (intent === "schedule" && !svc) {
+    if (derivedIntent === "schedule" && !svc) {
         return {
             handled: true,
             reply:
@@ -836,7 +908,7 @@ export async function handleSchedulingTurn(params: {
     const askedForDay =
         !!ex.when ||
         /\b(d[ií]a|fecha|hoy|mañana|manana|semana|pr[oó]xima)\b/i.test(text);
-    if (intent === "schedule" && svc && !askedForDay && !state.slotsCache?.items?.length) {
+    if (derivedIntent === "schedule" && svc && !askedForDay && !state.slotsCache?.items?.length) {
         return {
             handled: true,
             reply: `¿Tienes *algún día* en mente para *${svc.name}*? (por ej.: *miércoles en la tarde*, *jueves de la próxima semana*, *mañana*, o *la más próxima disponible*)`,
@@ -878,7 +950,6 @@ export async function handleSchedulingTurn(params: {
         let flat = byDay.flatMap((d) => d.slots);
 
         // Si se pidió un weekday específico, filtramos a ese día.
-        // Si se pidió un weekday específico, filtramos a ese día.
         if (isWeekdayWhen(ex.when)) {
             const wanted = ex.when.weekday;
             flat = flat.filter(
@@ -886,7 +957,6 @@ export async function handleSchedulingTurn(params: {
                     getWeekdayFromDate(utcToZonedTime(new Date(s.startISO), tz)) === wanted
             );
         }
-
 
         // Filtrar por franja si aplica
         const periodAsked = period ?? ex.period;
