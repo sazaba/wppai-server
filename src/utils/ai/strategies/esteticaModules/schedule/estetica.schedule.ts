@@ -79,21 +79,28 @@ export type SchedulingResult = {
 
 // al inicio del archivo (o junto con otros tipos)
 export type InterpreterNLU = {
-    intent: "ASK_SLOTS" | "BOOK" | "CHOOSE" | "RESCHEDULE" | "CANCEL" | "INFO" | "GREET" | "UNSURE";
+    intent:
+    | "ASK_SLOTS"
+    | "BOOK"
+    | "CHOOSE"
+    | "RESCHEDULE"
+    | "CANCEL"
+    | "INFO"
+    | "GREET"
+    | "UNSURE";
     confidence: number;
     missing?: Array<"date" | "time" | "service" | "name" | "phone">;
     slots: {
         date?: string | null;
-        time?: string | null;               // "HH:mm" en la TZ del negocio
+        time?: string | null; // "HH:mm" en la TZ del negocio
         time_of_day?: "morning" | "afternoon" | "evening" | null;
         serviceId?: number | null;
         serviceName?: string | null;
-        choice_index?: number | null;       // 1..n
+        choice_index?: number | null; // 1..n
         name?: string | null;
         phone?: string | null;
     };
 };
-
 
 /* ============================================================
    Constantes y utils de tiempo/TZ
@@ -130,8 +137,7 @@ const MONTHS: Record<string, number> = {
 
 function getWeekdayFromDate(dLocal: Date): Weekday {
     const dow = dLocal.getDay(); // 0..6
-    return (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dow] ||
-        "mon") as Weekday;
+    return (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dow] || "mon") as Weekday;
 }
 
 function periodToLocalRange(period: DayPeriod): { from: number; to: number } {
@@ -352,10 +358,7 @@ export function interpretNaturalWhen(
         "i"
     ).exec(t);
     if (nextWeekWd) {
-        const wd =
-            DAY_WORDS[
-            normalizeNoDiacritics(nextWeekWd[1]).toLowerCase()
-            ];
+        const wd = DAY_WORDS[normalizeNoDiacritics(nextWeekWd[1]).toLowerCase()];
         return {
             kind: "weekday",
             weekday: wd,
@@ -448,10 +451,7 @@ export function interpretNaturalWhen(
             t
         );
     if (wdDm) {
-        const wd =
-            DAY_WORDS[
-            normalizeNoDiacritics(wdDm[1]).toLowerCase()
-            ];
+        const wd = DAY_WORDS[normalizeNoDiacritics(wdDm[1]).toLowerCase()];
         const day = parseInt(wdDm[2], 10);
         const baseLocal = utcToZonedTime(now, tz);
         const year = baseLocal.getFullYear();
@@ -491,10 +491,7 @@ export async function getNextAvailableSlots(
 ): Promise<SlotsByDay[]> {
     const { empresaId, timezone: tz, bufferMin, granularityMin } = env;
 
-    const baseLocalDate = utcToZonedTime(
-        zonedTimeToUtc(`${fromLocalDayISO}T00:00:00`, tz),
-        tz
-    );
+    const baseLocalDate = utcToZonedTime(zonedTimeToUtc(`${fromLocalDayISO}T00:00:00`, tz), tz);
     const earliestAllowedUtc = addMinutes(new Date(), Math.max(bufferMin ?? 0, 0));
 
     const periodRange = period ? periodToLocalRange(period) : null;
@@ -640,12 +637,14 @@ function labelSlotsForTZ(slots: Slot[], tz: string): LabeledSlot[] {
     });
 }
 
-const NAME_RE = /(mi\s+nombre\s+es|soy|me\s+llamo)\s+([a-záéíóúñ\s]{2,60})/i;
-const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/; // 7–12 dígitos
+/*  Mejoras de NER para nombre/teléfono y aceptación */
+const NAME_RE =
+    /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñ\s]{2,80})/i;
+const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/; // 7–12 dígitos en cualquier parte
 const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/; // 24h
 const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i; // 12h
 const ACCEPT_RE =
-    /\b(ok(ay)?|perfecto|genial|listo|va|dale|sirve|me\s+sirve|me\s+va\s+bien|ag[eé]nd[ao]|reserv[ao]|vamos\s+con|tomemos|ese|esa|sí|si)\b/i;
+    /\b(quiero|tomo|me\s*(quedo|sirve|va\s*bien)|voy\s*con|vamos\s*con|la\s*de|esa\s*de|ok(ay)?|perfecto|genial|listo|va|dale|ag[eé]nd[ao]|reserv[ao]|sí|si)\b/i;
 
 const ORDINAL_RE = /\b(primera|1(?:ra|era)?|segunda|2(?:da)?|tercera|3(?:ra)?)\b/i;
 
@@ -850,21 +849,18 @@ export async function handleSchedulingTurn(params: {
                 ) || null)
                 : ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) || null);
 
-    const duration = (svc?.durationMin ??
-        ctx.kb.defaultServiceDurationMin ??
-        60) as number;
+    const duration = (svc?.durationMin ?? ctx.kb.defaultServiceDurationMin ?? 60) as number;
 
     // Derivar intent interno desde NLU si llegó
-    const derivedIntent =
-        nlu
-            ? (
-                nlu.intent === "CANCEL" ? "cancel" :
-                    nlu.intent === "RESCHEDULE" ? "reschedule" :
-                        nlu.intent === "INFO" ? "info" :
-                            // ASK_SLOTS, BOOK, CHOOSE, GREET, UNSURE → tratar como "schedule"
-                            "schedule"
-            )
-            : intent;
+    const derivedIntent = nlu
+        ? nlu.intent === "CANCEL"
+            ? "cancel"
+            : nlu.intent === "RESCHEDULE"
+                ? "reschedule"
+                : nlu.intent === "INFO"
+                    ? "info"
+                    : "schedule"
+        : intent;
 
     /* ===== Cancelar / Reagendar ===== */
     const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(text);
@@ -906,8 +902,7 @@ export async function handleSchedulingTurn(params: {
 
     /* ===== Paso 2: pedir día si aún no hay pista ===== */
     const askedForDay =
-        !!ex.when ||
-        /\b(d[ií]a|fecha|hoy|mañana|manana|semana|pr[oó]xima)\b/i.test(text);
+        !!ex.when || /\b(d[ií]a|fecha|hoy|mañana|manana|semana|pr[oó]xima)\b/i.test(text);
     if (derivedIntent === "schedule" && svc && !askedForDay && !state.slotsCache?.items?.length) {
         return {
             handled: true,
@@ -953,8 +948,7 @@ export async function handleSchedulingTurn(params: {
         if (isWeekdayWhen(ex.when)) {
             const wanted = ex.when.weekday;
             flat = flat.filter(
-                (s) =>
-                    getWeekdayFromDate(utcToZonedTime(new Date(s.startISO), tz)) === wanted
+                (s) => getWeekdayFromDate(utcToZonedTime(new Date(s.startISO), tz)) === wanted
             );
         }
 
@@ -985,11 +979,7 @@ export async function handleSchedulingTurn(params: {
     const periodOnly = !ex.when && !!ex.period;
     if (svc && periodOnly && state.slotsCache?.items?.length) {
         const pivotISO = localDayISOFromSlot(state.slotsCache.items[0].startISO, tz);
-        const { reply, labeledAll } = await offerFromPivot(
-            pivotISO,
-            ex.period,
-            "ajuste de franja"
-        );
+        const { reply, labeledAll } = await offerFromPivot(pivotISO, ex.period, "ajuste de franja");
         return {
             handled: true,
             reply,
@@ -1002,7 +992,7 @@ export async function handleSchedulingTurn(params: {
                     durationMin: duration,
                     stage: "offer",
                 },
-                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
+                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                 ...basePatch,
             },
         };
@@ -1039,7 +1029,7 @@ export async function handleSchedulingTurn(params: {
                     durationMin: duration,
                     stage: "offer",
                 },
-                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
+                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                 ...basePatch,
             },
         };
@@ -1082,11 +1072,7 @@ export async function handleSchedulingTurn(params: {
                 handled: true,
                 reply:
                     `Perfecto. Te reservo *${svc.name}* para *${fecha} a las ${hora}*.\n` +
-                    `Para confirmar, envíame tu ${!nextDraft.name && !nextDraft.phone
-                        ? "*nombre* y *teléfono*"
-                        : !nextDraft.name
-                            ? "*nombre*"
-                            : "*teléfono*"
+                    `Para confirmar, envíame tu ${!nextDraft.name && !nextDraft.phone ? "*nombre* y *teléfono*" : !nextDraft.name ? "*nombre*" : "*teléfono*"
                     }.`,
                 patch: { draft: nextDraft, ...basePatch },
             };
@@ -1118,11 +1104,10 @@ export async function handleSchedulingTurn(params: {
                                 procedureName: svc.name,
                                 durationMin: duration,
                                 name: state.draft?.name ?? ex.name ?? undefined,
-                                phone:
-                                    state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
+                                phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
                                 stage: "confirm",
                             },
-                            slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
+                            slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                             ...basePatch,
                         },
                     } as SchedulingResult;
@@ -1142,7 +1127,7 @@ export async function handleSchedulingTurn(params: {
                         durationMin: duration,
                         stage: "offer",
                     },
-                    slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
+                    slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                     ...basePatch,
                 },
             } as SchedulingResult;
@@ -1205,10 +1190,7 @@ export async function handleSchedulingTurn(params: {
                 : tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz })
             : tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
 
-        const { reply, labeledAll } = await offerFromPivot(
-            plan,
-            ex.when?.period ?? ex.period ?? null
-        );
+        const { reply, labeledAll } = await offerFromPivot(plan, ex.when?.period ?? ex.period ?? null);
         return {
             handled: true,
             reply,
@@ -1223,7 +1205,7 @@ export async function handleSchedulingTurn(params: {
                     durationMin: duration,
                     stage: "offer",
                 },
-                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(10) },
+                slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                 ...basePatch,
             },
         };
@@ -1242,7 +1224,8 @@ export async function handleSchedulingTurn(params: {
         let chosen = pool[0] || state.slotsCache.items[0];
 
         if (wantedMin != null) {
-            const hit = findSlotByLocalMinutes(pool, tz, wantedMin) ??
+            const hit =
+                findSlotByLocalMinutes(pool, tz, wantedMin) ??
                 findSlotByLocalMinutes(state.slotsCache.items, tz, wantedMin);
             if (hit) chosen = hit;
         } else if (periodAsked) {
@@ -1284,10 +1267,7 @@ export async function handleSchedulingTurn(params: {
         const hasAll = Boolean(nextDraft.whenISO && nextDraft.name && nextDraft.phone);
         if (accepting && hasAll) {
             try {
-                const endISO = addMinutes(
-                    new Date(nextDraft.whenISO!),
-                    nextDraft.durationMin ?? 60
-                ).toISOString();
+                const endISO = addMinutes(new Date(nextDraft.whenISO!), nextDraft.durationMin ?? 60).toISOString();
 
                 if (nextDraft.rescheduleApptId) {
                     await prisma.appointment.update({
@@ -1330,8 +1310,7 @@ export async function handleSchedulingTurn(params: {
                 return {
                     handled: true,
                     createOk: false,
-                    reply:
-                        "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
+                    reply: "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
                 };
             }
         }
