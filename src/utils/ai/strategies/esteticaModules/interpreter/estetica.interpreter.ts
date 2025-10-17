@@ -9,13 +9,13 @@ export type DayPeriod = "morning" | "afternoon" | "evening";
 
 export type BookingIntent =
     | "ASK_SLOTS"     // pedir horarios
-    | "BOOK"         // reservar (fecha/hora concreta, o elegir de lista)
-    | "CHOOSE"       // elegir una de las opciones ofrecidas (por índice)
-    | "RESCHEDULE"   // reagendar
-    | "CANCEL"       // cancelar
-    | "INFO"         // info de servicio (precios, duración, preparación)
-    | "GREET"        // saludo/pequeña charla
-    | "UNSURE";      // baja confianza / faltan datos
+    | "BOOK"          // reservar (fecha/hora concreta, o elegir de lista)
+    | "CHOOSE"        // elegir una de las opciones ofrecidas (por índice)
+    | "RESCHEDULE"    // reagendar
+    | "CANCEL"        // cancelar
+    | "INFO"          // info de servicio (precios, duración, preparación)
+    | "GREET"         // saludo/pequeña charla
+    | "UNSURE";       // baja confianza / faltan datos
 
 export type NLUResult = {
     intent: BookingIntent;
@@ -23,8 +23,8 @@ export type NLUResult = {
     missing?: Array<"date" | "time" | "service" | "name" | "phone">;
     slots: {
         // normalizados
-        date?: string | null;       // YYYY-MM-DD en TZ negocio
-        time?: string | null;       // HH:mm (24h, TZ negocio)
+        date?: string | null;         // YYYY-MM-DD en TZ negocio
+        time?: string | null;         // HH:mm (24h, TZ negocio)
         time_of_day?: DayPeriod | null;
         serviceId?: number | null;
         serviceName?: string | null;
@@ -78,12 +78,24 @@ export function parseDayPeriod(text: string): DayPeriod | null {
     return null;
 }
 
-const NAME_RE = /(mi\s+nombre\s+es|soy|me\s+llamo)\s+([a-záéíóúñ\s]{2,60})/i;
-const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/;
+/* ---------- Nombres y teléfonos (mejorados, no intrusivos) ---------- */
+// Explícito: “mi nombre es…”, “nombre: …”, “soy …”, “me llamo …”
+const NAME_RE =
+    /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñü\s]{2,80})/i;
+
+// Fallback: mensaje que parece SOLO un nombre (sin números/horas/keywords)
+// Útil para “Santiago z”
+const NAME_ONLY_RE = /^[a-záéíóúñü\s]{2,80}$/i;
+
+// Teléfono en cualquier formato (+57, paréntesis, guiones, espacios). Capturamos todos los dígitos y luego normalizamos.
+const PHONE_ANY_RE = /[\+\(]?\d[\d\)\-\s\.]{6,}/g;
+
 const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/;     // 24h
 const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i;
+
 const ACCEPT_RE =
-    /\b(ok(ay)?|perfecto|genial|listo|va|dale|sirve|me\s+sirve|me\s+va\s+bien|ag[eé]nd[ao]|reserv[ao]|confirmo|vamos\s+con|tomemos|ese|esa|sí|si)\b/i;
+    /\b(quiero|tomo|me\s*(quedo|sirve|va\s*bien)|voy\s*con|vamos\s*con|la\s*de|esa\s*de|ok(ay)?|perfecto|genial|listo|va|dale|ag[eé]nd[ao]|reserv[ao]|confirmo|sí|si)\b/i;
+
 const CANCEL_RE = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i;
 const RESCHED_RE = /\b(reagendar|mover|cambiar\s+la\s+cita|otra\s+hora|otro\s+d[ií]a)\b/i;
 const GREET_RE = /\b(hola|buen[oa]s|qué\s+tal|que\s+tal|saludos)\b/i;
@@ -113,7 +125,10 @@ function normalizePhone(raw?: string | null): string | null {
     if (!raw) return null;
     const digits = raw.replace(/\D+/g, "");
     if (!digits) return null;
-    return digits.length >= 10 ? digits.slice(-10) : digits;
+    // Preferimos 10–12 dígitos (COL/intl). Si hay más, nos quedamos con los últimos 10–12.
+    if (digits.length >= 12) return digits.slice(-12);
+    if (digits.length >= 10) return digits.slice(-10);
+    return digits.length >= 7 ? digits : null;
 }
 
 function pad2(n: number) { return n.toString().padStart(2, "0"); }
@@ -275,11 +290,6 @@ export function interpretUserMessage(
     const accepted = ACCEPT_RE.test(tLower);
     const ord = ordinalIndex(tLower);
 
-    // nombre / teléfono
-    const nameMatch = NAME_RE.exec(t);
-    const name = nameMatch ? properCase(nameMatch[2]) : null;
-    const phone = normalizePhone(PHONE_ANY_RE.exec(t)?.[2] || null);
-
     // servicio
     const svc = matchService(tLower, kb.procedures);
 
@@ -287,6 +297,33 @@ export function interpretUserMessage(
     const when = interpretNaturalWhen(tLower, now);
     const time_of_day = parseDayPeriod(tLower);
     const time = extractHHmm(tLower);
+
+    // --------- Nombre / Teléfono mejorados ----------
+    // 1) explícitos
+    const nameFromExp = (() => {
+        const m = NAME_RE.exec(t);
+        return m ? properCase(m[2]) : null;
+    })();
+
+    // 2) “solo nombre” (fallback contextual, no invasivo)
+    const looksLikeOnlyName =
+        !/\d/.test(t) && !HHMM_RE.test(tLower) && !AMPM_RE.test(tLower) &&
+        !Object.keys(DAY_WORDS).some(w => new RegExp(`\\b${w}\\b`, "i").test(tLower)) &&
+        !Object.keys(MONTHS).some(m => new RegExp(`\\b${m}\\b`, "i").test(tLower)) &&
+        NAME_ONLY_RE.test(t);
+
+    const name = nameFromExp || (looksLikeOnlyName ? properCase(t) : null);
+
+    // 3) teléfono: tomar el bloque más “rico” de dígitos
+    let phone: string | null = null;
+    const phoneMatches = t.match(PHONE_ANY_RE);
+    if (phoneMatches && phoneMatches.length) {
+        // elegir el candidato con más dígitos (robusto a varios en el mismo texto)
+        const best = phoneMatches
+            .map(s => s.replace(/\D+/g, ""))
+            .sort((a, b) => b.length - a.length)[0];
+        phone = normalizePhone(best);
+    }
 
     // Intención bruta
     let intent: BookingIntent = "UNSURE";
@@ -325,13 +362,12 @@ export function interpretUserMessage(
     const missing: NLUResult["missing"] = [];
     if (intent === "BOOK") {
         if (!slots.date && !when) missing.push("date");
-        // si menciona franja pero no hora, dejamos que schedule ofrezca, no lo marcamos como missing "time"
         if (!slots.time && !slots.time_of_day) missing.push("time");
-        if (!slots.serviceId && !slots.serviceName) missing.push("service"); // opcional si tu flujo permite sin servicio
+        if (!slots.serviceId && !slots.serviceName) missing.push("service"); // opcional según tu flujo
         if (!slots.name) missing.push("name");
         if (!slots.phone) missing.push("phone");
     } else if (intent === "ASK_SLOTS") {
-        if (!slots.date && !when) missing.push("date"); // al menos fecha/fanja
+        if (!slots.date && !when) missing.push("date"); // al menos fecha/franja
     } else if (intent === "CHOOSE") {
         if (!slots.choice_index) missing.push("time"); // equivalente a elegir hora
     }

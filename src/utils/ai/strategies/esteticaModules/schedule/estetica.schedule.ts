@@ -1,3 +1,4 @@
+
 // // utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
 // import prisma from "../../../../../lib/prisma";
 // import {
@@ -849,7 +850,9 @@
 //                 ) || null)
 //                 : ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) || null);
 
-//     const duration = (svc?.durationMin ?? ctx.kb.defaultServiceDurationMin ?? 60) as number;
+//     const duration = (svc?.durationMin ??
+//         ctx.kb.defaultServiceDurationMin ??
+//         60) as number;
 
 //     // Derivar intent interno desde NLU si llegó
 //     const derivedIntent = nlu
@@ -918,6 +921,130 @@
 //                 },
 //                 ...basePatch,
 //             },
+//         };
+//     }
+
+//     /* ===== (NUEVO ORDEN) Confirmación con cache si el usuario ya eligió ===== */
+//     if (svc && state.slotsCache?.items?.length) {
+//         const wantedMin = ex.timeMin;
+//         const periodAsked = ex.period;
+//         const ordIdx = ex.ordinal;
+//         const mentionWd = ex.mentionWeekday ?? null;
+
+//         let pool = state.slotsCache.items.slice();
+//         if (mentionWd) pool = findSlotsByWeekday(pool, tz, mentionWd);
+
+//         let chosen = pool[0] || state.slotsCache.items[0];
+
+//         if (wantedMin != null) {
+//             const hit =
+//                 findSlotByLocalMinutes(pool, tz, wantedMin) ??
+//                 findSlotByLocalMinutes(state.slotsCache.items, tz, wantedMin);
+//             if (hit) chosen = hit;
+//         } else if (periodAsked) {
+//             const hit = pool.find((s) =>
+//                 inPeriodLocal(utcToZonedTime(new Date(s.startISO), tz), periodAsked)
+//             );
+//             if (hit) chosen = hit;
+//         } else if (ordIdx != null && pool[ordIdx]) {
+//             chosen = pool[ordIdx];
+//         }
+
+//         const accepting = ex.accept || wantedMin != null || ordIdx != null || periodAsked != null;
+
+//         const nextDraft: SchedulingDraft = {
+//             ...(state.draft ?? {}),
+//             name: state.draft?.name ?? ex.name ?? undefined,
+//             phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
+//             whenISO: state.draft?.whenISO ?? chosen?.startISO ?? undefined,
+//             stage: "confirm",
+//             procedureName: state.draft?.procedureName ?? svc.name,
+//             procedureId: state.draft?.procedureId ?? svc.id,
+//             durationMin: state.draft?.durationMin ?? duration,
+//             rescheduleApptId: state.draft?.rescheduleApptId,
+//         };
+
+//         const local = nextDraft.whenISO ? utcToZonedTime(new Date(nextDraft.whenISO), tz) : null;
+//         const fecha = local
+//             ? local.toLocaleDateString("es-CO", {
+//                 weekday: "long",
+//                 year: "numeric",
+//                 month: "long",
+//                 day: "2-digit",
+//                 timeZone: tz,
+//             })
+//             : "fecha por confirmar";
+//         const hora = local ? formatAmPmLocal(local) : "hora por confirmar";
+
+//         // Auto-insert si ya tenemos todo y el usuario aceptó
+//         const hasAll = Boolean(nextDraft.whenISO && nextDraft.name && nextDraft.phone);
+//         if (accepting && hasAll) {
+//             try {
+//                 const endISO = addMinutes(
+//                     new Date(nextDraft.whenISO!),
+//                     nextDraft.durationMin ?? 60
+//                 ).toISOString();
+
+//                 if (nextDraft.rescheduleApptId) {
+//                     await prisma.appointment.update({
+//                         where: { id: nextDraft.rescheduleApptId },
+//                         data: {
+//                             startAt: new Date(nextDraft.whenISO!),
+//                             endAt: new Date(endISO),
+//                             status: "confirmed",
+//                         },
+//                     });
+//                     return {
+//                         handled: true,
+//                         createOk: true,
+//                         reply: `¡Hecho! Moví tu cita ✅. Quedó para ${fecha} a las ${hora}.`,
+//                         patch: { draft: { stage: "idle" } },
+//                     };
+//                 }
+
+//                 await createAppointmentSafe({
+//                     empresaId,
+//                     vertical: kb.vertical,
+//                     timezone: tz,
+//                     procedureId: nextDraft.procedureId ?? null,
+//                     serviceName: nextDraft.procedureName || svc.name,
+//                     customerName: nextDraft.name!,
+//                     customerPhone: nextDraft.phone || "",
+//                     startISO: nextDraft.whenISO!,
+//                     endISO,
+//                     notes: "Agendado por IA",
+//                     source: "ai",
+//                 });
+
+//                 return {
+//                     handled: true,
+//                     createOk: true,
+//                     reply: `¡Listo! Tu cita quedó confirmada ✅. ${fecha} a las ${hora}.`,
+//                     patch: { draft: { stage: "idle" } },
+//                 };
+//             } catch {
+//                 return {
+//                     handled: true,
+//                     createOk: false,
+//                     reply: "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
+//                 };
+//             }
+//         }
+
+//         // Falta nombre o teléfono → pedir lo que falta (sin volver a proponer)
+//         const missingPieces: string[] = [];
+//         if (!nextDraft.name) missingPieces.push("tu *nombre*");
+//         if (!nextDraft.phone) missingPieces.push("tu *teléfono*");
+//         const need = missingPieces.join(" y ");
+
+//         const resumen =
+//             `Perfecto. Te reservo *${svc.name}* para *${fecha} a las ${hora}*.\n` +
+//             (need ? `Para confirmar, por favor envíame ${need}.` : "¿Confirmo así?");
+
+//         return {
+//             handled: true,
+//             reply: resumen,
+//             patch: { draft: nextDraft, ...basePatch },
 //         };
 //     }
 
@@ -1072,7 +1199,11 @@
 //                 handled: true,
 //                 reply:
 //                     `Perfecto. Te reservo *${svc.name}* para *${fecha} a las ${hora}*.\n` +
-//                     `Para confirmar, envíame tu ${!nextDraft.name && !nextDraft.phone ? "*nombre* y *teléfono*" : !nextDraft.name ? "*nombre*" : "*teléfono*"
+//                     `Para confirmar, envíame tu ${!nextDraft.name && !nextDraft.phone
+//                         ? "*nombre* y *teléfono*"
+//                         : !nextDraft.name
+//                             ? "*nombre*"
+//                             : "*teléfono*"
 //                     }.`,
 //                 patch: { draft: nextDraft, ...basePatch },
 //             };
@@ -1211,137 +1342,9 @@
 //         };
 //     }
 
-//     /* ===== Paso 5: Selección/aceptación con cache → confirmar ===== */
-//     if (svc && state.slotsCache?.items?.length) {
-//         const wantedMin = ex.timeMin;
-//         const periodAsked = ex.period;
-//         const ordIdx = ex.ordinal;
-//         const mentionWd = ex.mentionWeekday ?? null;
-
-//         let pool = state.slotsCache.items.slice();
-//         if (mentionWd) pool = findSlotsByWeekday(pool, tz, mentionWd);
-
-//         let chosen = pool[0] || state.slotsCache.items[0];
-
-//         if (wantedMin != null) {
-//             const hit =
-//                 findSlotByLocalMinutes(pool, tz, wantedMin) ??
-//                 findSlotByLocalMinutes(state.slotsCache.items, tz, wantedMin);
-//             if (hit) chosen = hit;
-//         } else if (periodAsked) {
-//             const hit = pool.find((s) =>
-//                 inPeriodLocal(utcToZonedTime(new Date(s.startISO), tz), periodAsked)
-//             );
-//             if (hit) chosen = hit;
-//         } else if (ordIdx != null && pool[ordIdx]) {
-//             chosen = pool[ordIdx];
-//         }
-
-//         const accepting = ex.accept || wantedMin != null || ordIdx != null || periodAsked != null;
-
-//         const nextDraft: SchedulingDraft = {
-//             ...(state.draft ?? {}),
-//             name: state.draft?.name ?? ex.name ?? undefined,
-//             phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
-//             whenISO: state.draft?.whenISO ?? chosen?.startISO ?? undefined,
-//             stage: "confirm",
-//             procedureName: state.draft?.procedureName ?? svc.name,
-//             procedureId: state.draft?.procedureId ?? svc.id,
-//             durationMin: state.draft?.durationMin ?? duration,
-//             rescheduleApptId: state.draft?.rescheduleApptId,
-//         };
-
-//         const local = nextDraft.whenISO ? utcToZonedTime(new Date(nextDraft.whenISO), tz) : null;
-//         const fecha = local
-//             ? local.toLocaleDateString("es-CO", {
-//                 weekday: "long",
-//                 year: "numeric",
-//                 month: "long",
-//                 day: "2-digit",
-//                 timeZone: tz,
-//             })
-//             : "fecha por confirmar";
-//         const hora = local ? formatAmPmLocal(local) : "hora por confirmar";
-
-//         // Auto-insert si ya tenemos todo y el usuario aceptó
-//         const hasAll = Boolean(nextDraft.whenISO && nextDraft.name && nextDraft.phone);
-//         if (accepting && hasAll) {
-//             try {
-//                 const endISO = addMinutes(new Date(nextDraft.whenISO!), nextDraft.durationMin ?? 60).toISOString();
-
-//                 if (nextDraft.rescheduleApptId) {
-//                     await prisma.appointment.update({
-//                         where: { id: nextDraft.rescheduleApptId },
-//                         data: {
-//                             startAt: new Date(nextDraft.whenISO!),
-//                             endAt: new Date(endISO),
-//                             status: "confirmed",
-//                         },
-//                     });
-//                     return {
-//                         handled: true,
-//                         createOk: true,
-//                         reply: `¡Hecho! Moví tu cita ✅. Quedó para ${fecha} a las ${hora}.`,
-//                         patch: { draft: { stage: "idle" } },
-//                     };
-//                 }
-
-//                 await createAppointmentSafe({
-//                     empresaId,
-//                     vertical: kb.vertical,
-//                     timezone: tz,
-//                     procedureId: nextDraft.procedureId ?? null,
-//                     serviceName: nextDraft.procedureName || svc.name,
-//                     customerName: nextDraft.name!,
-//                     customerPhone: nextDraft.phone || "",
-//                     startISO: nextDraft.whenISO!,
-//                     endISO,
-//                     notes: "Agendado por IA",
-//                     source: "ai",
-//                 });
-
-//                 return {
-//                     handled: true,
-//                     createOk: true,
-//                     reply: `¡Listo! Tu cita quedó confirmada ✅. ${fecha} a las ${hora}.`,
-//                     patch: { draft: { stage: "idle" } },
-//                 };
-//             } catch {
-//                 return {
-//                     handled: true,
-//                     createOk: false,
-//                     reply: "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
-//                 };
-//             }
-//         }
-
-//         // Falta nombre o teléfono → pedir lo que falta (sin volver a proponer)
-//         const missingPieces: string[] = [];
-//         if (!nextDraft.name) missingPieces.push("tu *nombre*");
-//         if (!nextDraft.phone) missingPieces.push("tu *teléfono*");
-//         const need = missingPieces.join(" y ");
-
-//         const resumen =
-//             `Perfecto. Te reservo *${svc.name}* para *${fecha} a las ${hora}*.\n` +
-//             (need ? `Para confirmar, por favor envíame ${need}.` : "¿Confirmo así?");
-
-//         return {
-//             handled: true,
-//             reply: resumen,
-//             patch: { draft: nextDraft, ...basePatch },
-//         };
-//     }
-
 //     // Nada más que hacer en este turno
 //     return { handled: false, patch: basePatch };
 // }
-
-
-
-
-
-
-
 
 
 
@@ -1997,11 +2000,16 @@ function labelSlotsForTZ(slots: Slot[], tz: string): LabeledSlot[] {
 /*  Mejoras de NER para nombre/teléfono y aceptación */
 const NAME_RE =
     /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñ\s]{2,80})/i;
-const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/; // 7–12 dígitos en cualquier parte
+// Fallback cuando el mensaje parece sólo un nombre (p.ej. "Santiago z")
+const NAME_ONLY_RE = /^[a-záéíóúñü\s]{2,80}$/i;
+
+// Buscar TODOS los posibles teléfonos en el texto y quedarnos con el de más dígitos
+const PHONE_ANY_RE = /[\+\(]?\d[\d\)\-\s\.]{6,}/g;
+
 const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/; // 24h
 const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i; // 12h
 const ACCEPT_RE =
-    /\b(quiero|tomo|me\s*(quedo|sirve|va\s*bien)|voy\s*con|vamos\s*con|la\s*de|esa\s*de|ok(ay)?|perfecto|genial|listo|va|dale|ag[eé]nd[ao]|reserv[ao]|sí|si)\b/i;
+    /\b(quiero|tomo|me\s*(quedo|sirve|va\s*bien)|voy\s*con|vamos\s*con|la\s*de|esa\s*de|ok(ay)?|perfecto|genial|listo|va|dale|ag[eé]nd[ao]|reserv[ao]|confirmo|sí|si)\b/i;
 
 const ORDINAL_RE = /\b(primera|1(?:ra|era)?|segunda|2(?:da)?|tercera|3(?:ra)?)\b/i;
 
@@ -2026,7 +2034,9 @@ function normalizePhone(raw?: string): string | undefined {
     if (!raw) return undefined;
     const digits = raw.replace(/\D+/g, "");
     if (!digits) return undefined;
-    return digits.length >= 10 ? digits.slice(-10) : digits;
+    if (digits.length >= 12) return digits.slice(-12);
+    if (digits.length >= 10) return digits.slice(-10);
+    return digits.length >= 7 ? digits : undefined;
 }
 function extractLocalMinutesFromText(text: string): number | null {
     const m12 = AMPM_RE.exec(text);
@@ -2089,10 +2099,25 @@ type Extracted = {
 };
 
 function extractFromUtterance(text: string, tz: string, now: Date): Extracted {
-    const nameMatch = NAME_RE.exec(text);
-    const phoneMatch = PHONE_ANY_RE.exec(text);
-    const name = nameMatch ? properCase(nameMatch[2]) : undefined;
-    const phone = normalizePhone(phoneMatch?.[2]);
+    // Nombre: primero explícito (“mi nombre es …”), si no:
+    // fallback cuando el mensaje es sólo letras y parece un nombre.
+    const nameExplicit = NAME_RE.exec(text);
+    const looksLikeOnlyName =
+        !/\d/.test(text) &&
+        !HHMM_RE.test(text) &&
+        !AMPM_RE.test(text) &&
+        !Object.keys(DAY_WORDS).some(w => new RegExp(`\\b${w}\\b`, "i").test(text)) &&
+        !Object.keys(MONTHS).some(m => new RegExp(`\\b${m}\\b`, "i").test(text)) &&
+        NAME_ONLY_RE.test(text);
+    const name = nameExplicit ? properCase(nameExplicit[2]) : (looksLikeOnlyName ? properCase(text) : undefined);
+
+    // Teléfono: buscar todos los candidatos y elegir el de más dígitos
+    let phone: string | undefined = undefined;
+    const allPhones = text.match(PHONE_ANY_RE);
+    if (allPhones && allPhones.length) {
+        const best = allPhones.map(s => s.replace(/\D+/g, "")).sort((a, b) => b.length - a.length)[0];
+        phone = normalizePhone(best);
+    }
 
     const when = interpretNaturalWhen(text, tz, now);
     const period = parseDayPeriod(text);
