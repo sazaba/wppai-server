@@ -1,4 +1,3 @@
-
 // // utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
 // import prisma from "../../../../../lib/prisma";
 // import {
@@ -641,11 +640,16 @@
 // /*  Mejoras de NER para nombre/teléfono y aceptación */
 // const NAME_RE =
 //     /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñ\s]{2,80})/i;
-// const PHONE_ANY_RE = /(\+?57)?\D*?(\d{7,12})\b/; // 7–12 dígitos en cualquier parte
+// // Fallback cuando el mensaje parece sólo un nombre (p.ej. "Santiago z")
+// const NAME_ONLY_RE = /^[a-záéíóúñü\s]{2,80}$/i;
+
+// // Buscar TODOS los posibles teléfonos en el texto y quedarnos con el de más dígitos
+// const PHONE_ANY_RE = /[\+\(]?\d[\d\)\-\s\.]{6,}/g;
+
 // const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/; // 24h
 // const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i; // 12h
 // const ACCEPT_RE =
-//     /\b(quiero|tomo|me\s*(quedo|sirve|va\s*bien)|voy\s*con|vamos\s*con|la\s*de|esa\s*de|ok(ay)?|perfecto|genial|listo|va|dale|ag[eé]nd[ao]|reserv[ao]|sí|si)\b/i;
+//     /\b(quiero|tomo|me\s*(quedo|sirve|va\s*bien)|voy\s*con|vamos\s*con|la\s*de|esa\s*de|ok(ay)?|perfecto|genial|listo|va|dale|ag[eé]nd[ao]|reserv[ao]|confirmo|sí|si)\b/i;
 
 // const ORDINAL_RE = /\b(primera|1(?:ra|era)?|segunda|2(?:da)?|tercera|3(?:ra)?)\b/i;
 
@@ -670,7 +674,9 @@
 //     if (!raw) return undefined;
 //     const digits = raw.replace(/\D+/g, "");
 //     if (!digits) return undefined;
-//     return digits.length >= 10 ? digits.slice(-10) : digits;
+//     if (digits.length >= 12) return digits.slice(-12);
+//     if (digits.length >= 10) return digits.slice(-10);
+//     return digits.length >= 7 ? digits : undefined;
 // }
 // function extractLocalMinutesFromText(text: string): number | null {
 //     const m12 = AMPM_RE.exec(text);
@@ -733,10 +739,25 @@
 // };
 
 // function extractFromUtterance(text: string, tz: string, now: Date): Extracted {
-//     const nameMatch = NAME_RE.exec(text);
-//     const phoneMatch = PHONE_ANY_RE.exec(text);
-//     const name = nameMatch ? properCase(nameMatch[2]) : undefined;
-//     const phone = normalizePhone(phoneMatch?.[2]);
+//     // Nombre: primero explícito (“mi nombre es …”), si no:
+//     // fallback cuando el mensaje es sólo letras y parece un nombre.
+//     const nameExplicit = NAME_RE.exec(text);
+//     const looksLikeOnlyName =
+//         !/\d/.test(text) &&
+//         !HHMM_RE.test(text) &&
+//         !AMPM_RE.test(text) &&
+//         !Object.keys(DAY_WORDS).some(w => new RegExp(`\\b${w}\\b`, "i").test(text)) &&
+//         !Object.keys(MONTHS).some(m => new RegExp(`\\b${m}\\b`, "i").test(text)) &&
+//         NAME_ONLY_RE.test(text);
+//     const name = nameExplicit ? properCase(nameExplicit[2]) : (looksLikeOnlyName ? properCase(text) : undefined);
+
+//     // Teléfono: buscar todos los candidatos y elegir el de más dígitos
+//     let phone: string | undefined = undefined;
+//     const allPhones = text.match(PHONE_ANY_RE);
+//     if (allPhones && allPhones.length) {
+//         const best = allPhones.map(s => s.replace(/\D+/g, "")).sort((a, b) => b.length - a.length)[0];
+//         phone = normalizePhone(best);
+//     }
 
 //     const when = interpretNaturalWhen(text, tz, now);
 //     const period = parseDayPeriod(text);
@@ -1350,14 +1371,6 @@
 
 
 
-
-
-
-
-
-
-
-
 // utils/ai/strategies/esteticaModules/schedule/estetica.schedule.ts
 import prisma from "../../../../../lib/prisma";
 import {
@@ -1461,6 +1474,69 @@ export type InterpreterNLU = {
         phone?: string | null;
     };
 };
+
+/* ============================================================
+   Mini cliente HTTP a los CONTROLLERS (mismo archivo)
+   Usa APPTS_BASE_URL y llama tus endpoints existentes
+============================================================ */
+const APPTS_BASE =
+    process.env.APPTS_BASE_URL?.replace(/\/+$/, "") || "http://localhost:3000";
+const HDRS: Record<string, string> = {
+    "Content-Type": "application/json",
+};
+
+async function httpJSON<T = any>(input: RequestInfo, init?: RequestInit): Promise<T> {
+    const r = await fetch(input, init);
+    if (!r.ok) {
+        let errBody: any = null;
+        try {
+            errBody = await r.json();
+        } catch {/* noop */ }
+        const msg = (errBody && errBody.error) ? String(errBody.error) : `HTTP ${r.status}`;
+        throw new Error(msg);
+    }
+    return r.json();
+}
+
+/** Busca la PRÓXIMA cita confirmada por teléfono (usando GET /api/appointments y filtrando en memoria). */
+async function apiFindNextByPhone(empresaId: number, phone: string) {
+    const from = new Date().toISOString();
+    const to = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
+    const url = `${APPTS_BASE}/api/appointments?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+
+    const all = await httpJSON<Array<{
+        id: number;
+        empresaId: number;
+        status: AppointmentStatus;
+        customerPhone: string | null;
+        startAt: string;
+    }>>(url, { headers: HDRS });
+
+    const digits = phone.replace(/\D+/g, "");
+    return all
+        .filter(
+            (a) =>
+                a.empresaId === empresaId &&
+                (a.customerPhone || "").replace(/\D+/g, "").includes(digits) &&
+                a.status === "confirmed"
+        )
+        .sort((a, b) => +new Date(a.startAt) - +new Date(b.startAt))[0];
+}
+
+async function apiDeleteAppointment(id: number) {
+    const url = `${APPTS_BASE}/api/appointments/${id}`;
+    return httpJSON<{ ok: true }>(url, { method: "DELETE", headers: HDRS });
+}
+
+async function apiPutAppointment(id: number, patch: Record<string, unknown>) {
+    const url = `${APPTS_BASE}/api/appointments/${id}`;
+    return httpJSON(url, { method: "PUT", headers: HDRS, body: JSON.stringify(patch) });
+}
+
+async function apiCreateAppointment(body: Record<string, unknown>) {
+    const url = `${APPTS_BASE}/api/appointments`;
+    return httpJSON(url, { method: "POST", headers: HDRS, body: JSON.stringify(body) });
+}
 
 /* ============================================================
    Constantes y utils de tiempo/TZ
@@ -1571,7 +1647,6 @@ async function getOpenWindowsForDate(params: {
         where: { empresaId_day: { empresaId, day: weekday } },
     });
 
-    // excepción del día (00:00–23:59 local)
     const dayISO = tzFormat(dateLocal, "yyyy-MM-dd'T'00:00:00", { timeZone: tz });
     const startLocal = utcToZonedTime(zonedTimeToUtc(dayISO, tz), tz);
     const endLocal = utcToZonedTime(
@@ -1712,7 +1787,6 @@ export function interpretNaturalWhen(
 ): NaturalWhen | null {
     const t = text.trim().toLowerCase();
 
-    // "jueves de la próxima semana / semana que viene / la otra semana"
     const nextWeekWd = new RegExp(
         `(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo).{0,30}(pr[oó]xima\\s+semana|semana\\s+que\\s+viene|otra\\s+semana)`,
         "i"
@@ -1727,7 +1801,6 @@ export function interpretNaturalWhen(
         };
     }
 
-    // "miércoles", "este miércoles", "próximo miércoles"
     const wdWord = Object.keys(DAY_WORDS).find((w) => new RegExp(`\\b${w}\\b`, "i").test(t));
     if (wdWord) {
         const wd = DAY_WORDS[wdWord];
@@ -1740,16 +1813,10 @@ export function interpretNaturalWhen(
         };
     }
 
-    // “la más próxima / próxima disponible”
-    if (
-        /\b(la\s+m[aá]s\s+pr[oó]xima|m[aá]s\s+cercana|inmediata|lo\s+m[aá]s\s+pronto|pr[oó]xima\s+disponible)\b/.test(
-            t
-        )
-    ) {
+    if (/\b(la\s+m[aá]s\s+pr[oó]xima|m[aá]s\s+cercana|inmediata|lo\s+m[aá]s\s+pronto|pr[oó]xima\s+disponible)\b/.test(t)) {
         return { kind: "nearest", period: parseDayPeriod(t) };
     }
 
-    // "mañana" / "pasado mañana" / "hoy"
     if (/\bpasado\s*ma[ñn]ana\b/.test(t)) {
         const d = addDays(utcToZonedTime(now, tz), 2);
         return {
@@ -1775,7 +1842,6 @@ export function interpretNaturalWhen(
         };
     }
 
-    // Fechas explícitas: "15/10", "15-10", "15 de octubre"
     const dm =
         /(\b\d{1,2})\s*(?:\/|\-|de\s+)?\s*(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|\d{1,2})/i.exec(
             t
@@ -1805,7 +1871,6 @@ export function interpretNaturalWhen(
         };
     }
 
-    // Día de semana + día del mes: "jueves 15", "miércoles 3 de noviembre"
     const wdDm =
         /(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s+(\d{1,2})(?:\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre))?/i.exec(
             t
@@ -1843,7 +1908,7 @@ export async function getNextAvailableSlots(
         bufferMin?: number | null;
         granularityMin: number;
     },
-    fromLocalDayISO: string, // YYYY-MM-DD en TZ negocio (pivote)
+    fromLocalDayISO: string,
     durationMin: number,
     daysHorizon: number,
     maxPerDay: number,
@@ -1862,24 +1927,13 @@ export async function getNextAvailableSlots(
         const dayStartUtc = zonedTimeToUtc(startOfDay(dayLocal), tz);
         const dayEndUtc = zonedTimeToUtc(endOfDay(dayLocal), tz);
 
-        const windowsUtc = await getOpenWindowsForDate({
-            empresaId,
-            dateLocal: dayLocal,
-            tz,
-        });
+        const windowsUtc = await getOpenWindowsForDate({ empresaId, dateLocal: dayLocal, tz });
         if (!windowsUtc.length) {
-            results.push({
-                dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }),
-                slots: [],
-            });
+            results.push({ dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }), slots: [] });
             continue;
         }
 
-        const busyUtc = await getBusyIntervalsUTC({
-            empresaId,
-            dayStartUtc,
-            dayEndUtc,
-        });
+        const busyUtc = await getBusyIntervalsUTC({ empresaId, dayStartUtc, dayEndUtc });
 
         const slots = carveSlotsFromWindows({
             windowsUtc,
@@ -1893,17 +1947,14 @@ export async function getNextAvailableSlots(
                 : undefined,
         });
 
-        results.push({
-            dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }),
-            slots,
-        });
+        results.push({ dateISO: tzFormat(dayLocal, "yyyy-MM-dd", { timeZone: tz }), slots });
     }
 
     return results;
 }
 
 /* ============================================================
-   Crear cita segura (Prisma directo)
+   Crear cita segura (vía CONTROLLER para nuevas reservas)
 ============================================================ */
 export async function createAppointmentSafe(args: {
     empresaId: number;
@@ -1913,8 +1964,8 @@ export async function createAppointmentSafe(args: {
     serviceName: string;
     customerName: string;
     customerPhone: string;
-    startISO: string; // UTC ISO
-    endISO: string; // UTC ISO
+    startISO: string;
+    endISO: string;
     notes?: string;
     source?: "ai" | "web" | "manual" | "client";
 }) {
@@ -1931,23 +1982,6 @@ export async function createAppointmentSafe(args: {
         timezone,
     } = args;
 
-    const startAt = new Date(startISO);
-    const endAt = new Date(endISO);
-
-    // overlap rápido
-    const blocking: AppointmentStatus[] = ["pending", "confirmed", "rescheduled"];
-    const overlap = await prisma.appointment.findFirst({
-        where: {
-            empresaId,
-            deletedAt: null,
-            status: { in: blocking },
-            OR: [{ startAt: { lt: endAt }, endAt: { gt: startAt } }],
-        },
-        select: { id: true },
-    });
-    if (overlap) throw new Error("OVERLAP");
-
-    // fuente segura
     const SOURCE_MAP: Record<string, AppointmentSource> = {
         ai: "client" as AppointmentSource,
         web: "web" as AppointmentSource,
@@ -1956,28 +1990,21 @@ export async function createAppointmentSafe(args: {
     };
     const safeSource: AppointmentSource = SOURCE_MAP[source || "client"];
 
-    const created = await prisma.appointment.create({
-        data: {
-            empresaId,
-            procedureId: procedureId ?? null,
-            serviceName,
-            customerName,
-            customerPhone,
-            startAt,
-            endAt,
-            status: "confirmed",
-            source: safeSource,
-            notas: notes ?? null,
-            timezone: timezone || "America/Bogota",
-            customerDisplayName: customerName,
-            serviceDurationMin: Math.max(
-                1,
-                Math.round((endAt.getTime() - startAt.getTime()) / 60000)
-            ),
-            locationNameCache: null,
-        },
+    await apiCreateAppointment({
+        empresaId,
+        customerName,
+        customerPhone,
+        serviceName,
+        startAt: startISO,
+        endAt: endISO,
+        status: "confirmed",
+        source: safeSource,
+        timezone: timezone || "America/Bogota",
+        procedureId: procedureId ?? null,
+        notas: notes ?? null,
     });
-    return { ok: true, id: created.id };
+
+    return { ok: true };
 }
 
 /* ============================================================
@@ -1997,17 +2024,14 @@ function labelSlotsForTZ(slots: Slot[], tz: string): LabeledSlot[] {
     });
 }
 
-/*  Mejoras de NER para nombre/teléfono y aceptación */
 const NAME_RE =
     /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñ\s]{2,80})/i;
-// Fallback cuando el mensaje parece sólo un nombre (p.ej. "Santiago z")
 const NAME_ONLY_RE = /^[a-záéíóúñü\s]{2,80}$/i;
 
-// Buscar TODOS los posibles teléfonos en el texto y quedarnos con el de más dígitos
 const PHONE_ANY_RE = /[\+\(]?\d[\d\)\-\s\.]{6,}/g;
 
-const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/; // 24h
-const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i; // 12h
+const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/;
+const AMPM_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i;
 const ACCEPT_RE =
     /\b(quiero|tomo|me\s*(quedo|sirve|va\s*bien)|voy\s*con|vamos\s*con|la\s*de|esa\s*de|ok(ay)?|perfecto|genial|listo|va|dale|ag[eé]nd[ao]|reserv[ao]|confirmo|sí|si)\b/i;
 
@@ -2099,23 +2123,20 @@ type Extracted = {
 };
 
 function extractFromUtterance(text: string, tz: string, now: Date): Extracted {
-    // Nombre: primero explícito (“mi nombre es …”), si no:
-    // fallback cuando el mensaje es sólo letras y parece un nombre.
     const nameExplicit = NAME_RE.exec(text);
     const looksLikeOnlyName =
         !/\d/.test(text) &&
         !HHMM_RE.test(text) &&
         !AMPM_RE.test(text) &&
-        !Object.keys(DAY_WORDS).some(w => new RegExp(`\\b${w}\\b`, "i").test(text)) &&
-        !Object.keys(MONTHS).some(m => new RegExp(`\\b${m}\\b`, "i").test(text)) &&
+        !Object.keys(DAY_WORDS).some((w) => new RegExp(`\\b${w}\\b`, "i").test(text)) &&
+        !Object.keys(MONTHS).some((m) => new RegExp(`\\b${m}\\b`, "i").test(text)) &&
         NAME_ONLY_RE.test(text);
-    const name = nameExplicit ? properCase(nameExplicit[2]) : (looksLikeOnlyName ? properCase(text) : undefined);
+    const name = nameExplicit ? properCase(nameExplicit[2]) : looksLikeOnlyName ? properCase(text) : undefined;
 
-    // Teléfono: buscar todos los candidatos y elegir el de más dígitos
     let phone: string | undefined = undefined;
     const allPhones = text.match(PHONE_ANY_RE);
     if (allPhones && allPhones.length) {
-        const best = allPhones.map(s => s.replace(/\D+/g, "")).sort((a, b) => b.length - a.length)[0];
+        const best = allPhones.map((s) => s.replace(/\D+/g, "")).sort((a, b) => b.length - a.length)[0];
         phone = normalizePhone(best);
     }
 
@@ -2125,9 +2146,7 @@ function extractFromUtterance(text: string, tz: string, now: Date): Extracted {
     const ordinal = ordinalIndex(text);
     const accept = ACCEPT_RE.test(text);
 
-    const wdWord = Object.keys(DAY_WORDS).find((w) =>
-        new RegExp(`\\b${w}\\b`, "i").test(text)
-    );
+    const wdWord = Object.keys(DAY_WORDS).find((w) => new RegExp(`\\b${w}\\b`, "i").test(text));
     const mentionWeekday = wdWord ? DAY_WORDS[wdWord] : null;
 
     return { when, period, timeMin, ordinal, accept, name, phone, mentionWeekday };
@@ -2146,7 +2165,6 @@ function nluToExtracted(nlu: InterpreterNLU, _tz: string, _now: Date): Extracted
     if (nlu.slots.date) {
         when = { kind: "date", localDateISO: nlu.slots.date!, period };
     } else if (period) {
-        // si solo hay franja, buscamos “nearest”
         when = { kind: "nearest", period };
     }
 
@@ -2201,26 +2219,23 @@ export async function handleSchedulingTurn(params: {
         durationMin?: number | null;
     } | null;
     intent: "price" | "schedule" | "reschedule" | "cancel" | "info" | "other";
-    nlu?: InterpreterNLU; // <-- integración NLU (opcional)
+    nlu?: InterpreterNLU;
 }): Promise<SchedulingResult> {
     const { text, state: stateArg, ctx, serviceInContext, intent, nlu } = params;
     const { kb, empresaId, granularityMin, daysHorizon, maxSlots } = ctx;
     const tz = kb.timezone;
 
-    // copiar estado y limpiar cache vencida
     const state: StateShape = { ...stateArg };
     if (state.slotsCache && !cacheIsValid(state.slotsCache.expiresAt)) {
         state.slotsCache = undefined;
     }
 
     const localNow = utcToZonedTime(ctx.now ?? new Date(), tz);
-    // Usar NLU si viene; fallback al extractor nativo
     const ex = nlu ? nluToExtracted(nlu, tz, localNow) : extractFromUtterance(text, tz, localNow);
 
     const basePatch: Partial<StateShape> = {};
     if (ex.phone) basePatch.lastPhoneSeen = ex.phone;
 
-    // Resolver servicio con prioridad NLU
     const svc =
         serviceInContext ||
         (nlu?.slots.serviceId
@@ -2231,11 +2246,8 @@ export async function handleSchedulingTurn(params: {
                 ) || null)
                 : ctx.kb.procedures.find((p) => p.id === (state.draft?.procedureId ?? 0)) || null);
 
-    const duration = (svc?.durationMin ??
-        ctx.kb.defaultServiceDurationMin ??
-        60) as number;
+    const duration = (svc?.durationMin ?? ctx.kb.defaultServiceDurationMin ?? 60) as number;
 
-    // Derivar intent interno desde NLU si llegó
     const derivedIntent = nlu
         ? nlu.intent === "CANCEL"
             ? "cancel"
@@ -2246,31 +2258,78 @@ export async function handleSchedulingTurn(params: {
                     : "schedule"
         : intent;
 
-    /* ===== Cancelar / Reagendar ===== */
+    /* ===== CANCELAR → usar controller DELETE ===== */
     const wantsCancel = /\b(cancelar|anular|no puedo ir|cancela|cancelemos)\b/i.test(text);
     if (derivedIntent === "cancel" || wantsCancel) {
-        const phone = state.draft?.phone || ex.phone || state.lastPhoneSeen;
+        const phone = state.draft?.phone || ex.phone || state.lastPhoneSeen || undefined;
         if (!phone)
             return {
                 handled: true,
                 reply: "Para ubicar tu cita necesito tu *teléfono*. Escríbelo (solo números).",
                 patch: basePatch,
             };
-        const appt = await findUpcomingApptByPhone(empresaId, phone);
+
+        const apptFromApi = await apiFindNextByPhone(empresaId, phone as string).catch(() => null);
+        const appt = apptFromApi || (await findUpcomingApptByPhone(empresaId, phone as string));
         if (!appt)
             return {
                 handled: true,
-                reply: "No encuentro una cita próxima con ese teléfono. ¿Podrías verificar el número?",
+                reply:
+                    "No encuentro una cita *confirmada* con ese teléfono. ¿Podrías verificar el número o indicarme la *fecha*?",
                 patch: basePatch,
             };
-        await prisma.appointment.update({
-            where: { id: appt.id },
-            data: { status: "cancelled" },
-        });
+
+        try {
+            await apiDeleteAppointment(appt.id);
+            return {
+                handled: true,
+                reply:
+                    "Listo ✅. Tu cita fue *cancelada* en el sistema. Si quieres, te comparto horarios para volver a agendar.",
+                patch: { draft: { stage: "idle" }, slotsCache: undefined, lastIntent: "cancel", ...basePatch },
+            };
+        } catch (e) {
+            return {
+                handled: true,
+                reply:
+                    "No pude cancelar ahora mismo 😕. ¿Intento de nuevo o prefieres que te atienda una persona?",
+                failMessage: (e as Error)?.message,
+                patch: basePatch,
+            };
+        }
+    }
+
+    /* ===== REAGENDAR → reiniciar draft y pedir fecha nueva (FIX 2: phone tipado) ===== */
+    if (derivedIntent === "reschedule") {
+        const phone: string | undefined =
+            state.draft?.phone ??
+            ex.phone ??
+            (state.lastPhoneSeen ?? undefined);
+
+        let rescheduleApptId: number | undefined = state.draft?.rescheduleApptId;
+        if (!rescheduleApptId && phone) {
+            const appt = await apiFindNextByPhone(empresaId, phone).catch(() => null);
+            if (appt) rescheduleApptId = appt.id;
+        }
+
         return {
             handled: true,
-            reply: "Listo, tu cita fue *cancelada*. Si deseas, te muestro nuevos horarios.",
-            patch: { draft: { stage: "idle" }, lastIntent: "cancel", ...basePatch },
+            reply:
+                "¡Claro! Dime *qué día* te gustaría reagendarla 😊 (por ejemplo: *miércoles en la tarde*, *jueves 2:00 pm* o *la más próxima disponible*).",
+            patch: {
+                draft: {
+                    name: state.draft?.name,
+                    phone, // <- string | undefined
+                    procedureId: state.draft?.procedureId,
+                    procedureName: state.draft?.procedureName,
+                    durationMin: state.draft?.durationMin,
+                    stage: "offer",
+                    whenISO: undefined,
+                    rescheduleApptId,
+                } as SchedulingDraft,
+                slotsCache: undefined,
+                lastIntent: "reschedule",
+                ...basePatch,
+            },
         };
     }
 
@@ -2305,7 +2364,7 @@ export async function handleSchedulingTurn(params: {
         };
     }
 
-    /* ===== (NUEVO ORDEN) Confirmación con cache si el usuario ya eligió ===== */
+    /* ===== Confirmación con cache si el usuario ya eligió ===== */
     if (svc && state.slotsCache?.items?.length) {
         const wantedMin = ex.timeMin;
         const periodAsked = ex.period;
@@ -2336,7 +2395,7 @@ export async function handleSchedulingTurn(params: {
         const nextDraft: SchedulingDraft = {
             ...(state.draft ?? {}),
             name: state.draft?.name ?? ex.name ?? undefined,
-            phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
+            phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen || undefined),
             whenISO: state.draft?.whenISO ?? chosen?.startISO ?? undefined,
             stage: "confirm",
             procedureName: state.draft?.procedureName ?? svc.name,
@@ -2357,7 +2416,6 @@ export async function handleSchedulingTurn(params: {
             : "fecha por confirmar";
         const hora = local ? formatAmPmLocal(local) : "hora por confirmar";
 
-        // Auto-insert si ya tenemos todo y el usuario aceptó
         const hasAll = Boolean(nextDraft.whenISO && nextDraft.name && nextDraft.phone);
         if (accepting && hasAll) {
             try {
@@ -2367,19 +2425,19 @@ export async function handleSchedulingTurn(params: {
                 ).toISOString();
 
                 if (nextDraft.rescheduleApptId) {
-                    await prisma.appointment.update({
-                        where: { id: nextDraft.rescheduleApptId },
-                        data: {
-                            startAt: new Date(nextDraft.whenISO!),
-                            endAt: new Date(endISO),
-                            status: "confirmed",
-                        },
+                    await apiPutAppointment(nextDraft.rescheduleApptId, {
+                        startAt: nextDraft.whenISO!,
+                        endAt: endISO,
+                        status: "rescheduled",
                     });
+
                     return {
                         handled: true,
                         createOk: true,
-                        reply: `¡Hecho! Moví tu cita ✅. Quedó para ${fecha} a las ${hora}.`,
-                        patch: { draft: { stage: "idle" } },
+                        reply: `He movido tu cita 🔄. Quedó para *${fecha} a las ${hora}*.\nSi está bien, escribe *confirmo* para dejarla *confirmada*.`,
+                        patch: {
+                            draft: { ...state.draft, ...nextDraft, stage: "confirm" },
+                        },
                     };
                 }
 
@@ -2400,19 +2458,19 @@ export async function handleSchedulingTurn(params: {
                 return {
                     handled: true,
                     createOk: true,
-                    reply: `¡Listo! Tu cita quedó confirmada ✅. ${fecha} a las ${hora}.`,
-                    patch: { draft: { stage: "idle" } },
+                    reply: `¡Listo! Tu cita quedó confirmada ✅. *${fecha} a las ${hora}*.`,
+                    patch: { draft: { stage: "idle" }, slotsCache: undefined },
                 };
-            } catch {
+            } catch (e) {
                 return {
                     handled: true,
                     createOk: false,
                     reply: "Ese horario acaba de ocuparse 😕. ¿Te comparto otras opciones cercanas?",
+                    failMessage: (e as Error)?.message,
                 };
             }
         }
 
-        // Falta nombre o teléfono → pedir lo que falta (sin volver a proponer)
         const missingPieces: string[] = [];
         if (!nextDraft.name) missingPieces.push("tu *nombre*");
         if (!nextDraft.phone) missingPieces.push("tu *teléfono*");
@@ -2425,7 +2483,7 @@ export async function handleSchedulingTurn(params: {
         return {
             handled: true,
             reply: resumen,
-            patch: { draft: nextDraft, ...basePatch },
+            patch: { draft: nextDraft },
         };
     }
 
@@ -2452,7 +2510,6 @@ export async function handleSchedulingTurn(params: {
 
         let flat = byDay.flatMap((d) => d.slots);
 
-        // Si se pidió un weekday específico, filtramos a ese día.
         if (isWeekdayWhen(ex.when)) {
             const wanted = ex.when.weekday;
             flat = flat.filter(
@@ -2460,12 +2517,14 @@ export async function handleSchedulingTurn(params: {
             );
         }
 
-        // Filtrar por franja si aplica
-        const periodAsked = period ?? ex.period;
-        if (periodAsked)
+        // ===== FIX 1: periodAsked con estrechado explícito =====
+        const maybePeriod: DayPeriod | null = (period ?? ex.period) ?? null;
+        if (maybePeriod !== null) {
+            const p: DayPeriod = maybePeriod;
             flat = flat.filter((s) =>
-                inPeriodLocal(utcToZonedTime(new Date(s.startISO), tz), periodAsked)
+                inPeriodLocal(utcToZonedTime(new Date(s.startISO), tz), p)
             );
+        }
 
         flat = flat.slice(0, maxSlots);
         const labeledAll = labelSlotsForTZ(flat, tz);
@@ -2483,7 +2542,6 @@ export async function handleSchedulingTurn(params: {
         return { reply, labeledAll };
     }
 
-    // Solo cambia franja con cache vigente
     const periodOnly = !ex.when && !!ex.period;
     if (svc && periodOnly && state.slotsCache?.items?.length) {
         const pivotISO = localDayISOFromSlot(state.slotsCache.items[0].startISO, tz);
@@ -2501,12 +2559,10 @@ export async function handleSchedulingTurn(params: {
                     stage: "offer",
                 },
                 slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
-                ...basePatch,
             },
         };
     }
 
-    // Si pide nueva fecha/franja explícita y ya había cache → regenerar
     const askedNewRange = Boolean(ex.when);
     if (svc && askedNewRange && state.slotsCache?.items?.length) {
         let pivotISO = tzFormat(localNow, "yyyy-MM-dd", { timeZone: tz });
@@ -2538,12 +2594,11 @@ export async function handleSchedulingTurn(params: {
                     stage: "offer",
                 },
                 slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
-                ...basePatch,
             },
         };
     }
 
-    // NL → directamente intentar reservar si trae fecha/hora clara
+    /* ===== NL → reservar si trae fecha/hora clara ===== */
     if (svc && ex.when) {
         const wantedMin = ex.timeMin;
 
@@ -2555,7 +2610,7 @@ export async function handleSchedulingTurn(params: {
                 procedureName: svc.name,
                 durationMin: duration,
                 name: state.draft?.name ?? ex.name ?? undefined,
-                phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
+                phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen || undefined),
                 stage: "confirm",
             };
             const local = utcToZonedTime(new Date(slotISO), tz);
@@ -2586,7 +2641,7 @@ export async function handleSchedulingTurn(params: {
                             ? "*nombre*"
                             : "*teléfono*"
                     }.`,
-                patch: { draft: nextDraft, ...basePatch },
+                patch: { draft: nextDraft },
             };
         };
 
@@ -2616,17 +2671,15 @@ export async function handleSchedulingTurn(params: {
                                 procedureName: svc.name,
                                 durationMin: duration,
                                 name: state.draft?.name ?? ex.name ?? undefined,
-                                phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
+                                phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen || undefined),
                                 stage: "confirm",
                             },
                             slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
-                            ...basePatch,
                         },
                     } as SchedulingResult;
                 }
             }
 
-            // si no dio hora o no existe exacta → mostrar opciones
             return {
                 handled: true,
                 reply,
@@ -2640,7 +2693,6 @@ export async function handleSchedulingTurn(params: {
                         stage: "offer",
                     },
                     slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
-                    ...basePatch,
                 },
             } as SchedulingResult;
         };
@@ -2686,7 +2738,7 @@ export async function handleSchedulingTurn(params: {
         }
     }
 
-    /* ===== Paso 4: regenerar slots automáticamente si capturamos algo ===== */
+    /* ===== Regenerar slots si capturamos algo ===== */
     const isCapture =
         Boolean(ex.name || ex.phone) ||
         HHMM_RE.test(text) ||
@@ -2718,11 +2770,29 @@ export async function handleSchedulingTurn(params: {
                     stage: "offer",
                 },
                 slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
-                ...basePatch,
             },
         };
     }
 
-    // Nada más que hacer en este turno
+    /* ===== Confirmación textual “confirmo” para reagendo pendiente ===== */
+    if (state.draft?.rescheduleApptId && /\bconfirmo\b/i.test(text)) {
+        try {
+            await apiPutAppointment(state.draft.rescheduleApptId, { status: "confirmed" });
+            return {
+                handled: true,
+                reply: "¡Perfecto! Tu cita quedó *confirmada* ✅.",
+                patch: { draft: { stage: "idle" }, slotsCache: undefined, lastIntent: "schedule" },
+            };
+        } catch (e) {
+            return {
+                handled: true,
+                reply: "No pude confirmar ahora mismo 😕. ¿Intento de nuevo?",
+                failMessage: (e as Error)?.message,
+            };
+        }
+    }
+
     return { handled: false, patch: basePatch };
 }
+
+

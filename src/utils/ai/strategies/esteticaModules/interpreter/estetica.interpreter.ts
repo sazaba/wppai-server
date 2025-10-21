@@ -22,7 +22,6 @@ export type NLUResult = {
     confidence: number;           // 0..1
     missing?: Array<"date" | "time" | "service" | "name" | "phone">;
     slots: {
-        // normalizados
         date?: string | null;         // YYYY-MM-DD en TZ negocio
         time?: string | null;         // HH:mm (24h, TZ negocio)
         time_of_day?: DayPeriod | null;
@@ -30,16 +29,12 @@ export type NLUResult = {
         serviceName?: string | null;
         staffId?: number | null;
         location?: string | null;
-        choice_index?: number | null; // 1 = primera (humano), 2= segunda...
+        choice_index?: number | null; // 1 = primera, 2 = segunda...
         name?: string | null;
         phone?: string | null;
         notes?: string | null;
     };
-    // Para trazabilidad
-    debug?: {
-        raw: string;
-        signals: Record<string, unknown>;
-    };
+    debug?: { raw: string; signals: Record<string, unknown> };
 };
 
 /* ====== KB mínima (no DB) ====== */
@@ -83,11 +78,10 @@ export function parseDayPeriod(text: string): DayPeriod | null {
 const NAME_RE =
     /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñü\s]{2,80})/i;
 
-// Fallback: mensaje que parece SOLO un nombre (sin números/horas/keywords)
-// Útil para “Santiago z”
+// Fallback: mensaje que parece SOLO un nombre (sin números/horas/keywords) – “Santiago z”
 const NAME_ONLY_RE = /^[a-záéíóúñü\s]{2,80}$/i;
 
-// Teléfono en cualquier formato (+57, paréntesis, guiones, espacios). Capturamos todos los dígitos y luego normalizamos.
+// Teléfono en cualquier formato; tomamos el candidato con más dígitos.
 const PHONE_ANY_RE = /[\+\(]?\d[\d\)\-\s\.]{6,}/g;
 
 const HHMM_RE = /\b([01]?\d|2[0-3]):([0-5]\d)\b/;     // 24h
@@ -125,7 +119,6 @@ function normalizePhone(raw?: string | null): string | null {
     if (!raw) return null;
     const digits = raw.replace(/\D+/g, "");
     if (!digits) return null;
-    // Preferimos 10–12 dígitos (COL/intl). Si hay más, nos quedamos con los últimos 10–12.
     if (digits.length >= 12) return digits.slice(-12);
     if (digits.length >= 10) return digits.slice(-10);
     return digits.length >= 7 ? digits : null;
@@ -133,10 +126,7 @@ function normalizePhone(raw?: string | null): string | null {
 
 function pad2(n: number) { return n.toString().padStart(2, "0"); }
 
-/* ====== Interpretadores de fecha relativa (en TZ negocio) ======
-   Nota: aquí NO convertimos TZ realmente (dejamos YYYY-MM-DD).
-   La lógica de TZ/UTC la maneja estetica.schedule.
-================================================================= */
+/* ====== Interpretadores de fecha relativa (en TZ negocio) ====== */
 type NaturalWhen =
     | { kind: "nearest"; period: DayPeriod | null }
     | { kind: "weekday"; weekday: number; which: "this_or_next" | "next_week"; period: DayPeriod | null }
@@ -203,7 +193,6 @@ function interpretNaturalWhen(text: string, now: Date): NaturalWhen | null {
         const year = now.getFullYear();
         const month = /\d{1,2}/.test(monthToken) ? Math.max(0, Math.min(11, parseInt(monthToken, 10) - 1)) : MONTHS[monthToken];
         let candidate = new Date(year, month, day);
-        // si ya pasó, asume el próximo año
         if (candidate < new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
             candidate = new Date(year + 1, month, day);
         }
@@ -305,7 +294,7 @@ export function interpretUserMessage(
         return m ? properCase(m[2]) : null;
     })();
 
-    // 2) “solo nombre” (fallback contextual, no invasivo)
+    // 2) “solo nombre” (sin números/horas/días/meses)
     const looksLikeOnlyName =
         !/\d/.test(t) && !HHMM_RE.test(tLower) && !AMPM_RE.test(tLower) &&
         !Object.keys(DAY_WORDS).some(w => new RegExp(`\\b${w}\\b`, "i").test(tLower)) &&
@@ -314,11 +303,10 @@ export function interpretUserMessage(
 
     const name = nameFromExp || (looksLikeOnlyName ? properCase(t) : null);
 
-    // 3) teléfono: tomar el bloque más “rico” de dígitos
+    // 3) teléfono: elegir el candidato con más dígitos
     let phone: string | null = null;
     const phoneMatches = t.match(PHONE_ANY_RE);
     if (phoneMatches && phoneMatches.length) {
-        // elegir el candidato con más dígitos (robusto a varios en el mismo texto)
         const best = phoneMatches
             .map(s => s.replace(/\D+/g, ""))
             .sort((a, b) => b.length - a.length)[0];
@@ -352,7 +340,7 @@ export function interpretUserMessage(
         location: null,
     };
 
-    // Reglas: si dice “Sí, jueves 2:00 pm, Santiago, 310...” → BOOK directo
+    // “Sí, jueves 2:00 pm, Santiago, 310...” → BOOK directo
     if (intent === "ASK_SLOTS" && (name || phone) && (time || when)) {
         intent = "BOOK";
         confidence = Math.max(confidence, 0.82);
@@ -363,16 +351,15 @@ export function interpretUserMessage(
     if (intent === "BOOK") {
         if (!slots.date && !when) missing.push("date");
         if (!slots.time && !slots.time_of_day) missing.push("time");
-        if (!slots.serviceId && !slots.serviceName) missing.push("service"); // opcional según tu flujo
+        if (!slots.serviceId && !slots.serviceName) missing.push("service");
         if (!slots.name) missing.push("name");
         if (!slots.phone) missing.push("phone");
     } else if (intent === "ASK_SLOTS") {
-        if (!slots.date && !when) missing.push("date"); // al menos fecha/franja
+        if (!slots.date && !when) missing.push("date");
     } else if (intent === "CHOOSE") {
-        if (!slots.choice_index) missing.push("time"); // equivalente a elegir hora
+        if (!slots.choice_index) missing.push("time");
     }
 
-    // si faltan muchas cosas, baja la confianza e ir a UNSURE
     if (missing.length >= 3 && intent !== "GREET" && intent !== "INFO") {
         intent = "UNSURE";
         confidence = 0.45;
@@ -385,10 +372,7 @@ export function interpretUserMessage(
         slots,
         debug: {
             raw,
-            signals: {
-                greet, wantsCancel, wantsResched, wantsPrice, wantsInfo, accepted, ord,
-                name, phone, svc, when, time_of_day, time
-            }
+            signals: { greet, wantsCancel, wantsResched, wantsPrice, wantsInfo, accepted, ord, name, phone, svc, when, time_of_day, time }
         }
     };
 }
