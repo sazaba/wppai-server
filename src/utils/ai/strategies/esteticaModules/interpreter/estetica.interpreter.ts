@@ -75,8 +75,22 @@ export function parseDayPeriod(text: string): DayPeriod | null {
 
 /* ---------- Nombres y teléfonos (mejorados, no intrusivos) ---------- */
 // Explícito: “mi nombre es…”, “nombre: …”, “soy …”, “me llamo …”
+// Corta antes de ",", ".", "y mi teléfono", "teléfono", "cel", o un número
 const NAME_RE =
-    /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñü\s]{2,80})/i;
+    /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñü\s]{2,80}?)(?=\s*(?:,|\.|$|y\s+mi\s+tel[eé]fono|tel[eé]fono|cel(?:ular)?|contacto|\(?\+?\d|\d{7,}))/i;
+
+function cleanCapturedName(raw?: string | null): string | null {
+    if (!raw) return null;
+    let v = raw
+        .replace(/\s+y\s+mi\s+tel[eé]fono.*$/i, "")
+        .replace(/\s+(tel[eé]fono|cel(?:ular)?|contacto)\b.*$/i, "")
+        .replace(/[,\.\-–—]+$/g, "")
+        .trim()
+        .replace(/\s+/g, " ");
+    if (!v || /^mi\s*nombre\s*es$/i.test(v)) return null;
+    return properCase(v);
+}
+
 
 // Fallback: mensaje que parece SOLO un nombre (sin números/horas/keywords) – “Santiago z”
 const NAME_ONLY_RE = /^[a-záéíóúñü\s]{2,80}$/i;
@@ -291,8 +305,9 @@ export function interpretUserMessage(
     // 1) explícitos
     const nameFromExp = (() => {
         const m = NAME_RE.exec(t);
-        return m ? properCase(m[2]) : null;
+        return m ? cleanCapturedName(m[2]) : null;
     })();
+
 
     // 2) “solo nombre” (sin números/horas/días/meses)
     const looksLikeOnlyName =
