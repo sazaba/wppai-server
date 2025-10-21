@@ -980,7 +980,7 @@ export async function handleSchedulingTurn(params: {
                     : "schedule"
         : intent;
 
-    /* ===== Cancelar (PATCH 2: DELETE real en BD) ===== */
+    /* ===== Soft Delete ===== */
     const wantsCancel = /\b(cancelar|anular|no\s*puedo\s*ir|cancela|cancelemos|elimina\s*mi\s*cita)\b/i.test(text);
     if (derivedIntent === "cancel" || wantsCancel) {
         const phone = state.draft?.phone || ex.phone || state.lastPhoneSeen;
@@ -999,31 +999,39 @@ export async function handleSchedulingTurn(params: {
             };
 
         // Operación canónica: eliminar la cita
-        await prisma.appointment.delete({ where: { id: appt.id } });
-
+        // Alinear con el calendario: marcar como cancelada y ocultarla (soft delete)
+        await prisma.appointment.update({
+            where: { id: appt.id },
+            data: {
+                status: "cancelled",
+                deletedAt: new Date(),   // tu lógica de busy/queries ya filtra deletedAt: null
+            },
+        });
         return {
             handled: true,
             reply: "Listo, tu cita fue *cancelada*. ¿Quieres que te comparta horarios para reprogramar?",
-            patch: { draft: { stage: "idle" }, lastIntent: "cancel", ...basePatch },
+            patch: { draft: { stage: "idle" }, lastIntent: "cancel", slotsCache: undefined, ...basePatch },
+
         };
     }
 
-    /* ===== Reagendar: handshake (PATCH 3: fija rescheduleApptId) ===== */
+    /* ===== Reagendar: handshake (reinicio de flujo) ===== */
     if (derivedIntent === "reschedule") {
         const phone = state.draft?.phone || ex.phone || state.lastPhoneSeen;
         if (!phone) {
             return {
                 handled: true,
                 reply: "Para ubicar tu cita a reagendar necesito tu *teléfono*. Escríbelo (solo números).",
-                patch: basePatch,
+                patch: { ...basePatch, slotsCache: undefined, draft: { stage: "idle" } },
             };
         }
+
         const appt = await findUpcomingApptByPhone(empresaId, phone);
         if (!appt) {
             return {
                 handled: true,
                 reply: "No encuentro una cita próxima con ese teléfono. Si deseas, puedo ofrecerte nuevos horarios para agendar.",
-                patch: basePatch,
+                patch: { ...basePatch, slotsCache: undefined, draft: { stage: "idle" } },
             };
         }
 
@@ -1035,17 +1043,23 @@ export async function handleSchedulingTurn(params: {
             handled: true,
             reply: `Perfecto. ¿Para qué *día/franja* quieres mover tu cita (*${appt.serviceName}*)? (ej.: *jueves en la tarde*, *mañana*, *la más próxima*)`,
             patch: {
-                draft: {
-                    ...(state.draft ?? {}),
-                    phone,
-                    rescheduleApptId: appt.id,
-                    procedureId: svcFromAppt?.id ?? state.draft?.procedureId,
-                    procedureName: svcFromAppt?.name ?? appt.serviceName ?? state.draft?.procedureName,
-                    durationMin,
-                    stage: "offer",
-                },
-                lastIntent: "reschedule",
                 ...basePatch,
+                // 🔥 RESET duro para arrancar limpio el flujo de reagendar
+                slotsCache: undefined,
+                lastIntent: "reschedule",
+                lastServiceId: svcFromAppt?.id ?? null,
+                lastServiceName: svcFromAppt?.name ?? appt.serviceName ?? null,
+                draft: {
+                    // NO heredamos whenISO anterior para evitar auto-confirmaciones
+                    name: state.draft?.name,             // opcional conservar
+                    phone,                               // lo aseguramos para consultas
+                    whenISO: undefined,                  // ← clave
+                    rescheduleApptId: appt.id,
+                    procedureId: svcFromAppt?.id ?? undefined,
+                    procedureName: svcFromAppt?.name ?? appt.serviceName ?? undefined,
+                    durationMin,
+                    stage: "offer",                      // pediremos opciones
+                },
             },
         };
     }
@@ -1147,6 +1161,8 @@ export async function handleSchedulingTurn(params: {
                     const newStart = new Date(nextDraft.whenISO!);
                     const newEnd = new Date(endISO);
 
+                    const newDurationMin = Math.max(1, Math.round((newEnd.getTime() - newStart.getTime()) / 60000));
+
                     await validateAppointmentChange({
                         empresaId,
                         timezone: tz,
@@ -1157,11 +1173,13 @@ export async function handleSchedulingTurn(params: {
                     });
 
                     await prisma.appointment.update({
-                        where: { id: nextDraft.rescheduleApptId },
+                        where: { id: nextDraft.rescheduleApptId! },
                         data: {
                             startAt: newStart,
                             endAt: newEnd,
                             status: "confirmed",
+                            serviceDurationMin: newDurationMin,
+                            timezone: tz, // opcional, si tu UI lo muestra
                         },
                     });
 
@@ -1169,7 +1187,7 @@ export async function handleSchedulingTurn(params: {
                         handled: true,
                         createOk: true,
                         reply: `¡Hecho! Moví tu cita ✅. Quedó para ${fecha} a las ${hora}.`,
-                        patch: { draft: { stage: "idle" } },
+                        patch: { draft: { stage: "idle" }, slotsCache: undefined },
                     };
 
                 }
@@ -1202,7 +1220,7 @@ export async function handleSchedulingTurn(params: {
                     handled: true,
                     createOk: true,
                     reply: `¡Listo! Tu cita quedó confirmada ✅. ${fecha} a las ${hora}.`,
-                    patch: { draft: { stage: "idle" } },
+                    patch: { draft: { stage: "idle" }, slotsCache: undefined }
                 };
             } catch (e: unknown) {
                 const msg = e instanceof Error ? e.message : String(e);
