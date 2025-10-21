@@ -2,10 +2,10 @@
    Estética – INTÉRPRETE (NLU → JSON canónico)
    - Convierte lenguaje natural a intents/slots cerrados
    - No toca DB; usa solo KB en memoria
-   - Totalmente determinista + heurísticas ligeras
+   - Determinista + heurísticas ligeras
 ============================================================ */
-// ⬇️ Agrega esto al inicio del archivo (o junto a otras imports)
-import { utcToZonedTime, zonedTimeToUtc, format as tzFormat } from "date-fns-tz";
+// Solo usamos utcToZonedTime aquí
+import { utcToZonedTime } from "date-fns-tz";
 
 export type DayPeriod = "morning" | "afternoon" | "evening";
 
@@ -36,6 +36,8 @@ export type NLUResult = {
         phone?: string | null;
         notes?: string | null;
     };
+    /** Micro-respuesta empática: texto corto que puedes mostrar (opcional) */
+    microReply?: string;
     debug?: { raw: string; signals: Record<string, unknown> };
 };
 
@@ -58,28 +60,6 @@ const DAY_WORDS: Record<string, number> = {
     sabado: 6, sábado: 6
 };
 
-/* ===== Helpers de fecha con TZ del negocio ===== */
-function todayInTZ(tz: string, now: Date = new Date()): Date {
-    const z = utcToZonedTime(now, tz);
-    // normalizamos a medianoche local
-    return new Date(z.getFullYear(), z.getMonth(), z.getDate());
-}
-
-function addDaysTZ(baseLocal: Date, days: number, tz: string): Date {
-    // baseLocal se asume ya “local” (YYYY-MM-DD local)
-    const d = new Date(baseLocal.getFullYear(), baseLocal.getMonth(), baseLocal.getDate());
-    d.setDate(d.getDate() + days);
-    return d;
-}
-
-function toLocalISODateTZ(dLocal: Date): string {
-    const y = dLocal.getFullYear();
-    const m = String(dLocal.getMonth() + 1).padStart(2, "0");
-    const d = String(dLocal.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-}
-
-
 const MONTHS: Record<string, number> = {
     enero: 0, febrero: 1, marzo: 2, abril: 3, mayo: 4, junio: 5,
     julio: 6, agosto: 7, septiembre: 8, setiembre: 8, octubre: 9, noviembre: 10, diciembre: 11,
@@ -97,9 +77,29 @@ export function parseDayPeriod(text: string): DayPeriod | null {
     return null;
 }
 
+/* ===== Helpers de fecha con TZ del negocio ===== */
+function todayInTZ(tz: string, now: Date = new Date()): Date {
+    const z = utcToZonedTime(now, tz);
+    // normalizamos a medianoche local
+    return new Date(z.getFullYear(), z.getMonth(), z.getDate());
+}
+
+function addDaysTZ(baseLocal: Date, days: number, _tz: string): Date {
+    // baseLocal ya es “local” (YYYY-MM-DD local)
+    const d = new Date(baseLocal.getFullYear(), baseLocal.getMonth(), baseLocal.getDate());
+    d.setDate(d.getDate() + days);
+    return d;
+}
+
+function toLocalISODateTZ(dLocal: Date): string {
+    const y = dLocal.getFullYear();
+    const m = String(dLocal.getMonth() + 1).padStart(2, "0");
+    const d = String(dLocal.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+}
+
 /* ---------- Nombres y teléfonos (mejorados, no intrusivos) ---------- */
 // Explícito: “mi nombre es…”, “nombre: …”, “soy …”, “me llamo …”
-// Corta antes de ",", ".", "y mi teléfono", "teléfono", "cel", o un número
 const NAME_RE =
     /(mi\s*nombre\s*(?:es|:)?|^nombre\s*:|^soy\b|^yo\s*soy\b|me\s*llamo)\s+([a-záéíóúñü\s]{2,80}?)(?=\s*(?:,|\.|$|y\s+mi\s+tel[eé]fono|tel[eé]fono|cel(?:ular)?|contacto|\(?\+?\d|\d{7,}))/i;
 
@@ -115,8 +115,7 @@ function cleanCapturedName(raw?: string | null): string | null {
     return properCase(v);
 }
 
-
-// Fallback: mensaje que parece SOLO un nombre (sin números/horas/keywords) – “Santiago z”
+// Fallback: mensaje que parece SOLO un nombre – “Santiago z”
 const NAME_ONLY_RE = /^[a-záéíóúñü\s]{2,80}$/i;
 
 // Teléfono en cualquier formato; tomamos el candidato con más dígitos.
@@ -133,6 +132,9 @@ const RESCHED_RE = /\b(reagendar|mover|cambiar\s+la\s+cita|otra\s+hora|otro\s+d[
 const GREET_RE = /\b(hola|buen[oa]s|qué\s+tal|que\s+tal|saludos)\b/i;
 const PRICE_RE = /\b(precio|vale|cu[áa]nto\s+cuesta|costo|tarifa)\b/i;
 const INFO_RE = /\b(duraci[oó]n|preparaci[oó]n|contraindicaci[oó]n|cuidado|post\s*cuidado|indicaciones)\b/i;
+
+// Preguntas de disponibilidad tipo "¿tienes/hay/puedes...?"
+const AVAIL_QUESTION_RE = /\b(tienes|hay|puedes|podr[ií]as|queda|disponible|disponibilidad)\b/i;
 
 const ORDINAL_RE = /\b(primera|1(?:ra|era)?|segunda|2(?:da)?|tercera|3(?:ra)?)\b/i;
 function ordinalIndex(text: string): number | null {
@@ -181,7 +183,6 @@ function toLocalISODate(d: Date) {
 }
 
 // Acepta TZ del negocio y año explícito cuando el usuario lo provee
-// Acepta TZ del negocio y año explícito cuando el usuario lo provee
 function interpretNaturalWhen(text: string, now: Date, tz: string): NaturalWhen | null {
     const t = text.trim().toLowerCase();
     const today = todayInTZ(tz, now);
@@ -220,7 +221,7 @@ function interpretNaturalWhen(text: string, now: Date, tz: string): NaturalWhen 
         return { kind: "date", localDateISO: toLocalISODateTZ(addDaysTZ(today, 2, tz)), period: parseDayPeriod(t) };
     }
 
-    // Fechas explícitas: "15/10", "15-10", "15 de octubre", "15 de octubre de 2025", "15/10/2026"
+    // "15/10", "15-10", "15 de octubre", "15 de octubre de 2025", "15/10/2026"
     const dm =
         /(\b\d{1,2})\s*(?:\/|\-|de\s+)?\s*(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|\d{1,2})(?:\s*(?:de)?\s*(\d{4}))?/i.exec(t);
     if (dm) {
@@ -236,7 +237,7 @@ function interpretNaturalWhen(text: string, now: Date, tz: string): NaturalWhen 
         let candidate = new Date(year, month, day);
         const todayMid = new Date(today.getFullYear(), today.getMonth(), today.getDate());
 
-        // Si no hay año explícito y la fecha ya pasó, empuja al año siguiente
+        // Sin año explícito y la fecha ya pasó → empuja al próximo año
         if (!explicitYear && candidate < todayMid) {
             candidate = new Date(year + 1, month, day);
         }
@@ -244,7 +245,7 @@ function interpretNaturalWhen(text: string, now: Date, tz: string): NaturalWhen 
         return { kind: "date", localDateISO: toLocalISODateTZ(candidate), period: parseDayPeriod(t) };
     }
 
-    // Día de semana + día del mes: "jueves 15", "miércoles 3 de noviembre", opcional año
+    // "jueves 15", "miércoles 3 de noviembre", opcional año
     const wdDm =
         /(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s+(\d{1,2})(?:\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre))?(?:\s*(?:de)?\s*(\d{4}))?/i.exec(t);
     if (wdDm) {
@@ -257,7 +258,7 @@ function interpretNaturalWhen(text: string, now: Date, tz: string): NaturalWhen 
         let cand = new Date(year, month, day);
         const todayMid = new Date(today.getFullYear(), today.getMonth(), today.getDate());
 
-        // Si no hay año explícito y quedó en el pasado, empujar un mes
+        // Sin año explícito y en el pasado → empuja un mes
         if (!explicitYear && cand < todayMid) {
             cand = new Date(year, month + 1, day);
         }
@@ -267,7 +268,6 @@ function interpretNaturalWhen(text: string, now: Date, tz: string): NaturalWhen 
 
     return null;
 }
-
 
 /* ====== Extracción de hora (minutos locales) → HH:mm ====== */
 function extractHHmm(text: string): string | null {
@@ -310,6 +310,33 @@ function matchService(text: string, procs: KBProcLite[]): { id: number; name: st
     return best ? { id: best.id, name: best.name } : null;
 }
 
+/* ===== Micro-respuestas empáticas (texto opcional) ===== */
+function buildMicroReply(intent: BookingIntent, slots: NLUResult["slots"], missing: NLUResult["missing"] | undefined): string | undefined {
+    const faltan = (k: "date" | "time" | "service" | "name" | "phone") => missing?.includes(k);
+    switch (intent) {
+        case "GREET":
+            return "¡Hola! 😊 ¿En qué te ayudo hoy?";
+        case "INFO":
+            return "Con gusto te cuento. ¿De qué servicio te gustaría saber más?";
+        case "ASK_SLOTS":
+            if (slots.time_of_day && !slots.date) return "Perfecto, reviso horarios en esa franja y te paso opciones. ⏰";
+            return "Genial, te comparto disponibilidad cercana. ⏳";
+        case "BOOK":
+            if (faltan("name") || faltan("phone")) return "¡Casi listo! Solo necesito tu nombre y teléfono para confirmar. 🙌";
+            return "Excelente, reservo ese horario para ti. ✅";
+        case "CHOOSE":
+            return "¡Perfecto! Tomo esa opción y te confirmo. 👍";
+        case "RESCHEDULE":
+            return "Claro, movemos tu cita. Dime el día/franja y lo ajusto. 🔁";
+        case "CANCEL":
+            return "Entendido, gestiono la cancelación. 🗑️";
+        case "UNSURE":
+            return "Para ayudarte mejor, ¿me dices el día y la hora aproximada que prefieres? 🙂";
+        default:
+            return undefined;
+    }
+}
+
 /* ====== INTÉRPRETE PRINCIPAL ====== */
 export function interpretUserMessage(
     text: string,
@@ -328,6 +355,7 @@ export function interpretUserMessage(
     const wantsInfo = INFO_RE.test(tLower);
     const accepted = ACCEPT_RE.test(tLower);
     const ord = ordinalIndex(tLower);
+    const isAvailQuestion = AVAIL_QUESTION_RE.test(tLower);
 
     // servicio
     const svc = matchService(tLower, kb.procedures);
@@ -343,7 +371,6 @@ export function interpretUserMessage(
         const m = NAME_RE.exec(t);
         return m ? cleanCapturedName(m[2]) : null;
     })();
-
 
     // 2) “solo nombre” (sin números/horas/días/meses)
     const looksLikeOnlyName =
@@ -364,17 +391,31 @@ export function interpretUserMessage(
         phone = normalizePhone(best);
     }
 
-    // Intención bruta
+    // ---------- Decisión de intención (más natural) ----------
     let intent: BookingIntent = "UNSURE";
     let confidence = 0.5;
 
-    if (wantsCancel) { intent = "CANCEL"; confidence = 0.9; }
-    else if (wantsResched) { intent = "RESCHEDULE"; confidence = 0.85; }
-    else if (ord) { intent = "CHOOSE"; confidence = 0.85; }
-    else if (accepted && (time || when)) { intent = "BOOK"; confidence = 0.8; }
-    else if (time || when || time_of_day) { intent = "ASK_SLOTS"; confidence = 0.75; }
-    else if (wantsPrice || wantsInfo) { intent = "INFO"; confidence = 0.7; }
-    else if (greet) { intent = "GREET"; confidence = 0.6; }
+    const hasConcreteWhen = Boolean(when);                 // date/weekday/nearest
+    const hasSpecificTime = Boolean(time || time_of_day);  // hora exacta o franja
+
+    if (wantsCancel) {
+        intent = "CANCEL"; confidence = 0.9;
+    } else if (wantsResched) {
+        intent = "RESCHEDULE"; confidence = 0.85;
+    } else if (ord) {
+        intent = "CHOOSE"; confidence = 0.85;
+    } else if (hasConcreteWhen && hasSpecificTime && !(isAvailQuestion && !(name && phone))) {
+        // Fecha + hora/franja → BOOK directo, salvo que sea pregunta y sin contacto
+        intent = "BOOK"; confidence = 0.82;
+    } else if (accepted && (time || when)) {
+        intent = "BOOK"; confidence = Math.max(confidence, 0.82);
+    } else if (hasConcreteWhen || hasSpecificTime || isAvailQuestion) {
+        intent = "ASK_SLOTS"; confidence = 0.75;
+    } else if (wantsPrice || wantsInfo) {
+        intent = "INFO"; confidence = 0.7;
+    } else if (greet) {
+        intent = "GREET"; confidence = 0.6;
+    }
 
     // Slots normalizados
     const slots: NLUResult["slots"] = {
@@ -397,18 +438,16 @@ export function interpretUserMessage(
         confidence = Math.max(confidence, 0.82);
     }
 
-    // Faltantes según intent
+    // Faltantes según intent (relajado)
     const missing: NLUResult["missing"] = [];
     if (intent === "BOOK") {
         if (!slots.date && !when) missing.push("date");
         if (!slots.time && !slots.time_of_day) missing.push("time");
-        if (!slots.serviceId && !slots.serviceName) missing.push("service");
         if (!slots.name) missing.push("name");
         if (!slots.phone) missing.push("phone");
     } else if (intent === "ASK_SLOTS") {
-        // Si hay solo franja (morning/afternoon/evening), dejamos que schedule proponga sin exigir fecha
+        // Si solo hay franja, dejamos que schedule proponga sin exigir fecha
         if (!slots.date && !when && !slots.time_of_day) missing.push("date");
-
     } else if (intent === "CHOOSE") {
         if (!slots.choice_index) missing.push("time");
     }
@@ -418,14 +457,20 @@ export function interpretUserMessage(
         confidence = 0.45;
     }
 
+    const microReply = buildMicroReply(intent, slots, missing);
+
     return {
         intent,
         confidence,
         missing: missing.length ? missing : undefined,
         slots,
+        microReply,
         debug: {
             raw,
-            signals: { greet, wantsCancel, wantsResched, wantsPrice, wantsInfo, accepted, ord, name, phone, svc, when, time_of_day, time }
+            signals: {
+                greet, wantsCancel, wantsResched, wantsPrice, wantsInfo, accepted, ord,
+                isAvailQuestion, name, phone, svc, when, time_of_day, time
+            }
         }
     };
 }
