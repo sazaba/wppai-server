@@ -1044,6 +1044,7 @@ export async function handleSchedulingTurn(params: {
             reply: `Perfecto. ¿Para qué *día/franja* quieres mover tu cita (*${appt.serviceName}*)? (ej.: *jueves en la tarde*, *mañana*, *la más próxima*)`,
             patch: {
                 ...basePatch,
+                lastPhoneSeen: phone,
                 // 🔥 RESET duro para arrancar limpio el flujo de reagendar
                 slotsCache: undefined,
                 lastIntent: "reschedule",
@@ -1089,6 +1090,7 @@ export async function handleSchedulingTurn(params: {
                     procedureName: svc.name,
                     durationMin: duration,
                     stage: "offer",
+                    rescheduleApptId: undefined,
                 },
                 ...basePatch,
             },
@@ -1336,6 +1338,7 @@ export async function handleSchedulingTurn(params: {
                     procedureName: svc.name,
                     durationMin: duration,
                     stage: "offer",
+                    rescheduleApptId: undefined,
                 },
                 slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                 ...basePatch,
@@ -1373,6 +1376,7 @@ export async function handleSchedulingTurn(params: {
                     procedureName: svc.name,
                     durationMin: duration,
                     stage: "offer",
+                    rescheduleApptId: undefined,
                 },
                 slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                 ...basePatch,
@@ -1394,6 +1398,7 @@ export async function handleSchedulingTurn(params: {
                 name: state.draft?.name ?? ex.name ?? undefined,
                 phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
                 stage: "confirm",
+                rescheduleApptId: undefined,
             };
             const local = utcToZonedTime(new Date(slotISO), tz);
             const fecha = local.toLocaleDateString("es-CO", {
@@ -1455,6 +1460,7 @@ export async function handleSchedulingTurn(params: {
                                 name: state.draft?.name ?? ex.name ?? undefined,
                                 phone: state.draft?.phone ?? (ex.phone || state.lastPhoneSeen) ?? undefined,
                                 stage: "confirm",
+                                rescheduleApptId: undefined,
                             },
                             slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                             ...basePatch,
@@ -1475,6 +1481,8 @@ export async function handleSchedulingTurn(params: {
                         procedureName: svc.name,
                         durationMin: duration,
                         stage: "offer",
+                        rescheduleApptId: undefined,
+
                     },
                     slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                     ...basePatch,
@@ -1553,6 +1561,7 @@ export async function handleSchedulingTurn(params: {
                     procedureName: svc.name,
                     durationMin: duration,
                     stage: "offer",
+                    rescheduleApptId: undefined,
                 },
                 slotsCache: { items: labeledAll, expiresAt: nowPlusMin(25) },
                 ...basePatch,
