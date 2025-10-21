@@ -1150,8 +1150,9 @@ export async function handleSchedulingTurn(params: {
         const hora = local ? formatAmPmLocal(local) : "hora por confirmar";
 
         // Auto-insert si ya tenemos todo y el usuario aceptó
+        // Auto-insert: si ya tenemos todo, confirmamos (aunque el último mensaje sea solo nombre/teléfono)
         const hasAll = Boolean(nextDraft.whenISO && nextDraft.name && nextDraft.phone);
-        if (accepting && hasAll) {
+        if (hasAll) {
             try {
                 const endISO = addMinutes(
                     new Date(nextDraft.whenISO!),

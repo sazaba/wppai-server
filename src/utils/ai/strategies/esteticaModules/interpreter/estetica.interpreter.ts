@@ -4,6 +4,8 @@
    - No toca DB; usa solo KB en memoria
    - Totalmente determinista + heurísticas ligeras
 ============================================================ */
+// ⬇️ Agrega esto al inicio del archivo (o junto a otras imports)
+import { utcToZonedTime, zonedTimeToUtc, format as tzFormat } from "date-fns-tz";
 
 export type DayPeriod = "morning" | "afternoon" | "evening";
 
@@ -55,6 +57,28 @@ const DAY_WORDS: Record<string, number> = {
     domingo: 0, lunes: 1, martes: 2, miercoles: 3, miércoles: 3, jueves: 4, viernes: 5,
     sabado: 6, sábado: 6
 };
+
+/* ===== Helpers de fecha con TZ del negocio ===== */
+function todayInTZ(tz: string, now: Date = new Date()): Date {
+    const z = utcToZonedTime(now, tz);
+    // normalizamos a medianoche local
+    return new Date(z.getFullYear(), z.getMonth(), z.getDate());
+}
+
+function addDaysTZ(baseLocal: Date, days: number, tz: string): Date {
+    // baseLocal se asume ya “local” (YYYY-MM-DD local)
+    const d = new Date(baseLocal.getFullYear(), baseLocal.getMonth(), baseLocal.getDate());
+    d.setDate(d.getDate() + days);
+    return d;
+}
+
+function toLocalISODateTZ(dLocal: Date): string {
+    const y = dLocal.getFullYear();
+    const m = String(dLocal.getMonth() + 1).padStart(2, "0");
+    const d = String(dLocal.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+}
+
 
 const MONTHS: Record<string, number> = {
     enero: 0, febrero: 1, marzo: 2, abril: 3, mayo: 4, junio: 5,
@@ -156,10 +180,13 @@ function toLocalISODate(d: Date) {
     return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
-function interpretNaturalWhen(text: string, now: Date): NaturalWhen | null {
+// Acepta TZ del negocio y año explícito cuando el usuario lo provee
+// Acepta TZ del negocio y año explícito cuando el usuario lo provee
+function interpretNaturalWhen(text: string, now: Date, tz: string): NaturalWhen | null {
     const t = text.trim().toLowerCase();
+    const today = todayInTZ(tz, now);
 
-    // próxima semana
+    // "jueves de la próxima semana / semana que viene / la otra semana"
     const nextWeekWd = new RegExp(
         `(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo).{0,30}(pr[oó]xima\\s+semana|semana\\s+que\\s+viene|otra\\s+semana)`,
         "i"
@@ -182,56 +209,65 @@ function interpretNaturalWhen(text: string, now: Date): NaturalWhen | null {
         return { kind: "nearest", period: parseDayPeriod(t) };
     }
 
-    // "mañana" / "pasado mañana" / "hoy"
-    if (/\bpasado\s*ma[ñn]ana\b/.test(t)) {
-        const d = dayjsLike(now, 2);
-        return { kind: "date", localDateISO: toLocalISODate(d), period: parseDayPeriod(t) };
+    // "hoy / mañana / pasado mañana"
+    if (/\bhoy\b/.test(t)) {
+        return { kind: "date", localDateISO: toLocalISODateTZ(today), period: parseDayPeriod(t) };
     }
     if (/\bma[ñn]ana\b/.test(t)) {
-        const d = dayjsLike(now, 1);
-        return { kind: "date", localDateISO: toLocalISODate(d), period: parseDayPeriod(t) };
+        return { kind: "date", localDateISO: toLocalISODateTZ(addDaysTZ(today, 1, tz)), period: parseDayPeriod(t) };
     }
-    if (/\bhoy\b/.test(t)) {
-        const d = dayjsLike(now, 0);
-        return { kind: "date", localDateISO: toLocalISODate(d), period: parseDayPeriod(t) };
+    if (/\bpasado\s*ma[ñn]ana\b/.test(t)) {
+        return { kind: "date", localDateISO: toLocalISODateTZ(addDaysTZ(today, 2, tz)), period: parseDayPeriod(t) };
     }
 
-    // "15/10" o "15-10" o "15 de octubre"
+    // Fechas explícitas: "15/10", "15-10", "15 de octubre", "15 de octubre de 2025", "15/10/2026"
     const dm =
-        /(\b\d{1,2})\s*(?:\/|\-|de\s+)?\s*(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|\d{1,2})/i.exec(
-            t
-        );
+        /(\b\d{1,2})\s*(?:\/|\-|de\s+)?\s*(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre|\d{1,2})(?:\s*(?:de)?\s*(\d{4}))?/i.exec(t);
     if (dm) {
         const day = parseInt(dm[1], 10);
         const monthToken = dm[2].toLowerCase();
-        const year = now.getFullYear();
-        const month = /\d{1,2}/.test(monthToken) ? Math.max(0, Math.min(11, parseInt(monthToken, 10) - 1)) : MONTHS[monthToken];
+        const explicitYear = dm[3] ? parseInt(dm[3], 10) : null;
+
+        const year = explicitYear ?? today.getFullYear();
+        const month = /\d{1,2}/.test(monthToken)
+            ? Math.max(0, Math.min(11, parseInt(monthToken, 10) - 1))
+            : MONTHS[monthToken];
+
         let candidate = new Date(year, month, day);
-        if (candidate < new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
+        const todayMid = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+        // Si no hay año explícito y la fecha ya pasó, empuja al año siguiente
+        if (!explicitYear && candidate < todayMid) {
             candidate = new Date(year + 1, month, day);
         }
-        return { kind: "date", localDateISO: toLocalISODate(candidate), period: parseDayPeriod(t) };
+
+        return { kind: "date", localDateISO: toLocalISODateTZ(candidate), period: parseDayPeriod(t) };
     }
 
-    // "jueves 15", "miércoles 3 de noviembre"
+    // Día de semana + día del mes: "jueves 15", "miércoles 3 de noviembre", opcional año
     const wdDm =
-        /(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s+(\d{1,2})(?:\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre))?/i.exec(
-            t
-        );
+        /(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s+(\d{1,2})(?:\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre))?(?:\s*(?:de)?\s*(\d{4}))?/i.exec(t);
     if (wdDm) {
         const wd = DAY_WORDS[normalizeNoDiacritics(wdDm[1]).toLowerCase()];
         const day = parseInt(wdDm[2], 10);
-        const month = wdDm[3] ? MONTHS[wdDm[3].toLowerCase()] : now.getMonth();
-        const year = now.getFullYear();
+        const month = wdDm[3] ? MONTHS[wdDm[3].toLowerCase()] : today.getMonth();
+        const explicitYear = wdDm[4] ? parseInt(wdDm[4], 10) : null;
+        const year = explicitYear ?? today.getFullYear();
+
         let cand = new Date(year, month, day);
-        if (cand < new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
+        const todayMid = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+        // Si no hay año explícito y quedó en el pasado, empujar un mes
+        if (!explicitYear && cand < todayMid) {
             cand = new Date(year, month + 1, day);
         }
-        return { kind: "date", localDateISO: toLocalISODate(cand), period: parseDayPeriod(t) };
+
+        return { kind: "date", localDateISO: toLocalISODateTZ(cand), period: parseDayPeriod(t) };
     }
 
     return null;
 }
+
 
 /* ====== Extracción de hora (minutos locales) → HH:mm ====== */
 function extractHHmm(text: string): string | null {
@@ -297,7 +333,7 @@ export function interpretUserMessage(
     const svc = matchService(tLower, kb.procedures);
 
     // fecha y franja
-    const when = interpretNaturalWhen(tLower, now);
+    const when = interpretNaturalWhen(tLower, now, kb.timezone);
     const time_of_day = parseDayPeriod(tLower);
     const time = extractHHmm(tLower);
 
@@ -370,7 +406,9 @@ export function interpretUserMessage(
         if (!slots.name) missing.push("name");
         if (!slots.phone) missing.push("phone");
     } else if (intent === "ASK_SLOTS") {
-        if (!slots.date && !when) missing.push("date");
+        // Si hay solo franja (morning/afternoon/evening), dejamos que schedule proponga sin exigir fecha
+        if (!slots.date && !when && !slots.time_of_day) missing.push("date");
+
     } else if (intent === "CHOOSE") {
         if (!slots.choice_index) missing.push("time");
     }
