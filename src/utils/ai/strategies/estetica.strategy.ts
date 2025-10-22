@@ -12,7 +12,8 @@ import {
     type EsteticaKB,
 } from "./esteticaModules/domain/estetica.kb";
 
-import { RUN_AGENT_TURN } from "../strategies/esteticaModules/interpreter/estetica.facade";
+import { handleScheduleTurn as runSchedule } from "./esteticaModules/schedule/estetica.schedule";
+
 
 
 
@@ -535,76 +536,44 @@ export async function handleEsteticaReply(args: {
 
 
 
-    /* ====== AGENDA – delegada por completo al módulo (RUN_AGENT_TURN) ====== */
+    /* ====== AGENDA – full-agent (estetica.schedule) ====== */
     {
-        const kbMinimal = {
-            vertical: kb.vertical,
-            timezone: kb.timezone,
-            bufferMin: kb.bufferMin ?? null,
-            defaultServiceDurationMin: kb.defaultServiceDurationMin ?? null,
-            procedures: (kb.procedures ?? []).map((p) => ({
-                id: p.id,
-                name: p.name,
-                durationMin: p.durationMin ?? null,
-            })),
-        } as const;
-
-        const sched = await RUN_AGENT_TURN({
-            text: contenido,
+        // El nuevo módulo ya maneja: preguntar día, "lo más pronto", validar AppointmentHour/Exception,
+        // actualizar conversation_state y hacer INSERT/UPDATE/DELETE según corresponda.
+        const sched = await runSchedule({
             empresaId,
-            kb: kbMinimal,
-            state: {
-                draft: state.draft,
-                lastIntent: state.lastIntent,
-                lastServiceId: state.lastServiceId,
-                lastServiceName: state.lastServiceName,
-                slotsCache: state.slotsCache,
-                lastPhoneSeen: (state as any).lastPhoneSeen ?? null,
-            },
-            intent, // "schedule" | "reschedule" | "cancel" | "info" | "price" | "other"
-            granularityMin: CONF.GRAN_MIN,
-            daysHorizon: CONF.DAYS_HORIZON,
-            maxSlots: CONF.MAX_SLOTS,
-            serviceInContext: service
-                ? { id: service.id, name: service.name, durationMin: service.durationMin ?? null }
-                : null,
-            nlu: undefined, // si luego conectas tu NLU, pásalo aquí
-            now: new Date(),
+            conversationId,
+            userText: contenido,
         });
 
-        if (sched.patch) await patchState(conversationId, sched.patch as any);
+        // Determina si ya se concretó una acción (book/reschedule/cancel) para marcar respondido.
+        const committed =
+            sched?.updatedState?.commitTrace?.lastAction === "booked" ||
+            sched?.updatedState?.commitTrace?.lastAction === "rescheduled" ||
+            sched?.updatedState?.commitTrace?.lastAction === "canceled";
 
-        if (sched.handled) {
-            const reply = (sched.reply || "").trim();
-            if (reply) {
-                const saved = await persistBotReply({
-                    conversationId,
-                    empresaId,
-                    texto: reply,
-                    nuevoEstado: sched.createOk ? ConversationEstado.respondido : ConversationEstado.en_proceso,
-                    to: toPhone ?? conversacion.phone,
-                    phoneNumberId,
-                });
-                if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-                return {
-                    estado: sched.createOk ? "respondido" : "en_proceso",
-                    mensaje: saved.texto,
-                    messageId: saved.messageId,
-                    wamid: saved.wamid,
-                    media: [],
-                };
-            }
+        const replyText = (sched?.text || "").trim();
+
+        if (replyText) {
+            const saved = await persistBotReply({
+                conversationId,
+                empresaId,
+                texto: replyText,
+                nuevoEstado: committed ? ConversationEstado.respondido : ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return {
-                estado: sched.createOk ? "respondido" : "en_proceso",
-                mensaje: sched.reply || "",
+                estado: committed ? "respondido" : "en_proceso",
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
                 media: [],
             };
         }
     }
     /* ====== FIN AGENDA ====== */
-
-
-
 
 
 
