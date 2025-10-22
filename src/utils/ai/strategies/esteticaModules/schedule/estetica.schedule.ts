@@ -1,21 +1,21 @@
 /* =======================================================================
    Estética – SCHEDULE (Full Agent + conversation_state)
    - Conversational CRUD bridge contra BD (Prisma)
-   - Maneja cambio de opinión, lista de opciones y elección natural
-   - Mantiene un Summary útil como “lookup” al calendario
+   - Cambio de opinión, lista de opciones y elección natural
+   - Anáforas (“ese día”) y commit con nombre+teléfono
    ======================================================================= */
 
 import prisma from "../../../../../lib/prisma";
 import type { AppointmentStatus, Weekday } from "@prisma/client";
 import { loadEsteticaKB, type EsteticaKB } from "../domain/estetica.kb";
 import {
-    addMinutes, endOfDay, isBefore, isAfter, parseISO, formatISO, isEqual, differenceInMinutes
+    addMinutes, endOfDay, isBefore, isAfter, parseISO, formatISO, isEqual
 } from "date-fns";
 import { utcToZonedTime, zonedTimeToUtc, format as tzFormat } from "date-fns-tz";
 import { es as esLocale } from "date-fns/locale";
 
 /* ======================== Tipos públicos ======================== */
-export type ISO = string; // ISO-8601
+export type ISO = string;
 export type Phone = string;
 export type DayPeriod = "morning" | "afternoon" | "evening";
 export type FlowIntent = "BOOK" | "RESCHEDULE" | "CANCEL" | "ASK_SLOTS" | "INFO";
@@ -32,23 +32,15 @@ export type ConversationState = {
     };
     dateRequest?: {
         raw?: string | null;
-        dateISO?: ISO | null;
+        dateISO?: ISO | null;              // inicio del día (zona Bogotá)
         period?: DayPeriod | null;
         preferredHour?: number | null;
         preferredMinute?: number | null;
     };
-    /** Lista de opciones ofrecidas en el último turno */
     offeredSlots?: Array<{ id: string; startISO: ISO; endISO: ISO; staffId?: number | null; label: string }>;
-    /** Elección del usuario (por ordinal u hora) */
     chosenSlotId?: string | null;
 
-    /** Propuesta “actual” cuando solo hay una */
-    proposedSlot?: {
-        startISO?: ISO | null;
-        endISO?: ISO | null;
-        staffId?: number | null;
-        reason?: string | null;
-    };
+    proposedSlot?: { startISO?: ISO | null; endISO?: ISO | null; staffId?: number | null; reason?: string | null };
 
     identity?: { name?: string | null; phone?: Phone | null };
     commitTrace?: { lastAction?: "booked" | "rescheduled" | "canceled" | null; appointmentId?: number | null; at?: ISO | null };
@@ -56,12 +48,7 @@ export type ConversationState = {
     expireAt?: ISO | null;
 };
 
-/** Respuesta para WhatsApp/Chat */
-export type BotReply = {
-    text: string;
-    quickReplies?: string[];
-    updatedState?: ConversationState;
-};
+export type BotReply = { text: string; quickReplies?: string[]; updatedState?: ConversationState };
 
 /* ======================== Config ======================== */
 const TZ = "America/Bogota";
@@ -73,13 +60,17 @@ const MAX_OFFERS = 4;
 /* ======================== Utils tiempo ======================== */
 const toBogota = (iso: ISO) => utcToZonedTime(parseISO(iso), TZ);
 const fromBogota = (d: Date) => formatISO(zonedTimeToUtc(d, TZ));
-const fmtHuman = (iso: ISO) =>
-    tzFormat(parseISO(iso), "EEE dd 'de' MMM, h:mm a", { timeZone: TZ, locale: esLocale }).replace(/\./g, "");
+const fmtHuman = (iso: ISO) => tzFormat(parseISO(iso), "EEE dd 'de' MMM, h:mm a", { timeZone: TZ, locale: esLocale }).replace(/\./g, "");
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
-const between = (x: Date, a: Date, b: Date) =>
-    (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
+const between = (x: Date, a: Date, b: Date) => (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
 const toWeekday = (d: Date): Weekday => (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d.getDay()] as Weekday);
 const nowISO = () => new Date().toISOString();
+
+function startOfDayBogotaFromISO(iso: ISO): ISO {
+    const d = toBogota(iso);
+    d.setHours(0, 0, 0, 0);
+    return fromBogota(d);
+}
 
 /* ======================== Conversation State ======================== */
 const expireIn = (min: number) => new Date(Date.now() + min * 60_000).toISOString();
@@ -112,7 +103,7 @@ function makeSummary(state: ConversationState): string {
     if (act === "canceled") return `Cita cancelada${who ? ` • ${who}` : ""}`;
     if (offered) return `Opciones: ${svc} • ${offered}`;
     if (slot) return `Propuesta: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
-    if (state.dateRequest?.dateISO) return `Buscando: ${svc} • ${fmtHuman(state.dateRequest.dateISO)}`;
+    if (state.dateRequest?.dateISO) return `Buscando: ${svc} • ${tzFormat(parseISO(state.dateRequest.dateISO), "EEE dd MMM", { timeZone: TZ, locale: esLocale })}`;
     return `Flujo ${state.intent ?? "ASK_SLOTS"} en curso para ${svc}`;
 }
 
@@ -121,7 +112,7 @@ function detectIntent(text: string): FlowIntent | null {
     const t = (text || "").toLowerCase();
     if (/\b(cancelar|anular)\b/.test(t)) return "CANCEL";
     if (/\b(reagendar|reprogramar|mover|cambiar)\b/.test(t)) return "RESCHEDULE";
-    if (/\b(agendar|reservar|programar|agenda|horarios|disponibilidad)\b/.test(t)) return "BOOK";
+    if (/\b(agendar|reservar|programar|agenda|horarios|disponibilidad|quiero|podemos)\b/.test(t)) return "BOOK";
     if (/\b(info|informaci[oó]n|indicaciones|contraindicaciones|en qu[eé] consiste)\b/.test(t)) return "INFO";
     return null;
 }
@@ -131,13 +122,16 @@ function wantsMostRecent(text: string): boolean {
 }
 function isAffirm(text: string): boolean {
     const t = (text || "").toLowerCase();
-    return /\b(s[ií]|ok|vale|listo|me sirve|confirmo|de acuerdo)\b/.test(t);
+    return /\b(s[ií]|ok|vale|listo|me sirve|confirmo|de acuerdo|hagamos|perfecto)\b/.test(t);
 }
 function parseDatePeriod(text: string): {
-    dateISO?: ISO | null; period?: DayPeriod | null; preferredHour?: number | null; preferredMinute?: number | null;
+    dateISO?: ISO | null; period?: DayPeriod | null; preferredHour?: number | null; preferredMinute?: number | null; anaphoraSameDay?: boolean;
 } {
     const t = (text || "").toLowerCase().trim();
     if (!t) return {};
+
+    // anáfora “ese día”
+    const anaphoraSameDay = /\b(ese\s+mismo\s+d[ií]a|ese\s+d[ií]a|el\s+mismo\s+d[ií]a)\b/.test(t);
 
     // periodo
     let period: DayPeriod | null = null;
@@ -176,7 +170,7 @@ function parseDatePeriod(text: string): {
         if (add === 0 && /\bpr[oó]xim|siguiente\b/.test(t)) add = 7;
         const d = new Date(base); d.setDate(base.getDate() + add);
         dateISO = fromBogota(d);
-    } else if (delta >= 0 && (/\bhoy\b/.test(t) || /\bma[nñ]ana\b/.test(t) || /\bpasad[oa]\s+ma[nñ]ana\b/.test(t))) {
+    } else if (/\bhoy\b/.test(t) || /\bma[nñ]ana\b/.test(t) || /\bpasad[oa]\s+ma[nñ]ana\b/.test(t)) {
         const d = new Date(base); d.setDate(base.getDate() + delta);
         dateISO = fromBogota(d);
     }
@@ -188,7 +182,7 @@ function parseDatePeriod(text: string): {
         dateISO = fromBogota(dt);
     }
 
-    return { dateISO, period, preferredHour, preferredMinute };
+    return { dateISO, period, preferredHour, preferredMinute, anaphoraSameDay };
 }
 function extractIdentity(text: string): { name?: string | null; phone?: Phone | null } {
     const t = (text || "").trim();
@@ -200,16 +194,18 @@ function extractIdentity(text: string): { name?: string | null; phone?: Phone | 
 }
 
 /* ======================== KB wrappers ======================== */
+// ➤ IMPORTANT: si NO se menciona un servicio, NO hacemos fallback al primero.
+//   Así evitamos que el bot “salude con contexto” proponiendo Limpieza facial.
 function getServiceCandidate(kb: EsteticaKB, text: string | undefined) {
     const t = (text || "").toLowerCase();
-    const byAlias = kb.procedures.find(p =>
+    const svc = kb.procedures.find(p =>
         [p.name.toLowerCase(), ...(p.aliases || []).map(a => a.toLowerCase())].some(a => t.includes(a))
-    );
-    const svc = byAlias || kb.procedures.find(p => p.enabled !== false) || null;
+    ) || null;
+
     return {
         id: svc?.id ?? null,
         name: svc?.name ?? null,
-        durationMin: svc?.durationMin ?? kb.defaultServiceDurationMin ?? 60,
+        durationMin: (svc?.durationMin ?? kb.defaultServiceDurationMin ?? 60),
         priceMin: svc?.priceMin ?? null,
         requiresStaffIds: (svc?.requiredStaffIds as any) || null,
     };
@@ -218,11 +214,7 @@ function getRules(kb: EsteticaKB) {
     const morning = { start: "08:00", end: "12:00" };
     const afternoon = { start: "12:00", end: "17:00" };
     const evening = { start: "17:00", end: "20:00" };
-    return {
-        bufferMin: typeof kb.bufferMin === "number" ? kb.bufferMin : 0,
-        offerWindowDays: SEARCH_HORIZON_DAYS,
-        morning, afternoon, evening,
-    };
+    return { bufferMin: typeof kb.bufferMin === "number" ? kb.bufferMin : 0, offerWindowDays: SEARCH_HORIZON_DAYS, morning, afternoon, evening };
 }
 
 /* ======================== Disponibilidad ======================== */
@@ -357,9 +349,7 @@ async function collectFreeSlots(args: {
     return out;
 }
 
-async function validateAvailability(args: {
-    empresaId: number; startISO: ISO; endISO: ISO; staffId?: number | null;
-}): Promise<{ ok: boolean; reason?: string | null }> {
+async function validateAvailability(args: { empresaId: number; startISO: ISO; endISO: ISO; staffId?: number | null; }): Promise<{ ok: boolean; reason?: string | null }> {
     const { empresaId, startISO, endISO, staffId } = args;
     const startBo = toBogota(startISO);
     const endBo = toBogota(endISO);
@@ -432,9 +422,7 @@ async function findActiveByPhone(empresaId: number, phone: Phone) {
         : null;
 }
 
-async function reschedule(args: {
-    empresaId: number; appointmentId: number; nextStartISO: ISO; nextEndISO: ISO; nextStaffId?: number | null;
-}) {
+async function reschedule(args: { empresaId: number; appointmentId: number; nextStartISO: ISO; nextEndISO: ISO; nextStaffId?: number | null; }) {
     const { appointmentId, nextStartISO, nextEndISO, nextStaffId = null } = args;
     const upd = await prisma.appointment.update({
         where: { id: appointmentId },
@@ -481,13 +469,14 @@ function pickOfferedByUtterance(utterance: string, offered: ConversationState["o
         if (suf?.includes("pm") && h < 12) h += 12;
         if (suf?.includes("am") && h === 12) h = 0;
 
+        // elegir el slot más cercano a esa hora
         const best = offered.reduce<{ id: string; diff: number } | null>((acc, s) => {
             const d = toBogota(s.startISO);
             const diff = Math.abs(d.getHours() * 60 + d.getMinutes() - (h * 60 + m));
             if (!acc || diff < acc.diff) return { id: s.id, diff };
             return acc;
         }, null);
-        if (best && best.diff <= 20) return best.id; // tolerancia
+        if (best && best.diff <= 25) return best.id;
     }
 
     return null;
@@ -498,7 +487,7 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
     const { empresaId, conversationId, userText } = args;
 
     const kbOrNull = await loadEsteticaKB({ empresaId });
-    if (!kbOrNull) return { text: "Por ahora no tengo la configuración de la clínica para ofrecer horarios. Puedo pasarte con un asesor humano." };
+    if (!kbOrNull) return { text: "Por ahora no tengo la configuración de la clínica para ofrecer horarios. ¿Te paso con un asesor humano?" };
 
     const kb = kbOrNull as EsteticaKB;
     const rules = getRules(kb);
@@ -508,61 +497,61 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
     const intentNow = detectIntent(userText) ?? prev.intent ?? (wantsMostRecent(userText) ? "BOOK" : "ASK_SLOTS");
 
     const svcFromText = getServiceCandidate(kb, userText);
-    const serviceChanged = svcFromText.name && svcFromText.name !== prev.serviceCandidate?.name;
+    const serviceChanged = !!svcFromText.name && svcFromText.name !== prev.serviceCandidate?.name;
     const service = serviceChanged ? svcFromText : (prev.serviceCandidate ?? svcFromText);
 
-    // Si cambió el servicio → limpiar propuestas previas
+    // Si NO hay servicio aún → pedirlo (no proponemos por defecto)
+    if (!service?.name && (intentNow === "BOOK" || intentNow === "ASK_SLOTS")) {
+        const next: ConversationState = { ...prev, intent: "BOOK", serviceCandidate: service };
+        next.summaryText = makeSummary(next);
+        await saveConvState(conversationId, next);
+        const qrs = kb.procedures.slice(0, 4).map(p => p.name);
+        return { text: "¿Qué servicio te gustaría agendar?", quickReplies: qrs, updatedState: next };
+    }
+
+    // Reset si cambió el servicio
     const baseState: ConversationState = serviceChanged
         ? { ...prev, serviceCandidate: service, proposedSlot: {}, offeredSlots: [], chosenSlotId: null }
         : { ...prev, serviceCandidate: service };
 
     if (intentNow === "CANCEL") return await flowCancel({ empresaId, conversationId, userText, state: baseState });
-    if (intentNow === "RESCHEDULE") return await flowReschedule({
-        empresaId, conversationId, userText, state: baseState, durationMin: service.durationMin ?? 60
-    });
+    if (intentNow === "RESCHEDULE") {
+        return await flowReschedule({ empresaId, conversationId, userText, state: baseState, durationMin: service.durationMin ?? 60 });
+    }
 
-    return await flowBooking({
-        empresaId,
-        conversationId,
-        userText,
-        state: baseState,
-        service,
-        durationMin: service.durationMin ?? 60,
-        rules
-    });
+    return await flowBooking({ empresaId, conversationId, userText, state: baseState, service, durationMin: service.durationMin ?? 60, rules });
 }
 
 /* ======================== Booking Flow ======================== */
 async function flowBooking(args: {
-    empresaId: number;
-    conversationId: number;
-    userText: string;
-    state: ConversationState;
-    service: NonNullable<ConversationState["serviceCandidate"]>;
-    durationMin: number;
+    empresaId: number; conversationId: number; userText: string; state: ConversationState;
+    service: NonNullable<ConversationState["serviceCandidate"]>; durationMin: number;
     rules: ReturnType<typeof getRules>;
 }): Promise<BotReply> {
     const { empresaId, conversationId, userText, state, service, durationMin, rules } = args;
 
-    // 1) Parsear fecha/franja/hora; permitir sobrescribir si el usuario cambió de idea
     const parsed = parseDatePeriod(userText);
     const nearest = wantsMostRecent(userText);
-    const dateISO = parsed.dateISO ?? state.dateRequest?.dateISO ?? null;
+
+    // anáfora “ese día”: usar último día conocido (dateRequest o primera opción ofrecida)
+    let dateISO = parsed.dateISO ?? state.dateRequest?.dateISO ?? null;
+    if (parsed.anaphoraSameDay && !parsed.dateISO) {
+        const fromOffered = state.offeredSlots?.[0]?.startISO ? startOfDayBogotaFromISO(state.offeredSlots[0].startISO) : null;
+        dateISO = dateISO ?? fromOffered ?? null;
+    }
     const period = parsed.period ?? state.dateRequest?.period ?? null;
 
-    // 2) Si ya ofrecimos opciones, intenta mapear la elección natural
+    // 2) intentar mapear elección natural sobre opciones existentes
     let chosenSlotId = pickOfferedByUtterance(userText, state.offeredSlots);
     let offered = state.offeredSlots ?? [];
 
-    // 3) Si ya hay elegido y llega identidad o afirmación, intenta commit directo
+    // 3) si ya eligió y da afirmación/identidad → commit
     if (chosenSlotId && (isAffirm(userText) || extractIdentity(userText).phone || extractIdentity(userText).name)) {
         const chosen = offered.find(s => s.id === chosenSlotId)!;
-        return await tryCommitBooking({
-            empresaId, conversationId, state, service, slot: chosen, userText
-        });
+        return await tryCommitBooking({ empresaId, conversationId, state, service, slot: chosen, userText });
     }
 
-    // 4) Si no hay fecha y tampoco “lo más pronto”, pregunta
+    // 4) si no hay fecha ni “lo más pronto”, preguntar fecha/franja
     if (!dateISO && !nearest && !offered.length) {
         const next: ConversationState = {
             ...state, intent: "BOOK", serviceCandidate: service,
@@ -571,16 +560,16 @@ async function flowBooking(args: {
         next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
         return {
-            text: `¿Tienes un día en mente para *${service.name ?? "el servicio"}*? Si prefieres, te propongo *lo más pronto posible*.`,
+            text: `¿Tienes un día en mente para *${service.name}*? Si prefieres, te propongo *lo más pronto posible*.`,
             quickReplies: ["Hoy en la tarde", "Mañana", "Viernes en la mañana", "Lo más pronto"],
             updatedState: next,
         };
     }
 
-    // 5) Obtener varias opciones
+    // 5) buscar opciones (si usuario dijo “9:45” sin elegir de la lista, igual buscamos ese día cerca de esa hora)
     const slots = await collectFreeSlots({
         empresaId,
-        dateISO: nearest ? null : dateISO,
+        dateISO: nearest ? null : (dateISO ? startOfDayBogotaFromISO(dateISO) : null),
         durationMin,
         bufferMin: rules.bufferMin,
         staffIdsPreferred: service.requiresStaffIds ?? null,
@@ -590,66 +579,48 @@ async function flowBooking(args: {
         max: MAX_OFFERS,
     });
 
-    // 6) Si no hay, sugerir alternativas
     if (!slots.length) {
         const next: ConversationState = {
-            ...state,
-            intent: "BOOK",
-            serviceCandidate: service,
+            ...state, intent: "BOOK", serviceCandidate: service,
             dateRequest: {
                 raw: userText ?? state.dateRequest?.raw ?? null,
-                dateISO,
+                dateISO: dateISO ?? null,
                 period: period ?? null,
                 preferredHour: parsed.preferredHour ?? state.dateRequest?.preferredHour ?? null,
                 preferredMinute: parsed.preferredMinute ?? state.dateRequest?.preferredMinute ?? null,
             },
-            offeredSlots: [],
-            chosenSlotId: null,
-            proposedSlot: {},
+            offeredSlots: [], chosenSlotId: null, proposedSlot: {},
         };
         next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
-        return {
-            text: `No veo cupos para esa fecha/franja. ¿Quieres que proponga *lo más pronto* o prefieres otro día?`,
-            quickReplies: ["Lo más pronto", "Este jueves", "La próxima semana"],
-            updatedState: next,
-        };
+        return { text: `No veo cupos para esa fecha/franja. ¿Quieres *lo más pronto* o prefieres otro día?`, quickReplies: ["Lo más pronto", "Este jueves", "La próxima semana"], updatedState: next };
     }
 
-    // 7) Validar primero (por si cambió algo justo ahora)
-    const validFirst = await validateAvailability({
-        empresaId, startISO: slots[0].startISO, endISO: slots[0].endISO, staffId: slots[0].staffId ?? undefined
-    });
-    if (!validFirst.ok) {
-        // filtrar inválidos y dejar lo válido
-        const filtered: FreeSlot[] = [];
-        for (const s of slots) {
-            const ok = await validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined });
-            if (ok.ok) filtered.push(s);
-        }
-        if (!filtered.length) {
-            const next = { ...state, offeredSlots: [], chosenSlotId: null, proposedSlot: {} } as ConversationState;
-            next.summaryText = makeSummary(next);
-            await saveConvState(conversationId, next);
-            return { text: "Los cupos cambiaron mientras reservábamos. ¿Intentamos con *otras opciones* o *lo más pronto*?", updatedState: next };
-        }
+    // validar uno (y filtrar si cambió algo)
+    const valid = await Promise.all(slots.map(s => validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined })));
+    const validSlots = slots.filter((_, i) => valid[i].ok);
+    if (!validSlots.length) {
+        const next = { ...state, offeredSlots: [], chosenSlotId: null, proposedSlot: {} } as ConversationState;
+        next.summaryText = makeSummary(next);
+        await saveConvState(conversationId, next);
+        return { text: "Los cupos cambiaron mientras reservábamos. ¿Intentamos con *otras opciones* o *lo más pronto*?", updatedState: next };
     }
 
-    // 8) Construir lista human friendly
-    offered = slots.slice(0, MAX_OFFERS).map((s, i) => {
-        const a = toBogota(s.startISO), b = toBogota(s.endISO);
+    // construir lista
+    offered = validSlots.slice(0, MAX_OFFERS).map((s, i) => {
+        const a = toBogota(s.startISO);
         const label = `${tzFormat(a, "EEE dd MMM", { timeZone: TZ, locale: esLocale })} • ${tzFormat(a, "h:mm a", { timeZone: TZ, locale: esLocale })}`;
         return { id: `opt_${i}_${s.startISO}`, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? null, label };
     });
 
-    // 9) Actualizar estado
+    // estado base actualizado
     const nextBase: ConversationState = {
         ...state,
         intent: "BOOK",
         serviceCandidate: service,
         dateRequest: {
             raw: userText ?? state.dateRequest?.raw ?? null,
-            dateISO,
+            dateISO: dateISO ?? null,
             period: period ?? null,
             preferredHour: parsed.preferredHour ?? state.dateRequest?.preferredHour ?? null,
             preferredMinute: parsed.preferredMinute ?? state.dateRequest?.preferredMinute ?? null,
@@ -661,37 +632,37 @@ async function flowBooking(args: {
     nextBase.summaryText = makeSummary(nextBase);
     await saveConvState(conversationId, nextBase);
 
-    // 10) Si en este mismo turno nos eligió por ordinal/hora, intentar commit
-    if (!chosenSlotId) chosenSlotId = pickOfferedByUtterance(userText, offered);
+    // si dijo “9:45” y no hizo match por ID, elegir el más cercano ahora
+    if (!chosenSlotId && (parsed.preferredHour != null)) {
+        chosenSlotId = pickOfferedByUtterance(userText, offered);
+    }
     if (chosenSlotId) {
         const slot = offered.find(x => x.id === chosenSlotId)!;
         return await tryCommitBooking({ empresaId, conversationId, state: nextBase, service, slot, userText });
     }
 
-    // 11) Ofrecer opciones (con precio “Desde”)
+    // ofrecer opciones y esperar elección
     const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
     const lines = offered.map((s, i) => `${i + 1}) *${s.label}*`).join("\n");
     return {
-        text: `Para *${service.name ?? "el servicio"}*${priceLabel} te propongo:\n${lines}\n\nDime “la 2” o “10:30”.`,
+        text: `Para *${service.name}*${priceLabel} te propongo:\n${lines}\n\nDime “la 2” o “10:30”.`,
         quickReplies: offered.slice(0, 3).map((s, i) => `${i + 1}) ${s.label}`),
         updatedState: nextBase,
     };
 }
 
-/* ---------- Intento de commit cuando ya hay slot elegido + identidad ---------- */
+/* ---------- Commit con slot elegido + identidad ---------- */
 async function tryCommitBooking(args: {
-    empresaId: number;
-    conversationId: number;
-    state: ConversationState;
+    empresaId: number; conversationId: number; state: ConversationState;
     service: NonNullable<ConversationState["serviceCandidate"]>;
     slot: { startISO: ISO; endISO: ISO; staffId?: number | null; label?: string };
     userText: string;
 }): Promise<BotReply> {
     const { empresaId, conversationId, state, service, slot, userText } = args;
 
-    const idtFromTurn = extractIdentity(userText);
-    const name = idtFromTurn.name ?? state.identity?.name ?? null;
-    const phone = idtFromTurn.phone ?? state.identity?.phone ?? null;
+    const idt = extractIdentity(userText);
+    const name = idt.name ?? state.identity?.name ?? null;
+    const phone = idt.phone ?? state.identity?.phone ?? null;
 
     if (!name || !phone) {
         const ns: ConversationState = {
@@ -739,7 +710,7 @@ async function tryCommitBooking(args: {
     await saveConvState(conversationId, done);
 
     const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
-    return { text: `¡Listo **${name}**! Agendé *${service.name ?? "tu servicio"}${priceLabel}* para *${fmtHuman(slot.startISO)}*.`, updatedState: done };
+    return { text: `¡Listo **${name}**! Agendé *${service.name}${priceLabel}* para *${fmtHuman(slot.startISO)}*.`, updatedState: done };
 }
 
 /* ======================== Reschedule Flow ======================== */
