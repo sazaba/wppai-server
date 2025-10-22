@@ -47,6 +47,7 @@ export type ConversationState = {
         appointmentId?: number | null;
         at?: ISO | null;
     };
+    summaryText?: string | null; // ⬅️ resumen operativo corto
     expireAt?: ISO | null;
 };
 
@@ -94,6 +95,22 @@ async function saveConvState(conversationId: number, next: ConversationState) {
     });
 }
 const expireIn = (min: number) => new Date(Date.now() + min * 60_000).toISOString();
+
+/* ======================== Resumen operativo ======================== */
+function makeSummary(state: ConversationState): string {
+    const svc = state.serviceCandidate?.name ?? "servicio";
+    const slot = state.proposedSlot?.startISO ? fmtHuman(state.proposedSlot.startISO) : null;
+    const who = state.identity?.name ?? null;
+    const act = state.commitTrace?.lastAction;
+
+    if (act === "booked" && slot) return `Cita confirmada: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
+    if (act === "rescheduled" && slot) return `Cita reagendada: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
+    if (act === "canceled") return `Cita cancelada${who ? ` • ${who}` : ""}`;
+
+    if (slot) return `Propuesta: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
+    if (state.dateRequest?.dateISO) return `Buscando: ${svc} • ${fmtHuman(state.dateRequest.dateISO)}`;
+    return `Flujo ${state.intent ?? "ASK_SLOTS"} en curso para ${svc}`;
+}
 
 /* ======================== NLP determinista ======================== */
 function detectIntent(text: string): FlowIntent | null {
@@ -531,6 +548,7 @@ async function flowBooking(args: {
             intent: "BOOK",
             serviceCandidate: service,
         };
+        next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
         return {
             text: `¿Tienes un día en mente para *${service.name ?? "el servicio"}*? Puedo revisar disponibilidad. Si prefieres, te propongo *lo más pronto posible*.`,
@@ -557,10 +575,11 @@ async function flowBooking(args: {
     };
 
     if (!slot) {
-        const next = {
+        const next: ConversationState = {
             ...nextBase,
             proposedSlot: { startISO: null, endISO: null, staffId: null, reason: nearest ? "first_free_slot" : "user_requested_date" }
         };
+        next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
         return {
             text: `No veo cupos para esa fecha/franja. ¿Quieres que proponga *lo más pronto* o prefieres otro día?`,
@@ -576,7 +595,8 @@ async function flowBooking(args: {
         staffId: slot.staffId ?? undefined
     });
     if (!valid.ok) {
-        const next = { ...nextBase, proposedSlot: { startISO: null, endISO: null, staffId: null, reason: "validation_failed" } };
+        const next: ConversationState = { ...nextBase, proposedSlot: { startISO: null, endISO: null, staffId: null, reason: "validation_failed" } };
+        next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
         return {
             text: `Se liberó un horario pero ya no cumple reglas internas. ¿Probamos con otra opción cercana o *lo más pronto*?`,
@@ -595,6 +615,7 @@ async function flowBooking(args: {
             reason: nearest ? "first_free_slot" : "user_requested_date"
         },
     };
+    proposed.summaryText = makeSummary(proposed);
     await saveConvState(conversationId, proposed);
 
     // ¿Vino nombre y teléfono en este turno?
@@ -619,6 +640,7 @@ async function flowBooking(args: {
                 identity: { name: idt.name, phone: idt.phone },
                 commitTrace: { lastAction: "booked", appointmentId: commit.appointmentId, at: nowISO() },
             };
+            done.summaryText = makeSummary(done);
             await saveConvState(conversationId, done);
 
             const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
@@ -649,7 +671,8 @@ async function flowReschedule(args: {
     const idt = state.identity ?? extractIdentity(userText);
     const phone = idt.phone ?? null;
     if (!phone) {
-        const ns = { ...state, intent: "RESCHEDULE" } as ConversationState;
+        const ns: ConversationState = { ...state, intent: "RESCHEDULE" };
+        ns.summaryText = makeSummary(ns);
         await saveConvState(conversationId, ns);
         return { text: `Para reagendar, ¿me confirmas tu *teléfono* asociado a la cita?`, updatedState: ns };
     }
@@ -667,6 +690,7 @@ async function flowReschedule(args: {
             identity: { ...(state.identity ?? {}), phone },
             commitTrace: { ...state.commitTrace, appointmentId: active.id, lastAction: null, at: null },
         };
+        ns.summaryText = makeSummary(ns);
         await saveConvState(conversationId, ns);
         return {
             text: `¿Para qué día te gustaría moverla? Puedo proponerte la opción más próxima disponible.`,
@@ -709,6 +733,7 @@ async function flowReschedule(args: {
         proposedSlot: { ...slot, reason: "reschedule" },
         commitTrace: { lastAction: "rescheduled", appointmentId: active.id, at: nowISO() },
     };
+    ns.summaryText = makeSummary(ns);
     await saveConvState(conversationId, ns);
 
     return { text: `¡Hecho! Tu cita quedó para *${fmtHuman(slot.startISO)}*. ¿Necesitas algo más?`, updatedState: ns };
@@ -727,6 +752,7 @@ async function flowCancel(args: {
 
     if (!phone) {
         const ns: ConversationState = { ...state, intent: "CANCEL" };
+        ns.summaryText = makeSummary(ns);
         await saveConvState(conversationId, ns);
         return { text: `Para cancelar, ¿me confirmas el *teléfono* asociado a la cita?`, updatedState: ns };
     }
@@ -743,6 +769,7 @@ async function flowCancel(args: {
         identity: { ...(state.identity ?? {}), phone },
         commitTrace: { lastAction: "canceled", appointmentId: active.id, at: nowISO() },
     };
+    ns.summaryText = makeSummary(ns);
     await saveConvState(conversationId, ns);
 
     return { text: `Listo, cancelé tu cita. Si quieres, puedo proponerte nueva fecha.`, updatedState: ns };
