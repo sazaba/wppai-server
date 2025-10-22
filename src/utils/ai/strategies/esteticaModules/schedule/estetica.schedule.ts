@@ -10,6 +10,7 @@ import type { AppointmentStatus, Weekday } from "@prisma/client";
 import { loadEsteticaKB, type EsteticaKB } from "../domain/estetica.kb";
 import { addMinutes, endOfDay, isBefore, isAfter, parseISO, formatISO, isEqual } from "date-fns";
 import { utcToZonedTime, zonedTimeToUtc, format as tzFormat } from "date-fns-tz";
+import { es } from "date-fns/locale";
 
 /* ======================== Tipos públicos ======================== */
 export type ISO = string; // ISO-8601
@@ -47,7 +48,7 @@ export type ConversationState = {
         appointmentId?: number | null;
         at?: ISO | null;
     };
-    summaryText?: string | null; // ⬅️ resumen operativo corto
+    summaryText?: string | null; // resumen operativo corto
     expireAt?: ISO | null;
 };
 
@@ -68,14 +69,12 @@ const SEARCH_HORIZON_DAYS = 21;
 const toBogota = (iso: ISO) => utcToZonedTime(parseISO(iso), TZ);
 const fromBogota = (d: Date) => formatISO(zonedTimeToUtc(d, TZ));
 const fmtHuman = (iso: ISO) =>
-    tzFormat(parseISO(iso), "EEE dd 'de' MMM, h:mm a", { timeZone: TZ, locale: undefined }).replace(/\./g, "");
+    tzFormat(parseISO(iso), "EEE d 'de' MMM, h:mm a", { timeZone: TZ, locale: es }).replace(/\./g, "");
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
-const between = (x: Date, a: Date, b: Date) =>
-    (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
+const between = (x: Date, a: Date, b: Date) => (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
 const toWeekday = (d: Date): Weekday => {
     const dow = d.getDay(); // 0 Sun .. 6 Sat
-    // ADAPTA si tu enum Weekday tiene otro orden/valores.
-    return (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dow] as Weekday);
+    return (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][dow] as Weekday); // adapta si tu enum difiere
 };
 const nowISO = () => new Date().toISOString();
 
@@ -125,32 +124,39 @@ function wantsMostRecent(text: string): boolean {
     const t = (text || "").toLowerCase();
     return /\b(m[aá]s\s+pronto|m[aá]s\s+reciente|lo\s+m[aá]s\s+cerca|primer[oa]\s+disponible|lo\s+m[aá]s\s+pronto)\b/.test(t);
 }
-function parseDatePeriod(text: string): { dateISO?: ISO | null; period?: DayPeriod | null } {
+
+/** Distingue “en la mañana” (periodo) de “mañana” (día siguiente) y soporta “ese día” */
+function parseDatePeriod(text: string): { dateISO?: ISO | null; period?: DayPeriod | null; keepSameDay?: boolean } {
     const t = (text || "").toLowerCase().trim();
     if (!t) return {};
-    // Detección simple de periodo
-    let period: DayPeriod | null = null;
-    if (/\b(ma[nñ]ana|mañana)\b/.test(t) || /\b(8|9|10|11)\s*(:\d\d)?\s*(am|a\.m\.)\b/.test(t)) period = "morning";
-    if (/\b(tarde)\b/.test(t) || /\b(12|13|14|15|16|17)\b/.test(t)) period = "afternoon";
-    if (/\b(noche)\b/.test(t) || /\b(18|19|20|21)\b/.test(t)) period = "evening";
 
-    // Días relativos
+    const keepSameDay = /\b(ese\s+d[ií]a|ese\s+mismo\s+d[ií]a)\b/.test(t);
+    const saysMorningPhrase = /\ben\s+la\s+ma[nñ]ana\b/.test(t);
+
+    let period: DayPeriod | null = null;
+    if (saysMorningPhrase || /\b(ma[nñ]ana\b)(?!\s*es)/.test(t)) period = "morning";
+    if (/\b(tarde)\b/.test(t)) period = "afternoon";
+    if (/\b(noche)\b/.test(t)) period = "evening";
+    if (/\b(8|9|10|11)\s*(:\d\d)?\s*(am|a\.m\.)\b/.test(t)) period = "morning";
+    if (/\b(12|13|14|15|16|17)\b/.test(t)) period = "afternoon";
+    if (/\b(18|19|20|21)\b/.test(t)) period = "evening";
+
     const today = new Date();
     const base = utcToZonedTime(today, TZ);
     base.setHours(0, 0, 0, 0);
 
     let delta = 0;
+    const saysTomorrow = /\bma[nñ]ana\b/.test(t) && !saysMorningPhrase;
     if (/\bhoy\b/.test(t)) delta = 0;
-    else if (/\bma[nñ]ana\b/.test(t)) delta = 1;
+    else if (saysTomorrow) delta = 1;
     else if (/\bpasad[o|a]\s*ma[nñ]ana\b/.test(t)) delta = 2;
 
-    // Nombres de días
     const wdMap: Record<string, number> = {
         lunes: 1, martes: 2, miercoles: 3, miércoles: 3, jueves: 4, viernes: 5, sabado: 6, sábado: 6, domingo: 0,
     };
     const wdMatch = t.match(/\b(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b/);
-    let dateISO: ISO | null = null;
 
+    let dateISO: ISO | null = null;
     if (wdMatch) {
         const target = wdMap[wdMatch[1]];
         const curr = base.getDay();
@@ -165,7 +171,6 @@ function parseDatePeriod(text: string): { dateISO?: ISO | null; period?: DayPeri
         dateISO = fromBogota(d);
     }
 
-    // ISO directo “YYYY-MM-DD”
     const ymd = t.match(/\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b/);
     if (ymd) {
         const [_, y, m, d] = ymd;
@@ -173,12 +178,12 @@ function parseDatePeriod(text: string): { dateISO?: ISO | null; period?: DayPeri
         dateISO = fromBogota(dt);
     }
 
-    return { dateISO, period };
+    return { dateISO, period, keepSameDay };
 }
+
 function extractIdentity(text: string): { name?: string | null; phone?: Phone | null } {
     const t = (text || "").trim();
     const phone = (t.match(/(\+?\d[\d\s-]{7,}\d)/)?.[1] || "").replace(/[^\d+]/g, "");
-    // nombre: heurística básica
     const name =
         t.match(/\b(mi\s+nombre\s+es|soy)\s+([A-Za-zÁÉÍÓÚáéíóúñÑ][\wÁÉÍÓÚáéíóúñÑ\s.'-]{2,})/i)?.[2]?.trim() ||
         undefined;
@@ -216,13 +221,11 @@ type OpenWindow = { start: Date; end: Date };
 type FreeSlot = { startISO: ISO; endISO: ISO; staffId?: number | null };
 
 async function getOpenWindowsForDay(empresaId: number, dayStart: Date): Promise<OpenWindow[]> {
-    // Horario base
     const weekday = toWeekday(dayStart);
     const hours = await prisma.appointmentHour.findUnique({
         where: { empresaId_day: { empresaId, day: weekday } },
     });
 
-    // Excepción del día (si existe)
     const ex = await prisma.appointmentException.findFirst({
         where: {
             empresaId,
@@ -230,7 +233,6 @@ async function getOpenWindowsForDay(empresaId: number, dayStart: Date): Promise<
         },
     });
 
-    // Helper HH:MM -> Date en TZ
     const mkDate = (base: Date, hhmm?: string | null) => {
         if (!hhmm) return null;
         const [hh, mm] = hhmm.split(":").map(Number);
@@ -242,7 +244,7 @@ async function getOpenWindowsForDay(empresaId: number, dayStart: Date): Promise<
     const blocks: OpenWindow[] = [];
 
     if (ex) {
-        if (ex.isOpen === false) return []; // cerrado todo el día
+        if (ex.isOpen === false) return [];
         const s1 = mkDate(dayStart, ex.start1);
         const e1 = mkDate(dayStart, ex.end1);
         const s2 = mkDate(dayStart, ex.start2);
@@ -269,8 +271,8 @@ async function findConflicts(empresaId: number, from: Date, to: Date, staffId?: 
             status: { in: ["pending", "confirmed", "rescheduled"] as AppointmentStatus[] },
             ...(staffId ? { staffId } : {}),
             AND: [
-                { startAt: { lt: to } }, // start < to
-                { endAt: { gt: from } }, // end > from (solape)
+                { startAt: { lt: to } },
+                { endAt: { gt: from } },
             ],
         },
         select: { id: true, startAt: true, endAt: true, staffId: true },
@@ -294,14 +296,12 @@ async function findFirstFreeSlot(args: {
     const horizonEnd = new Date(startDate);
     horizonEnd.setDate(horizonEnd.getDate() + SEARCH_HORIZON_DAYS);
 
-    // normalizar bufferMin a number
     const safeBuffer = typeof bufferMin === "number" ? bufferMin : 0;
 
     for (let day = new Date(startDate); isBefore(day, horizonEnd); day.setDate(day.getDate() + 1)) {
         const windows = await getOpenWindowsForDay(empresaId, day);
         if (!windows.length) continue;
 
-        // filtrar por periodo (si viene)
         const periodFilter = (w: OpenWindow): OpenWindow | null => {
             if (!period) return w;
             const copy: OpenWindow = { start: new Date(w.start), end: new Date(w.end) };
@@ -319,9 +319,7 @@ async function findFirstFreeSlot(args: {
             const block = periodFilter(w);
             if (!block) continue;
 
-            // granularidad
             let cursor = new Date(block.start);
-            // si es el mismo día y es “hoy”, adelantar a ahora+buffer
             const today = utcToZonedTime(new Date(), TZ);
             if (cursor.toDateString() === today.toDateString()) {
                 const nowPlus = addMinutes(today, clamp(safeBuffer, 0, 240));
@@ -337,8 +335,7 @@ async function findFirstFreeSlot(args: {
                 const candidateStart = new Date(cursor);
                 const candidateEnd = addMinutes(candidateStart, durationMin);
 
-                // Revisión de choques
-                const staffList = staffIdsPreferred && staffIdsPreferred.length ? staffIdsPreferred : [null]; // si no se exige staff, permitir null
+                const staffList = staffIdsPreferred && staffIdsPreferred.length ? staffIdsPreferred : [null];
                 for (const st of staffList) {
                     const conflicts = await findConflicts(
                         empresaId,
@@ -348,7 +345,6 @@ async function findFirstFreeSlot(args: {
                     );
                     if (conflicts.length) continue;
 
-                    // Si no hay conflictos, retornamos
                     return {
                         startISO: fromBogota(candidateStart),
                         endISO: fromBogota(candidateEnd),
@@ -359,6 +355,37 @@ async function findFirstFreeSlot(args: {
         }
     }
     return null;
+}
+
+/** Encuentra varias opciones consecutivas (hasta `limit`) */
+async function findNextSlots(args: {
+    empresaId: number;
+    startFromISO: ISO | null; // si null, desde hoy
+    durationMin: number;
+    bufferMin?: number | null;
+    staffIdsPreferred?: number[] | null;
+    period?: DayPeriod | null;
+    limit?: number;
+}): Promise<FreeSlot[]> {
+    const out: FreeSlot[] = [];
+    let cursorISO = args.startFromISO;
+
+    for (let i = 0; i < (args.limit ?? 3); i++) {
+        const slot = await findFirstFreeSlot({
+            empresaId: args.empresaId,
+            dateISO: cursorISO,
+            durationMin: args.durationMin,
+            bufferMin: args.bufferMin ?? 0,
+            staffIdsPreferred: args.staffIdsPreferred ?? null,
+            period: args.period ?? null,
+        });
+        if (!slot) break;
+        out.push(slot);
+        const nextStartLocal = toBogota(slot.startISO);
+        nextStartLocal.setMinutes(nextStartLocal.getMinutes() + 1);
+        cursorISO = fromBogota(nextStartLocal);
+    }
+    return out;
 }
 
 /** Valida que un rango esté dentro de ventanas abiertas + sin choques */
@@ -489,14 +516,20 @@ export async function handleScheduleTurn(
 
     const kbOrNull = await loadEsteticaKB({ empresaId });
     if (!kbOrNull) {
-        // Respuesta segura si falta la configuración
-        return {
-            text: "Por ahora no tengo la configuración de la clínica para ofrecer horarios. Te puedo pasar con un asesor humano o intentar más tarde.",
-        };
+        return { text: "Por ahora no tengo la configuración de la clínica para ofrecer horarios. Te puedo pasar con un asesor humano o intentar más tarde." };
     }
 
     const kb: EsteticaKB = kbOrNull;
-    const state = await loadConvState(conversationId);
+    let state = await loadConvState(conversationId);
+
+    // Reset suave si el usuario inicia con un saludo simple
+    const isGreeting = /^\s*(hola|buen[oa]s|hello|hi)\b/i.test(userText);
+    if (isGreeting && (state.intent || state.proposedSlot || state.summaryText)) {
+        state = { expireAt: expireIn(MEM_TTL_MIN) };
+        state.summaryText = makeSummary(state);
+        await saveConvState(conversationId, state);
+    }
+
     const rules = getRules(kb);
 
     const intent: FlowIntent =
@@ -538,8 +571,14 @@ async function flowBooking(args: {
 
     const parsed = parseDatePeriod(userText);
     const nearest = wantsMostRecent(userText);
-    const dateISO = parsed.dateISO ?? state.dateRequest?.dateISO ?? null;
+
+    // Respetar “ese día” (si ya había date en estado)
+    const baseDateISO = state.dateRequest?.dateISO ?? null;
+    const dateISO = parsed.keepSameDay ? (baseDateISO ?? parsed.dateISO ?? null) : (parsed.dateISO ?? baseDateISO);
     const period = parsed.period ?? state.dateRequest?.period ?? null;
+
+    // Opción “otras opciones”
+    const wantsMore = /\b(otra|otras|m[aá]s\s+opciones|otro\s+horario)\b/i.test(userText);
 
     // Si no hay fecha y tampoco “lo más pronto”, preguntamos
     if (!dateISO && !nearest) {
@@ -555,6 +594,35 @@ async function flowBooking(args: {
             quickReplies: ["Hoy en la tarde", "Mañana", "Este sábado", "Lo más pronto"],
             updatedState: next,
         };
+    }
+
+    if (wantsMore) {
+        const options = await findNextSlots({
+            empresaId,
+            startFromISO: nearest ? null : (dateISO ?? null),
+            durationMin,
+            bufferMin: rules.bufferMin,
+            staffIdsPreferred: service.requiresStaffIds ?? null,
+            period,
+            limit: 3,
+        });
+        if (options.length) {
+            const lines = options.map((s, i) => `${i + 1}. ${fmtHuman(s.startISO)}`).join("\n");
+            const ns: ConversationState = {
+                ...state,
+                intent: "BOOK",
+                serviceCandidate: service,
+                dateRequest: { raw: userText, dateISO: dateISO ?? null, period: period ?? null },
+                proposedSlot: { startISO: options[0].startISO, endISO: options[0].endISO, staffId: options[0].staffId ?? null, reason: "user_requested_date" },
+            };
+            ns.summaryText = makeSummary(ns);
+            await saveConvState(conversationId, ns);
+            return {
+                text: `Tengo estas opciones:\n${lines}\n\n¿Te funciona alguna? Si te va bien la #1, dime tu *nombre* y *teléfono* para confirmar.`,
+                quickReplies: ["La #1", "La #2", "La #3", "Otro día"],
+                updatedState: ns,
+            };
+        }
     }
 
     // Buscar slot (fecha dada o el primero libre)
