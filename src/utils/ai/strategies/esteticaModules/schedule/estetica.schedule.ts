@@ -68,10 +68,13 @@ const MAX_OFFERS = 4;
 /* ======================== Utils tiempo ======================== */
 const toBogota = (iso: ISO) => utcToZonedTime(parseISO(iso), TZ);
 const fromBogota = (d: Date) => formatISO(zonedTimeToUtc(d, TZ));
-const fmtHuman = (iso: ISO) => tzFormat(parseISO(iso), "EEE dd 'de' MMM, h:mm a", { timeZone: TZ, locale: esLocale }).replace(/\./g, "");
+const fmtHuman = (iso: ISO) =>
+    tzFormat(parseISO(iso), "EEE dd 'de' MMM, h:mm a", { timeZone: TZ, locale: esLocale }).replace(/\./g, "");
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
-const between = (x: Date, a: Date, b: Date) => (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
-const toWeekday = (d: Date): Weekday => (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d.getDay()] as Weekday);
+const between = (x: Date, a: Date, b: Date) =>
+    (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
+const toWeekday = (d: Date): Weekday =>
+    (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d.getDay()] as Weekday);
 const nowISO = () => new Date().toISOString();
 
 function startOfDayBogotaFromISO(iso: ISO): ISO {
@@ -124,7 +127,8 @@ function makeSummary(state: ConversationState): string {
     if (act === "canceled") return `Cita cancelada${who ? ` • ${who}` : ""}`;
     if (offered) return `Opciones: ${svc} • ${offered}`;
     if (slot) return `Propuesta: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
-    if (state.dateRequest?.dateISO) return `Buscando: ${svc} • ${tzFormat(parseISO(state.dateRequest.dateISO), "EEE dd MMM", { timeZone: TZ, locale: esLocale })}`;
+    if (state.dateRequest?.dateISO)
+        return `Buscando: ${svc} • ${tzFormat(parseISO(state.dateRequest.dateISO), "EEE dd MMM", { timeZone: TZ, locale: esLocale })}`;
     return `Flujo ${state.intent ?? "ASK_SLOTS"} en curso para ${svc}`;
 }
 
@@ -180,7 +184,8 @@ function parseDatePeriod(text: string): {
     else if (/\bma[nñ]ana\b/.test(t)) delta = 1;
     else if (/\bpasad[oa]\s+ma[nñ]ana\b/.test(t)) delta = 2;
 
-    const wdMap: Record<string, number> = { lunes: 1, martes: 2, miercoles: 3, miércoles: 3, jueves: 4, viernes: 5, sabado: 6, sábado: 6, domingo: 0 };
+    const wdMap: Record<string, number> =
+        { lunes: 1, martes: 2, miercoles: 3, miércoles: 3, jueves: 4, viernes: 5, sabado: 6, sábado: 6, domingo: 0 };
     const wdMatch = t.match(/\b(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b/);
     let dateISO: ISO | null = null;
 
@@ -189,10 +194,10 @@ function parseDatePeriod(text: string): {
         const curr = base.getDay();
         let add = (target - curr + 7) % 7;
         if (add === 0 && /\bpr[oó]xim|siguiente\b/.test(t)) add = 7;
-        const d = new Date(base); d.setDate(d.getDate() + add);
+        const d = new Date(base); d.setDate(base.getDate() + add);
         dateISO = fromBogota(d);
     } else if (/\bhoy\b/.test(t) || /\bma[nñ]ana\b/.test(t) || /\bpasad[oa]\s+ma[nñ]ana\b/.test(t)) {
-        const d = new Date(base); d.setDate(d.getDate() + delta);
+        const d = new Date(base); d.setDate(base.getDate() + delta);
         dateISO = fromBogota(d);
     }
 
@@ -333,22 +338,34 @@ async function collectFreeSlots(args: {
             // cursor inicial
             let cursor = new Date(block.start);
 
+            // Si pidió "tarde" y NO dio hora explícita, arrancar cerca de 14:00 para dar variedad
+            if (period === "afternoon" && typeof preferredHour !== "number") {
+                const pivot = new Date(day);
+                pivot.setHours(14, 0, 0, 0);
+                if (isAfter(pivot, block.start) && isBefore(pivot, block.end)) {
+                    cursor = pivot;
+                }
+            }
+
+            // Si el usuario dio hora preferida y cae dentro del bloque, cursor = esa hora
             if (typeof preferredHour === "number") {
                 const pref = new Date(day);
                 pref.setHours(preferredHour, preferredMinute ?? 0, 0, 0);
                 if (isAfter(pref, block.start) && isBefore(pref, block.end)) cursor = new Date(pref);
             }
 
-            // si es hoy: ahora + buffer
+            // Si es hoy: ahora + buffer
             const today = utcToZonedTime(new Date(), TZ);
             if (cursor.toDateString() === today.toDateString()) {
                 const nowPlus = addMinutes(today, clamp(safeBuffer, 0, 240));
                 if (isAfter(nowPlus, cursor)) cursor = nowPlus;
             }
 
-            for (; isBefore(addMinutes(cursor, durationMin), block.end) || isEqual(addMinutes(cursor, durationMin), block.end); cursor = addMinutes(cursor, GRAN_MIN)) {
+            // Generar slots SIN pasar el cierre del bloque (candidato debe terminar <= block.end)
+            for (; ;) {
                 const start = new Date(cursor);
                 const end = addMinutes(start, durationMin);
+                if (isAfter(end, block.end)) break;
 
                 const staffList = staffIdsPreferred && staffIdsPreferred.length ? staffIdsPreferred : [null];
                 for (const st of staffList) {
@@ -363,6 +380,7 @@ async function collectFreeSlots(args: {
                     out.push({ startISO: fromBogota(start), endISO: fromBogota(end), staffId: st ?? null });
                     if (out.length >= max) return out;
                 }
+                cursor = addMinutes(cursor, GRAN_MIN);
             }
         }
     }
@@ -626,11 +644,17 @@ async function flowBooking(args: {
         };
         next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
-        return { text: `No veo cupos para esa fecha/franja. ¿Quieres *lo más pronto* o prefieres otro día?`, quickReplies: ["Lo más pronto", "Este jueves", "La próxima semana"], updatedState: next };
+        return {
+            text: `No veo cupos para esa fecha/franja. ¿Quieres *lo más pronto* o prefieres otro día?`,
+            quickReplies: ["Lo más pronto", "Este jueves", "La próxima semana"],
+            updatedState: next
+        };
     }
 
     // validar y filtrar
-    const valid = await Promise.all(slots.map(s => validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined })));
+    const valid = await Promise.all(
+        slots.map(s => validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined }))
+    );
     const validSlots = slots.filter((_, i) => valid[i].ok);
     if (!validSlots.length) {
         const next = { ...state, offeredSlots: [], chosenSlotId: null, proposedSlot: {} } as ConversationState;
