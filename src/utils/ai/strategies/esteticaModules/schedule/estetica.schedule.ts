@@ -1,15 +1,15 @@
 /* =======================================================================
    Estética – SCHEDULE (Full Agent + conversation_state)
-   - Unifica diálogo + verificación real en BD + commit
-   - Sin interpreter/facade; FSM ligera y helpers deterministas
-   - Prisma Appointment/Hour/Exception + KB
+   - Conversational CRUD bridge contra BD (Prisma)
+   - Maneja cambio de opinión, lista de opciones y elección natural
+   - Mantiene un Summary útil como “lookup” al calendario
    ======================================================================= */
 
 import prisma from "../../../../../lib/prisma";
 import type { AppointmentStatus, Weekday } from "@prisma/client";
 import { loadEsteticaKB, type EsteticaKB } from "../domain/estetica.kb";
 import {
-    addMinutes, endOfDay, isBefore, isAfter, parseISO, formatISO, isEqual
+    addMinutes, endOfDay, isBefore, isAfter, parseISO, formatISO, isEqual, differenceInMinutes
 } from "date-fns";
 import { utcToZonedTime, zonedTimeToUtc, format as tzFormat } from "date-fns-tz";
 import { es as esLocale } from "date-fns/locale";
@@ -20,7 +20,7 @@ export type Phone = string;
 export type DayPeriod = "morning" | "afternoon" | "evening";
 export type FlowIntent = "BOOK" | "RESCHEDULE" | "CANCEL" | "ASK_SLOTS" | "INFO";
 
-/** Estado de la conversación persistido como JSON */
+/** Estado persistido */
 export type ConversationState = {
     intent?: FlowIntent;
     serviceCandidate?: {
@@ -34,29 +34,29 @@ export type ConversationState = {
         raw?: string | null;
         dateISO?: ISO | null;
         period?: DayPeriod | null;
-        preferredHour?: number | null;   // ⬅️ nueva pista: “4 pm”
-        preferredMinute?: number | null; // ⬅️
+        preferredHour?: number | null;
+        preferredMinute?: number | null;
     };
+    /** Lista de opciones ofrecidas en el último turno */
+    offeredSlots?: Array<{ id: string; startISO: ISO; endISO: ISO; staffId?: number | null; label: string }>;
+    /** Elección del usuario (por ordinal u hora) */
+    chosenSlotId?: string | null;
+
+    /** Propuesta “actual” cuando solo hay una */
     proposedSlot?: {
         startISO?: ISO | null;
         endISO?: ISO | null;
         staffId?: number | null;
-        reason?: string | null; // "first_free_slot" | "user_requested_date" | "reschedule" | "validation_failed"
+        reason?: string | null;
     };
-    identity?: {
-        name?: string | null;
-        phone?: Phone | null;
-    };
-    commitTrace?: {
-        lastAction?: "booked" | "rescheduled" | "canceled" | null;
-        appointmentId?: number | null;
-        at?: ISO | null;
-    };
+
+    identity?: { name?: string | null; phone?: Phone | null };
+    commitTrace?: { lastAction?: "booked" | "rescheduled" | "canceled" | null; appointmentId?: number | null; at?: ISO | null };
     summaryText?: string | null;
     expireAt?: ISO | null;
 };
 
-/** Respuesta para el canal (ej. WhatsApp) */
+/** Respuesta para WhatsApp/Chat */
 export type BotReply = {
     text: string;
     quickReplies?: string[];
@@ -66,15 +66,15 @@ export type BotReply = {
 /* ======================== Config ======================== */
 const TZ = "America/Bogota";
 const GRAN_MIN = 15;
-const MEM_TTL_MIN = 10;
+const MEM_TTL_MIN = 15;
 const SEARCH_HORIZON_DAYS = 21;
+const MAX_OFFERS = 4;
 
-/* ======================== Utilidades ======================== */
+/* ======================== Utils tiempo ======================== */
 const toBogota = (iso: ISO) => utcToZonedTime(parseISO(iso), TZ);
 const fromBogota = (d: Date) => formatISO(zonedTimeToUtc(d, TZ));
 const fmtHuman = (iso: ISO) =>
-    tzFormat(parseISO(iso), "EEE dd 'de' MMM, h:mm a", { timeZone: TZ, locale: esLocale })
-        .replace(/\./g, "");
+    tzFormat(parseISO(iso), "EEE dd 'de' MMM, h:mm a", { timeZone: TZ, locale: esLocale }).replace(/\./g, "");
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
 const between = (x: Date, a: Date, b: Date) =>
     (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
@@ -102,6 +102,7 @@ async function saveConvState(conversationId: number, next: ConversationState) {
 /* ======================== Summary ======================== */
 function makeSummary(state: ConversationState): string {
     const svc = state.serviceCandidate?.name ?? "servicio";
+    const offered = state.offeredSlots?.length ? state.offeredSlots.map((s, i) => `${i + 1}) ${s.label}`).join(" | ") : null;
     const slot = state.proposedSlot?.startISO ? fmtHuman(state.proposedSlot.startISO) : null;
     const who = state.identity?.name ?? null;
     const act = state.commitTrace?.lastAction;
@@ -109,7 +110,7 @@ function makeSummary(state: ConversationState): string {
     if (act === "booked" && slot) return `Cita confirmada: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
     if (act === "rescheduled" && slot) return `Cita reagendada: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
     if (act === "canceled") return `Cita cancelada${who ? ` • ${who}` : ""}`;
-
+    if (offered) return `Opciones: ${svc} • ${offered}`;
     if (slot) return `Propuesta: ${svc} • ${slot}${who ? ` • ${who}` : ""}`;
     if (state.dateRequest?.dateISO) return `Buscando: ${svc} • ${fmtHuman(state.dateRequest.dateISO)}`;
     return `Flujo ${state.intent ?? "ASK_SLOTS"} en curso para ${svc}`;
@@ -140,14 +141,14 @@ function parseDatePeriod(text: string): {
 
     // periodo
     let period: DayPeriod | null = null;
-    if (/\b(ma[nñ]ana|mañana)\b/.test(t) || /\b(8|9|10|11)\s*(:\d\d)?\s*(am|a\.m\.)\b/.test(t)) period = "morning";
-    if (/\b(tarde)\b/.test(t) || /\b(12|13|14|15|16|17)\b/.test(t)) period = "afternoon";
-    if (/\b(noche)\b/.test(t) || /\b(18|19|20|21)\b/.test(t)) period = "evening";
+    if (/\b(mañana|ma[nñ]ana)\b/.test(t)) period = "morning";
+    if (/\b(tarde)\b/.test(t)) period = "afternoon";
+    if (/\b(noche)\b/.test(t)) period = "evening";
 
-    // hora explícita: “4 pm”, “16:30”, “a las 5”
+    // hora explícita
     let preferredHour: number | null = null;
     let preferredMinute: number | null = 0;
-    const hm1 = t.match(/\b(\d{1,2})\s*(:\s*(\d{2}))?\s*(h|hrs|pm|a\.m\.|p\.m\.|am)?\b/);
+    const hm1 = t.match(/\b(\d{1,2})\s*(:\s*(\d{2}))?\s*(h|hrs|pm|p\.m\.|am|a\.m\.)?\b/);
     if (hm1) {
         let h = Number(hm1[1]);
         const m = hm1[3] ? Number(hm1[3]) : 0;
@@ -162,7 +163,7 @@ function parseDatePeriod(text: string): {
     let delta = 0;
     if (/\bhoy\b/.test(t)) delta = 0;
     else if (/\bma[nñ]ana\b/.test(t)) delta = 1;
-    else if (/\bpasad[o|a]\s*ma[nñ]ana\b/.test(t)) delta = 2;
+    else if (/\bpasad[oa]\s+ma[nñ]ana\b/.test(t)) delta = 2;
 
     const wdMap: Record<string, number> = { lunes: 1, martes: 2, miercoles: 3, miércoles: 3, jueves: 4, viernes: 5, sabado: 6, sábado: 6, domingo: 0 };
     const wdMatch = t.match(/\b(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b/);
@@ -175,7 +176,7 @@ function parseDatePeriod(text: string): {
         if (add === 0 && /\bpr[oó]xim|siguiente\b/.test(t)) add = 7;
         const d = new Date(base); d.setDate(base.getDate() + add);
         dateISO = fromBogota(d);
-    } else if (delta > 0 || /\bhoy\b/.test(t)) {
+    } else if (delta >= 0 && (/\bhoy\b/.test(t) || /\bma[nñ]ana\b/.test(t) || /\bpasad[oa]\s+ma[nñ]ana\b/.test(t))) {
         const d = new Date(base); d.setDate(base.getDate() + delta);
         dateISO = fromBogota(d);
     }
@@ -273,8 +274,8 @@ async function findConflicts(empresaId: number, from: Date, to: Date, staffId?: 
     });
 }
 
-/** Primer slot libre válido, respetando granulado/buffer/periodo/hora preferida */
-async function findFirstFreeSlot(args: {
+/** Colecciona N slots libres cumpliendo reglas */
+async function collectFreeSlots(args: {
     empresaId: number;
     dateISO?: ISO | null;
     durationMin: number;
@@ -283,19 +284,20 @@ async function findFirstFreeSlot(args: {
     period?: DayPeriod | null;
     preferredHour?: number | null;
     preferredMinute?: number | null;
-}): Promise<FreeSlot | null> {
+    max?: number;
+}): Promise<FreeSlot[]> {
     const {
         empresaId, dateISO, durationMin,
         bufferMin, staffIdsPreferred, period,
-        preferredHour, preferredMinute
+        preferredHour, preferredMinute, max = MAX_OFFERS
     } = args;
 
+    const out: FreeSlot[] = [];
     const startDate = dateISO ? toBogota(dateISO) : utcToZonedTime(new Date(), TZ);
     startDate.setHours(0, 0, 0, 0);
 
     const horizonEnd = new Date(startDate);
     horizonEnd.setDate(horizonEnd.getDate() + SEARCH_HORIZON_DAYS);
-
     const safeBuffer = typeof bufferMin === "number" ? bufferMin : 0;
 
     for (let day = new Date(startDate); isBefore(day, horizonEnd); day.setDate(day.getDate() + 1)) {
@@ -319,16 +321,13 @@ async function findFirstFreeSlot(args: {
             // cursor inicial
             let cursor = new Date(block.start);
 
-            // preferencia de hora dentro del día
             if (typeof preferredHour === "number") {
                 const pref = new Date(day);
                 pref.setHours(preferredHour, preferredMinute ?? 0, 0, 0);
-                if (isAfter(pref, block.start) && isBefore(pref, block.end)) {
-                    cursor = new Date(pref);
-                }
+                if (isAfter(pref, block.start) && isBefore(pref, block.end)) cursor = new Date(pref);
             }
 
-            // si es hoy, ahora+buffer
+            // si es hoy: ahora + buffer
             const today = utcToZonedTime(new Date(), TZ);
             if (cursor.toDateString() === today.toDateString()) {
                 const nowPlus = addMinutes(today, clamp(safeBuffer, 0, 240));
@@ -336,37 +335,30 @@ async function findFirstFreeSlot(args: {
             }
 
             for (; isBefore(addMinutes(cursor, durationMin), block.end) || isEqual(addMinutes(cursor, durationMin), block.end); cursor = addMinutes(cursor, GRAN_MIN)) {
-                const candidateStart = new Date(cursor);
-                const candidateEnd = addMinutes(candidateStart, durationMin);
+                const start = new Date(cursor);
+                const end = addMinutes(start, durationMin);
 
                 const staffList = staffIdsPreferred && staffIdsPreferred.length ? staffIdsPreferred : [null];
                 for (const st of staffList) {
                     const conflicts = await findConflicts(
                         empresaId,
-                        zonedTimeToUtc(candidateStart, TZ),
-                        zonedTimeToUtc(candidateEnd, TZ),
+                        zonedTimeToUtc(start, TZ),
+                        zonedTimeToUtc(end, TZ),
                         st ?? undefined
                     );
                     if (conflicts.length) continue;
 
-                    return {
-                        startISO: fromBogota(candidateStart),
-                        endISO: fromBogota(candidateEnd),
-                        staffId: st ?? null,
-                    };
+                    out.push({ startISO: fromBogota(start), endISO: fromBogota(end), staffId: st ?? null });
+                    if (out.length >= max) return out;
                 }
             }
         }
     }
-    return null;
+    return out;
 }
 
-/** Validación de disponibilidad real */
 async function validateAvailability(args: {
-    empresaId: number;
-    startISO: ISO;
-    endISO: ISO;
-    staffId?: number | null;
+    empresaId: number; startISO: ISO; endISO: ISO; staffId?: number | null;
 }): Promise<{ ok: boolean; reason?: string | null }> {
     const { empresaId, startISO, endISO, staffId } = args;
     const startBo = toBogota(startISO);
@@ -384,7 +376,6 @@ async function validateAvailability(args: {
         staffId ?? undefined
     );
     if (conflicts.length) return { ok: false, reason: "conflict" };
-
     return { ok: true };
 }
 
@@ -429,9 +420,7 @@ async function findActiveByPhone(empresaId: number, phone: Phone) {
     const now = new Date();
     const appt = await prisma.appointment.findFirst({
         where: {
-            empresaId,
-            customerPhone: phone,
-            deletedAt: null,
+            empresaId, customerPhone: phone, deletedAt: null,
             status: { in: ["pending", "confirmed", "rescheduled"] as AppointmentStatus[] },
             endAt: { gt: now },
         },
@@ -444,11 +433,7 @@ async function findActiveByPhone(empresaId: number, phone: Phone) {
 }
 
 async function reschedule(args: {
-    empresaId: number;
-    appointmentId: number;
-    nextStartISO: ISO;
-    nextEndISO: ISO;
-    nextStaffId?: number | null;
+    empresaId: number; appointmentId: number; nextStartISO: ISO; nextEndISO: ISO; nextStaffId?: number | null;
 }) {
     const { appointmentId, nextStartISO, nextEndISO, nextStaffId = null } = args;
     const upd = await prisma.appointment.update({
@@ -474,31 +459,77 @@ async function cancel(args: { empresaId: number; appointmentId: number }) {
     return { ok: true as const };
 }
 
-/* ======================== Motor principal ======================== */
-export async function handleScheduleTurn(
-    args: { empresaId: number; conversationId: number; userText: string; }
-): Promise<BotReply> {
+/* ======================== Elección humana sobre offeredSlots ======================== */
+function pickOfferedByUtterance(utterance: string, offered: ConversationState["offeredSlots"]): string | null {
+    if (!offered?.length) return null;
+    const t = (utterance || "").toLowerCase();
+
+    // “la segunda / la 2 / opción 2”
+    const ord = t.match(/\b(primera|segunda|tercera|cuarta|quinta|sexta|1|2|3|4|5|6)\b/);
+    if (ord) {
+        const map: Record<string, number> = { primera: 1, segunda: 2, tercera: 3, cuarta: 4, quinta: 5, sexta: 6 };
+        const n = isNaN(Number(ord[0])) ? map[ord[0]] : Number(ord[0]);
+        if (n && n >= 1 && n <= offered.length) return offered[n - 1].id;
+    }
+
+    // “la de las 5 / 17:30”
+    const hm = t.match(/\b(\d{1,2})(?::(\d{2}))?\s*(pm|p\.m\.|am|a\.m\.)?\b/);
+    if (hm) {
+        let h = Number(hm[1]);
+        const m = hm[2] ? Number(hm[2]) : 0;
+        const suf = hm[3]?.toLowerCase();
+        if (suf?.includes("pm") && h < 12) h += 12;
+        if (suf?.includes("am") && h === 12) h = 0;
+
+        const best = offered.reduce<{ id: string; diff: number } | null>((acc, s) => {
+            const d = toBogota(s.startISO);
+            const diff = Math.abs(d.getHours() * 60 + d.getMinutes() - (h * 60 + m));
+            if (!acc || diff < acc.diff) return { id: s.id, diff };
+            return acc;
+        }, null);
+        if (best && best.diff <= 20) return best.id; // tolerancia
+    }
+
+    return null;
+}
+
+/* ======================== Motor principal (public) ======================== */
+export async function handleScheduleTurn(args: { empresaId: number; conversationId: number; userText: string; }): Promise<BotReply> {
     const { empresaId, conversationId, userText } = args;
 
     const kbOrNull = await loadEsteticaKB({ empresaId });
-    if (!kbOrNull) {
-        return { text: "Por ahora no tengo la configuración de la clínica para ofrecer horarios. Puedo pasarte con un asesor humano." };
-    }
+    if (!kbOrNull) return { text: "Por ahora no tengo la configuración de la clínica para ofrecer horarios. Puedo pasarte con un asesor humano." };
 
-    const kb: EsteticaKB = kbOrNull;
-    const state = await loadConvState(conversationId);
+    const kb = kbOrNull as EsteticaKB;
     const rules = getRules(kb);
+    const prev = await loadConvState(conversationId);
 
-    const intent: FlowIntent =
-        detectIntent(userText) ?? state.intent ?? (wantsMostRecent(userText) ? "BOOK" : "ASK_SLOTS");
+    // 1) Intent y servicio (permitir cambio de opinión)
+    const intentNow = detectIntent(userText) ?? prev.intent ?? (wantsMostRecent(userText) ? "BOOK" : "ASK_SLOTS");
 
-    const service = state.serviceCandidate ?? getServiceCandidate(kb, userText);
-    const durationMin = service.durationMin ?? kb.defaultServiceDurationMin ?? 60;
+    const svcFromText = getServiceCandidate(kb, userText);
+    const serviceChanged = svcFromText.name && svcFromText.name !== prev.serviceCandidate?.name;
+    const service = serviceChanged ? svcFromText : (prev.serviceCandidate ?? svcFromText);
 
-    if (intent === "CANCEL") return await flowCancel({ empresaId, conversationId, userText, state });
-    if (intent === "RESCHEDULE") return await flowReschedule({ empresaId, conversationId, userText, state, durationMin });
+    // Si cambió el servicio → limpiar propuestas previas
+    const baseState: ConversationState = serviceChanged
+        ? { ...prev, serviceCandidate: service, proposedSlot: {}, offeredSlots: [], chosenSlotId: null }
+        : { ...prev, serviceCandidate: service };
 
-    return await flowBooking({ empresaId, conversationId, userText, state, service, durationMin, rules });
+    if (intentNow === "CANCEL") return await flowCancel({ empresaId, conversationId, userText, state: baseState });
+    if (intentNow === "RESCHEDULE") return await flowReschedule({
+        empresaId, conversationId, userText, state: baseState, durationMin: service.durationMin ?? 60
+    });
+
+    return await flowBooking({
+        empresaId,
+        conversationId,
+        userText,
+        state: baseState,
+        service,
+        durationMin: service.durationMin ?? 60,
+        rules
+    });
 }
 
 /* ======================== Booking Flow ======================== */
@@ -513,72 +544,41 @@ async function flowBooking(args: {
 }): Promise<BotReply> {
     const { empresaId, conversationId, userText, state, service, durationMin, rules } = args;
 
+    // 1) Parsear fecha/franja/hora; permitir sobrescribir si el usuario cambió de idea
     const parsed = parseDatePeriod(userText);
     const nearest = wantsMostRecent(userText);
     const dateISO = parsed.dateISO ?? state.dateRequest?.dateISO ?? null;
     const period = parsed.period ?? state.dateRequest?.period ?? null;
 
-    // 🔁 CONFIRMAR SLOT YA PROPUESTO: si hay propuesta en state y llega identidad/afirmación
-    if (state.proposedSlot?.startISO && !/otro|otra|cambiar|m[aá]s tarde|m[aá]s temprano/i.test(userText)) {
-        const idtNow = extractIdentity(userText);
-        const name = idtNow.name ?? state.identity?.name ?? null;
-        const phone = idtNow.phone ?? state.identity?.phone ?? null;
+    // 2) Si ya ofrecimos opciones, intenta mapear la elección natural
+    let chosenSlotId = pickOfferedByUtterance(userText, state.offeredSlots);
+    let offered = state.offeredSlots ?? [];
 
-        if (name || phone || isAffirm(userText)) {
-            if (!name || !phone) {
-                const ns: ConversationState = {
-                    ...state,
-                    intent: "BOOK",
-                    identity: { name: name ?? null, phone: phone ?? null },
-                };
-                ns.summaryText = makeSummary(ns);
-                await saveConvState(conversationId, ns);
-                return { text: `Perfecto. Para confirmar *${fmtHuman(state.proposedSlot.startISO)}*, ¿me compartes *nombre* y *teléfono*?`, updatedState: ns };
-            }
-
-            // commit usando el slot ya propuesto
-            const commit = await book({
-                empresaId,
-                serviceId: service.id ?? null,
-                serviceName: service.name ?? "Servicio",
-                serviceDurationMin: durationMin,
-                startISO: state.proposedSlot.startISO!,
-                endISO: state.proposedSlot.endISO!,
-                customerName: name,
-                customerPhone: phone,
-                staffId: state.proposedSlot.staffId ?? null,
-                source: "chat",
-            });
-
-            if (commit.ok) {
-                const done: ConversationState = {
-                    ...state,
-                    identity: { name, phone },
-                    commitTrace: { lastAction: "booked", appointmentId: commit.appointmentId, at: nowISO() },
-                };
-                done.summaryText = makeSummary(done);
-                await saveConvState(conversationId, done);
-
-                const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
-                return { text: `¡Listo! Agendé *${service.name ?? "tu servicio"}${priceLabel}* para *${fmtHuman(state.proposedSlot.startISO)}*. ¿Deseas agregar notas?`, updatedState: done };
-            }
-        }
+    // 3) Si ya hay elegido y llega identidad o afirmación, intenta commit directo
+    if (chosenSlotId && (isAffirm(userText) || extractIdentity(userText).phone || extractIdentity(userText).name)) {
+        const chosen = offered.find(s => s.id === chosenSlotId)!;
+        return await tryCommitBooking({
+            empresaId, conversationId, state, service, slot: chosen, userText
+        });
     }
 
-    // Si no hay fecha y tampoco “lo más pronto”, preguntar
-    if (!dateISO && !nearest) {
-        const next: ConversationState = { ...state, intent: "BOOK", serviceCandidate: service };
+    // 4) Si no hay fecha y tampoco “lo más pronto”, pregunta
+    if (!dateISO && !nearest && !offered.length) {
+        const next: ConversationState = {
+            ...state, intent: "BOOK", serviceCandidate: service,
+            dateRequest: { ...(state.dateRequest ?? {}), raw: userText ?? state.dateRequest?.raw ?? null }
+        };
         next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
         return {
-            text: `¿Tienes un día en mente para *${service.name ?? "el servicio"}*? Puedo revisar disponibilidad. Si prefieres, te propongo *lo más pronto posible*.`,
-            quickReplies: ["Hoy en la tarde", "Mañana", "Este sábado", "Lo más pronto"],
+            text: `¿Tienes un día en mente para *${service.name ?? "el servicio"}*? Si prefieres, te propongo *lo más pronto posible*.`,
+            quickReplies: ["Hoy en la tarde", "Mañana", "Viernes en la mañana", "Lo más pronto"],
             updatedState: next,
         };
     }
 
-    // Buscar slot
-    const slot = await findFirstFreeSlot({
+    // 5) Obtener varias opciones
+    const slots = await collectFreeSlots({
         empresaId,
         dateISO: nearest ? null : dateISO,
         durationMin,
@@ -587,8 +587,62 @@ async function flowBooking(args: {
         period: period ?? null,
         preferredHour: parsed.preferredHour ?? state.dateRequest?.preferredHour ?? null,
         preferredMinute: parsed.preferredMinute ?? state.dateRequest?.preferredMinute ?? null,
+        max: MAX_OFFERS,
     });
 
+    // 6) Si no hay, sugerir alternativas
+    if (!slots.length) {
+        const next: ConversationState = {
+            ...state,
+            intent: "BOOK",
+            serviceCandidate: service,
+            dateRequest: {
+                raw: userText ?? state.dateRequest?.raw ?? null,
+                dateISO,
+                period: period ?? null,
+                preferredHour: parsed.preferredHour ?? state.dateRequest?.preferredHour ?? null,
+                preferredMinute: parsed.preferredMinute ?? state.dateRequest?.preferredMinute ?? null,
+            },
+            offeredSlots: [],
+            chosenSlotId: null,
+            proposedSlot: {},
+        };
+        next.summaryText = makeSummary(next);
+        await saveConvState(conversationId, next);
+        return {
+            text: `No veo cupos para esa fecha/franja. ¿Quieres que proponga *lo más pronto* o prefieres otro día?`,
+            quickReplies: ["Lo más pronto", "Este jueves", "La próxima semana"],
+            updatedState: next,
+        };
+    }
+
+    // 7) Validar primero (por si cambió algo justo ahora)
+    const validFirst = await validateAvailability({
+        empresaId, startISO: slots[0].startISO, endISO: slots[0].endISO, staffId: slots[0].staffId ?? undefined
+    });
+    if (!validFirst.ok) {
+        // filtrar inválidos y dejar lo válido
+        const filtered: FreeSlot[] = [];
+        for (const s of slots) {
+            const ok = await validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined });
+            if (ok.ok) filtered.push(s);
+        }
+        if (!filtered.length) {
+            const next = { ...state, offeredSlots: [], chosenSlotId: null, proposedSlot: {} } as ConversationState;
+            next.summaryText = makeSummary(next);
+            await saveConvState(conversationId, next);
+            return { text: "Los cupos cambiaron mientras reservábamos. ¿Intentamos con *otras opciones* o *lo más pronto*?", updatedState: next };
+        }
+    }
+
+    // 8) Construir lista human friendly
+    offered = slots.slice(0, MAX_OFFERS).map((s, i) => {
+        const a = toBogota(s.startISO), b = toBogota(s.endISO);
+        const label = `${tzFormat(a, "EEE dd MMM", { timeZone: TZ, locale: esLocale })} • ${tzFormat(a, "h:mm a", { timeZone: TZ, locale: esLocale })}`;
+        return { id: `opt_${i}_${s.startISO}`, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? null, label };
+    });
+
+    // 9) Actualizar estado
     const nextBase: ConversationState = {
         ...state,
         intent: "BOOK",
@@ -600,95 +654,97 @@ async function flowBooking(args: {
             preferredHour: parsed.preferredHour ?? state.dateRequest?.preferredHour ?? null,
             preferredMinute: parsed.preferredMinute ?? state.dateRequest?.preferredMinute ?? null,
         },
+        offeredSlots: offered,
+        proposedSlot: {},
+        chosenSlotId: chosenSlotId ?? null,
     };
+    nextBase.summaryText = makeSummary(nextBase);
+    await saveConvState(conversationId, nextBase);
 
-    if (!slot) {
-        const next: ConversationState = {
-            ...nextBase,
-            proposedSlot: { startISO: null, endISO: null, staffId: null, reason: nearest ? "first_free_slot" : "user_requested_date" },
-        };
-        next.summaryText = makeSummary(next);
-        await saveConvState(conversationId, next);
-        return {
-            text: `No veo cupos para esa fecha/franja. ¿Quieres que proponga *lo más pronto* o prefieres otro día?`,
-            quickReplies: ["Lo más pronto", "Este jueves", "La próxima semana"],
-            updatedState: next,
-        };
+    // 10) Si en este mismo turno nos eligió por ordinal/hora, intentar commit
+    if (!chosenSlotId) chosenSlotId = pickOfferedByUtterance(userText, offered);
+    if (chosenSlotId) {
+        const slot = offered.find(x => x.id === chosenSlotId)!;
+        return await tryCommitBooking({ empresaId, conversationId, state: nextBase, service, slot, userText });
     }
 
-    const valid = await validateAvailability({
+    // 11) Ofrecer opciones (con precio “Desde”)
+    const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
+    const lines = offered.map((s, i) => `${i + 1}) *${s.label}*`).join("\n");
+    return {
+        text: `Para *${service.name ?? "el servicio"}*${priceLabel} te propongo:\n${lines}\n\nDime “la 2” o “10:30”.`,
+        quickReplies: offered.slice(0, 3).map((s, i) => `${i + 1}) ${s.label}`),
+        updatedState: nextBase,
+    };
+}
+
+/* ---------- Intento de commit cuando ya hay slot elegido + identidad ---------- */
+async function tryCommitBooking(args: {
+    empresaId: number;
+    conversationId: number;
+    state: ConversationState;
+    service: NonNullable<ConversationState["serviceCandidate"]>;
+    slot: { startISO: ISO; endISO: ISO; staffId?: number | null; label?: string };
+    userText: string;
+}): Promise<BotReply> {
+    const { empresaId, conversationId, state, service, slot, userText } = args;
+
+    const idtFromTurn = extractIdentity(userText);
+    const name = idtFromTurn.name ?? state.identity?.name ?? null;
+    const phone = idtFromTurn.phone ?? state.identity?.phone ?? null;
+
+    if (!name || !phone) {
+        const ns: ConversationState = {
+            ...state,
+            chosenSlotId: state.chosenSlotId ?? state.offeredSlots?.find(s => s.startISO === slot.startISO)?.id ?? null,
+            identity: { name: name ?? null, phone: phone ?? null },
+        };
+        ns.summaryText = makeSummary(ns);
+        await saveConvState(conversationId, ns);
+        return { text: `Perfecto. Para confirmar *${fmtHuman(slot.startISO)}*, ¿me compartes *nombre* y *teléfono*?`, updatedState: ns };
+    }
+
+    const ok = await validateAvailability({ empresaId, startISO: slot.startISO, endISO: slot.endISO, staffId: slot.staffId ?? undefined });
+    if (!ok.ok) {
+        const ns = { ...state, offeredSlots: [], chosenSlotId: null } as ConversationState;
+        ns.summaryText = makeSummary(ns);
+        await saveConvState(conversationId, ns);
+        return { text: `Ese horario acaba de ocuparse. Te propongo otras opciones cercanas.`, updatedState: ns };
+    }
+
+    const commit = await book({
         empresaId,
+        serviceId: service.id ?? null,
+        serviceName: service.name ?? "Servicio",
+        serviceDurationMin: service.durationMin ?? 60,
         startISO: slot.startISO,
         endISO: slot.endISO,
-        staffId: slot.staffId ?? undefined
+        customerName: name,
+        customerPhone: phone,
+        staffId: slot.staffId ?? null,
+        source: "chat",
     });
-    if (!valid.ok) {
-        const next: ConversationState = { ...nextBase, proposedSlot: { startISO: null, endISO: null, staffId: null, reason: "validation_failed" } };
-        next.summaryText = makeSummary(next);
-        await saveConvState(conversationId, next);
-        return {
-            text: `Se liberó un horario pero ya no cumple reglas internas. ¿Probamos con otra opción cercana o *lo más pronto*?`,
-            quickReplies: ["Lo más pronto", "Mañana", "Tarde", "Noche"],
-            updatedState: next,
-        };
-    }
 
-    // Guardar propuesta
-    const proposed: ConversationState = {
-        ...nextBase,
-        proposedSlot: {
-            startISO: slot.startISO,
-            endISO: slot.endISO,
-            staffId: slot.staffId ?? null,
-            reason: nearest ? "first_free_slot" : "user_requested_date",
-        },
+    if (!commit.ok) return { text: `No pude finalizar la reserva. ¿Probamos con otra opción?` };
+
+    const done: ConversationState = {
+        ...state,
+        identity: { name, phone },
+        commitTrace: { lastAction: "booked", appointmentId: commit.appointmentId, at: nowISO() },
+        proposedSlot: { startISO: slot.startISO, endISO: slot.endISO, staffId: slot.staffId ?? null, reason: "user_choice" },
+        offeredSlots: [],
+        chosenSlotId: null,
     };
-    proposed.summaryText = makeSummary(proposed);
-    await saveConvState(conversationId, proposed);
+    done.summaryText = makeSummary(done);
+    await saveConvState(conversationId, done);
 
-    // Intentar commit si en este turno ya llegaron datos
-    const idt = extractIdentity(userText);
-    if (idt.name && idt.phone) {
-        const commit = await book({
-            empresaId,
-            serviceId: service.id ?? null,
-            serviceName: service.name ?? "Servicio",
-            serviceDurationMin: durationMin,
-            startISO: slot.startISO,
-            endISO: slot.endISO,
-            customerName: idt.name,
-            customerPhone: idt.phone,
-            staffId: slot.staffId ?? null,
-            source: "chat",
-        });
-        if (commit.ok) {
-            const done: ConversationState = {
-                ...proposed,
-                identity: { name: idt.name, phone: idt.phone },
-                commitTrace: { lastAction: "booked", appointmentId: commit.appointmentId, at: nowISO() },
-            };
-            done.summaryText = makeSummary(done);
-            await saveConvState(conversationId, done);
-
-            const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
-            return { text: `¡Listo! Agendé *${service.name ?? "tu servicio"}${priceLabel}* para *${fmtHuman(slot.startISO)}*.`, updatedState: done };
-        }
-    }
-
-    return {
-        text: `Puedo reservar *${service.name ?? "el servicio"}* el *${fmtHuman(slot.startISO)}*. Si te funciona, por favor dime *nombre* y *teléfono* para confirmar.`,
-        quickReplies: ["Sí, agendar", "Otro horario"],
-        updatedState: proposed,
-    };
+    const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
+    return { text: `¡Listo **${name}**! Agendé *${service.name ?? "tu servicio"}${priceLabel}* para *${fmtHuman(slot.startISO)}*.`, updatedState: done };
 }
 
 /* ======================== Reschedule Flow ======================== */
 async function flowReschedule(args: {
-    empresaId: number;
-    conversationId: number;
-    userText: string;
-    state: ConversationState;
-    durationMin: number;
+    empresaId: number; conversationId: number; userText: string; state: ConversationState; durationMin: number;
 }): Promise<BotReply> {
     const { empresaId, conversationId, userText, state, durationMin } = args;
 
@@ -707,21 +763,15 @@ async function flowReschedule(args: {
     const parsed = parseDatePeriod(userText);
     if (!parsed.dateISO && !wantsMostRecent(userText)) {
         const ns: ConversationState = {
-            ...state,
-            intent: "RESCHEDULE",
-            identity: { ...(state.identity ?? {}), phone },
+            ...state, intent: "RESCHEDULE", identity: { ...(state.identity ?? {}), phone },
             commitTrace: { ...state.commitTrace, appointmentId: active.id, lastAction: null, at: null },
         };
         ns.summaryText = makeSummary(ns);
         await saveConvState(conversationId, ns);
-        return {
-            text: `¿Para qué día te gustaría moverla? Puedo proponerte la opción más próxima disponible.`,
-            quickReplies: ["Lo más pronto", "Mañana", "Jueves en la tarde"],
-            updatedState: ns,
-        };
+        return { text: `¿Para qué día te gustaría moverla? Puedo proponerte la opción más próxima disponible.`, quickReplies: ["Lo más pronto", "Mañana", "Jueves en la tarde"], updatedState: ns };
     }
 
-    const slot = await findFirstFreeSlot({
+    const slots = await collectFreeSlots({
         empresaId,
         dateISO: wantsMostRecent(userText) ? null : parsed.dateISO ?? null,
         durationMin,
@@ -730,40 +780,35 @@ async function flowReschedule(args: {
         period: parsed.period ?? null,
         preferredHour: parsed.preferredHour ?? null,
         preferredMinute: parsed.preferredMinute ?? null,
+        max: 1,
     });
-    if (!slot) return { text: `No encuentro disponibilidad para esa fecha/franja. ¿Probamos otra fecha o “lo más pronto”?` };
+    if (!slots.length) return { text: `No encuentro disponibilidad para esa fecha/franja. ¿Probamos otra fecha o “lo más pronto”?` };
 
-    const ok = await validateAvailability({ empresaId, startISO: slot.startISO, endISO: slot.endISO, staffId: slot.staffId ?? undefined });
+    const s = slots[0];
+    const ok = await validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined });
     if (!ok.ok) return { text: `Ese horario ya no cumple reglas internas. ¿Probamos otra opción cercana?` };
 
-    const upd = await reschedule({
-        empresaId,
-        appointmentId: active.id,
-        nextStartISO: slot.startISO,
-        nextEndISO: slot.endISO,
-        nextStaffId: slot.staffId ?? null,
-    });
+    const upd = await reschedule({ empresaId, appointmentId: active.id, nextStartISO: s.startISO, nextEndISO: s.endISO, nextStaffId: s.staffId ?? null });
     if (!upd.ok) return { text: `Ocurrió un problema al reagendar. ¿Intentamos con otro horario?` };
 
     const ns: ConversationState = {
         ...state,
         intent: "RESCHEDULE",
         identity: { ...(state.identity ?? {}), phone },
-        proposedSlot: { ...slot, reason: "reschedule" },
+        proposedSlot: { ...s, reason: "reschedule" },
         commitTrace: { lastAction: "rescheduled", appointmentId: active.id, at: nowISO() },
+        offeredSlots: [],
+        chosenSlotId: null
     };
     ns.summaryText = makeSummary(ns);
     await saveConvState(conversationId, ns);
 
-    return { text: `¡Hecho! Tu cita quedó para *${fmtHuman(slot.startISO)}*. ¿Necesitas algo más?`, updatedState: ns };
+    return { text: `¡Hecho! Tu cita quedó para *${fmtHuman(s.startISO)}*. ¿Necesitas algo más?`, updatedState: ns };
 }
 
 /* ======================== Cancel Flow ======================== */
 async function flowCancel(args: {
-    empresaId: number;
-    conversationId: number;
-    userText: string;
-    state: ConversationState;
+    empresaId: number; conversationId: number; userText: string; state: ConversationState;
 }): Promise<BotReply> {
     const { empresaId, conversationId, userText, state } = args;
     const idt = state.identity ?? extractIdentity(userText);
@@ -787,6 +832,8 @@ async function flowCancel(args: {
         intent: "CANCEL",
         identity: { ...(state.identity ?? {}), phone },
         commitTrace: { lastAction: "canceled", appointmentId: active.id, at: nowISO() },
+        offeredSlots: [],
+        chosenSlotId: null
     };
     ns.summaryText = makeSummary(ns);
     await saveConvState(conversationId, ns);
