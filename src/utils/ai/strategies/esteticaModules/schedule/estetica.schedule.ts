@@ -3,6 +3,7 @@
    - Conversational CRUD bridge contra BD (Prisma)
    - Cambio de opinión, lista de opciones y elección natural
    - Anáforas (“ese día”) y commit con nombre+teléfono
+   - Export helpers + noop para integrarse con strategy
    ======================================================================= */
 
 import prisma from "../../../../../lib/prisma";
@@ -48,7 +49,14 @@ export type ConversationState = {
     expireAt?: ISO | null;
 };
 
-export type BotReply = { text: string; quickReplies?: string[]; updatedState?: ConversationState };
+/** Respuesta canal chat */
+export type BotReply = {
+    text: string;
+    quickReplies?: string[];
+    updatedState?: ConversationState;
+    /** si true, el caller (strategy) continúa y no se envía texto al usuario */
+    noop?: boolean;
+};
 
 /* ======================== Config ======================== */
 const TZ = "America/Bogota";
@@ -88,6 +96,19 @@ async function saveConvState(conversationId: number, next: ConversationState) {
         create: { conversationId, data: data as any },
         update: { data: data as any },
     });
+}
+
+/* ======= Helpers públicos para strategy (summary/estado) ======= */
+export async function readConvState(conversationId: number) {
+    return await loadConvState(conversationId);
+}
+export async function ensureScheduleSummary(conversationId: number) {
+    const s = await loadConvState(conversationId);
+    if (!s.summaryText) {
+        s.summaryText = makeSummary(s);
+        await saveConvState(conversationId, s);
+    }
+    return s.summaryText!;
 }
 
 /* ======================== Summary ======================== */
@@ -168,10 +189,10 @@ function parseDatePeriod(text: string): {
         const curr = base.getDay();
         let add = (target - curr + 7) % 7;
         if (add === 0 && /\bpr[oó]xim|siguiente\b/.test(t)) add = 7;
-        const d = new Date(base); d.setDate(base.getDate() + add);
+        const d = new Date(base); d.setDate(d.getDate() + add);
         dateISO = fromBogota(d);
     } else if (/\bhoy\b/.test(t) || /\bma[nñ]ana\b/.test(t) || /\bpasad[oa]\s+ma[nñ]ana\b/.test(t)) {
-        const d = new Date(base); d.setDate(base.getDate() + delta);
+        const d = new Date(base); d.setDate(d.getDate() + delta);
         dateISO = fromBogota(d);
     }
 
@@ -194,8 +215,7 @@ function extractIdentity(text: string): { name?: string | null; phone?: Phone | 
 }
 
 /* ======================== KB wrappers ======================== */
-// ➤ IMPORTANT: si NO se menciona un servicio, NO hacemos fallback al primero.
-//   Así evitamos que el bot “salude con contexto” proponiendo Limpieza facial.
+// ➤ Importante: si NO se menciona servicio, no hacemos fallback al primero.
 function getServiceCandidate(kb: EsteticaKB, text: string | undefined) {
     const t = (text || "").toLowerCase();
     const svc = kb.procedures.find(p =>
@@ -493,6 +513,19 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
     const rules = getRules(kb);
     const prev = await loadConvState(conversationId);
 
+    // —— Router no-op: si no hay señales claras de agenda, devolvemos el control a strategy
+    const parsed0 = parseDatePeriod(userText);
+    const hasBookingSignals =
+        detectIntent(userText) !== null ||
+        wantsMostRecent(userText) ||
+        !!getServiceCandidate(kb, userText).name ||
+        !!parsed0.dateISO || !!parsed0.period || !!parsed0.preferredHour;
+
+    if (!hasBookingSignals) {
+        if (!prev.summaryText) { prev.summaryText = makeSummary(prev); await saveConvState(conversationId, prev); }
+        return { text: "", noop: true, updatedState: prev };
+    }
+
     // 1) Intent y servicio (permitir cambio de opinión)
     const intentNow = detectIntent(userText) ?? prev.intent ?? (wantsMostRecent(userText) ? "BOOK" : "ASK_SLOTS");
 
@@ -533,7 +566,7 @@ async function flowBooking(args: {
     const parsed = parseDatePeriod(userText);
     const nearest = wantsMostRecent(userText);
 
-    // anáfora “ese día”: usar último día conocido (dateRequest o primera opción ofrecida)
+    // anáfora “ese día”
     let dateISO = parsed.dateISO ?? state.dateRequest?.dateISO ?? null;
     if (parsed.anaphoraSameDay && !parsed.dateISO) {
         const fromOffered = state.offeredSlots?.[0]?.startISO ? startOfDayBogotaFromISO(state.offeredSlots[0].startISO) : null;
@@ -541,17 +574,17 @@ async function flowBooking(args: {
     }
     const period = parsed.period ?? state.dateRequest?.period ?? null;
 
-    // 2) intentar mapear elección natural sobre opciones existentes
+    // intentar mapear elección natural sobre opciones existentes
     let chosenSlotId = pickOfferedByUtterance(userText, state.offeredSlots);
     let offered = state.offeredSlots ?? [];
 
-    // 3) si ya eligió y da afirmación/identidad → commit
+    // si ya eligió y da afirmación/identidad → commit
     if (chosenSlotId && (isAffirm(userText) || extractIdentity(userText).phone || extractIdentity(userText).name)) {
         const chosen = offered.find(s => s.id === chosenSlotId)!;
         return await tryCommitBooking({ empresaId, conversationId, state, service, slot: chosen, userText });
     }
 
-    // 4) si no hay fecha ni “lo más pronto”, preguntar fecha/franja
+    // si no hay fecha ni “lo más pronto”, preguntar fecha/franja
     if (!dateISO && !nearest && !offered.length) {
         const next: ConversationState = {
             ...state, intent: "BOOK", serviceCandidate: service,
@@ -566,7 +599,7 @@ async function flowBooking(args: {
         };
     }
 
-    // 5) buscar opciones (si usuario dijo “9:45” sin elegir de la lista, igual buscamos ese día cerca de esa hora)
+    // buscar opciones
     const slots = await collectFreeSlots({
         empresaId,
         dateISO: nearest ? null : (dateISO ? startOfDayBogotaFromISO(dateISO) : null),
@@ -596,7 +629,7 @@ async function flowBooking(args: {
         return { text: `No veo cupos para esa fecha/franja. ¿Quieres *lo más pronto* o prefieres otro día?`, quickReplies: ["Lo más pronto", "Este jueves", "La próxima semana"], updatedState: next };
     }
 
-    // validar uno (y filtrar si cambió algo)
+    // validar y filtrar
     const valid = await Promise.all(slots.map(s => validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined })));
     const validSlots = slots.filter((_, i) => valid[i].ok);
     if (!validSlots.length) {
@@ -641,7 +674,7 @@ async function flowBooking(args: {
         return await tryCommitBooking({ empresaId, conversationId, state: nextBase, service, slot, userText });
     }
 
-    // ofrecer opciones y esperar elección
+    // ofrecer opciones
     const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
     const lines = offered.map((s, i) => `${i + 1}) *${s.label}*`).join("\n");
     return {

@@ -12,7 +12,12 @@ import {
     type EsteticaKB,
 } from "./esteticaModules/domain/estetica.kb";
 
-import { handleScheduleTurn as runSchedule } from "./esteticaModules/schedule/estetica.schedule";
+import {
+    handleScheduleTurn as runSchedule,
+    readConvState as readScheduleState,
+    ensureScheduleSummary as ensureScheduleSummary,
+} from "./esteticaModules/schedule/estetica.schedule";
+
 
 
 
@@ -517,11 +522,27 @@ export async function handleEsteticaReply(args: {
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
+
     // Estado + Historial + Summary
     let state = await loadState(conversationId);
     const history = await getRecentHistory(conversationId, undefined, CONF.MAX_HISTORY);
-    const compactContext = await buildOrReuseSummary({ conversationId, kb, history });
-    state = await loadState(conversationId); // refrescar summary
+
+    // Summary “general” (catálogo/operativo)
+    let compactContext = await buildOrReuseSummary({ conversationId, kb, history });
+
+    // ⬇️ Línea adicional: trae/siembra el summary del SCHEDULE para que strategy lo tenga a mano
+    let schedSummary = "";
+    try {
+        schedSummary = await ensureScheduleSummary(conversationId);
+    } catch { /* opcional: ignora */ }
+
+    // Concatena una línea breve de agenda al contexto (solo si existe)
+    if (schedSummary && !/^\s*$/.test(schedSummary)) {
+        compactContext = `${compactContext}\n\nAgenda: ${schedSummary}`;
+    }
+
+    state = await loadState(conversationId); // refrescar summary (por si cambió)
+
 
     // Servicio + Intención (con sinónimos)
     let match = resolveServiceName(kb, contenido || "");
@@ -538,42 +559,48 @@ export async function handleEsteticaReply(args: {
 
     /* ====== AGENDA – full-agent (estetica.schedule) ====== */
     {
-        // El nuevo módulo ya maneja: preguntar día, "lo más pronto", validar AppointmentHour/Exception,
-        // actualizar conversation_state y hacer INSERT/UPDATE/DELETE según corresponda.
+        // Llamamos SIEMPRE al scheduler. Si no detecta señales de agenda, devuelve noop=true
         const sched = await runSchedule({
             empresaId,
             conversationId,
             userText: contenido,
         });
 
-        // Determina si ya se concretó una acción (book/reschedule/cancel) para marcar respondido.
-        const committed =
-            sched?.updatedState?.commitTrace?.lastAction === "booked" ||
-            sched?.updatedState?.commitTrace?.lastAction === "rescheduled" ||
-            sched?.updatedState?.commitTrace?.lastAction === "canceled";
+        // ➜ Caso NO-OP: no hay intención de agenda → devolvemos el control a strategy (seguir abajo)
+        if (sched?.noop) {
+            // opcional: nada; continúa el flujo general
+        } else {
+            // ¿Se concretó acción? (INSERT/UPDATE/DELETE ya hecho dentro del scheduler)
+            const committed =
+                sched?.updatedState?.commitTrace?.lastAction === "booked" ||
+                sched?.updatedState?.commitTrace?.lastAction === "rescheduled" ||
+                sched?.updatedState?.commitTrace?.lastAction === "canceled";
 
-        const replyText = (sched?.text || "").trim();
+            const replyText = (sched?.text || "").trim();
 
-        if (replyText) {
-            const saved = await persistBotReply({
-                conversationId,
-                empresaId,
-                texto: replyText,
-                nuevoEstado: committed ? ConversationEstado.respondido : ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
-            });
-            if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-            return {
-                estado: committed ? "respondido" : "en_proceso",
-                mensaje: saved.texto,
-                messageId: saved.messageId,
-                wamid: saved.wamid,
-                media: [],
-            };
+            if (replyText) {
+                const saved = await persistBotReply({
+                    conversationId,
+                    empresaId,
+                    texto: replyText,
+                    nuevoEstado: committed ? ConversationEstado.respondido : ConversationEstado.en_proceso,
+                    to: toPhone ?? conversacion.phone,
+                    phoneNumberId,
+                });
+                if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+                return {
+                    estado: committed ? "respondido" : "en_proceso",
+                    mensaje: saved.texto,
+                    messageId: saved.messageId,
+                    wamid: saved.wamid,
+                    media: [],
+                };
+            }
+            // Si no hubo texto pero tampoco noop, igual devolvemos control a strategy.
         }
     }
     /* ====== FIN AGENDA ====== */
+
 
 
 
