@@ -3,13 +3,27 @@ import prisma from "../../../../../lib/prisma";
 import {
     getNextAvailableSlots as _getNextAvailableSlots,
     createAppointmentSafe as _createAppointmentSafe,
+    handleSchedulingTurn, // 🔥 agente principal
 } from "../schedule/estetica.schedule";
+
 import type {
     AppointmentStatus,
     AppointmentVertical,
 } from "@prisma/client";
-import type { SlotsByDay, Slot } from "../schedule/estetica.schedule";;
 
+import type {
+    Slot,
+    SlotsByDay,
+    KBMinimal,
+    StateShape,
+    SchedulingCtx,
+    SchedulingResult,
+    InterpreterNLU,
+} from "../schedule/estetica.schedule";
+
+/* ============================================================
+   📅 FUNCIONES AUXILIARES
+============================================================ */
 export type DayPeriod = "morning" | "afternoon" | "evening";
 export type LabeledSlot = { startISO: string; endISO: string; label: string };
 
@@ -19,7 +33,7 @@ export type FindSlotsArgs = {
     vertical: AppointmentVertical | "custom";
     bufferMin?: number | null;
     granularityMin: number;
-    pivotLocalDateISO: string; // YYYY-MM-DD en TZ del negocio
+    pivotLocalDateISO: string;
     durationMin: number;
     daysHorizon: number;
     maxSlots: number;
@@ -42,10 +56,8 @@ export async function FIND_SLOTS(args: FindSlotsArgs): Promise<LabeledSlot[]> {
         args.period ?? undefined
     );
 
-    // Flatea con tipos explícitos
     const flat: Slot[] = byDay.flatMap((d: SlotsByDay) => d.slots);
 
-    // Formateador de label en la TZ del negocio
     const fmt = new Intl.DateTimeFormat("es-CO", {
         timeZone: args.timezone,
         weekday: "long",
@@ -56,15 +68,16 @@ export async function FIND_SLOTS(args: FindSlotsArgs): Promise<LabeledSlot[]> {
         hour12: true,
     });
 
-    const labeled: LabeledSlot[] = flat.map((s) => ({
+    return flat.map((s) => ({
         startISO: s.startISO,
         endISO: s.endISO,
         label: fmt.format(new Date(s.startISO)),
     }));
-
-    return labeled;
 }
 
+/* ============================================================
+   ✳️ BOOK / CANCEL / RESCHEDULE
+============================================================ */
 export type BookArgs = {
     empresaId: number;
     timezone: string;
@@ -74,7 +87,7 @@ export type BookArgs = {
     serviceName: string;
     customerName: string;
     customerPhone: string;
-    startISO: string; // UTC
+    startISO: string;
     durationMin: number;
     notes?: string;
 };
@@ -113,11 +126,7 @@ export async function CANCEL_APPOINTMENT(args: CancelArgs) {
         return { ok: true };
     }
 
-    const blocking: AppointmentStatus[] = [
-        "pending",
-        "confirmed",
-        "rescheduled",
-    ];
+    const blocking: AppointmentStatus[] = ["pending", "confirmed", "rescheduled"];
     const appt = await prisma.appointment.findFirst({
         where: {
             empresaId: args.empresaId,
@@ -141,7 +150,7 @@ export type RescheduleArgs = {
     empresaId: number;
     appointmentId: number;
     timezone: string;
-    newStartISO: string; // UTC
+    newStartISO: string;
     durationMin: number;
 };
 
@@ -168,4 +177,41 @@ export async function RESCHEDULE_APPOINTMENT(args: RescheduleArgs) {
     });
 
     return { ok: true };
+}
+
+/* ============================================================
+   🤖 RUN_AGENT_TURN — modo ChatGPT total
+============================================================ */
+export type RunAgentTurnArgs = {
+    text: string;
+    empresaId: number;
+    kb: KBMinimal;
+    state: StateShape;
+    intent: "price" | "schedule" | "reschedule" | "cancel" | "info" | "other";
+    granularityMin: number;
+    daysHorizon: number;
+    maxSlots: number;
+    serviceInContext?: { id: number; name: string; durationMin?: number | null } | null;
+    nlu?: InterpreterNLU | null;
+    now?: Date;
+};
+
+export async function RUN_AGENT_TURN(args: RunAgentTurnArgs): Promise<SchedulingResult> {
+    const ctx: SchedulingCtx = {
+        empresaId: args.empresaId,
+        kb: args.kb,
+        granularityMin: args.granularityMin,
+        daysHorizon: args.daysHorizon,
+        maxSlots: args.maxSlots,
+        now: args.now,
+    };
+
+    return handleSchedulingTurn({
+        text: args.text,
+        state: args.state,
+        ctx,
+        serviceInContext: args.serviceInContext ?? null,
+        intent: args.intent,
+        nlu: args.nlu ?? undefined,
+    });
 }
