@@ -310,7 +310,7 @@ async function createHold(args: {
         });
         return { ok: true };
     } catch (e: any) {
-        if (String(e?.code) === "23505") return { ok: false, reason: "conflict" }; // (para PG); en MySQL retornará error de unique igualmente
+        // Para MySQL/MariaDB será un error de unique igualmente
         return { ok: false, reason: "db_error" };
     }
 }
@@ -592,13 +592,17 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
     const rules = getRules(kb);
     const prev = await loadConvState(conversationId);
 
-    // —— Router no-op: si no hay señales claras de agenda, devolvemos el control a strategy
+    // —— Router no-op: SOLO entrar a agenda si hay intención clara o ya veníamos en agenda
     const parsed0 = parseDatePeriod(userText);
+    const explicitIntent = detectIntent(userText); // BOOK / RESCHEDULE / CANCEL / INFO | null
+    const prevInSchedule = prev.intent === "BOOK" || prev.intent === "ASK_SLOTS" || prev.intent === "RESCHEDULE";
+
     const hasBookingSignals =
-        detectIntent(userText) !== null ||
+        explicitIntent === "BOOK" ||
+        explicitIntent === "RESCHEDULE" ||
+        explicitIntent === "CANCEL" ||
         wantsMostRecent(userText) ||
-        !!getServiceCandidate(kb, userText).name ||
-        !!parsed0.dateISO || !!parsed0.period || !!parsed0.preferredHour;
+        (prevInSchedule && (!!parsed0.dateISO || !!parsed0.period || !!parsed0.preferredHour));
 
     if (!hasBookingSignals) {
         if (!prev.summaryText) { prev.summaryText = makeSummary(prev); await saveConvState(conversationId, prev); }
@@ -606,7 +610,7 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
     }
 
     // 1) Intent y servicio (permitir cambio de opinión)
-    const intentNow = detectIntent(userText) ?? prev.intent ?? (wantsMostRecent(userText) ? "BOOK" : "ASK_SLOTS");
+    const intentNow = explicitIntent ?? prev.intent ?? (wantsMostRecent(userText) ? "BOOK" : "ASK_SLOTS");
 
     const svcFromText = getServiceCandidate(kb, userText);
     const serviceChanged = !!svcFromText.name && svcFromText.name !== prev.serviceCandidate?.name;
@@ -653,9 +657,14 @@ async function flowBooking(args: {
     }
     const period = parsed.period ?? state.dateRequest?.period ?? null;
 
-    // intentar mapear elección natural sobre opciones existentes
-    let chosenSlotId = pickOfferedByUtterance(userText, state.offeredSlots);
-    let offered = state.offeredSlots ?? [];
+    // Si el usuario cambió explícitamente la fecha o la franja, limpiamos ofertas previas
+    const periodChanged = parsed.period && parsed.period !== state?.dateRequest?.period;
+    const dateChanged =
+        parsed.dateISO &&
+        startOfDayBogotaFromISO(parsed.dateISO) !== (state?.dateRequest?.dateISO ? startOfDayBogotaFromISO(state.dateRequest.dateISO) : null);
+
+    let offered = (periodChanged || dateChanged) ? [] : (state.offeredSlots ?? []);
+    let chosenSlotId = pickOfferedByUtterance(userText, offered);
 
     // si ya eligió y da afirmación/identidad → commit
     if (chosenSlotId && (isAffirm(userText) || extractIdentity(userText).phone || extractIdentity(userText).name)) {
