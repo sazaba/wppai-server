@@ -4,6 +4,7 @@
    - Cambio de opinión, lista de opciones y elección natural
    - Anáforas (“ese día”) y commit con nombre+teléfono
    - Export helpers + noop para integrarse con strategy
+   - Holds (appointment_hold) para congelar cupos mientras pedimos identidad
    ======================================================================= */
 
 import prisma from "../../../../../lib/prisma";
@@ -278,17 +279,80 @@ async function getOpenWindowsForDay(empresaId: number, dayStart: Date): Promise<
     return blocks;
 }
 
-async function findConflicts(empresaId: number, from: Date, to: Date, staffId?: number | null) {
-    return prisma.appointment.findMany({
+/* ======================== Holds (congelar cupos) ======================== */
+const HOLD_TTL_MIN = 7;
+
+async function purgeExpiredHolds(empresaId: number) {
+    await prisma.appointmentHold.deleteMany({
+        where: { empresaId, expiresAt: { lt: new Date() } },
+    });
+}
+
+async function createHold(args: {
+    empresaId: number;
+    startISO: ISO;
+    endISO: ISO;
+    staffId?: number | null;
+    conversationId: number;
+    ttlMin?: number;
+}): Promise<{ ok: true } | { ok: false; reason: "conflict" | "db_error" }> {
+    const { empresaId, startISO, endISO, staffId = null, conversationId, ttlMin = HOLD_TTL_MIN } = args;
+    try {
+        await prisma.appointmentHold.create({
+            data: {
+                empresaId,
+                startAt: parseISO(startISO),
+                endAt: parseISO(endISO),
+                staffId: staffId ?? undefined,
+                conversationId,
+                expiresAt: new Date(Date.now() + ttlMin * 60_000),
+            },
+        });
+        return { ok: true };
+    } catch (e: any) {
+        if (String(e?.code) === "23505") return { ok: false, reason: "conflict" }; // (para PG); en MySQL retornará error de unique igualmente
+        return { ok: false, reason: "db_error" };
+    }
+}
+
+async function releaseHold(args: { empresaId: number; startISO: ISO; endISO: ISO; staffId?: number | null }) {
+    const { empresaId, startISO, endISO, staffId = null } = args;
+    await prisma.appointmentHold.deleteMany({
         where: {
             empresaId,
-            deletedAt: null,
-            status: { in: ["pending", "confirmed", "rescheduled"] as AppointmentStatus[] },
-            ...(staffId ? { staffId } : {}),
-            AND: [{ startAt: { lt: to } }, { endAt: { gt: from } }],
+            startAt: parseISO(startISO),
+            endAt: parseISO(endISO),
+            staffId: staffId ?? undefined,
         },
-        select: { id: true, startAt: true, endAt: true, staffId: true },
     });
+}
+
+async function findConflicts(empresaId: number, from: Date, to: Date, staffId?: number | null) {
+    await purgeExpiredHolds(empresaId);
+
+    const [apps, holds] = await Promise.all([
+        prisma.appointment.findMany({
+            where: {
+                empresaId,
+                deletedAt: null,
+                status: { in: ["pending", "confirmed", "rescheduled"] as AppointmentStatus[] },
+                ...(staffId ? { staffId } : {}),
+                AND: [{ startAt: { lt: to } }, { endAt: { gt: from } }],
+            },
+            select: { id: true, startAt: true, endAt: true, staffId: true },
+        }),
+        prisma.appointmentHold.findMany({
+            where: {
+                empresaId,
+                expiresAt: { gt: new Date() },
+                ...(staffId ? { staffId } : {}),
+                AND: [{ startAt: { lt: to } }, { endAt: { gt: from } }],
+            },
+            select: { id: true, startAt: true, endAt: true, staffId: true },
+        }),
+    ]);
+
+    return [...apps, ...holds];
 }
 
 /** Colecciona N slots libres cumpliendo reglas */
@@ -338,30 +402,27 @@ async function collectFreeSlots(args: {
             // cursor inicial
             let cursor = new Date(block.start);
 
-            // Si pidió "tarde" y NO dio hora explícita, arrancar cerca de 14:00 para dar variedad
+            // “tarde” sin hora → arrancar cerca de 14:00 para dar variedad útil
             if (period === "afternoon" && typeof preferredHour !== "number") {
-                const pivot = new Date(day);
-                pivot.setHours(14, 0, 0, 0);
-                if (isAfter(pivot, block.start) && isBefore(pivot, block.end)) {
-                    cursor = pivot;
-                }
+                const pivot = new Date(day); pivot.setHours(14, 0, 0, 0);
+                if (isAfter(pivot, block.start) && isBefore(pivot, block.end)) cursor = pivot;
             }
 
-            // Si el usuario dio hora preferida y cae dentro del bloque, cursor = esa hora
+            // hora preferida dentro del bloque
             if (typeof preferredHour === "number") {
                 const pref = new Date(day);
                 pref.setHours(preferredHour, preferredMinute ?? 0, 0, 0);
                 if (isAfter(pref, block.start) && isBefore(pref, block.end)) cursor = new Date(pref);
             }
 
-            // Si es hoy: ahora + buffer
+            // si es hoy: ahora + buffer
             const today = utcToZonedTime(new Date(), TZ);
             if (cursor.toDateString() === today.toDateString()) {
                 const nowPlus = addMinutes(today, clamp(safeBuffer, 0, 240));
                 if (isAfter(nowPlus, cursor)) cursor = nowPlus;
             }
 
-            // Generar slots SIN pasar el cierre del bloque (candidato debe terminar <= block.end)
+            // generar slots; el fin no puede pasar del fin del bloque
             for (; ;) {
                 const start = new Date(cursor);
                 const end = addMinutes(start, durationMin);
@@ -722,6 +783,21 @@ async function tryCommitBooking(args: {
     const phone = idt.phone ?? state.identity?.phone ?? null;
 
     if (!name || !phone) {
+        // congela el cupo mientras pedimos identidad
+        const held = await createHold({
+            empresaId,
+            startISO: slot.startISO,
+            endISO: slot.endISO,
+            staffId: slot.staffId ?? null,
+            conversationId,
+        });
+        if (!held.ok) {
+            const ns = { ...state, offeredSlots: [], chosenSlotId: null } as ConversationState;
+            ns.summaryText = makeSummary(ns);
+            await saveConvState(conversationId, ns);
+            return { text: `Ese horario se ocupó justo ahora. Te propongo otras opciones.`, updatedState: ns };
+        }
+
         const ns: ConversationState = {
             ...state,
             chosenSlotId: state.chosenSlotId ?? state.offeredSlots?.find(s => s.startISO === slot.startISO)?.id ?? null,
@@ -732,42 +808,87 @@ async function tryCommitBooking(args: {
         return { text: `Perfecto. Para confirmar *${fmtHuman(slot.startISO)}*, ¿me compartes *nombre* y *teléfono*?`, updatedState: ns };
     }
 
-    const ok = await validateAvailability({ empresaId, startISO: slot.startISO, endISO: slot.endISO, staffId: slot.staffId ?? undefined });
-    if (!ok.ok) {
+    // commit transaccional + liberación de hold
+    try {
+        const result = await prisma.$transaction(async (tx) => {
+            const start = parseISO(slot.startISO);
+            const end = parseISO(slot.endISO);
+
+            const [apptConflict, holdConflict] = await Promise.all([
+                tx.appointment.findFirst({
+                    where: {
+                        empresaId,
+                        deletedAt: null,
+                        status: { in: ["pending", "confirmed", "rescheduled"] as AppointmentStatus[] },
+                        ...(slot.staffId ? { staffId: slot.staffId } : {}),
+                        AND: [{ startAt: { lt: end } }, { endAt: { gt: start } }],
+                    },
+                    select: { id: true },
+                }),
+                tx.appointmentHold.findFirst({
+                    where: {
+                        empresaId,
+                        expiresAt: { gt: new Date() },
+                        ...(slot.staffId ? { staffId: slot.staffId } : {}),
+                        AND: [{ startAt: { lt: end } }, { endAt: { gt: start } }],
+                    },
+                    select: { id: true },
+                }),
+            ]);
+            if (apptConflict || holdConflict) return { ok: false as const };
+
+            const created = await tx.appointment.create({
+                data: {
+                    empresaId,
+                    source: "chat" as any,
+                    status: "confirmed",
+                    customerName: name!,
+                    customerPhone: phone!,
+                    serviceName: service.name ?? "Servicio",
+                    serviceDurationMin: service.durationMin ?? 60,
+                    startAt: start,
+                    endAt: end,
+                    timezone: TZ,
+                    procedureId: service.id ?? undefined,
+                    staffId: slot.staffId ?? undefined,
+                },
+                select: { id: true },
+            });
+
+            await tx.appointmentHold.deleteMany({
+                where: { empresaId, startAt: start, endAt: end, staffId: slot.staffId ?? undefined },
+            });
+
+            return { ok: true as const, id: created.id };
+        });
+
+        if (!result.ok) {
+            const ns = { ...state, offeredSlots: [], chosenSlotId: null } as ConversationState;
+            ns.summaryText = makeSummary(ns);
+            await saveConvState(conversationId, ns);
+            return { text: `Ese horario acaba de ocuparse. Te propongo otras opciones cercanas.`, updatedState: ns };
+        }
+
+        const done: ConversationState = {
+            ...state,
+            identity: { name, phone },
+            commitTrace: { lastAction: "booked", appointmentId: (result as any).id, at: nowISO() },
+            proposedSlot: { startISO: slot.startISO, endISO: slot.endISO, staffId: slot.staffId ?? null, reason: "user_choice" },
+            offeredSlots: [],
+            chosenSlotId: null,
+        };
+        done.summaryText = makeSummary(done);
+        await saveConvState(conversationId, done);
+
+        const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
+        return { text: `¡Listo **${name}**! Agendé *${service.name}${priceLabel}* para *${fmtHuman(slot.startISO)}*.`, updatedState: done };
+
+    } catch {
         const ns = { ...state, offeredSlots: [], chosenSlotId: null } as ConversationState;
         ns.summaryText = makeSummary(ns);
         await saveConvState(conversationId, ns);
-        return { text: `Ese horario acaba de ocuparse. Te propongo otras opciones cercanas.`, updatedState: ns };
+        return { text: `Tuve un problema al confirmar. Intentemos con otro horario, ¿te parece?`, updatedState: ns };
     }
-
-    const commit = await book({
-        empresaId,
-        serviceId: service.id ?? null,
-        serviceName: service.name ?? "Servicio",
-        serviceDurationMin: service.durationMin ?? 60,
-        startISO: slot.startISO,
-        endISO: slot.endISO,
-        customerName: name,
-        customerPhone: phone,
-        staffId: slot.staffId ?? null,
-        source: "chat",
-    });
-
-    if (!commit.ok) return { text: `No pude finalizar la reserva. ¿Probamos con otra opción?` };
-
-    const done: ConversationState = {
-        ...state,
-        identity: { name, phone },
-        commitTrace: { lastAction: "booked", appointmentId: commit.appointmentId, at: nowISO() },
-        proposedSlot: { startISO: slot.startISO, endISO: slot.endISO, staffId: slot.staffId ?? null, reason: "user_choice" },
-        offeredSlots: [],
-        chosenSlotId: null,
-    };
-    done.summaryText = makeSummary(done);
-    await saveConvState(conversationId, done);
-
-    const priceLabel = service.priceMin ? ` (Desde ${formatCOP(service.priceMin)} COP)` : "";
-    return { text: `¡Listo **${name}**! Agendé *${service.name}${priceLabel}* para *${fmtHuman(slot.startISO)}*.`, updatedState: done };
 }
 
 /* ======================== Reschedule Flow ======================== */
