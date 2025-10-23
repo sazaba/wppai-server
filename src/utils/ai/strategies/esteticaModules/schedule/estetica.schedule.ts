@@ -2,7 +2,7 @@
    Estética – SCHEDULE (Full Agent + conversation_state)
    - Conversational CRUD bridge contra BD (Prisma)
    - Cambio de opinión, lista de opciones y elección natural
-   - Anáforas (“ese día”) y commit con nombre+teléfono
+   - Anáforas (“ese día”, “este procedimiento”) y commit con nombre+teléfono
    - Export helpers + noop para integrarse con strategy
    - Holds (appointment_hold) para congelar cupos mientras pedimos identidad
    ======================================================================= */
@@ -11,7 +11,7 @@ import prisma from "../../../../../lib/prisma";
 import type { AppointmentStatus, Weekday } from "@prisma/client";
 import { loadEsteticaKB, type EsteticaKB } from "../domain/estetica.kb";
 import {
-    addMinutes, endOfDay, isBefore, isAfter, parseISO, formatISO, isEqual
+    addMinutes, endOfDay, isBefore, isAfter, parseISO, formatISO, isEqual,
 } from "date-fns";
 import { utcToZonedTime, zonedTimeToUtc, format as tzFormat } from "date-fns-tz";
 import { es as esLocale } from "date-fns/locale";
@@ -74,14 +74,21 @@ const fmtHuman = (iso: ISO) =>
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
 const between = (x: Date, a: Date, b: Date) =>
     (isAfter(x, a) || isEqual(x, a)) && (isBefore(x, b) || isEqual(x, b));
-const toWeekday = (d: Date): Weekday =>
-    (["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d.getDay()] as Weekday);
 const nowISO = () => new Date().toISOString();
 
 function startOfDayBogotaFromISO(iso: ISO): ISO {
     const d = toBogota(iso);
     d.setHours(0, 0, 0, 0);
     return fromBogota(d);
+}
+
+/* ======================== Weekday tolerant ======================== */
+/** Devuelve {short:'mon', long:'monday'} según Date.getDay() */
+function weekdayPair(d: Date): { short: Weekday | any; long: Weekday | any } {
+    const shortArr = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+    const longArr = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
+    const idx = d.getDay();
+    return { short: shortArr[idx], long: longArr[idx] };
 }
 
 /* ======================== Conversation State ======================== */
@@ -187,7 +194,7 @@ function parseDatePeriod(text: string): {
 
     const wdMap: Record<string, number> =
         { lunes: 1, martes: 2, miercoles: 3, miércoles: 3, jueves: 4, viernes: 5, sabado: 6, sábado: 6, domingo: 0 };
-    const wdMatch = t.match(/\b(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b/);
+    const wdMatch = t.match(/\b(lunes|ma[rt]tes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b/);
     let dateISO: ISO | null = null;
 
     if (wdMatch) {
@@ -199,7 +206,7 @@ function parseDatePeriod(text: string): {
         const saysNextWeek = /\b(pr[oó]xima\s+semana|siguiente\s+semana)\b/.test(t);
         if (saysNextWeek) add += (add === 0 ? 7 : 7);
 
-        // “próximo viernes” explícito (sin “semana”)
+        // “próximo viernes” explícito (sin “semana”) -> si hoy es viernes, ir a +7
         if (!saysNextWeek && add === 0 && /\bpr[oó]xim[oa]|siguiente\b/.test(t)) add = 7;
 
         const d = new Date(base); d.setDate(base.getDate() + add);
@@ -254,56 +261,49 @@ function getRules(kb: EsteticaKB) {
 type OpenWindow = { start: Date; end: Date };
 type FreeSlot = { startISO: ISO; endISO: ISO; staffId?: number | null };
 
-async function getOpenWindowsForDay(empresaId: number, dayStart: Date): Promise<OpenWindow[]> {
-    const weekday = toWeekday(dayStart);
-    const hours = await prisma.appointmentHour.findUnique({ where: { empresaId_day: { empresaId, day: weekday } } });
+/** HH:mm sobre un día dado */
+function mkDayTime(base: Date, hhmm?: string | null) {
+    if (!hhmm) return null;
+    const [hh, mm] = hhmm.split(":").map(Number);
+    const d = new Date(base); d.setHours(hh, mm, 0, 0);
+    return d;
+}
 
+/** Lee horario aperturas (tolerante a enums) + excepciones */
+async function getOpenWindowsForDay(empresaId: number, dayStart: Date): Promise<OpenWindow[]> {
+    const { short, long } = weekdayPair(dayStart);
+
+    // Excepción del día (tiene prioridad)
     const ex = await prisma.appointmentException.findFirst({
         where: { empresaId, date: { gte: dayStart, lte: endOfDay(dayStart) } },
     });
-
-    const mkDate = (base: Date, hhmm?: string | null) => {
-        if (!hhmm) return null;
-        const [hh, mm] = hhmm.split(":").map(Number);
-        const d = new Date(base); d.setHours(hh, mm, 0, 0);
-        return d;
-    };
-
-    const blocks: OpenWindow[] = [];
     if (ex) {
         if (ex.isOpen === false) return [];
-        const s1 = mkDate(dayStart, ex.start1), e1 = mkDate(dayStart, ex.end1);
-        const s2 = mkDate(dayStart, ex.start2), e2 = mkDate(dayStart, ex.end2);
-        if (s1 && e1 && isBefore(s1, e1)) blocks.push({ start: s1, end: e1 });
-        if (s2 && e2 && isBefore(s2, e2)) blocks.push({ start: s2, end: e2 });
-    } else if (hours?.isOpen) {
-        const s1 = mkDate(dayStart, hours.start1), e1 = mkDate(dayStart, hours.end1);
-        const s2 = mkDate(dayStart, hours.start2), e2 = mkDate(dayStart, hours.end2);
-        if (s1 && e1 && isBefore(s1, e1)) blocks.push({ start: s1, end: e1 });
-        if (s2 && e2 && isBefore(s2, e2)) blocks.push({ start: s2, end: e2 });
+        const s1 = mkDayTime(dayStart, ex.start1), e1 = mkDayTime(dayStart, ex.end1);
+        const s2 = mkDayTime(dayStart, ex.start2), e2 = mkDayTime(dayStart, ex.end2);
+        const out: OpenWindow[] = [];
+        if (s1 && e1 && isBefore(s1, e1)) out.push({ start: s1, end: e1 });
+        if (s2 && e2 && isBefore(s2, e2)) out.push({ start: s2, end: e2 });
+        return out;
     }
 
+    // Horario regular (consulta tolerante)
+    const hours =
+        (await prisma.appointmentHour.findFirst({ where: { empresaId, day: short as any } })) ??
+        (await prisma.appointmentHour.findFirst({ where: { empresaId, day: long as any } }));
+
+    if (!hours || !hours.isOpen) return [];
+
+    const s1 = mkDayTime(dayStart, hours.start1), e1 = mkDayTime(dayStart, hours.end1);
+    const s2 = mkDayTime(dayStart, hours.start2), e2 = mkDayTime(dayStart, hours.end2);
+    const blocks: OpenWindow[] = [];
+    if (s1 && e1 && isBefore(s1, e1)) blocks.push({ start: s1, end: e1 });
+    if (s2 && e2 && isBefore(s2, e2)) blocks.push({ start: s2, end: e2 });
     return blocks;
 }
 
 /* ======================== Holds (congelar cupos) ======================== */
 const HOLD_TTL_MIN = 7;
-
-/*
-   ➤ Prisma schema recomendado para holds:
-   model AppointmentHold {
-     id          Int      @id @default(autoincrement())
-     empresaId   Int
-     startAt     DateTime
-     endAt       DateTime
-     staffId     Int?
-     conversationId Int
-     expiresAt   DateTime
- 
-     @@unique([empresaId, startAt, endAt, staffId])
-     @@index([expiresAt])
-   }
-*/
 
 async function purgeExpiredHolds(empresaId: number) {
     await prisma.appointmentHold.deleteMany({
@@ -326,13 +326,13 @@ async function createHold(args: {
                 empresaId,
                 startAt: parseISO(startISO),
                 endAt: parseISO(endISO),
-                staffId: staffId ?? undefined,
+                staffId: staffId ?? null,   // <<<<<< opción A: permitir null
                 conversationId,
                 expiresAt: new Date(Date.now() + ttlMin * 60_000),
             },
         });
         return { ok: true };
-    } catch (e: any) {
+    } catch {
         return { ok: false, reason: "db_error" };
     }
 }
@@ -344,13 +344,19 @@ async function releaseHold(args: { empresaId: number; startISO: ISO; endISO: ISO
             empresaId,
             startAt: parseISO(startISO),
             endAt: parseISO(endISO),
-            staffId: staffId ?? undefined,
+            staffId: staffId ?? null,   // coincide con nullable
         },
     });
 }
 
+/** Conflictos: si se consulta por un staff concreto, también chocan holds “globales” (staffId null) */
 async function findConflicts(empresaId: number, from: Date, to: Date, staffId?: number | null) {
     await purgeExpiredHolds(empresaId);
+
+    const holdsWhere =
+        staffId == null
+            ? { empresaId, expiresAt: { gt: new Date() } }
+            : { empresaId, expiresAt: { gt: new Date() }, OR: [{ staffId }, { staffId: null }] };
 
     const [apps, holds] = await Promise.all([
         prisma.appointment.findMany({
@@ -358,16 +364,14 @@ async function findConflicts(empresaId: number, from: Date, to: Date, staffId?: 
                 empresaId,
                 deletedAt: null,
                 status: { in: ["pending", "confirmed", "rescheduled"] as AppointmentStatus[] },
-                ...(staffId ? { staffId } : {}),
+                ...(staffId != null ? { staffId } : {}),
                 AND: [{ startAt: { lt: to } }, { endAt: { gt: from } }],
             },
             select: { id: true, startAt: true, endAt: true, staffId: true },
         }),
         prisma.appointmentHold.findMany({
             where: {
-                empresaId,
-                expiresAt: { gt: new Date() },
-                ...(staffId ? { staffId } : {}),
+                ...holdsWhere,
                 AND: [{ startAt: { lt: to } }, { endAt: { gt: from } }],
             },
             select: { id: true, startAt: true, endAt: true, staffId: true },
@@ -424,7 +428,7 @@ async function collectFreeSlots(args: {
             // cursor inicial
             let cursor = new Date(block.start);
 
-            // “tarde” sin hora → arrancar cerca de 14:00 para dar variedad útil
+            // “tarde” sin hora → arrancar cerca de 14:00
             if (period === "afternoon" && typeof preferredHour !== "number") {
                 const pivot = new Date(day); pivot.setHours(14, 0, 0, 0);
                 if (isAfter(pivot, block.start) && isBefore(pivot, block.end)) cursor = pivot;
@@ -444,7 +448,7 @@ async function collectFreeSlots(args: {
                 if (isAfter(nowPlus, cursor)) cursor = nowPlus;
             }
 
-            // generar slots; el fin no puede pasar del fin del bloque
+            // generar slots
             for (; ;) {
                 const start = new Date(cursor);
                 const end = addMinutes(start, durationMin);
@@ -456,7 +460,7 @@ async function collectFreeSlots(args: {
                         empresaId,
                         zonedTimeToUtc(start, TZ),
                         zonedTimeToUtc(end, TZ),
-                        st ?? undefined
+                        st ?? null
                     );
                     if (conflicts.length) continue;
 
@@ -484,7 +488,7 @@ async function validateAvailability(args: { empresaId: number; startISO: ISO; en
         empresaId,
         zonedTimeToUtc(startBo, TZ),
         zonedTimeToUtc(endBo, TZ),
-        staffId ?? undefined
+        staffId ?? null
     );
     if (conflicts.length) return { ok: false, reason: "conflict" };
     return { ok: true };
@@ -631,6 +635,13 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
         prevMut.identity = { ...(prev.identity ?? {}), ...idtNow };
     }
 
+    // —— Anáfora de servicio (“este procedimiento / ese servicio”)
+    const refersToPreviousService =
+        /\b(este|ese)\s+(procedimiento|servicio)\b/i.test(userText) && !!prev.serviceCandidate?.name;
+    if (refersToPreviousService && !svcFromTextLoose?.name && prev.serviceCandidate?.name) {
+        prevMut.serviceCandidate = prev.serviceCandidate; // afirma el servicio previo
+    }
+
     const hasBookingSignals =
         explicitIntent === "BOOK" ||
         explicitIntent === "RESCHEDULE" ||
@@ -649,7 +660,9 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
 
     const svcFromText = getServiceCandidate(kb, userText);
     const serviceChanged = !!svcFromText.name && svcFromText.name !== prev.serviceCandidate?.name;
-    const service = serviceChanged ? svcFromText : (prev.serviceCandidate ?? svcFromText);
+    const service = serviceChanged
+        ? svcFromText
+        : (prev.serviceCandidate ?? (refersToPreviousService ? prev.serviceCandidate : svcFromText));
 
     // Si NO hay servicio aún → pedirlo (no proponemos por defecto)
     if (!service?.name && (intentNow === "BOOK" || intentNow === "ASK_SLOTS")) {
@@ -666,11 +679,29 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
         : { ...prevMut, serviceCandidate: service };
 
     if (intentNow === "CANCEL") return await flowCancel({ empresaId, conversationId, userText, state: baseState });
+
+    // Narrowing explícito para TS (service ya existe por el guard anterior)
+    const serviceDef = service as NonNullable<ConversationState["serviceCandidate"]>;
+
     if (intentNow === "RESCHEDULE") {
-        return await flowReschedule({ empresaId, conversationId, userText, state: baseState, durationMin: service.durationMin ?? 60 });
+        return await flowReschedule({
+            empresaId,
+            conversationId,
+            userText,
+            state: baseState,
+            durationMin: serviceDef.durationMin ?? 60
+        });
     }
 
-    return await flowBooking({ empresaId, conversationId, userText, state: baseState, service, durationMin: service.durationMin ?? 60, rules });
+    return await flowBooking({
+        empresaId,
+        conversationId,
+        userText,
+        state: baseState,
+        service: serviceDef,
+        durationMin: serviceDef.durationMin ?? 60,
+        rules
+    });
 }
 
 /* ======================== Booking Flow ======================== */
@@ -764,7 +795,7 @@ async function flowBooking(args: {
 
     // validar y filtrar
     const valid = await Promise.all(
-        slots.map(s => validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined }))
+        slots.map(s => validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? null }))
     );
     const validSlots = slots.filter((_, i) => valid[i].ok);
     if (!validSlots.length) {
@@ -774,7 +805,7 @@ async function flowBooking(args: {
         return { text: "Los cupos cambiaron mientras reservábamos. ¿Intentamos con *otras opciones* o *lo más pronto*?", updatedState: next };
     }
 
-    // construir lista
+    // construir lista (fecha+hora explícitas)
     offered = validSlots.slice(0, MAX_OFFERS).map((s, i) => {
         const a = toBogota(s.startISO);
         const label = `${tzFormat(a, "EEE dd MMM", { timeZone: TZ, locale: esLocale })} • ${tzFormat(a, "h:mm a", { timeZone: TZ, locale: esLocale })}`;
@@ -878,7 +909,7 @@ async function tryCommitBooking(args: {
                         empresaId,
                         deletedAt: null,
                         status: { in: ["pending", "confirmed", "rescheduled"] as AppointmentStatus[] },
-                        ...(slot.staffId ? { staffId: slot.staffId } : {}),
+                        ...(slot.staffId != null ? { staffId: slot.staffId } : {}),
                         AND: [{ startAt: { lt: end } }, { endAt: { gt: start } }],
                     },
                     select: { id: true },
@@ -887,7 +918,7 @@ async function tryCommitBooking(args: {
                     where: {
                         empresaId,
                         expiresAt: { gt: new Date() },
-                        ...(slot.staffId ? { staffId: slot.staffId } : {}),
+                        ...(slot.staffId != null ? { OR: [{ staffId: slot.staffId }, { staffId: null }] } : {}),
                         AND: [{ startAt: { lt: end } }, { endAt: { gt: start } }],
                     },
                     select: { id: true },
@@ -914,13 +945,13 @@ async function tryCommitBooking(args: {
             });
 
             await tx.appointmentHold.deleteMany({
-                where: { empresaId, startAt: start, endAt: end, staffId: slot.staffId ?? undefined },
+                where: { empresaId, startAt: start, endAt: end, staffId: slot.staffId ?? null },
             });
 
             return { ok: true as const, id: created.id };
         });
 
-        if (!result.ok) {
+        if (!("ok" in result) || !result.ok) {
             const ns = { ...state, offeredSlots: [], chosenSlotId: null } as ConversationState;
             ns.summaryText = makeSummary(ns);
             await saveConvState(conversationId, ns);
@@ -992,7 +1023,7 @@ async function flowReschedule(args: {
     if (!slots.length) return { text: `No encuentro disponibilidad para esa fecha/franja. ¿Probamos otra fecha o “lo más pronto”?` };
 
     const s = slots[0];
-    const ok = await validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? undefined });
+    const ok = await validateAvailability({ empresaId, startISO: s.startISO, endISO: s.endISO, staffId: s.staffId ?? null });
     if (!ok.ok) return { text: `Ese horario ya no cumple reglas internas. ¿Probamos otra opción cercana?` };
 
     const upd = await reschedule({ empresaId, appointmentId: active.id, nextStartISO: s.startISO, nextEndISO: s.endISO, nextStaffId: s.staffId ?? null });
