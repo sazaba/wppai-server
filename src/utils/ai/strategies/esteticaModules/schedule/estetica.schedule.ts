@@ -194,7 +194,14 @@ function parseDatePeriod(text: string): {
         const target = wdMap[wdMatch[1]];
         const curr = base.getDay();
         let add = (target - curr + 7) % 7;
-        if (add === 0 && /\bpr[oó]xim|siguiente\b/.test(t)) add = 7;
+
+        // “viernes de la próxima/siguiente semana”
+        const saysNextWeek = /\b(pr[oó]xima\s+semana|siguiente\s+semana)\b/.test(t);
+        if (saysNextWeek) add += (add === 0 ? 7 : 7);
+
+        // “próximo viernes” explícito (sin “semana”)
+        if (!saysNextWeek && add === 0 && /\bpr[oó]xim[oa]|siguiente\b/.test(t)) add = 7;
+
         const d = new Date(base); d.setDate(base.getDate() + add);
         dateISO = fromBogota(d);
     } else if (/\bhoy\b/.test(t) || /\bma[nñ]ana\b/.test(t) || /\bpasad[oa]\s+ma[nñ]ana\b/.test(t)) {
@@ -282,6 +289,22 @@ async function getOpenWindowsForDay(empresaId: number, dayStart: Date): Promise<
 /* ======================== Holds (congelar cupos) ======================== */
 const HOLD_TTL_MIN = 7;
 
+/*
+   ➤ Prisma schema recomendado para holds:
+   model AppointmentHold {
+     id          Int      @id @default(autoincrement())
+     empresaId   Int
+     startAt     DateTime
+     endAt       DateTime
+     staffId     Int?
+     conversationId Int
+     expiresAt   DateTime
+ 
+     @@unique([empresaId, startAt, endAt, staffId])
+     @@index([expiresAt])
+   }
+*/
+
 async function purgeExpiredHolds(empresaId: number) {
     await prisma.appointmentHold.deleteMany({
         where: { empresaId, expiresAt: { lt: new Date() } },
@@ -310,7 +333,6 @@ async function createHold(args: {
         });
         return { ok: true };
     } catch (e: any) {
-        // Para MySQL/MariaDB será un error de unique igualmente
         return { ok: false, reason: "db_error" };
     }
 }
@@ -411,7 +433,7 @@ async function collectFreeSlots(args: {
             // hora preferida dentro del bloque
             if (typeof preferredHour === "number") {
                 const pref = new Date(day);
-                pref.setHours(preferredHour, preferredMinute ?? 0, 0, 0);
+                pref.setHours(preferredHour, (preferredMinute ?? 0), 0, 0);
                 if (isAfter(pref, block.start) && isBefore(pref, block.end)) cursor = new Date(pref);
             }
 
@@ -597,6 +619,18 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
     const explicitIntent = detectIntent(userText); // BOOK / RESCHEDULE / CANCEL / INFO | null
     const prevInSchedule = prev.intent === "BOOK" || prev.intent === "ASK_SLOTS" || prev.intent === "RESCHEDULE";
 
+    // pistas suaves a memoria (servicio + identidad) aunque no entremos a agenda
+    const svcFromTextLoose = getServiceCandidate(kb, userText); // captar servicio aunque no vayamos a agendar
+    const idtNow = extractIdentity(userText);
+    let prevMut: ConversationState = { ...prev };
+
+    if (svcFromTextLoose?.name && !prevMut.serviceCandidate?.name) {
+        prevMut.serviceCandidate = svcFromTextLoose;
+    }
+    if ((idtNow.name || idtNow.phone)) {
+        prevMut.identity = { ...(prev.identity ?? {}), ...idtNow };
+    }
+
     const hasBookingSignals =
         explicitIntent === "BOOK" ||
         explicitIntent === "RESCHEDULE" ||
@@ -605,8 +639,9 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
         (prevInSchedule && (!!parsed0.dateISO || !!parsed0.period || !!parsed0.preferredHour));
 
     if (!hasBookingSignals) {
-        if (!prev.summaryText) { prev.summaryText = makeSummary(prev); await saveConvState(conversationId, prev); }
-        return { text: "", noop: true, updatedState: prev };
+        if (!prevMut.summaryText) { prevMut.summaryText = makeSummary(prevMut); }
+        await saveConvState(conversationId, prevMut);
+        return { text: "", noop: true, updatedState: prevMut };
     }
 
     // 1) Intent y servicio (permitir cambio de opinión)
@@ -618,7 +653,7 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
 
     // Si NO hay servicio aún → pedirlo (no proponemos por defecto)
     if (!service?.name && (intentNow === "BOOK" || intentNow === "ASK_SLOTS")) {
-        const next: ConversationState = { ...prev, intent: "BOOK", serviceCandidate: service };
+        const next: ConversationState = { ...prevMut, intent: "BOOK", serviceCandidate: service };
         next.summaryText = makeSummary(next);
         await saveConvState(conversationId, next);
         const qrs = kb.procedures.slice(0, 4).map(p => p.name);
@@ -627,8 +662,8 @@ export async function handleScheduleTurn(args: { empresaId: number; conversation
 
     // Reset si cambió el servicio
     const baseState: ConversationState = serviceChanged
-        ? { ...prev, serviceCandidate: service, proposedSlot: {}, offeredSlots: [], chosenSlotId: null }
-        : { ...prev, serviceCandidate: service };
+        ? { ...prevMut, serviceCandidate: service, proposedSlot: {}, offeredSlots: [], chosenSlotId: null }
+        : { ...prevMut, serviceCandidate: service };
 
     if (intentNow === "CANCEL") return await flowCancel({ empresaId, conversationId, userText, state: baseState });
     if (intentNow === "RESCHEDULE") {
@@ -648,6 +683,12 @@ async function flowBooking(args: {
 
     const parsed = parseDatePeriod(userText);
     const nearest = wantsMostRecent(userText);
+
+    // ← capturar identidad suave ni bien entra al booking
+    const idtSoft = extractIdentity(userText);
+    if (idtSoft.name || idtSoft.phone) {
+        state.identity = { ...(state.identity ?? {}), ...idtSoft };
+    }
 
     // anáfora “ese día”
     let dateISO = parsed.dateISO ?? state.dateRequest?.dateISO ?? null;
@@ -807,6 +848,10 @@ async function tryCommitBooking(args: {
             return { text: `Ese horario se ocupó justo ahora. Te propongo otras opciones.`, updatedState: ns };
         }
 
+        const faltantes: string[] = [];
+        if (!name) faltantes.push("*nombre*");
+        if (!phone) faltantes.push("*teléfono*");
+
         const ns: ConversationState = {
             ...state,
             chosenSlotId: state.chosenSlotId ?? state.offeredSlots?.find(s => s.startISO === slot.startISO)?.id ?? null,
@@ -814,7 +859,11 @@ async function tryCommitBooking(args: {
         };
         ns.summaryText = makeSummary(ns);
         await saveConvState(conversationId, ns);
-        return { text: `Perfecto. Para confirmar *${fmtHuman(slot.startISO)}*, ¿me compartes *nombre* y *teléfono*?`, updatedState: ns };
+
+        return {
+            text: `Perfecto. Reservé temporalmente *${fmtHuman(slot.startISO)}*. Para confirmar, ¿me compartes ${faltantes.join(" y ")}?`,
+            updatedState: ns
+        };
     }
 
     // commit transaccional + liberación de hold

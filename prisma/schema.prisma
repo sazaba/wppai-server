@@ -765,12 +765,14 @@ model AppointmentHold {
   empresaId      Int      @map("empresa_id")
   startAt        DateTime @map("start_at")
   endAt          DateTime @map("end_at")
-  staffId        Int?     @map("staff_id")
+  staffId        Int      @map("staff_id") // <-- ahora NOT NULL
   conversationId Int      @map("conversation_id")
   expiresAt      DateTime @map("expires_at")
   createdAt      DateTime @default(now()) @map("created_at")
 
-  // No declares @@unique aquí; el UNIQUE real está en la BD sobre staff_id_key
+  // Bloquea el mismo cupo para el mismo staff
+  @@unique([empresaId, startAt, endAt, staffId], map: "appointment_hold_unique_slot_staff")
+  // Purga rápida por expiración
   @@index([empresaId, expiresAt], map: "appointment_hold_empresa_expires_idx")
   @@map("appointment_hold")
 }
