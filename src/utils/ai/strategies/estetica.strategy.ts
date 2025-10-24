@@ -22,6 +22,10 @@ const CONF = {
     MODEL: process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini",
 };
 
+// --- MODO COLECTA SOLAMENTE (no validamos disponibilidad; todo es referencial)
+const COLLECT_ONLY = true;
+
+
 /* ==== Imagen (arrastre contextual) ==== */
 const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000);
 const IMAGE_CARRY_MS = Number(process.env.IA_IMAGE_CARRY_MS ?? 60_000);
@@ -57,8 +61,9 @@ function normalizeToE164(n: string) {
 /* ===========================
    Helpers de agenda (DB)
    =========================== */
-const DOW_LABELS = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+
 function pad2(n: number) { return String(n).padStart(2, "0"); }
+
 function hhmmFrom(raw?: string | null) {
     if (!raw) return null;
     const m = raw.match(/^(\d{1,2})(?::?(\d{2}))?/);
@@ -68,28 +73,35 @@ function hhmmFrom(raw?: string | null) {
     return `${pad2(hh)}:${pad2(mm)}`;
 }
 
-// Lectura robusta de appointmentHour (varios posibles nombres/columnas)
-async function fetchAppointmentHours(empresaId: number) {
-    try {
-        const rows: any[] = await (prisma as any).appointmentHour.findMany({
-            where: { empresaId },
-            orderBy: [{ dow: "asc" as any }, { dayOfWeek: "asc" as any }, { start: "asc" as any }],
-            select: { dow: true, dayOfWeek: true, start: true, startTime: true, end: true, endTime: true, active: true },
-        });
-        return rows;
-    } catch {
-        try {
-            const rows: any[] = await (prisma as any).appointment_hours.findMany({
-                where: { empresaId },
-                orderBy: [{ dow: "asc" as any }, { dayOfWeek: "asc" as any }, { start: "asc" as any }],
-                select: { dow: true, dayOfWeek: true, start: true, startTime: true, end: true, endTime: true, active: true },
-            });
-            return rows;
-        } catch {
-            return [];
-        }
-    }
+// === PATCH 2: Map Weekday enum -> 0..6 (0=Dom, 6=Sáb)
+function weekdayToDow(day: any): number | null {
+    const key = String(day || "").toUpperCase();
+    // Ajusta estos nombres si tu enum Weekday usa otros identificadores
+    const map: Record<string, number> = {
+        SUNDAY: 0, SUNDAY_: 0, DOMINGO: 0,
+        MONDAY: 1, LUNES: 1,
+        TUESDAY: 2, MARTES: 2,
+        WEDNESDAY: 3, MIERCOLES: 3, MIÉRCOLES: 3,
+        THURSDAY: 4, JUEVES: 4,
+        FRIDAY: 5, VIERNES: 5,
+        SATURDAY: 6, SABADO: 6, SÁBADO: 6,
+    };
+    return map.hasOwnProperty(key) ? map[key] : null;
 }
+
+
+// Lectura robusta de appointmentHour (varios posibles nombres/columnas)
+// === PATCH 1: Lectura directa del modelo AppointmentHour (mapea a tabla "appointmenthour")
+async function fetchAppointmentHours(empresaId: number) {
+    // Prisma usa el nombre del modelo (AppointmentHour) -> cliente: prisma.appointmentHour
+    const rows = await prisma.appointmentHour.findMany({
+        where: { empresaId },
+        orderBy: [{ day: "asc" }],
+        select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
+    });
+    return rows;
+}
+
 
 // Lectura robusta de appointment_exeption / appointment_exception
 async function fetchAppointmentExceptions(empresaId: number, horizonDays = 35) {
@@ -116,32 +128,27 @@ async function fetchAppointmentExceptions(empresaId: number, horizonDays = 35) {
     }
 }
 
+// === PATCH 3: Normaliza usando day/isOpen/start1-2/end1-2
 function normalizeHours(rows: any[]) {
     const byDow: Record<number, Array<{ start: string; end: string }>> = {};
     for (const r of rows || []) {
-        const active = r.active ?? true;
-        if (!active) continue;
-        const dow = (typeof r.dow === "number" ? r.dow : r.dayOfWeek) ?? null;
+        if (!r) continue;
+
+        // Si el día está marcado cerrado, lo saltamos
+        if (r.isOpen === false) continue;
+
+        const dow = weekdayToDow(r.day);
         if (dow == null) continue;
-        const start = hhmmFrom(r.startTime ?? r.start);
-        const end = hhmmFrom(r.endTime ?? r.end);
-        if (!start || !end) continue;
-        (byDow[dow] ||= []).push({ start, end });
+
+        const s1 = hhmmFrom(r.start1), e1 = hhmmFrom(r.end1);
+        const s2 = hhmmFrom(r.start2), e2 = hhmmFrom(r.end2);
+
+        if (s1 && e1) (byDow[dow] ||= []).push({ start: s1, end: e1 });
+        if (s2 && e2) (byDow[dow] ||= []).push({ start: s2, end: e2 });
     }
     return byDow;
 }
 
-function formatHoursLine(byDow: Record<number, Array<{ start: string; end: string }>>) {
-    const parts: string[] = [];
-    for (let d = 0; d < 7; d++) {
-        const ranges = byDow[d];
-        if (!ranges || !ranges.length) continue;
-        const label = DOW_LABELS[d];
-        const joined = ranges.map(r => `${r.start}–${r.end}`).join(", ");
-        parts.push(`${label} ${joined}`);
-    }
-    return parts.join("; ");
-}
 
 function normalizeExceptions(rows: any[]) {
     const items: Array<{ date: string; closed: boolean; motivo?: string }> = [];
@@ -337,14 +344,25 @@ async function buildOrReuseSummary(args: {
     const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
     if (fresh) return cached.summary!.text;
 
+    // === PATCH 5A/5B/5C ===
+    // 5A) Evita consultar excepciones cuando COLLECT_ONLY es true
     const [hoursRows, exceptionsRows] = await Promise.all([
         fetchAppointmentHours(empresaId),
-        fetchAppointmentExceptions(empresaId, 35),
+        COLLECT_ONLY ? Promise.resolve([]) : fetchAppointmentExceptions(empresaId, 35),
     ]);
-    const byDow = normalizeHours(hoursRows);
-    const hoursLine = formatHoursLine(byDow);
-    const exceptions = normalizeExceptions(exceptionsRows);
-    const closedSoon = exceptions.filter(e => e.closed).slice(0, 6).map(e => e.date).join(", ");
+
+    // 5B) Reutiliza las filas de horarios para no reconsultar dentro de buildBusinessRangesHuman
+    const { human: hoursLine } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
+
+    // 5C) Solo arma línea de excepciones si no estamos en modo colecta
+    let exceptionsLine = "";
+    if (!COLLECT_ONLY) {
+        const exceptions = normalizeExceptions(exceptionsRows);
+        const closedSoon = exceptions.filter(e => e.closed).slice(0, 6).map(e => e.date).join(", ");
+        if (closedSoon) exceptionsLine = `Excepciones agenda (DB): ${closedSoon} (cerrado)`;
+    }
+
+
 
     const services = (kb.procedures ?? [])
         .filter((s) => s.enabled !== false)
@@ -383,7 +401,7 @@ async function buildOrReuseSummary(args: {
                 .join(" | ")}`
             : "",
         hoursLine ? `Horario base (DB): ${hoursLine}` : "",
-        closedSoon ? `Excepciones agenda (DB): ${closedSoon} (cerrado)` : "",
+        exceptionsLine,
         kb.exceptions?.length
             ? `Excepciones próximas (KB): ${kb.exceptions.slice(0, 2).map((e) => `${e.dateISO}${e.isOpen === false ? " cerrado" : ""}`).join(", ")}`
             : "",
@@ -544,46 +562,57 @@ async function maybePrependGreeting(opts: {
     return { text: `${hi}${text}`, greetedNow: true };
 }
 
-
-// Lee appointment_hour y arma línea humana. Para este cliente la última cita = 17:00 si existe 14:00–18:00
-async function buildBusinessRangesHuman(empresaId: number, kb: EsteticaKB, opts?: { defaultDurMin?: number }) {
-    const rows = await fetchAppointmentHours(empresaId);
+// Lee appointment_hour y arma línea humana SOLO informativa (sin marcar días cerrados).
+// === PATCH 4: 100% referencial, sin marcar "cerrado", admite "rows" para evitar doble query
+async function buildBusinessRangesHuman(
+    empresaId: number,
+    kb: EsteticaKB,
+    opts?: { defaultDurMin?: number; rows?: any[] }
+): Promise<{ human: string; lastStart?: string }> {
+    const rows = opts?.rows ?? await fetchAppointmentHours(empresaId);
     const byDow = normalizeHours(rows);
 
     const dayShort = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
-    const rangesByDow: Record<number, string[]> = {};
-    for (let d = 0; d < 7; d++) if (byDow[d]?.length) rangesByDow[d] = byDow[d].map(x => `${x.start}–${x.end}`);
 
-    const hasMorning = (d: number) => byDow[d]?.some(r => r.start === "09:00" && r.end === "13:00");
-    const hasAfternoon = (d: number) => byDow[d]?.some(r => r.start === "14:00" && r.end === "18:00");
-    const mondayToFriday = [1, 2, 3, 4, 5];
-    const mfMorning = mondayToFriday.every(hasMorning);
-    const mfAfternoon = mondayToFriday.every(hasAfternoon);
-
-    let human = "";
-    if (mfMorning && mfAfternoon) human = "Lun–Vie 09:00–13:00 y 14:00–18:00";
-    else {
-        const parts: string[] = [];
-        for (let d = 0; d < 7; d++) if (rangesByDow[d]) parts.push(`${dayShort[d]} ${rangesByDow[d].join(", ")}`);
-        human = parts.join("; ");
+    // 1) Texto humano por día solo con DB
+    const parts: string[] = [];
+    for (let d = 0; d < 7; d++) {
+        const ranges = byDow[d];
+        if (ranges?.length) {
+            parts.push(`${dayShort[d]} ${ranges.map(r => `${r.start}–${r.end}`).join(", ")}`);
+        }
     }
+    const human = parts.join("; ") || "Horario referencial";
 
+    // 2) Última hora de INICIO referencial = (máximo fin observado) - duración
     const dur = Math.max(30, opts?.defaultDurMin ?? (kb.defaultServiceDurationMin ?? 60));
-    let lastStart = "17:00"; // caso estándar
-    if (!mfAfternoon) {
-        let maxEnd = "18:00";
-        for (const d of mondayToFriday) for (const r of (byDow[d] || [])) if (r.end > maxEnd) maxEnd = r.end;
-        const [eh, em] = maxEnd.split(":").map(Number);
-        const startMins = eh * 60 + em - dur;
-        const sh = Math.floor(startMins / 60), sm = startMins % 60;
-        lastStart = `${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}`;
+    const weekdays = [1, 2, 3, 4, 5];
+
+    // juntamos todos los "end" y priorizamos Lun–Vie si existen
+    const endsWeekdays: string[] = [];
+    const endsAll: string[] = [];
+
+    for (const d of weekdays) for (const r of (byDow[d] || [])) if (r.end) endsWeekdays.push(r.end);
+    for (let d = 0; d < 7; d++) for (const r of (byDow[d] || [])) if (r.end) endsAll.push(r.end);
+
+    const pool = endsWeekdays.length ? endsWeekdays : endsAll;
+    if (!pool.length) {
+        return { human: `${human} (referencial)` }; // sin lastStart si no hay fines
     }
 
-    const closedDays = [0, 1, 2, 3, 4, 5, 6].filter(d => !(byDow[d]?.length));
-    const closedHuman = closedDays.length ? `; Cerrado: ${closedDays.map(d => dayShort[d]).join(", ")}` : "";
+    const maxEnd = pool.sort()[pool.length - 1]; // "HH:MM"
+    const [eh, em] = maxEnd.split(":").map(Number);
+    const startMins = eh * 60 + em - dur;
+    const sh = Math.max(0, Math.floor(startMins / 60));
+    const sm = Math.max(0, startMins % 60);
+    const lastStart = `${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}`;
 
-    return { human: `${human}${closedHuman}`.trim(), lastStart };
+    return { human: `${human} (referencial)`, lastStart };
 }
+
+
+
+
 
 /* ===========================
    Persistencia + WhatsApp
@@ -908,7 +937,14 @@ export async function handleEsteticaReply(args: {
         // 1) Pedir día
         if (!draft.whenISO) {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-            const textoBase = `¿Tienes *algún día* en mente para tu cita? Trabajamos: ${human}. Para este caso la *última cita* es a las ${lastStart}.`;
+            const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
+
+            const textoBase =
+                COLLECT_ONLY
+                    ? `¿Tienes *algún día* en mente para tu cita? (Horario ${human}${sufijoUltima}). Yo recojo tus datos y nuestro equipo confirma por aquí.`
+                    : `¿Tienes *algún día* en mente para tu cita? Trabajamos: ${human}. Para este caso la *última cita* es a las ${lastStart ?? "…"}.`;
+
+
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: textoBase, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
@@ -927,7 +963,14 @@ export async function handleEsteticaReply(args: {
         // 1.5) Con día, pedir hora si NO hay ni hora exacta ni franja
         if (!draft.timeHHMM && !draft.timeNote) {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-            const askHour = `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar una *franja* como "mañana" o "tarde". Trabajamos: ${human}; última cita ${lastStart}.`;
+            const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
+
+            const askHour =
+                COLLECT_ONLY
+                    ? `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm) o dame una *franja* como "mañana"/"tarde". (Horario ${human}${sufijoUltima}). Yo solo recojo la preferencia y el equipo confirma.`
+                    : `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar una *franja* como "mañana" o "tarde". Trabajamos: ${human}; última cita ${lastStart ?? "…"}.`;
+
+
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askHour, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
@@ -976,7 +1019,10 @@ export async function handleEsteticaReply(args: {
         piezas.push(`Nombre: *${draft.name}*`);
         piezas.push(`Preferencia: *${preferencia}*`);
 
-        const reply = `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha/hora y te escribimos por aquí.\n${piezas.join(" · ")}`;
+        const reply = COLLECT_ONLY
+            ? `¡Gracias! 🙏 Tomé tu preferencia para la cita.\n${piezas.join(" · ")}\n\nNuestro equipo te confirma *disponibilidad exacta* por este mismo chat.`
+            : `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha/hora y te escribimos por aquí.\n${piezas.join(" · ")}`;
+
 
         const saved = await persistBotReply({
             conversationId, empresaId,
@@ -1055,12 +1101,17 @@ export async function handleEsteticaReply(args: {
     /* ===== ¿Qué servicios ofrecen?  (AJUSTADO) ===== */
     if (/que\s+servicios|qué\s+servicios|servicios\s+ofreces?/i.test(contenido)) {
         const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
+        const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
+
         const items = kb.procedures.slice(0, 6).map((p) => {
             const desde = p.priceMin ? ` (desde ${formatCOP(p.priceMin)})` : "";
             return `• ${p.name}${desde}`;
         }).join("\n");
 
-        let texto = clampLines(closeNicely(`${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar (trabajamos: ${human}; última cita ${lastStart}).`));
+        let texto = clampLines(closeNicely(
+            `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar (trabajamos: ${human}${sufijoUltima}).`
+        ));
+
 
         const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
         texto = greet.text;
@@ -1082,7 +1133,10 @@ export async function handleEsteticaReply(args: {
     /* ===== “Precio exacto según mi caso” (AJUSTADO) ===== */
     if (detectExactPriceQuery(contenido)) {
         const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-        let texto = `El *precio exacto* se confirma en la *valoración presencial* antes del procedimiento. 💡 Si te parece, dime el *día y hora* que prefieres (trabajamos: ${human}; última cita ${lastStart}) y luego tu *nombre completo* para reservar.`;
+        const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
+
+        let texto = `El *precio exacto* se confirma en la *valoración presencial* antes del procedimiento. 💡 Si te parece, dime el *día y hora* que prefieres (trabajamos: ${human}${sufijoUltima}) y luego tu *nombre completo* para reservar.`;
+
         const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
         texto = greet.text;
         if (greet.greetedNow) await patchState(conversationId, { greeted: true });
@@ -1128,8 +1182,11 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         } else {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
+            const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
+
             const nombres = kb.procedures.slice(0, 3).map((s) => s.name).join(", ");
-            let ask = `Manejo los *precios de catálogo* (valores “desde”). ¿De cuál tratamiento te paso precio? (Ej.: ${nombres}). Si ya sabes cuál, dime también el *día y hora* que prefieres (trabajamos: ${human}; última cita ${lastStart}).`;
+            let ask = `Manejo los *precios de catálogo* (valores “desde”). ¿De cuál tratamiento te paso precio? (Ej.: ${nombres}). Si ya sabes cuál, dime también el *día y hora* que prefieres (trabajamos: ${human}${sufijoUltima}).`;
+
 
             const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: ask, state });
             ask = greet.text;
@@ -1157,10 +1214,12 @@ export async function handleEsteticaReply(args: {
         `Si el usuario pide precio exacto, aclara que se confirma en *valoración presencial* e invita a elegir *día y hora* y a compartir su *nombre completo* para agendar.`,
         `Nunca digas “precio exacto según tu caso”.`,
         `No inventes promociones, ni confirmes citas, ni ofrezcas horarios específicos.`,
+        `En esta fase NO confirmes ni niegues disponibilidad ni digas que algún día está cerrado. Si preguntan por horarios, responde en términos generales, pide *día/hora o franja* y *nombre*, y aclara que el equipo humano confirma.`,
         `En el primer mensaje puedes saludar brevemente; después NO repitas saludos.`,
         `Responde directo, breve (2–5 líneas, 0–2 emojis).`,
         `Resumen operativo (OBLIGATORIO LEER Y RESPETAR):\n${compactContext}`,
     ].join("\n");
+
 
     const userCtx = [
         service ? `Servicio en contexto: ${service.name}` : state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : "",
