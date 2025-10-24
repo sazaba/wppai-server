@@ -6,7 +6,6 @@ import {
     AiMode,
     AgentSpecialty,
     ConversationEstado,
-    AppointmentVertical,
 } from '@prisma/client'
 
 type OrchestratorOpts = { toPhone?: string; autoSend?: boolean; phoneNumberId?: string }
@@ -108,55 +107,11 @@ export const handleIAReply = async (
         return handleEsteticaReply({
             chatId,
             empresaId: conversacion.empresaId,
-            mensajeArg,
+            contenido: mensajeArg,
             toPhone: opts?.toPhone ?? conversacion.phone,
             phoneNumberId: opts?.phoneNumberId,
             // Normalizamos aquí todos los JSON/unknown a tipos “seguros”
-            apptConfig: bca
-                ? {
-                    timezone: bca.appointmentTimezone ?? 'America/Bogota',
-                    bufferMin: bca.appointmentBufferMin ?? 10,
-                    vertical: (bca.appointmentVertical ?? AppointmentVertical.custom),
-                    verticalCustom: bca.appointmentVerticalCustom ?? null,
-                    enabled: !!bca.appointmentEnabled,
-                    policies: bca.appointmentPolicies ?? null,
-                    reminders: !!bca.appointmentReminders,
-                    services: asArray(bca.services), // evita error de tipado con Json
-                    servicesText: bca.servicesText ?? undefined,
-                    logistics: {
-                        locationName: bca.locationName ?? undefined,
-                        locationAddress: bca.locationAddress ?? undefined,
-                        locationMapsUrl: bca.locationMapsUrl ?? undefined,
-                        virtualMeetingLink: bca.virtualMeetingLink ?? undefined,
-                        parkingInfo: bca.parkingInfo ?? undefined,
-                        instructionsArrival: bca.instructionsArrival ?? undefined,
-                    },
-                    rules: {
-                        cancellationWindowHours: bca.cancellationWindowHours ?? undefined,
-                        noShowPolicy: bca.noShowPolicy ?? undefined,
-                        depositRequired: bca.depositRequired ?? undefined,
-                        depositAmount: bca.depositAmount as any,
-                        maxDailyAppointments: bca.maxDailyAppointments ?? undefined,
-                        bookingWindowDays: bca.bookingWindowDays ?? undefined,
-                        blackoutDates: (bca.blackoutDates ?? undefined) as any,
-                        overlapStrategy: bca.overlapStrategy ?? undefined,
-                    },
-                    remindersConfig: {
-                        schedule: (bca.reminderSchedule ?? undefined) as any,
-                        templateId: bca.reminderTemplateId ?? undefined,
-                        postBookingMessage: bca.postBookingMessage ?? undefined,
-                    },
-                    kb: {
-                        businessOverview: bca.kbBusinessOverview ?? undefined,
-                        faqs: (bca.kbFAQs ?? undefined) as any,
-                        serviceNotes: (bca.kbServiceNotes ?? undefined) as any,
-                        escalationRules: (bca.kbEscalationRules ?? undefined) as any,
-                        disclaimers: bca.kbDisclaimers ?? undefined,
-                        media: (bca.kbMedia ?? undefined) as any,
-                        freeText: bca.kbFreeText ?? undefined,
-                    },
-                }
-                : undefined,
+
         })
     }
 
