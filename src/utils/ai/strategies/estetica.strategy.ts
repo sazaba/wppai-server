@@ -169,6 +169,7 @@ type AgentState = {
         procedureId?: number;
         procedureName?: string;
         whenISO?: string;
+        timeHHMM?: string; // NUEVO: hora preferida
         durationMin?: number;
         stage?: DraftStage;
     };
@@ -520,7 +521,6 @@ async function maybePrependGreeting(opts: {
 }): Promise<{ text: string; greetedNow: boolean }> {
     const { conversationId, kbName, text, state } = opts;
 
-    // ¿El propio texto ya arranca con saludo?
     const startsWithGreeting = /^\s*(?:¡?\s*hola|buen[oa]s)\b/i.test(text);
     if (state.greeted || startsWithGreeting) return { text, greetedNow: false };
 
@@ -678,6 +678,40 @@ function extractWhen(raw: string): { label?: string; iso?: string } | null {
     return null;
 }
 
+// NUEVO: extraer hora y formatear para mostrar
+function extractHour(raw: string): string | null {
+    const t = (raw || "").toLowerCase().replace(/\s+/g, " ").trim();
+
+    let m = t.match(/\b(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?|am|pm)?\b/);
+    if (m) {
+        let hh = parseInt(m[1], 10);
+        const mm = parseInt(m[2], 10);
+        const suf = (m[3] || "").replace(/\./g, "");
+        if (suf === "pm" && hh < 12) hh += 12;
+        if (suf === "am" && hh === 12) hh = 0;
+        if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+            return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+        }
+    }
+    m = t.match(/\b(?:a\s+las?\s+)?(\d{1,2})(?:\s*(a\.?m\.?|p\.?m\.?|am|pm))?\b/);
+    if (m) {
+        let hh = parseInt(m[1], 10);
+        const suf = (m[2] || "").replace(/\./g, "");
+        if (suf === "pm" && hh < 12) hh += 12;
+        if (suf === "am" && hh === 12) hh = 0;
+        if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
+    }
+    return null;
+}
+function fmtHourLabel(hhmm?: string): string | null {
+    if (!hhmm) return null;
+    const [h, m] = hhmm.split(":").map(Number);
+    if (isNaN(h) || isNaN(m)) return null;
+    const suf = h >= 12 ? "p. m." : "a. m.";
+    const hr12 = h % 12 === 0 ? 12 : h % 12;
+    return `${hr12}:${String(m).padStart(2, "0")} ${suf}`;
+}
+
 function missingFieldsForSchedule(d: AgentState["draft"] | undefined) {
     const faltan: Array<"name" | "phone" | "procedure"> = [];
     if (!d?.name) faltan.push("name");
@@ -799,7 +833,24 @@ export async function handleEsteticaReply(args: {
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
-    /* ===== Interés en agendar (simple → día → nombre → handoff) ===== */
+    // NUEVO: Reagendar o cancelar → directo a requiere_agente
+    if (intent === "reschedule" || intent === "cancel") {
+        await tagAsSchedulingNeeded({ conversationId, empresaId });
+        const actionLabel = intent === "cancel" ? "cancelar tu cita" : "reagendar tu cita";
+        const texto = `Entiendo. Dame un momento, reviso tus citas para ayudarte a ${actionLabel} y te escribo por aquí.`;
+        const saved = await persistBotReply({
+            conversationId,
+            empresaId,
+            texto: clampLines(closeNicely(texto)),
+            nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+        return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+
+    /* ===== Interés en agendar (día → hora → nombre → handoff) ===== */
     const wantsSchedule = detectScheduleAsk(contenido) || intent === "schedule";
     if (wantsSchedule) {
         const prev = state.draft ?? {};
@@ -809,12 +860,13 @@ export async function handleEsteticaReply(args: {
         const draft = {
             ...prev,
             whenISO: prev.whenISO || whenAsk?.iso || undefined,
+            timeHHMM: prev.timeHHMM || extractHour(contenido) || undefined, // NUEVO
             name: prev.name || nameInText || undefined,
             procedureId: prev.procedureId || (service?.id ?? undefined),
             procedureName: prev.procedureName || (service?.name ?? undefined),
         };
 
-        // 1) Primero: pedir día y recordar horarios (desde DB)
+        // 1) Pedir día
         if (!draft.whenISO) {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
             const textoBase = `¿Tienes *algún día* en mente para tu cita? Trabajamos: ${human}. Para este caso la *última cita* es a las ${lastStart}.`;
@@ -832,7 +884,25 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        // 2) Segundo: ya con día, pedir *solo* el nombre
+        // 1.5) Con día, pedir hora si falta
+        if (!draft.timeHHMM) {
+            const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
+            const askHour = `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). Trabajamos: ${human}; última cita ${lastStart}.`;
+            let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askHour, state });
+            if (greet.greetedNow) await patchState(conversationId, { greeted: true });
+
+            await patchState(conversationId, { lastIntent: "schedule", draft });
+            const saved = await persistBotReply({
+                conversationId, empresaId,
+                texto: clampLines(closeNicely(greet.text)),
+                nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone, phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+            return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        }
+
+        // 2) Con día y hora, pedir nombre
         if (!draft.name) {
             const askName = "Perfecto 👌 ¿Me regalas tu *nombre completo* para reservar?";
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askName, state });
@@ -849,16 +919,17 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        // 3) Con día + nombre → NO agendas. Hand-off inmediato al humano.
+        // 3) Día + hora + nombre → handoff al humano
         await patchState(conversationId, { lastIntent: "schedule", draft });
-        await tagAsSchedulingNeeded({ conversationId, empresaId }); // aquí mismo cambiamos a requiere_agente
+        await tagAsSchedulingNeeded({ conversationId, empresaId });
 
         const piezas: string[] = [];
         if (draft.procedureName) piezas.push(`Tratamiento: *${draft.procedureName}*`);
         piezas.push(`Nombre: *${draft.name}*`);
-        piezas.push(`Preferencia de día: *recibida*`);
+        if (draft.whenISO) piezas.push(`Día: *recibido*`);
+        if (draft.timeHHMM) piezas.push(`Hora preferida: *${fmtHourLabel(draft.timeHHMM) || draft.timeHHMM}*`);
 
-        const reply = `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha específica y te escribimos por aquí.\n${piezas.join(" · ")}`;
+        const reply = `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha y hora específicas y te escribimos por aquí.\n${piezas.join(" · ")}`;
 
         const saved = await persistBotReply({
             conversationId, empresaId,
@@ -940,14 +1011,13 @@ export async function handleEsteticaReply(args: {
             return `• ${p.name}${desde}`;
         }).join("\n");
 
-        // En vez de “¿Te paso precios…?” → invitamos a elegir día/hora para agendar
         let texto = clampLines(closeNicely(`${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar (trabajamos: ${human}; última cita ${lastStart}).`));
 
         const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
         texto = greet.text;
         if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
-        await patchState(conversationId, { lastIntent: "schedule" }); // orientamos al mini-flujo
+        await patchState(conversationId, { lastIntent: "schedule" });
         const saved = await persistBotReply({
             conversationId,
             empresaId,
@@ -990,7 +1060,6 @@ export async function handleEsteticaReply(args: {
                 `⏱️ Aprox. ${dur} min`,
                 staff ? `👩‍⚕️ Profesional: ${staff.name}` : "",
             ].filter(Boolean);
-            // En vez de “precio exacto”, orientamos a horarios
             let texto = clampLines(closeNicely(`${piezas.join(" · ")}\n\n${varyPrefix("ask")} ¿quieres ver horarios cercanos? 🗓️`));
 
             const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
