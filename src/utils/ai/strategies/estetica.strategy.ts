@@ -169,14 +169,18 @@ type AgentState = {
         procedureId?: number;
         procedureName?: string;
         whenISO?: string;
-        timeHHMM?: string; // NUEVO: hora preferida
+        /** NUEVO: hora preferida en formato HH:MM (opcional) */
+        timeHHMM?: string;
         durationMin?: number;
         stage?: DraftStage;
     };
     slotsCache?: { items: Array<{ startISO: string; endISO: string; label: string }>; expiresAt: string };
     summary?: { text: string; expiresAt: string };
     expireAt?: string;
+    handoffLocked?: boolean; // si ya lo añadiste en el paso anterior, déjalo
 };
+
+
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
@@ -736,8 +740,11 @@ async function tagAsSchedulingNeeded(opts: { conversationId: number; empresaId: 
         where: { id: conversationId },
         data: { estado: ConversationEstado.requiere_agente },
     });
+    // Congelamos el flujo para que el bot no siga contestando solo
+    await patchState(conversationId, { handoffLocked: true });
     // await prisma.conversationTag.create({ data: { conversationId, empresaId: opts.empresaId, value: opts.label ?? "AGENDAMIENTO_SOLICITADO" } });
 }
+
 
 /* ===========================
    Núcleo
@@ -773,6 +780,12 @@ export async function handleEsteticaReply(args: {
         orderBy: { timestamp: "desc" },
         select: { id: true, timestamp: true, contenido: true, mediaType: true, caption: true, mediaUrl: true },
     });
+    // === Guard: si ya estamos en handoff, no respondemos para no romper el estado ===
+    let statePre = await loadState(conversationId);
+    if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
+        return { estado: "pendiente", mensaje: "" };
+    }
+
 
     // Idempotencia de entrada
     if (last?.id && seenInboundRecently(last.id)) return { estado: "pendiente", mensaje: "" };
@@ -834,14 +847,17 @@ export async function handleEsteticaReply(args: {
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
     // NUEVO: Reagendar o cancelar → directo a requiere_agente
+    // === Reagendar / Cancelar: escalar de una vez y congelar ===
     if (intent === "reschedule" || intent === "cancel") {
+        const texto =
+            intent === "cancel"
+                ? "Entiendo, te ayudo con la cancelación 🗓️. Dame un momento, reviso tu cita y te confirmo por aquí."
+                : "Claro, te ayudo a reprogramarla 🗓️. Dame un momento, reviso tu cita y te propongo opciones por aquí.";
         await tagAsSchedulingNeeded({ conversationId, empresaId });
-        const actionLabel = intent === "cancel" ? "cancelar tu cita" : "reagendar tu cita";
-        const texto = `Entiendo. Dame un momento, reviso tus citas para ayudarte a ${actionLabel} y te escribo por aquí.`;
         const saved = await persistBotReply({
             conversationId,
             empresaId,
-            texto: clampLines(closeNicely(texto)),
+            texto,
             nuevoEstado: ConversationEstado.requiere_agente,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
@@ -849,6 +865,7 @@ export async function handleEsteticaReply(args: {
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
+
 
     /* ===== Interés en agendar (día → hora → nombre → handoff) ===== */
     const wantsSchedule = detectScheduleAsk(contenido) || intent === "schedule";
@@ -920,16 +937,16 @@ export async function handleEsteticaReply(args: {
         }
 
         // 3) Día + hora + nombre → handoff al humano
+        // 3) Con día + nombre → NO agendas. Hand-off inmediato al humano.
         await patchState(conversationId, { lastIntent: "schedule", draft });
-        await tagAsSchedulingNeeded({ conversationId, empresaId });
+        await tagAsSchedulingNeeded({ conversationId, empresaId }); // cambia a requiere_agente + lock
 
         const piezas: string[] = [];
         if (draft.procedureName) piezas.push(`Tratamiento: *${draft.procedureName}*`);
         piezas.push(`Nombre: *${draft.name}*`);
-        if (draft.whenISO) piezas.push(`Día: *recibido*`);
-        if (draft.timeHHMM) piezas.push(`Hora preferida: *${fmtHourLabel(draft.timeHHMM) || draft.timeHHMM}*`);
+        piezas.push(`Preferencia de día/hora: *${draft.whenISO ? new Date(draft.whenISO).toLocaleString("es-CO") : "recibida"}*`);
 
-        const reply = `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha y hora específicas y te escribimos por aquí.\n${piezas.join(" · ")}`;
+        const reply = `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha/hora y te escribimos por aquí.\n${piezas.join(" · ")}`;
 
         const saved = await persistBotReply({
             conversationId, empresaId,
@@ -939,6 +956,7 @@ export async function handleEsteticaReply(args: {
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+
     }
 
     /* ===== UBICACIÓN ===== */
