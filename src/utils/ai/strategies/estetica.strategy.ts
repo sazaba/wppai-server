@@ -169,11 +169,14 @@ type AgentState = {
         procedureId?: number;
         procedureName?: string;
         whenISO?: string;
-        /** NUEVO: hora preferida en formato HH:MM (opcional) */
+        /** Hora exacta en HH:MM (opcional) */
         timeHHMM?: string;
+        /** Franja horaria libre: "mañana", "tarde", "noche", etc. */
+        timeNote?: string;
         durationMin?: number;
         stage?: DraftStage;
     };
+
     slotsCache?: { items: Array<{ startISO: string; endISO: string; label: string }>; expiresAt: string };
     summary?: { text: string; expiresAt: string };
     expireAt?: string;
@@ -200,11 +203,14 @@ async function loadState(conversationId: number): Promise<AgentState> {
         slotsCache: raw.slotsCache ?? undefined,
         summary: raw.summary ?? undefined,
         expireAt: raw.expireAt,
+        handoffLocked: !!raw.handoffLocked,              // <- AÑADE ESTO
     };
     const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
-    if (expired) return { greeted: data.greeted, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
+    // Mantén handoffLocked aunque expire la TTL de memoria
+    if (expired) return { greeted: data.greeted, handoffLocked: data.handoffLocked, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) }; // <- AJUSTA ESTA LÍNEA
     return data;
 }
+
 async function saveState(conversationId: number, data: AgentState) {
     const next: AgentState = { ...data, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
     await prisma.conversationState.upsert({
@@ -681,6 +687,16 @@ function extractWhen(raw: string): { label?: string; iso?: string } | null {
     }
     return null;
 }
+// Detecta franjas como "en la mañana", "tarde", "noche", "mediodía"
+function extractDayPeriod(raw: string): string | null {
+    const t = (raw || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, ""); // quita tildes
+    if (/\b(ma[nñ]ana|por la ma[nñ]ana|en la ma[nñ]ana)\b/.test(t)) return "mañana";
+    if (/\b(tarde|por la tarde|en la tarde)\b/.test(t)) return "tarde";
+    if (/\b(noche|por la noche|en la noche)\b/.test(t)) return "noche";
+    if (/\b(mediodia|medio dia)\b/.test(t)) return "mediodía";
+    return null;
+}
+
 
 // NUEVO: extraer hora y formatear para mostrar
 function extractHour(raw: string): string | null {
@@ -780,11 +796,13 @@ export async function handleEsteticaReply(args: {
         orderBy: { timestamp: "desc" },
         select: { id: true, timestamp: true, contenido: true, mediaType: true, caption: true, mediaUrl: true },
     });
+
     // === Guard: si ya estamos en handoff, no respondemos para no romper el estado ===
     let statePre = await loadState(conversationId);
     if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
         return { estado: "pendiente", mensaje: "" };
     }
+
 
 
     // Idempotencia de entrada
@@ -873,15 +891,19 @@ export async function handleEsteticaReply(args: {
         const prev = state.draft ?? {};
         const whenAsk = extractWhen(contenido);
         const nameInText = extractName(contenido);
+        const hourExact = extractHour(contenido);           // si ya tienes extractHour, úsalo
+        const hourPeriod = extractDayPeriod(contenido);     // <- NUEVO
 
         const draft = {
             ...prev,
             whenISO: prev.whenISO || whenAsk?.iso || undefined,
-            timeHHMM: prev.timeHHMM || extractHour(contenido) || undefined, // NUEVO
+            timeHHMM: prev.timeHHMM || hourExact || undefined,
+            timeNote: prev.timeNote || hourPeriod || undefined,
             name: prev.name || nameInText || undefined,
             procedureId: prev.procedureId || (service?.id ?? undefined),
             procedureName: prev.procedureName || (service?.name ?? undefined),
         };
+
 
         // 1) Pedir día
         if (!draft.whenISO) {
@@ -901,10 +923,11 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        // 1.5) Con día, pedir hora si falta
-        if (!draft.timeHHMM) {
+
+        // 1.5) Con día, pedir hora si NO hay ni hora exacta ni franja
+        if (!draft.timeHHMM && !draft.timeNote) {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-            const askHour = `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). Trabajamos: ${human}; última cita ${lastStart}.`;
+            const askHour = `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar una *franja* como "mañana" o "tarde". Trabajamos: ${human}; última cita ${lastStart}.`;
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askHour, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
@@ -918,6 +941,7 @@ export async function handleEsteticaReply(args: {
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
+
 
         // 2) Con día y hora, pedir nombre
         if (!draft.name) {
@@ -936,15 +960,21 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        // 3) Día + hora + nombre → handoff al humano
-        // 3) Con día + nombre → NO agendas. Hand-off inmediato al humano.
+        // 3) Día + (hora o franja) + nombre → handoff al humano
         await patchState(conversationId, { lastIntent: "schedule", draft });
         await tagAsSchedulingNeeded({ conversationId, empresaId }); // cambia a requiere_agente + lock
+
+        const preferencia =
+            draft.timeHHMM
+                ? `${new Date(draft.whenISO!).toLocaleDateString("es-CO")} · ${fmtHourLabel(draft.timeHHMM)}`
+                : draft.timeNote
+                    ? `${new Date(draft.whenISO!).toLocaleDateString("es-CO")} · ${draft.timeNote}`
+                    : "recibida";
 
         const piezas: string[] = [];
         if (draft.procedureName) piezas.push(`Tratamiento: *${draft.procedureName}*`);
         piezas.push(`Nombre: *${draft.name}*`);
-        piezas.push(`Preferencia de día/hora: *${draft.whenISO ? new Date(draft.whenISO).toLocaleString("es-CO") : "recibida"}*`);
+        piezas.push(`Preferencia: *${preferencia}*`);
 
         const reply = `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha/hora y te escribimos por aquí.\n${piezas.join(" · ")}`;
 
@@ -956,6 +986,7 @@ export async function handleEsteticaReply(args: {
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+
 
     }
 
