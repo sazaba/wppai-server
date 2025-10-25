@@ -11,11 +11,11 @@ import {
 } from "./esteticaModules/domain/estetica.kb";
 
 const CONF = {
-    MEM_TTL_MIN: 5,
+    MEM_TTL_MIN: 60,
     GRAN_MIN: 15,
     MAX_SLOTS: 6,
     DAYS_HORIZON: 14,
-    MAX_HISTORY: 12,
+    MAX_HISTORY: 20,
     REPLY_MAX_LINES: 5,
     REPLY_MAX_CHARS: 900,
     TEMPERATURE: 0.2,
@@ -468,6 +468,14 @@ function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
     return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
 }
+// === Auto-handoff detector (por texto)
+function shouldTriggerHandoff(text: string): boolean {
+    const t = (text || "").toLowerCase();
+    return /\b(verificar|revisar(?:á|a)?)\s+la\s+disponibilidad\b/.test(t)
+        || /\bte\s+confirmo\b/.test(t)
+        || /\bnuestro\s+equipo\s+te\s+confirm(a|ará)\b/.test(t);
+}
+
 
 /* ===========================
    Saludo + horarios humanos (DB, SOLO informativo)
@@ -499,8 +507,10 @@ async function buildBusinessRangesHuman(
         const ranges = byDow[d];
         if (ranges?.length) parts.push(`${dayShort[d]} ${ranges.map(r => `${r.start}–${r.end}`).join(", ")}`);
     }
-    const human = parts.join("; ") || "Horario referencial";
+    // si no hay horas en BD, devolvemos vacío (no inventamos texto “referencial”)
+    const human = parts.join("; ");
 
+    // última hora de *inicio* referencial (si hay horas), útil para copy
     const dur = Math.max(30, opts?.defaultDurMin ?? (kb.defaultServiceDurationMin ?? 60));
     const weekdays = [1, 2, 3, 4, 5];
     const endsWeekdays: string[] = [];
@@ -509,7 +519,7 @@ async function buildBusinessRangesHuman(
     for (const d of weekdays) for (const r of (byDow[d] || [])) if (r.end) endsWeekdays.push(r.end);
     for (let d = 0; d < 7; d++) for (const r of (byDow[d] || [])) if (r.end) endsAll.push(r.end);
     const pool = endsWeekdays.length ? endsWeekdays : endsAll;
-    if (!pool.length) return { human: `${human} (referencial)` };
+    if (!pool.length) return { human, lastStart: undefined };
 
     const maxEnd = pool.sort()[pool.length - 1];
     const [eh, em] = maxEnd.split(":").map(Number);
@@ -517,8 +527,10 @@ async function buildBusinessRangesHuman(
     const sh = Math.max(0, Math.floor(startMins / 60));
     const sm = Math.max(0, startMins % 60);
     const lastStart = `${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}`;
-    return { human: `${human} (referencial)`, lastStart };
+
+    return { human, lastStart };
 }
+
 
 /* ===========================
    Persistencia + WhatsApp
@@ -807,8 +819,9 @@ export async function handleEsteticaReply(args: {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
             const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
             const textoBase = COLLECT_ONLY
-                ? `¿Tienes *algún día* en mente para tu cita? (Horario ${human}${sufijoUltima}). Yo recojo tus datos y nuestro equipo confirma por aquí.`
-                : `¿Tienes *algún día* en mente para tu cita? Trabajamos: ${human}. Para este caso la *última cita* es a las ${lastStart ?? "…"}.`;
+                ? `¿Tienes *algún día* en mente para tu cita?${human ? ` Trabajamos: ${human}${sufijoUltima}.` : ""} Yo recojo tu preferencia y nuestro equipo confirma por aquí.`
+                : `¿Tienes *algún día* en mente para tu cita?${human ? ` Trabajamos: ${human}.` : ""} Para este caso la *última cita* es a las ${lastStart ?? "…"}.`;
+
 
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: textoBase, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
@@ -827,8 +840,9 @@ export async function handleEsteticaReply(args: {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
             const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
             const askHour = COLLECT_ONLY
-                ? `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm) o dame una *franja* como "mañana"/"tarde". (Horario ${human}${sufijoUltima}). Yo solo recojo la preferencia y el equipo confirma.`
-                : `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar "mañana"/"tarde". Trabajamos: ${human}; última cita ${lastStart ?? "…"}.`;
+                ? `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm) o dame una *franja* como "mañana"/"tarde".${human ? ` Trabajamos: ${human}${sufijoUltima}.` : ""} Yo solo recojo la preferencia y el equipo confirma.`
+                : `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar "mañana"/"tarde".${human ? ` Trabajamos: ${human};` : ""} última cita ${lastStart ?? "…"}.`;
+
 
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askHour, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
@@ -859,7 +873,6 @@ export async function handleEsteticaReply(args: {
 
         // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
         await patchState(conversationId, { lastIntent: "schedule", draft });
-        await tagAsSchedulingNeeded({ conversationId, empresaId });
 
         const preferencia =
             draft.timeHHMM
@@ -874,14 +887,26 @@ export async function handleEsteticaReply(args: {
         piezas.push(`Preferencia: *${preferencia}*`);
 
         const reply =
-            `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* de ese horario y te *confirmo por aquí*. \n${piezas.join(" · ")}`;
+            `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* de ese horario y te *confirmo por aquí*.\n${piezas.join(" · ")}`;
+
+        // Forzamos handoff si el mensaje lo indica (y en este caso lo indica)
+        const willHandoff = shouldTriggerHandoff(reply);
+        if (willHandoff) {
+            await tagAsSchedulingNeeded({ conversationId, empresaId });
+        }
 
         const saved = await persistBotReply({
-            conversationId, empresaId, texto: clampLines(closeNicely(reply)),
-            nuevoEstado: ConversationEstado.requiere_agente, to: toPhone ?? conversacion.phone, phoneNumberId,
+            conversationId,
+            empresaId,
+            texto: clampLines(closeNicely(reply)),
+            nuevoEstado: willHandoff ? ConversationEstado.requiere_agente : ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
         });
+
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-        return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        return { estado: willHandoff ? "requiere_agente" : "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+
     }
 
     /* ===== UBICACIÓN ===== */
@@ -946,7 +971,8 @@ export async function handleEsteticaReply(args: {
         }).join("\n");
 
         let texto = clampLines(closeNicely(
-            `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar (trabajamos: ${human}${sufijoUltima}).`
+            `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar${human ? ` (trabajamos: ${human}${sufijoUltima})` : ""}.`
+
         ));
         const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
         texto = greet.text;
