@@ -889,23 +889,27 @@ export async function handleEsteticaReply(args: {
         const reply =
             `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* de ese horario y te *confirmo por aquí*.\n${piezas.join(" · ")}`;
 
-        // Forzamos handoff si el mensaje lo indica (y en este caso lo indica)
-        const willHandoff = shouldTriggerHandoff(reply);
-        if (willHandoff) {
-            await tagAsSchedulingNeeded({ conversationId, empresaId });
-        }
+        // Handoff inmediato: ya tenemos todos los datos
+        await tagAsSchedulingNeeded({ conversationId, empresaId });
 
+        // ⬇️ Usa reply (NO 'texto') y marca requiere_agente
         const saved = await persistBotReply({
             conversationId,
             empresaId,
             texto: clampLines(closeNicely(reply)),
-            nuevoEstado: willHandoff ? ConversationEstado.requiere_agente : ConversationEstado.respondido,
+            nuevoEstado: ConversationEstado.requiere_agente,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
         });
 
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-        return { estado: willHandoff ? "requiere_agente" : "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        return {
+            estado: "requiere_agente",
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
 
     }
 
