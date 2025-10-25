@@ -4,20 +4,17 @@ import { MessageFrom, ConversationEstado, MediaType } from "@prisma/client";
 import { openai } from "../../../lib/openai";
 import * as Wam from "../../../services/whatsapp.service";
 
-
 import {
     loadEsteticaKB,
     resolveServiceName,
     type EsteticaKB,
 } from "./esteticaModules/domain/estetica.kb";
 
-
-
 const CONF = {
     MEM_TTL_MIN: 5,
     GRAN_MIN: 15,
-    MAX_SLOTS: 6,     // compat
-    DAYS_HORIZON: 14, // compat
+    MAX_SLOTS: 6,
+    DAYS_HORIZON: 14,
     MAX_HISTORY: 12,
     REPLY_MAX_LINES: 5,
     REPLY_MAX_CHARS: 900,
@@ -25,9 +22,8 @@ const CONF = {
     MODEL: process.env.IA_TEXT_MODEL || process.env.IA_MODEL || "gpt-4o-mini",
 };
 
-// --- MODO COLECTA SOLAMENTE (no validamos disponibilidad; todo es referencial)
+// ——— Solo colecta (horarios referenciales; el equipo humano confirma)
 const COLLECT_ONLY = true;
-
 
 /* ==== Imagen (arrastre contextual) ==== */
 const IMAGE_WAIT_MS = Number(process.env.IA_IMAGE_WAIT_MS ?? 1000);
@@ -64,9 +60,9 @@ function normalizeToE164(n: string) {
 /* ===========================
    Helpers de agenda (DB)
    =========================== */
-
-function pad2(n: number) { return String(n).padStart(2, "0"); }
-
+function pad2(n: number) {
+    return String(n).padStart(2, "0");
+}
 function hhmmFrom(raw?: string | null) {
     if (!raw) return null;
     const m = raw.match(/^(\d{1,2})(?::?(\d{2}))?/);
@@ -75,11 +71,8 @@ function hhmmFrom(raw?: string | null) {
     const mm = Math.min(59, Number(m[2] ?? 0));
     return `${pad2(hh)}:${pad2(mm)}`;
 }
-
-// === PATCH 2: Map Weekday enum -> 0..6 (0=Dom, 6=Sáb)
 function weekdayToDow(day: any): number | null {
     const key = String(day || "").toUpperCase();
-    // Ajusta estos nombres si tu enum Weekday usa otros identificadores
     const map: Record<string, number> = {
         SUNDAY: 0, SUNDAY_: 0, DOMINGO: 0,
         MONDAY: 1, LUNES: 1,
@@ -89,14 +82,11 @@ function weekdayToDow(day: any): number | null {
         FRIDAY: 5, VIERNES: 5,
         SATURDAY: 6, SABADO: 6, SÁBADO: 6,
     };
-    return map.hasOwnProperty(key) ? map[key] : null;
+    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
 }
 
-
-// Lectura robusta de appointmentHour (varios posibles nombres/columnas)
-// === PATCH 1: Lectura directa del modelo AppointmentHour (mapea a tabla "appointmenthour")
+// — Lectura de appointmentHour
 async function fetchAppointmentHours(empresaId: number) {
-    // Prisma usa el nombre del modelo (AppointmentHour) -> cliente: prisma.appointmentHour
     const rows = await prisma.appointmentHour.findMany({
         where: { empresaId },
         orderBy: [{ day: "asc" }],
@@ -105,11 +95,11 @@ async function fetchAppointmentHours(empresaId: number) {
     return rows;
 }
 
-
-// Lectura robusta de appointment_exeption / appointment_exception
+// — Lectura de excepciones (robusto)
 async function fetchAppointmentExceptions(empresaId: number, horizonDays = 35) {
     const now = new Date();
-    const end = new Date(now); end.setDate(end.getDate() + horizonDays);
+    const end = new Date(now);
+    end.setDate(end.getDate() + horizonDays);
     try {
         const rows: any[] = await (prisma as any).appointment_exeption.findMany({
             where: { empresaId, date: { gte: now, lte: end } },
@@ -131,28 +121,20 @@ async function fetchAppointmentExceptions(empresaId: number, horizonDays = 35) {
     }
 }
 
-// === PATCH 3: Normaliza usando day/isOpen/start1-2/end1-2
 function normalizeHours(rows: any[]) {
     const byDow: Record<number, Array<{ start: string; end: string }>> = {};
     for (const r of rows || []) {
         if (!r) continue;
-
-        // Si el día está marcado cerrado, lo saltamos
         if (r.isOpen === false) continue;
-
         const dow = weekdayToDow(r.day);
         if (dow == null) continue;
-
         const s1 = hhmmFrom(r.start1), e1 = hhmmFrom(r.end1);
         const s2 = hhmmFrom(r.start2), e2 = hhmmFrom(r.end2);
-
         if (s1 && e1) (byDow[dow] ||= []).push({ start: s1, end: e1 });
         if (s2 && e2) (byDow[dow] ||= []).push({ start: s2, end: e2 });
     }
     return byDow;
 }
-
-
 function normalizeExceptions(rows: any[]) {
     const items: Array<{ date: string; closed: boolean; motivo?: string }> = [];
     for (const r of rows || []) {
@@ -167,11 +149,7 @@ function normalizeExceptions(rows: any[]) {
 /* ===========================
    Draft utils
    =========================== */
-type ConversationLite = {
-    id: number;
-    phone: string;
-    estado: ConversationEstado;
-};
+type ConversationLite = { id: number; phone: string; estado: ConversationEstado; };
 
 type DraftStage = "idle" | "offer" | "confirm";
 type AgentState = {
@@ -185,30 +163,22 @@ type AgentState = {
         procedureId?: number;
         procedureName?: string;
         whenISO?: string;
-        /** Hora exacta en HH:MM (opcional) */
-        timeHHMM?: string;
-        /** Franja horaria libre: "mañana", "tarde", "noche", etc. */
-        timeNote?: string;
+        timeHHMM?: string; // hora exacta (opcional)
+        timeNote?: string; // franja: mañana/tarde/noche
         durationMin?: number;
         stage?: DraftStage;
     };
-
     slotsCache?: { items: Array<{ startISO: string; endISO: string; label: string }>; expiresAt: string };
     summary?: { text: string; expiresAt: string };
     expireAt?: string;
-    handoffLocked?: boolean; // si ya lo añadiste en el paso anterior, déjalo
+    handoffLocked?: boolean; // congela cuando pasa a requiere_agente
 };
-
 
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
-
 async function loadState(conversationId: number): Promise<AgentState> {
-    const row = await prisma.conversationState.findUnique({
-        where: { conversationId },
-        select: { data: true },
-    });
+    const row = await prisma.conversationState.findUnique({ where: { conversationId }, select: { data: true } });
     const raw = (row?.data as any) || {};
     const data: AgentState = {
         greeted: !!raw.greeted,
@@ -219,14 +189,12 @@ async function loadState(conversationId: number): Promise<AgentState> {
         slotsCache: raw.slotsCache ?? undefined,
         summary: raw.summary ?? undefined,
         expireAt: raw.expireAt,
-        handoffLocked: !!raw.handoffLocked,              // <- AÑADE ESTO
+        handoffLocked: !!raw.handoffLocked,
     };
     const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
-    // Mantén handoffLocked aunque expire la TTL de memoria
-    if (expired) return { greeted: data.greeted, handoffLocked: data.handoffLocked, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) }; // <- AJUSTA ESTA LÍNEA
+    if (expired) return { greeted: data.greeted, handoffLocked: data.handoffLocked, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
     return data;
 }
-
 async function saveState(conversationId: number, data: AgentState) {
     const next: AgentState = { ...data, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
     await prisma.conversationState.upsert({
@@ -244,11 +212,7 @@ async function patchState(conversationId: number, patch: Partial<AgentState>) {
    Historial y summary
    =========================== */
 type ChatHistoryItem = { role: "user" | "assistant"; content: string };
-async function getRecentHistory(
-    conversationId: number,
-    excludeMessageId?: number,
-    take = CONF.MAX_HISTORY
-): Promise<ChatHistoryItem[]> {
+async function getRecentHistory(conversationId: number, excludeMessageId?: number, take = CONF.MAX_HISTORY): Promise<ChatHistoryItem[]> {
     const where: Prisma.MessageWhereInput = { conversationId };
     if (excludeMessageId) where.id = { not: excludeMessageId };
     const rows = await prisma.message.findMany({
@@ -257,13 +221,14 @@ async function getRecentHistory(
         take,
         select: { from: true, contenido: true },
     });
-    return rows
-        .reverse()
-        .map((r) => ({ role: r.from === MessageFrom.client ? "user" : "assistant", content: softTrim(r.contenido || "", 280) })) as ChatHistoryItem[];
+    return rows.reverse().map((r) => ({
+        role: r.from === MessageFrom.client ? "user" : "assistant",
+        content: softTrim(r.contenido || "", 280),
+    })) as ChatHistoryItem[];
 }
 
 /* ===========================
-   Manejo de imagen (arrastre contextual)
+   Manejo de imagen
    =========================== */
 function mentionsImageExplicitly(t: string) {
     const s = String(t || "").toLowerCase();
@@ -274,7 +239,6 @@ function mentionsImageExplicitly(t: string) {
         /\b(de|en)\s+la\s+(foto|imagen)\b/.test(s)
     );
 }
-
 async function pickImageForContext(opts: {
     conversationId: number;
     directUrl?: string | null;
@@ -283,12 +247,8 @@ async function pickImageForContext(opts: {
     referenceTs: Date;
 }): Promise<{ url: string | null; noteToAppend: string }> {
     const { conversationId, directUrl, userText, caption, referenceTs } = opts;
-
     if (directUrl) {
-        return {
-            url: String(directUrl),
-            noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : "",
-        };
+        return { url: String(directUrl), noteToAppend: caption ? `\n\nNota de la imagen: ${caption}` : "" };
     }
     if (!userText) return { url: null, noteToAppend: "" };
 
@@ -297,19 +257,13 @@ async function pickImageForContext(opts: {
             conversationId,
             from: MessageFrom.client,
             mediaType: MediaType.image,
-            timestamp: {
-                gte: new Date(referenceTs.getTime() - IMAGE_CARRY_MS),
-                lte: referenceTs,
-            },
+            timestamp: { gte: new Date(referenceTs.getTime() - IMAGE_CARRY_MS), lte: referenceTs },
         },
         orderBy: { timestamp: "desc" },
         select: { mediaUrl: true, caption: true },
     });
     if (veryRecent?.mediaUrl) {
-        return {
-            url: String(veryRecent.mediaUrl),
-            noteToAppend: veryRecent.caption ? `\n\nNota de la imagen: ${veryRecent.caption}` : "",
-        };
+        return { url: String(veryRecent.mediaUrl), noteToAppend: veryRecent.caption ? `\n\nNota de la imagen: ${veryRecent.caption}` : "" };
     }
 
     if (mentionsImageExplicitly(userText)) {
@@ -318,28 +272,20 @@ async function pickImageForContext(opts: {
                 conversationId,
                 from: MessageFrom.client,
                 mediaType: MediaType.image,
-                timestamp: {
-                    gte: new Date(referenceTs.getTime() - IMAGE_LOOKBACK_MS),
-                    lte: referenceTs,
-                },
+                timestamp: { gte: new Date(referenceTs.getTime() - IMAGE_LOOKBACK_MS), lte: referenceTs },
             },
             orderBy: { timestamp: "desc" },
             select: { mediaUrl: true, caption: true },
         });
         if (referenced?.mediaUrl) {
-            return {
-                url: String(referenced.mediaUrl),
-                noteToAppend: referenced.caption ? `\n\nNota de la imagen: ${referenced.caption}` : "",
-            };
+            return { url: String(referenced.mediaUrl), noteToAppend: referenced.caption ? `\n\nNota de la imagen: ${referenced.caption}` : "" };
         }
     }
-
     return { url: null, noteToAppend: "" };
 }
 
-
 /* ===========================
-   Summary (con horas/excepciones DB)
+   Summary (con horarios DB)
    =========================== */
 async function buildOrReuseSummary(args: {
     empresaId: number;
@@ -353,17 +299,13 @@ async function buildOrReuseSummary(args: {
     const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
     if (fresh) return cached.summary!.text;
 
-    // === PATCH 5A/5B/5C ===
-    // 5A) Evita consultar excepciones cuando COLLECT_ONLY es true
     const [hoursRows, exceptionsRows] = await Promise.all([
         fetchAppointmentHours(empresaId),
         COLLECT_ONLY ? Promise.resolve([]) : fetchAppointmentExceptions(empresaId, 35),
     ]);
 
-    // 5B) Reutiliza las filas de horarios para no reconsultar dentro de buildBusinessRangesHuman
     const { human: hoursLine } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
 
-    // 5C) Solo arma línea de excepciones si no estamos en modo colecta
     let exceptionsLine = "";
     if (!COLLECT_ONLY) {
         const exceptions = normalizeExceptions(exceptionsRows);
@@ -371,20 +313,13 @@ async function buildOrReuseSummary(args: {
         if (closedSoon) exceptionsLine = `Excepciones agenda (DB): ${closedSoon} (cerrado)`;
     }
 
-
-
     const services = (kb.procedures ?? [])
         .filter((s) => s.enabled !== false)
-        .map((s) => {
-            const desde = s.priceMin ? formatCOP(s.priceMin) : null;
-            return desde ? `${s.name} (Desde ${desde} COP)` : s.name;
-        })
+        .map((s) => (s.priceMin ? `${s.name} (Desde ${formatCOP(s.priceMin)} COP)` : s.name))
         .join(" • ");
 
     const staffByRole: Record<StaffRole, string[]> = { esteticista: [], medico: [], profesional: [] } as any;
-    (kb.staff || []).forEach((s) => {
-        if (s.active) (staffByRole[s.role] ||= []).push(s.name);
-    });
+    (kb.staff || []).forEach((s) => { if (s.active) (staffByRole[s.role] ||= []).push(s.name); });
 
     const rules: string[] = [];
     if (kb.bufferMin) rules.push(`Buffer ${kb.bufferMin} min`);
@@ -405,9 +340,7 @@ async function buildOrReuseSummary(args: {
                 staffByRole.medico?.length ? `Médicos: ${staffByRole.medico.join(", ")}` : "",
                 staffByRole.esteticista?.length ? `Esteticistas: ${staffByRole.esteticista.join(", ")}` : "",
                 staffByRole.profesional?.length ? `Profesionales: ${staffByRole.profesional.join(", ")}` : "",
-            ]
-                .filter(Boolean)
-                .join(" | ")}`
+            ].filter(Boolean).join(" | ")}`
             : "",
         hoursLine ? `Horario base (DB): ${hoursLine}` : "",
         exceptionsLine,
@@ -415,9 +348,7 @@ async function buildOrReuseSummary(args: {
             ? `Excepciones próximas (KB): ${kb.exceptions.slice(0, 2).map((e) => `${e.dateISO}${e.isOpen === false ? " cerrado" : ""}`).join(", ")}`
             : "",
         `Historial breve: ${history.slice(-6).map((h) => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 100)).join(" | ")}`,
-    ]
-        .filter(Boolean)
-        .join("\n");
+    ].filter(Boolean).join("\n");
 
     let compact = base;
     try {
@@ -460,7 +391,6 @@ function detectIntent(text: string): "price" | "schedule" | "reschedule" | "canc
     if (/\b(beneficios?|indicaciones|cuidados|contraindicaciones|en qu[eé] consiste|como funciona)\b/.test(t)) return "info";
     return "other";
 }
-// Detección explícita de “precio exacto / según mi caso”
 function detectExactPriceQuery(text: string): boolean {
     const t = (text || "").toLowerCase();
     return /\b(precio\s+exacto|exacto\s+seg[uú]n\s+mi\s+caso|precio\s+final)\b/.test(t);
@@ -481,7 +411,6 @@ function varyPrefix(kind: "offer" | "ask" | "ok"): string {
 function pickStaffForProcedure(kb: EsteticaKB, proc?: EsteticaKB["procedures"][number] | null) {
     const active = (kb.staff || []).filter((s) => s.active);
     if (!active.length) return null;
-
     if (proc?.requiredStaffIds?.length) {
         const byId = active.find((s) => proc.requiredStaffIds!.includes(s.id));
         if (byId) return byId;
@@ -494,7 +423,6 @@ function pickStaffForProcedure(kb: EsteticaKB, proc?: EsteticaKB["procedures"][n
     if (esteticista) return esteticista;
     return active[0];
 }
-
 function resolveBySynonyms(kb: EsteticaKB, text: string) {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
     if (/\bbotox|botox\b/.test(t) || /\btoxina\b/.test(t)) {
@@ -538,41 +466,25 @@ function clampLines(text: string, maxLines = CONF.REPLY_MAX_LINES) {
 }
 function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
-    return new Intl.NumberFormat("es-CO", {
-        style: "currency",
-        currency: "COP",
-        maximumFractionDigits: 0,
-    }).format(Number(value));
+    return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
 }
 
 /* ===========================
-   Saludo único + horarios humanos (DB)
+   Saludo + horarios humanos (DB, SOLO informativo)
    =========================== */
-
-// Inserta saludo solo si NO hay bot previo y greeted=false, y evita duplicar si el texto ya saluda
-async function maybePrependGreeting(opts: {
-    conversationId: number;
-    kbName?: string | null;
-    text: string;
-    state: AgentState;
-}): Promise<{ text: string; greetedNow: boolean }> {
+async function maybePrependGreeting(opts: { conversationId: number; kbName?: string | null; text: string; state: AgentState; })
+    : Promise<{ text: string; greetedNow: boolean }> {
     const { conversationId, kbName, text, state } = opts;
-
     const startsWithGreeting = /^\s*(?:¡?\s*hola|buen[oa]s)\b/i.test(text);
     if (state.greeted || startsWithGreeting) return { text, greetedNow: false };
 
-    const botPrev = await prisma.message.findFirst({
-        where: { conversationId, from: MessageFrom.bot },
-        select: { id: true },
-    });
+    const botPrev = await prisma.message.findFirst({ where: { conversationId, from: MessageFrom.bot }, select: { id: true } });
     if (botPrev) return { text, greetedNow: false };
 
     const hi = kbName ? `¡Hola! Bienvenido(a) a ${kbName}. ` : "¡Hola! ";
     return { text: `${hi}${text}`, greetedNow: true };
 }
 
-// Lee appointment_hour y arma línea humana SOLO informativa (sin marcar días cerrados).
-// === PATCH 4: 100% referencial, sin marcar "cerrado", admite "rows" para evitar doble query
 async function buildBusinessRangesHuman(
     empresaId: number,
     kb: EsteticaKB,
@@ -580,48 +492,33 @@ async function buildBusinessRangesHuman(
 ): Promise<{ human: string; lastStart?: string }> {
     const rows = opts?.rows ?? await fetchAppointmentHours(empresaId);
     const byDow = normalizeHours(rows);
-
     const dayShort = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
 
-    // 1) Texto humano por día solo con DB
     const parts: string[] = [];
     for (let d = 0; d < 7; d++) {
         const ranges = byDow[d];
-        if (ranges?.length) {
-            parts.push(`${dayShort[d]} ${ranges.map(r => `${r.start}–${r.end}`).join(", ")}`);
-        }
+        if (ranges?.length) parts.push(`${dayShort[d]} ${ranges.map(r => `${r.start}–${r.end}`).join(", ")}`);
     }
     const human = parts.join("; ") || "Horario referencial";
 
-    // 2) Última hora de INICIO referencial = (máximo fin observado) - duración
     const dur = Math.max(30, opts?.defaultDurMin ?? (kb.defaultServiceDurationMin ?? 60));
     const weekdays = [1, 2, 3, 4, 5];
-
-    // juntamos todos los "end" y priorizamos Lun–Vie si existen
     const endsWeekdays: string[] = [];
     const endsAll: string[] = [];
 
     for (const d of weekdays) for (const r of (byDow[d] || [])) if (r.end) endsWeekdays.push(r.end);
     for (let d = 0; d < 7; d++) for (const r of (byDow[d] || [])) if (r.end) endsAll.push(r.end);
-
     const pool = endsWeekdays.length ? endsWeekdays : endsAll;
-    if (!pool.length) {
-        return { human: `${human} (referencial)` }; // sin lastStart si no hay fines
-    }
+    if (!pool.length) return { human: `${human} (referencial)` };
 
-    const maxEnd = pool.sort()[pool.length - 1]; // "HH:MM"
+    const maxEnd = pool.sort()[pool.length - 1];
     const [eh, em] = maxEnd.split(":").map(Number);
     const startMins = eh * 60 + em - dur;
     const sh = Math.max(0, Math.floor(startMins / 60));
     const sm = Math.max(0, startMins % 60);
     const lastStart = `${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}`;
-
     return { human: `${human} (referencial)`, lastStart };
 }
-
-
-
-
 
 /* ===========================
    Persistencia + WhatsApp
@@ -650,9 +547,7 @@ async function persistBotReply(opts: {
         }
     }
 
-    const msg = await prisma.message.create({
-        data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId },
-    });
+    const msg = await prisma.message.create({ data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId } });
     await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
 
     let wamid: string | undefined;
@@ -674,13 +569,12 @@ async function persistBotReply(opts: {
 }
 
 /* ===========================
-   Detector + extractores + tagging
+   Detector + extractores
    =========================== */
 function detectScheduleAsk(t: string): boolean {
     const s = (t || "").toLowerCase();
     return /\b(agendar|reservar|programar|cita|agenda|horarios|disponibilidad)\b/.test(s);
 }
-
 function extractPhone(raw: string): string | null {
     const t = String(raw || "");
     const m = t.match(/(?:\+?57)?\D?(\d{9,13})/);
@@ -688,34 +582,21 @@ function extractPhone(raw: string): string | null {
     const clean = normalizeToE164(m[0]);
     return clean.length >= 10 && clean.length <= 13 ? clean : null;
 }
-
 function extractName(raw: string): string | null {
     const t = (raw || "").trim();
-
-    // 1) Frases típicas
     let m =
         t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ\s]{2,50})/i) ||
         t.match(/\b([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2})\b.*(cel|tel|whatsapp)/i);
     if (m && m[1]) return m[1].trim().replace(/\s+/g, " ");
-
-    // 2) Mensaje corto que SOLO parece nombre (1–3 palabras, sin dígitos, sin @, sin signos raros)
     const onlyLetters = /^[A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2}$/;
-    if (onlyLetters.test(t) && t.length >= 3 && t.length <= 60) {
-        return t.replace(/\s+/g, " ");
-    }
-
+    if (onlyLetters.test(t) && t.length >= 3 && t.length <= 60) return t.replace(/\s+/g, " ");
     return null;
 }
-
-
 function extractWhen(raw: string): { label?: string; iso?: string } | null {
     const t = (raw || "").toLowerCase();
     const now = new Date();
     if (/\b(hoy)\b/.test(t)) return { label: "hoy", iso: now.toISOString() };
-    if (/\b(mañana|manana)\b/.test(t)) {
-        const d = new Date(now); d.setDate(d.getDate() + 1);
-        return { label: "mañana", iso: d.toISOString() };
-    }
+    if (/\b(mañana|manana)\b/.test(t)) { const d = new Date(now); d.setDate(d.getDate() + 1); return { label: "mañana", iso: d.toISOString() }; }
     const wdMap: Record<string, number> = { domingo: 0, lunes: 1, martes: 2, miércoles: 3, miercoles: 3, jueves: 4, viernes: 5, sábado: 6, sabado: 6 };
     const key = Object.keys(wdMap).find(k => t.includes(k));
     if (key) {
@@ -735,21 +616,16 @@ function extractWhen(raw: string): { label?: string; iso?: string } | null {
     }
     return null;
 }
-// Detecta franjas como "en la mañana", "tarde", "noche", "mediodía"
 function extractDayPeriod(raw: string): string | null {
-    const t = (raw || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, ""); // quita tildes
+    const t = (raw || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
     if (/\b(ma[nñ]ana|por la ma[nñ]ana|en la ma[nñ]ana)\b/.test(t)) return "mañana";
     if (/\b(tarde|por la tarde|en la tarde)\b/.test(t)) return "tarde";
     if (/\b(noche|por la noche|en la noche)\b/.test(t)) return "noche";
     if (/\b(mediodia|medio dia)\b/.test(t)) return "mediodía";
     return null;
 }
-
-
-// NUEVO: extraer hora y formatear para mostrar
 function extractHour(raw: string): string | null {
     const t = (raw || "").toLowerCase().replace(/\s+/g, " ").trim();
-
     let m = t.match(/\b(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?|am|pm)?\b/);
     if (m) {
         let hh = parseInt(m[1], 10);
@@ -757,9 +633,7 @@ function extractHour(raw: string): string | null {
         const suf = (m[3] || "").replace(/\./g, "");
         if (suf === "pm" && hh < 12) hh += 12;
         if (suf === "am" && hh === 12) hh = 0;
-        if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-            return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-        }
+        if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
     }
     m = t.match(/\b(?:a\s+las?\s+)?(\d{1,2})(?:\s*(a\.?m\.?|p\.?m\.?|am|pm))?\b/);
     if (m) {
@@ -779,7 +653,6 @@ function fmtHourLabel(hhmm?: string): string | null {
     const hr12 = h % 12 === 0 ? 12 : h % 12;
     return `${hr12}:${String(m).padStart(2, "0")} ${suf}`;
 }
-
 function missingFieldsForSchedule(d: AgentState["draft"] | undefined) {
     const faltan: Array<"name" | "phone" | "procedure"> = [];
     if (!d?.name) faltan.push("name");
@@ -787,7 +660,6 @@ function missingFieldsForSchedule(d: AgentState["draft"] | undefined) {
     if (!(d?.procedureId || d?.procedureName)) faltan.push("procedure");
     return faltan;
 }
-
 function friendlyAskForMissing(faltan: ReturnType<typeof missingFieldsForSchedule>) {
     const asks: string[] = [];
     if (faltan.includes("name")) asks.push("¿Cuál es tu *nombre*?");
@@ -797,25 +669,11 @@ function friendlyAskForMissing(faltan: ReturnType<typeof missingFieldsForSchedul
     if (asks.length === 2) return `${asks[0]} ${asks[1]}`;
     return `Para agendar, necesito tres datos: *nombre*, *número de contacto* y *tratamiento*. ${asks.join(" ")}`;
 }
-
 async function tagAsSchedulingNeeded(opts: { conversationId: number; empresaId: number; label?: string }) {
-    const { conversationId /*, empresaId, label*/ } = opts;
-
-    // 1) Estado visible en el sidebar
-    await prisma.conversation.update({
-        where: { id: conversationId },
-        data: { estado: ConversationEstado.requiere_agente },
-    });
-
-    // 2) Lock en memoria para que el bot no siga respondiendo
+    const { conversationId } = opts;
+    await prisma.conversation.update({ where: { id: conversationId }, data: { estado: ConversationEstado.requiere_agente } });
     await patchState(conversationId, { handoffLocked: true });
-
-    // 3) (Opcional) etiquetado si usas tabla de tags
-    // await prisma.conversationTag.create({ data: { conversationId, empresaId, value: label ?? "REQUIERE_AGENTE" } });
 }
-
-
-
 
 /* ===========================
    Núcleo
@@ -844,10 +702,7 @@ export async function handleEsteticaReply(args: {
         where: { id: conversationId },
         select: { id: true, phone: true, estado: true },
     })) as ConversationLite | null;
-
     if (!conversacion) return { estado: "pendiente", mensaje: "" };
-
-
 
     const last = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.client },
@@ -855,16 +710,11 @@ export async function handleEsteticaReply(args: {
         select: { id: true, timestamp: true, contenido: true, mediaType: true, caption: true, mediaUrl: true },
     });
 
-    // === Guard: si ya estamos en handoff, no respondemos para no romper el estado ===
+    // — Guard: si ya está en handoff, no responder
     let statePre = await loadState(conversationId);
     if (conversacion?.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
         return { estado: "pendiente", mensaje: "" };
     }
-
-
-
-
-
 
     // Idempotencia de entrada
     if (last?.id && seenInboundRecently(last.id)) return { estado: "pendiente", mensaje: "" };
@@ -884,7 +734,6 @@ export async function handleEsteticaReply(args: {
     const imageUrl = isImage ? String(last.mediaUrl) : null;
     const caption = String(last?.caption || "").trim();
     const referenceTs = last?.timestamp ?? new Date();
-
     if (isImage && !caption && (!contenido || contenido === "…")) {
         await new Promise((r) => setTimeout(r, IMAGE_WAIT_MS));
         return { estado: "pendiente", mensaje: "" };
@@ -898,12 +747,8 @@ export async function handleEsteticaReply(args: {
     if (!kb) {
         const txt = "Por ahora no tengo la configuración de la clínica. Te comunico con un asesor humano. 🙏";
         const saved = await persistBotReply({
-            conversationId,
-            empresaId,
-            texto: txt,
-            nuevoEstado: ConversationEstado.requiere_agente,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
+            conversationId, empresaId, texto: txt, nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
@@ -914,46 +759,38 @@ export async function handleEsteticaReply(args: {
     const compactContext = await buildOrReuseSummary({ empresaId, conversationId, kb, history });
     state = await loadState(conversationId);
 
-    // Servicio + Intención (con sinónimos)
+    // Servicio + Intención
     let match = resolveServiceName(kb, contenido || "");
     if (!match.procedure) {
         const extra = resolveBySynonyms(kb, contenido || "");
         if (extra) match = { procedure: extra, matched: extra.name };
     }
-    const service =
-        match.procedure ?? (state.lastServiceId ? kb.procedures.find((p) => p.id === state.lastServiceId) ?? null : null);
+    const service = match.procedure ?? (state.lastServiceId ? kb.procedures.find((p) => p.id === state.lastServiceId) ?? null : null);
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
-    // NUEVO: Reagendar o cancelar → directo a requiere_agente
-    // === Reagendar / Cancelar: escalar de una vez y congelar ===
+    // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
-        const texto =
-            intent === "cancel"
-                ? "Entiendo, te ayudo con la cancelación 🗓️. Dame un momento, reviso tu cita y te confirmo por aquí."
-                : "Claro, te ayudo a reprogramarla 🗓️. Dame un momento, reviso tu cita y te propongo opciones por aquí.";
+        const texto = intent === "cancel"
+            ? "Entiendo, te ayudo con la cancelación 🗓️. Dame un momento, reviso tu cita y te confirmo por aquí."
+            : "Claro, te ayudo a reprogramarla 🗓️. Dame un momento, reviso tu cita y te propongo opciones por aquí.";
         await tagAsSchedulingNeeded({ conversationId, empresaId });
         const saved = await persistBotReply({
-            conversationId,
-            empresaId,
-            texto,
-            nuevoEstado: ConversationEstado.requiere_agente,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
+            conversationId, empresaId, texto, nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-
-    /* ===== Interés en agendar (día → hora → nombre → handoff) ===== */
+    /* ===== Interés en agendar (día → hora/franja → nombre → handoff) ===== */
     const wantsSchedule = detectScheduleAsk(contenido) || intent === "schedule";
     if (wantsSchedule) {
         const prev = state.draft ?? {};
         const whenAsk = extractWhen(contenido);
         const nameInText = extractName(contenido);
-        const hourExact = extractHour(contenido);           // si ya tienes extractHour, úsalo
-        const hourPeriod = extractDayPeriod(contenido);     // <- NUEVO
+        const hourExact = extractHour(contenido);
+        const hourPeriod = extractDayPeriod(contenido);
 
         const draft = {
             ...prev,
@@ -965,60 +802,47 @@ export async function handleEsteticaReply(args: {
             procedureName: prev.procedureName || (service?.name ?? undefined),
         };
 
-
         // 1) Pedir día
         if (!draft.whenISO) {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
             const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-
-            const textoBase =
-                COLLECT_ONLY
-                    ? `¿Tienes *algún día* en mente para tu cita? (Horario ${human}${sufijoUltima}). Yo recojo tus datos y nuestro equipo confirma por aquí.`
-                    : `¿Tienes *algún día* en mente para tu cita? Trabajamos: ${human}. Para este caso la *última cita* es a las ${lastStart ?? "…"}.`;
-
+            const textoBase = COLLECT_ONLY
+                ? `¿Tienes *algún día* en mente para tu cita? (Horario ${human}${sufijoUltima}). Yo recojo tus datos y nuestro equipo confirma por aquí.`
+                : `¿Tienes *algún día* en mente para tu cita? Trabajamos: ${human}. Para este caso la *última cita* es a las ${lastStart ?? "…"}.`;
 
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: textoBase, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
             await patchState(conversationId, { lastIntent: "schedule", draft });
             const saved = await persistBotReply({
-                conversationId, empresaId,
-                texto: clampLines(closeNicely(greet.text)),
-                nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
+                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-
-        // 1.5) Con día, pedir hora si NO hay ni hora exacta ni franja
+        // 1.5) Con día, pedir hora si falta (hora o franja)
         if (!draft.timeHHMM && !draft.timeNote) {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
             const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-
-            const askHour =
-                COLLECT_ONLY
-                    ? `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm) o dame una *franja* como "mañana"/"tarde". (Horario ${human}${sufijoUltima}). Yo solo recojo la preferencia y el equipo confirma.`
-                    : `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar una *franja* como "mañana" o "tarde". Trabajamos: ${human}; última cita ${lastStart ?? "…"}.`;
-
+            const askHour = COLLECT_ONLY
+                ? `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm) o dame una *franja* como "mañana"/"tarde". (Horario ${human}${sufijoUltima}). Yo solo recojo la preferencia y el equipo confirma.`
+                : `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar "mañana"/"tarde". Trabajamos: ${human}; última cita ${lastStart ?? "…"}.`;
 
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askHour, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
             await patchState(conversationId, { lastIntent: "schedule", draft });
             const saved = await persistBotReply({
-                conversationId, empresaId,
-                texto: clampLines(closeNicely(greet.text)),
-                nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
+                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-
-        // 2) Con día y hora, pedir nombre
+        // 2) Con día y hora/franja, pedir nombre
         if (!draft.name) {
             const askName = "Perfecto 👌 ¿Me regalas tu *nombre completo* para reservar?";
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askName, state });
@@ -1026,18 +850,16 @@ export async function handleEsteticaReply(args: {
 
             await patchState(conversationId, { lastIntent: "schedule", draft });
             const saved = await persistBotReply({
-                conversationId, empresaId,
-                texto: clampLines(closeNicely(greet.text)),
-                nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
+                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        // 3) Día + (hora o franja) + nombre → handoff al humano
+        // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
         await patchState(conversationId, { lastIntent: "schedule", draft });
-        await tagAsSchedulingNeeded({ conversationId, empresaId }); // cambia a requiere_agente + lock
+        await tagAsSchedulingNeeded({ conversationId, empresaId });
 
         const preferencia =
             draft.timeHHMM
@@ -1051,27 +873,19 @@ export async function handleEsteticaReply(args: {
         piezas.push(`Nombre: *${draft.name}*`);
         piezas.push(`Preferencia: *${preferencia}*`);
 
-        const reply = COLLECT_ONLY
-            ? `¡Gracias! 🙏 Tomé tu preferencia para la cita.\n${piezas.join(" · ")}\n\nNuestro equipo te confirma *disponibilidad exacta* por este mismo chat.`
-            : `¡Gracias! 🙏 Danos un momento para *confirmar disponibilidad* de esa fecha/hora y te escribimos por aquí.\n${piezas.join(" · ")}`;
-
+        const reply =
+            `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* de ese horario y te *confirmo por aquí*. \n${piezas.join(" · ")}`;
 
         const saved = await persistBotReply({
-            conversationId, empresaId,
-            texto: clampLines(closeNicely(reply)),
-            nuevoEstado: ConversationEstado.requiere_agente,
-            to: toPhone ?? conversacion.phone, phoneNumberId,
+            conversationId, empresaId, texto: clampLines(closeNicely(reply)),
+            nuevoEstado: ConversationEstado.requiere_agente, to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-
-
     }
 
     /* ===== UBICACIÓN ===== */
-    const isLocation =
-        /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde\s+est[áa]n|mapa|c[oó]mo\s+llego|como\s+llego|sede|ubicados?)\b/i.test(contenido);
-
+    const isLocation = /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde\s+est[áa]n|mapa|c[oó]mo\s+llego|como\s+llego|sede|ubicados?)\b/i.test(contenido);
     if (isLocation) {
         const loc = (kb.location ?? {}) as any;
         const lines: string[] = [];
@@ -1084,28 +898,21 @@ export async function handleEsteticaReply(args: {
         if (arrival) lines.push(`Indicaciones: ${String(arrival)}`);
 
         let texto = lines.length ? lines.join("\n") : "Estamos ubicados en nuestra sede principal. 😊";
-
         const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
         texto = greet.text;
         if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
         await patchState(conversationId, { lastIntent: "info" });
         const saved = await persistBotReply({
-            conversationId,
-            empresaId,
-            texto: clampLines(closeNicely(texto)),
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
+            conversationId, empresaId, texto: clampLines(closeNicely(texto)),
+            nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    /* ===== Preguntas sobre “quién realiza” ===== */
-    if (
-        /\b(qu[ié]n|quien|persona|profesional|doctor|doctora|m[eé]dico|esteticista).*(hace|realiza|atiende|me va a hacer)\b/i.test(contenido)
-    ) {
+    /* ===== Quién realiza ===== */
+    if (/\b(qu[ié]n|quien|persona|profesional|doctor|doctora|m[eé]dico|esteticista).*(hace|realiza|atiende|me va a hacer)\b/i.test(contenido)) {
         const whoProc = service || (state.lastServiceId ? kb.procedures.find((p) => p.id === state.lastServiceId) : null);
         const staff = pickStaffForProcedure(kb, whoProc || undefined);
         const labelSvc = whoProc?.name ? `*${whoProc.name}* ` : "";
@@ -1117,24 +924,22 @@ export async function handleEsteticaReply(args: {
         texto = greet.text;
         if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
-        await patchState(conversationId, { lastIntent: "info", ...(whoProc ? { lastServiceId: whoProc.id, lastServiceName: whoProc.name } : {}) });
+        await patchState(conversationId, {
+            lastIntent: "info",
+            ...(whoProc ? { lastServiceId: whoProc.id, lastServiceName: whoProc.name } : {}),
+        });
         const saved = await persistBotReply({
-            conversationId,
-            empresaId,
-            texto: clampLines(closeNicely(texto)),
-            nuevoEstado: ConversationEstado.en_proceso,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
+            conversationId, empresaId, texto: clampLines(closeNicely(texto)),
+            nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    /* ===== ¿Qué servicios ofrecen?  (AJUSTADO) ===== */
+    /* ===== ¿Qué servicios ofrecen? ===== */
     if (/que\s+servicios|qué\s+servicios|servicios\s+ofreces?/i.test(contenido)) {
         const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
         const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-
         const items = kb.procedures.slice(0, 6).map((p) => {
             const desde = p.priceMin ? ` (desde ${formatCOP(p.priceMin)})` : "";
             return `• ${p.name}${desde}`;
@@ -1143,47 +948,38 @@ export async function handleEsteticaReply(args: {
         let texto = clampLines(closeNicely(
             `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar (trabajamos: ${human}${sufijoUltima}).`
         ));
-
-
         const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
         texto = greet.text;
         if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
         await patchState(conversationId, { lastIntent: "schedule" });
         const saved = await persistBotReply({
-            conversationId,
-            empresaId,
-            texto,
-            nuevoEstado: ConversationEstado.en_proceso,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-        return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-    }
-
-    /* ===== “Precio exacto según mi caso” (AJUSTADO) ===== */
-    if (detectExactPriceQuery(contenido)) {
-        const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-        const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-
-        let texto = `El *precio exacto* se confirma en la *valoración presencial* antes del procedimiento. 💡 Si te parece, dime el *día y hora* que prefieres (trabajamos: ${human}${sufijoUltima}) y luego tu *nombre completo* para reservar.`;
-
-        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
-        texto = greet.text;
-        if (greet.greetedNow) await patchState(conversationId, { greeted: true });
-
-        await patchState(conversationId, { lastIntent: "schedule" });
-        const saved = await persistBotReply({
-            conversationId, empresaId, texto,
-            nuevoEstado: ConversationEstado.en_proceso,
+            conversationId, empresaId, texto, nuevoEstado: ConversationEstado.en_proceso,
             to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    /* ===== Precio – SOLO catálogo (mantiene “desde”) ===== */
+    /* ===== “Precio exacto según mi caso” ===== */
+    if (detectExactPriceQuery(contenido)) {
+        const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
+        const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
+        let texto = `El *precio exacto* se confirma en la *valoración presencial* antes del procedimiento. 💡 Si te parece, dime el *día y hora* que prefieres (trabajamos: ${human}${sufijoUltima}) y luego tu *nombre completo* para reservar.`;
+        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
+        texto = greet.text;
+        if (greet.greetedNow) await patchState(conversationId, { greeted: true });
+
+        await patchState(conversationId, { lastIntent: "schedule" });
+        const saved = await persistBotReply({
+            conversationId, empresaId, texto, nuevoEstado: ConversationEstado.en_proceso,
+            to: toPhone ?? conversacion.phone, phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+        return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+
+    /* ===== Precio – catálogo (DESDE) ===== */
     if (detectIntent(contenido) === "price") {
         if (service) {
             const priceLabel = service.priceMin ? `Desde ${formatCOP(service.priceMin)} (COP)` : null;
@@ -1203,22 +999,16 @@ export async function handleEsteticaReply(args: {
 
             await patchState(conversationId, { lastIntent: "price", lastServiceId: service.id, lastServiceName: service.name });
             const saved = await persistBotReply({
-                conversationId,
-                empresaId,
-                texto,
-                nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
+                conversationId, empresaId, texto, nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         } else {
             const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
             const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-
             const nombres = kb.procedures.slice(0, 3).map((s) => s.name).join(", ");
             let ask = `Manejo los *precios de catálogo* (valores “desde”). ¿De cuál tratamiento te paso precio? (Ej.: ${nombres}). Si ya sabes cuál, dime también el *día y hora* que prefieres (trabajamos: ${human}${sufijoUltima}).`;
-
 
             const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: ask, state });
             ask = greet.text;
@@ -1226,43 +1016,35 @@ export async function handleEsteticaReply(args: {
 
             await patchState(conversationId, { lastIntent: "price" });
             const saved = await persistBotReply({
-                conversationId,
-                empresaId,
-                texto: ask,
-                nuevoEstado: ConversationEstado.en_proceso,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
+                conversationId, empresaId, texto: ask, nuevoEstado: ConversationEstado.en_proceso,
+                to: toPhone ?? conversacion.phone, phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
     }
-    // ===== Cortafuegos antes de la respuesta libre: si se bloqueó, no sigas
+
+    // — Cortafuegos antes de respuesta libre
     {
-        const conversacionNow = await prisma.conversation.findUnique({
-            where: { id: conversationId },
-            select: { estado: true },
-        });
+        const conversacionNow = await prisma.conversation.findUnique({ where: { id: conversationId }, select: { estado: true } });
         const stateNow = await loadState(conversationId);
         if (conversacionNow?.estado === ConversationEstado.requiere_agente || stateNow.handoffLocked) {
             return { estado: "pendiente", mensaje: "" };
         }
     }
 
-    /* ===== Respuesta libre con contexto (guardrails + imagen) ===== */
+    /* ===== Respuesta libre con contexto ===== */
     const system = [
         `Eres asesor de una clínica estética (${kb.timezone}).`,
         `Usa EXCLUSIVAMENTE la información del siguiente "Resumen operativo".`,
         `Precios: toma SOLO los valores “desde” del catálogo (priceMin). NO confirmes precios exactos ni personalices costos por chat.`,
         `Si el usuario pide precio exacto, aclara que se confirma en *valoración presencial* e invita a elegir *día y hora* y a compartir su *nombre completo* para agendar.`,
-        `Nunca digas “precio exacto según tu caso”.`,
         `No inventes promociones, ni confirmes citas, ni ofrezcas horarios específicos.`,
         `En esta fase NO confirmes ni niegues disponibilidad ni digas que algún día está cerrado. Si preguntan por horarios, responde en términos generales, pide *día/hora o franja* y *nombre*, y aclara que el equipo humano confirma.`,
         `En el primer mensaje puedes saludar brevemente; después NO repitas saludos.`,
         `Responde directo, breve (2–5 líneas, 0–2 emojis).`,
         `Resumen operativo (OBLIGATORIO LEER Y RESPETAR):\n${compactContext}`,
     ].join("\n");
-
 
     const userCtx = [
         service ? `Servicio en contexto: ${service.name}` : state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : "",
@@ -1275,11 +1057,7 @@ export async function handleEsteticaReply(args: {
     let contenidoConNota = contenido;
     if (!effectiveImageUrl && contenido) {
         const picked = await pickImageForContext({
-            conversationId,
-            directUrl: null,
-            userText: contenido,
-            caption,
-            referenceTs,
+            conversationId, directUrl: null, userText: contenido, caption, referenceTs,
         });
         effectiveImageUrl = picked.url;
         if (picked.noteToAppend) contenidoConNota = `${contenido}${picked.noteToAppend}`;
@@ -1302,25 +1080,14 @@ export async function handleEsteticaReply(args: {
     try {
         const resp: any =
             (openai as any).chat?.completions?.create
-                ? await (openai as any).chat.completions.create({
-                    model: CONF.MODEL,
-                    temperature: CONF.TEMPERATURE,
-                    max_tokens: 190,
-                    messages,
-                })
-                : await (openai as any).createChatCompletion({
-                    model: CONF.MODEL,
-                    temperature: CONF.TEMPERATURE,
-                    max_tokens: 190,
-                    messages,
-                });
+                ? await (openai as any).chat.completions.create({ model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 190, messages })
+                : await (openai as any).createChatCompletion({ model: CONF.MODEL, temperature: CONF.TEMPERATURE, max_tokens: 190, messages });
         texto = (resp?.choices?.[0]?.message?.content || "").trim();
     } catch {
         texto = "Puedo ayudarte con tratamientos faciales (limpieza, peeling, toxina botulínica). ¿Sobre cuál quieres info?";
     }
 
     texto = clampLines(closeNicely(texto));
-
     const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
     texto = greet.text;
     if (greet.greetedNow) await patchState(conversationId, { greeted: true });
@@ -1331,12 +1098,8 @@ export async function handleEsteticaReply(args: {
     });
 
     const saved = await persistBotReply({
-        conversationId,
-        empresaId,
-        texto,
-        nuevoEstado: ConversationEstado.respondido,
-        to: toPhone ?? conversacion.phone,
-        phoneNumberId,
+        conversationId, empresaId, texto, nuevoEstado: ConversationEstado.respondido,
+        to: toPhone ?? conversacion.phone, phoneNumberId,
     });
     if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
     return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
