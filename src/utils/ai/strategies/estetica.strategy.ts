@@ -4,11 +4,14 @@ import { MessageFrom, ConversationEstado, MediaType } from "@prisma/client";
 import { openai } from "../../../lib/openai";
 import * as Wam from "../../../services/whatsapp.service";
 
+
 import {
     loadEsteticaKB,
     resolveServiceName,
     type EsteticaKB,
 } from "./esteticaModules/domain/estetica.kb";
+
+
 
 const CONF = {
     MEM_TTL_MIN: 5,
@@ -164,6 +167,12 @@ function normalizeExceptions(rows: any[]) {
 /* ===========================
    Draft utils
    =========================== */
+type ConversationLite = {
+    id: number;
+    phone: string;
+    estado: ConversationEstado;
+};
+
 type DraftStage = "idle" | "offer" | "confirm";
 type AgentState = {
     greeted?: boolean;
@@ -682,12 +691,22 @@ function extractPhone(raw: string): string | null {
 
 function extractName(raw: string): string | null {
     const t = (raw || "").trim();
-    const m =
+
+    // 1) Frases típicas
+    let m =
         t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ\s]{2,50})/i) ||
         t.match(/\b([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2})\b.*(cel|tel|whatsapp)/i);
     if (m && m[1]) return m[1].trim().replace(/\s+/g, " ");
+
+    // 2) Mensaje corto que SOLO parece nombre (1–3 palabras, sin dígitos, sin @, sin signos raros)
+    const onlyLetters = /^[A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2}$/;
+    if (onlyLetters.test(t) && t.length >= 3 && t.length <= 60) {
+        return t.replace(/\s+/g, " ");
+    }
+
     return null;
 }
+
 
 function extractWhen(raw: string): { label?: string; iso?: string } | null {
     const t = (raw || "").toLowerCase();
@@ -780,15 +799,22 @@ function friendlyAskForMissing(faltan: ReturnType<typeof missingFieldsForSchedul
 }
 
 async function tagAsSchedulingNeeded(opts: { conversationId: number; empresaId: number; label?: string }) {
-    const { conversationId } = opts;
+    const { conversationId /*, empresaId, label*/ } = opts;
+
+    // 1) Estado visible en el sidebar
     await prisma.conversation.update({
         where: { id: conversationId },
         data: { estado: ConversationEstado.requiere_agente },
     });
-    // Congelamos el flujo para que el bot no siga contestando solo
+
+    // 2) Lock en memoria para que el bot no siga respondiendo
     await patchState(conversationId, { handoffLocked: true });
-    // await prisma.conversationTag.create({ data: { conversationId, empresaId: opts.empresaId, value: opts.label ?? "AGENDAMIENTO_SOLICITADO" } });
+
+    // 3) (Opcional) etiquetado si usas tabla de tags
+    // await prisma.conversationTag.create({ data: { conversationId, empresaId, value: label ?? "REQUIERE_AGENTE" } });
 }
+
+
 
 
 /* ===========================
@@ -814,11 +840,14 @@ export async function handleEsteticaReply(args: {
     const conversationId = conversationIdArg ?? chatId;
     if (!conversationId) return { estado: "pendiente", mensaje: "" };
 
-    const conversacion = await prisma.conversation.findUnique({
+    const conversacion = (await prisma.conversation.findUnique({
         where: { id: conversationId },
         select: { id: true, phone: true, estado: true },
-    });
+    })) as ConversationLite | null;
+
     if (!conversacion) return { estado: "pendiente", mensaje: "" };
+
+
 
     const last = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.client },
@@ -828,9 +857,12 @@ export async function handleEsteticaReply(args: {
 
     // === Guard: si ya estamos en handoff, no respondemos para no romper el estado ===
     let statePre = await loadState(conversationId);
-    if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
+    if (conversacion?.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
         return { estado: "pendiente", mensaje: "" };
     }
+
+
+
 
 
 
@@ -1203,6 +1235,17 @@ export async function handleEsteticaReply(args: {
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        }
+    }
+    // ===== Cortafuegos antes de la respuesta libre: si se bloqueó, no sigas
+    {
+        const conversacionNow = await prisma.conversation.findUnique({
+            where: { id: conversationId },
+            select: { estado: true },
+        });
+        const stateNow = await loadState(conversationId);
+        if (conversacionNow?.estado === ConversationEstado.requiere_agente || stateNow.handoffLocked) {
+            return { estado: "pendiente", mensaje: "" };
         }
     }
 
