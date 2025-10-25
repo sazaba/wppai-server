@@ -872,6 +872,7 @@ export async function handleEsteticaReply(args: {
         }
 
         // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
+        // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
         await patchState(conversationId, { lastIntent: "schedule", draft });
 
         const preferencia =
@@ -889,10 +890,10 @@ export async function handleEsteticaReply(args: {
         const reply =
             `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* de ese horario y te *confirmo por aquí*.\n${piezas.join(" · ")}`;
 
-        // Handoff inmediato: ya tenemos todos los datos
+        // 1) Marcar handoff y congelar el flujo
         await tagAsSchedulingNeeded({ conversationId, empresaId });
 
-        // ⬇️ Usa reply (NO 'texto') y marca requiere_agente
+        // 2) Persistir SIEMPRE como requiere_agente (no condicionarlo)
         const saved = await persistBotReply({
             conversationId,
             empresaId,
@@ -903,6 +904,7 @@ export async function handleEsteticaReply(args: {
         });
 
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+
         return {
             estado: "requiere_agente",
             mensaje: saved.texto,
@@ -910,6 +912,7 @@ export async function handleEsteticaReply(args: {
             wamid: saved.wamid,
             media: [],
         };
+
 
     }
 
