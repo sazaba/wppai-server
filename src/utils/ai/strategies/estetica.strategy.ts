@@ -626,8 +626,6 @@ async function maybePrependGreeting(opts: {
     });
     if (botPrev) return { text, greetedNow: false };
 
-    // si aún así el texto arranca con saludo (por si quedó algo), lo dejamos sin agregar otro
-    if (looksLikeGreetingHead(text)) return { text, greetedNow: false };
 
     // agregar el ÚNICO saludo de Angélica
     const empresa = (kbName || "la clínica").trim();
@@ -968,14 +966,19 @@ export async function handleEsteticaReply(args: {
 
     // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
-        const texto = intent === "cancel"
+        let texto = intent === "cancel"
             ? "Entiendo, te ayudo con la cancelación 🗓️. Dame un momento, reviso tu cita y te confirmo por aquí."
             : "Claro, te ayudo a reprogramarla 🗓️. Dame un momento, reviso tu cita y te propongo opciones por aquí.";
+
+        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
+        texto = greet.text;
+
         await tagAsSchedulingNeeded({ conversationId, empresaId });
         const saved = await persistBotReply({
             conversationId, empresaId, texto, nuevoEstado: ConversationEstado.requiere_agente,
             to: toPhone ?? conversacion.phone, phoneNumberId,
         });
+
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
@@ -1023,9 +1026,17 @@ export async function handleEsteticaReply(args: {
         const hasDate = hasSomeDate(draft);
 
         if (hasProcedure && hasName && hasDate) {
-            const preferencia = draft.whenISO
-                ? `${new Date(draft.whenISO).toLocaleDateString("es-CO")}${draft.timeHHMM ? " · " + fmtHourLabel(draft.timeHHMM) : draft.timeNote ? " · " + draft.timeNote : ""}`
-                : (draft.whenText || "recibida");
+            // Fecha con día de la semana + fecha local; agrega hora exacta o franja si viene
+            const fechaDet = draft.whenISO
+                ? new Intl.DateTimeFormat("es-CO", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })
+                    .format(new Date(draft.whenISO))
+                : null;
+
+            const horaDet = draft.timeHHMM ? fmtHourLabel(draft.timeHHMM) : (draft.timeNote || null);
+
+            const preferencia = fechaDet
+                ? `${fechaDet}${horaDet ? " · " + horaDet : ""}`
+                : (draft.whenText || (horaDet ? `(${horaDet})` : "recibida"));
 
             const piezas = [
                 `Tratamiento: *${draft.procedureName ?? "—"}*`,
@@ -1034,6 +1045,7 @@ export async function handleEsteticaReply(args: {
             ].join(" · ");
 
             const texto = `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* y te *confirmo por aquí*.\n${piezas}`;
+
 
             await tagAsSchedulingNeeded({ conversationId, empresaId });
             const saved = await persistBotReply({
