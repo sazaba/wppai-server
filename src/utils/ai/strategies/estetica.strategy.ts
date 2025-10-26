@@ -329,12 +329,44 @@ async function buildOrReuseSummary(args: {
     if (kb.location?.name) logistics.push(`Sede: ${kb.location.name}`);
     if (kb.location?.address) logistics.push(`Dirección: ${kb.location.address}`);
 
+    // --- PATCH NUEVO: línea de pagos para el resumen ---
+    // Soporta: kb.paymentMethods (string[] o {name}), kb.payments, y banderas simples (cash, card, transfer, pse, nequi, daviplata)
+    const paymentsFromArrays = (() => {
+        const pm: any = (kb as any).paymentMethods ?? (kb as any).payments ?? [];
+        const list: string[] = [];
+        if (Array.isArray(pm)) {
+            for (const it of pm) {
+                if (!it) continue;
+                if (typeof it === "string") list.push(it);
+                else if (typeof it?.name === "string") list.push(it.name);
+            }
+        }
+        return list;
+    })();
+
+    const paymentFlags: Array<[string, any]> = [
+        ["Efectivo", (kb as any).cash],
+        ["Tarjeta débito/crédito", (kb as any).card || (kb as any).cards],
+        ["Transferencia", (kb as any).transfer || (kb as any).wire],
+        ["PSE", (kb as any).pse],
+        ["Nequi", (kb as any).nequi],
+        ["Daviplata", (kb as any).daviplata],
+    ];
+    const paymentsFromFlags = paymentFlags.filter(([_, v]) => v === true).map(([label]) => label);
+
+    const paymentsSet = new Set<string>([...paymentsFromArrays, ...paymentsFromFlags].filter(Boolean));
+    const paymentsList = Array.from(paymentsSet).sort();
+    const paymentsLine = paymentsList.length ? `Pagos: ${paymentsList.join(" • ")}` : "";
+    // --- FIN PATCH NUEVO ---
+
+
     const base = [
         kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
         `TZ: ${kb.timezone}`,
         logistics.length ? logistics.join(" | ") : "",
         rules.length ? rules.join(" | ") : "",
         services ? `Servicios: ${services}` : "",
+        paymentsLine, // <-- NUEVO: métodos de pago
         Object.entries(staffByRole).some(([_, arr]) => (arr?.length ?? 0) > 0)
             ? `Staff: ${[
                 staffByRole.medico?.length ? `Médicos: ${staffByRole.medico.join(", ")}` : "",
@@ -350,6 +382,7 @@ async function buildOrReuseSummary(args: {
             : "",
         `Historial breve: ${history.slice(-6).map((h) => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 100)).join(" | ")}`,
     ].filter(Boolean).join("\n");
+
 
     let compact = base;
     try {
@@ -476,6 +509,42 @@ function shouldTriggerHandoff(text: string): boolean {
         || /\bte\s+confirmo\b/.test(t)
         || /\bnuestro\s+equipo\s+te\s+confirm(a|ará)\b/.test(t);
 }
+// --- PATCH: detector métodos de pago ---
+function isPaymentQuestion(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return /\b(pagos?|metodos? de pago|formas? de pago|tarjeta|efectivo|transferencia|financiaci[oó]n|credito|cr[eé]dito|cuotas?)\b/.test(s);
+}
+
+function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
+    // Soporta varias formas comunes en la KB
+    const list: string[] = [];
+
+    // 1) kb.paymentMethods: string[] | {name:string, details?:string}[]
+    const pm: any = (kb as any).paymentMethods ?? (kb as any).payments ?? [];
+    if (Array.isArray(pm)) {
+        for (const it of pm) {
+            if (!it) continue;
+            if (typeof it === "string") list.push(it);
+            else if (typeof it?.name === "string") list.push(it.name);
+        }
+    }
+
+    // 2) banderas simples comunes
+    const flags: Array<[string, any]> = [
+        ["Efectivo", (kb as any).cash],
+        ["Tarjeta débito/crédito", (kb as any).card || (kb as any).cards],
+        ["Transferencia", (kb as any).transfer || (kb as any).wire],
+        ["PSE", (kb as any).pse],
+        ["Nequi", (kb as any).nequi],
+        ["Daviplata", (kb as any).daviplata],
+    ];
+    for (const [label, v] of flags) if (v === true) list.push(label);
+
+    // dedupe y orden alfabético simple
+    return Array.from(new Set(list)).sort();
+}
+// --- END PATCH ---
+
 
 /* ===========================
    Saludo + horarios humanos (DB, SOLO informativo)
@@ -483,12 +552,13 @@ function shouldTriggerHandoff(text: string): boolean {
 // 👇 NUEVO: nombre por defecto configurable, con fallback a “del equipo”
 const GREETER_NAME = process.env.GREETER_NAME ?? "Angélica";
 
+// --- PATCH: maybePrependGreeting (anti-doble saludo) ---
 async function maybePrependGreeting(opts: { conversationId: number; kbName?: string | null; text: string; state: AgentState; })
     : Promise<{ text: string; greetedNow: boolean }> {
     const { conversationId, kbName, text, state } = opts;
 
-    // si ya saludó o el usuario empezó saludando, no repetir
-    const startsWithGreeting = /^\s*(?:hola|buen[oa]s)\b/i.test(text);
+    // ya saludó o el texto YA trae saludo al inicio → no anteponer
+    const startsWithGreeting = /^\s*[¡!"]?\s*(?:hola|buen[oa]s)\b/i.test(text) || /\bte\s+saluda\b/i.test(text);
     if (state.greeted || startsWithGreeting) return { text, greetedNow: false };
 
     // si ya hubo un mensaje del bot antes, no anteponer saludo
@@ -505,6 +575,8 @@ async function maybePrependGreeting(opts: { conversationId: number; kbName?: str
     const hi = `Hola, ¿cómo estás? Te saluda ${who} de ${empresa}. `;
     return { text: `${hi}${text}`, greetedNow: true };
 }
+
+
 
 async function buildBusinessRangesHuman(
     empresaId: number,
@@ -954,6 +1026,29 @@ export async function handleEsteticaReply(args: {
         };
 
     }
+    // --- PATCH: handler de métodos de pago ---
+    if (isPaymentQuestion(contenido)) {
+        const methods = readPaymentMethodsFromKB(kb);
+        let texto: string;
+        if (methods.length) {
+            texto = `Medios de pago disponibles: ${methods.map(m => `*${m}*`).join(" · ")}. Si deseas, puedo tomar tu preferencia de *día y hora* y el equipo confirma en sede.`;
+        } else {
+            texto = "No tengo los *métodos de pago* registrados en sistema. Podemos confirmarlos en sede durante la *valoración presencial* o por este medio con el equipo.";
+        }
+
+        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
+        texto = greet.text;
+        if (greet.greetedNow) await patchState(conversationId, { greeted: true });
+
+        await patchState(conversationId, { lastIntent: "info" });
+        const saved = await persistBotReply({
+            conversationId, empresaId, texto: clampLines(closeNicely(texto)),
+            nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+        return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+    // --- END PATCH ---
 
     /* ===== UBICACIÓN ===== */
     const isLocation = /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde\s+est[áa]n|mapa|c[oó]mo\s+llego|como\s+llego|sede|ubicados?)\b/i.test(contenido);
@@ -1056,13 +1151,18 @@ export async function handleEsteticaReply(args: {
             const priceLabel = service.priceMin ? `Desde ${formatCOP(service.priceMin)} (COP)` : null;
             const dur = service.durationMin ?? kb.defaultServiceDurationMin ?? 60;
             const staff = pickStaffForProcedure(kb, service);
+            // --- PATCH: price summary - evitar doble pregunta de horarios ---
             const piezas = [
                 `${varyPrefix("offer")} *${service.name}*`,
                 priceLabel ? `💵 ${priceLabel}` : "",
                 `⏱️ Aprox. ${dur} min`,
                 staff ? `👩‍⚕️ Profesional: ${staff.name}` : "",
             ].filter(Boolean);
-            let texto = clampLines(closeNicely(`${piezas.join(" · ")}\n\n${varyPrefix("ask")} ¿quieres ver horarios cercanos? 🗓️`));
+
+            // Deja UNA sola pregunta clara (sin varyPrefix para no duplicar)
+            let texto = clampLines(closeNicely(`${piezas.join(" · ")}\n\n¿Quieres ver horarios cercanos? 🗓️`));
+            // --- END PATCH ---
+
 
             const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
             texto = greet.text;
