@@ -322,12 +322,27 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 })
 
                 let result: Awaited<ReturnType<typeof handleIAReply>>
+
                 try {
-                    result = await handleIAReply(conversation.id, contenido, {
-                        autoSend: true,
-                        toPhone: conversation.phone,
-                        phoneNumberId,
-                    })
+                    if (isEstetica) {
+                        // ⚡ Usa el flujo específico para estética
+                        const { handleEsteticaReply } = await import('../utils/ai/strategies/estetica.strategy')
+                        result = await handleEsteticaReply({
+                            conversationId: conversation.id,
+                            empresaId,
+                            contenido,
+                            toPhone: conversation.phone,
+                            phoneNumberId,
+                        })
+                    } else {
+                        // 💬 Mantiene el flujo general para otras empresas
+                        result = await handleIAReply(conversation.id, contenido, {
+                            autoSend: true,
+                            toPhone: conversation.phone,
+                            phoneNumberId,
+                        })
+                    }
+
 
                     if (
                         skipEscalateForAudioNoTranscript &&

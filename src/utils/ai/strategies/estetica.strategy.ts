@@ -550,32 +550,41 @@ function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
 /* ===========================
    Saludo + horarios humanos (DB, SOLO informativo)
    =========================== */
-// 👇 NUEVO: nombre por defecto configurable, con fallback a “del equipo”
-const GREETER_NAME = process.env.GREETER_NAME ?? "Angélica";
 
 // --- PATCH: maybePrependGreeting (anti-doble saludo) ---
-async function maybePrependGreeting(opts: { conversationId: number; kbName?: string | null; text: string; state: AgentState; })
-    : Promise<{ text: string; greetedNow: boolean }> {
+const GREETER_NAME = process.env.GREETER_NAME ?? "Angélica";
+
+async function maybePrependGreeting(opts: {
+    conversationId: number;
+    kbName?: string | null;
+    text: string;
+    state: AgentState;
+}): Promise<{ text: string; greetedNow: boolean }> {
     const { conversationId, kbName, text, state } = opts;
 
-    // ya saludó o el texto YA trae saludo al inicio → no anteponer
-    const startsWithGreeting = /^\s*[¡!"]?\s*(?:hola|buen[oa]s)\b/i.test(text) || /\bte\s+saluda\b/i.test(text);
-    if (state.greeted || startsWithGreeting) return { text, greetedNow: false };
+    // 1) Si ya saludamos en esta conversación → no repetir
+    if (state.greeted) return { text, greetedNow: false };
 
-    // si ya hubo un mensaje del bot antes, no anteponer saludo
+    // 2) Si ya existe cualquier mensaje previo del bot → no repetir
     const botPrev = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
-        select: { id: true }
+        select: { id: true },
     });
     if (botPrev) return { text, greetedNow: false };
 
-    const greeter = (state as any)?.greeterName || GREETER_NAME || "";
-    const who = greeter ? greeter : "del equipo";
-    const empresa = kbName ? kbName : "la clínica";
+    // 3) Si el texto ya comienza con un saludo → no repetir
+    const startsWithGreeting =
+        /^\s*[¡!"]?\s*(hola|buen[oa]s)\b/i.test(text) ||
+        /\bte\s+saluda\b/i.test(text);
+    if (startsWithGreeting) return { text, greetedNow: false };
 
-    const hi = `Hola, ¿cómo estás? Te saluda ${who} de ${empresa}. `;
+    // 4) Agregar saludo corto y natural solo la primera vez
+    const empresa = kbName || "la clínica";
+    const who = GREETER_NAME;
+    const hi = `Hola, soy ${who} de ${empresa}. ¿En qué te puedo ayudar hoy? `;
     return { text: `${hi}${text}`, greetedNow: true };
 }
+
 
 
 
