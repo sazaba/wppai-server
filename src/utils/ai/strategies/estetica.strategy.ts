@@ -601,12 +601,6 @@ function stripIntro(raw: string): string {
 }
 
 
-/**
- * Devuelve el texto final con, si corresponde, el saludo de Angélica.
- * - Solo saluda la PRIMERA vez que el bot responde en la conversación.
- * - Quita intros del LLM para que el único saludo visible sea el de Angélica.
- * - Marca greeted=true internamente para no repetir saludos más adelante.
- */
 async function maybePrependGreeting(opts: {
     conversationId: number;
     kbName?: string | null;
@@ -983,20 +977,17 @@ export async function handleEsteticaReply(args: {
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    /* ===== Interés en agendar (día → hora/franja → nombre → handoff) ===== */
-    /* ===== Colecta flexible para agendar (no bloquea) ===== */
-    /* ===== Interés en agendar (día → hora/franja → nombre → handoff) ===== */
-    /* ===== Colecta flexible para agendar (no bloquea) ===== */
-    // 🔴 “Pegadizo” (sticky): si ya veníamos en modo agenda o ya hay datos en el borrador,
-    // seguimos en este flujo aunque el nuevo mensaje no diga "agendar".
     const hasDraftData =
         !!(state.draft?.procedureId || state.draft?.procedureName ||
             state.draft?.whenISO || state.draft?.timeHHMM ||
             state.draft?.timeNote || state.draft?.whenText) ||
         state.lastIntent === "schedule";
 
+    const isPay = isPaymentQuestion(contenido);
+
     const wantsSchedule =
-        hasDraftData || detectScheduleAsk(contenido) || intent === "schedule";
+        !EDUCATIONAL_MODE && !isPay &&
+        (hasDraftData || detectScheduleAsk(contenido) || intent === "schedule");
 
     if (wantsSchedule) {
 
