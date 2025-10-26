@@ -628,9 +628,9 @@ async function maybePrependGreeting(opts: {
 
 
     // agregar el ÚNICO saludo de Angélica
-    const empresa = (kbName || "la clínica").trim();
-    const hi = `Hola, soy ${GREETER_NAME} de ${empresa}. ¿En qué te puedo ayudar hoy? `;
+    const hi = `Hola, soy ${GREETER_NAME}. ¿En qué te puedo ayudar hoy? `;
     const finalText = `${hi}${text}`.trim();
+
 
     // marcamos greeted=true aquí mismo (para no depender de cada rama)
     await patchState(conversationId, { greeted: true });
@@ -1044,14 +1044,19 @@ export async function handleEsteticaReply(args: {
                 `Preferencia: *${preferencia}*`
             ].join(" · ");
 
-            const texto = `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* y te *confirmo por aquí*.\n${piezas}`;
+            let texto = `¡Perfecto! ⏱️ Dame *unos minutos* para *verificar disponibilidad* 🗓️ y te *confirmo por aquí* ✅.\n${piezas}`;
 
 
             await tagAsSchedulingNeeded({ conversationId, empresaId });
+
             const saved = await persistBotReply({
-                conversationId, empresaId, texto: clampLines(closeNicely(texto)),
+                conversationId,
+                empresaId,
+                // solo clampLines; ya termina en punto para que no agregue “…” 
+                texto: clampLines(texto),
                 nuevoEstado: ConversationEstado.requiere_agente,
-                to: toPhone ?? conversacion.phone, phoneNumberId,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
