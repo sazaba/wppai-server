@@ -77,7 +77,7 @@ function weekdayToDow(day: any): number | null {
         SUNDAY: 0, SUNDAY_: 0, DOMINGO: 0,
         MONDAY: 1, LUNES: 1,
         TUESDAY: 2, MARTES: 2,
-        WEDNESDAY: 3, MIERCOLES: 3, MIÉRCOLES: 3,
+        WEDNESDAY: 3, MIERCOLES: 3, MIÉRCULES: 3,
         THURSDAY: 4, JUEVES: 4,
         FRIDAY: 5, VIERNES: 5,
         SATURDAY: 6, SABADO: 6, SÁBADO: 6,
@@ -340,7 +340,8 @@ async function buildOrReuseSummary(args: {
                 staffByRole.medico?.length ? `Médicos: ${staffByRole.medico.join(", ")}` : "",
                 staffByRole.esteticista?.length ? `Esteticistas: ${staffByRole.esteticista.join(", ")}` : "",
                 staffByRole.profesional?.length ? `Profesionales: ${staffByRole.profesional.join(", ")}` : "",
-            ].filter(Boolean).join(" | ")}`
+            ].filter(Boolean).join(" | ")
+            }`
             : "",
         hoursLine ? `Horario base (DB): ${hoursLine}` : "",
         exceptionsLine,
@@ -451,7 +452,7 @@ function softTrim(s: string | null | undefined, max = 240) {
 function endsWithPunctuation(t: string) {
     return /[.!?…]\s*$/.test((t || "").trim());
 }
-function closeNicely(raw: string): string {
+function closeNicely(raw: string) {
     let t = (raw || "").trim();
     if (!t) return t;
     if (endsWithPunctuation(t)) return t;
@@ -476,20 +477,32 @@ function shouldTriggerHandoff(text: string): boolean {
         || /\bnuestro\s+equipo\s+te\s+confirm(a|ará)\b/.test(t);
 }
 
-
 /* ===========================
    Saludo + horarios humanos (DB, SOLO informativo)
    =========================== */
+// 👇 NUEVO: nombre por defecto configurable, con fallback a “del equipo”
+const GREETER_NAME = process.env.GREETER_NAME ?? "Angélica";
+
 async function maybePrependGreeting(opts: { conversationId: number; kbName?: string | null; text: string; state: AgentState; })
     : Promise<{ text: string; greetedNow: boolean }> {
     const { conversationId, kbName, text, state } = opts;
-    const startsWithGreeting = /^\s*(?:¡?\s*hola|buen[oa]s)\b/i.test(text);
+
+    // si ya saludó o el usuario empezó saludando, no repetir
+    const startsWithGreeting = /^\s*(?:hola|buen[oa]s)\b/i.test(text);
     if (state.greeted || startsWithGreeting) return { text, greetedNow: false };
 
-    const botPrev = await prisma.message.findFirst({ where: { conversationId, from: MessageFrom.bot }, select: { id: true } });
+    // si ya hubo un mensaje del bot antes, no anteponer saludo
+    const botPrev = await prisma.message.findFirst({
+        where: { conversationId, from: MessageFrom.bot },
+        select: { id: true }
+    });
     if (botPrev) return { text, greetedNow: false };
 
-    const hi = kbName ? `¡Hola! Bienvenido(a) a ${kbName}. ` : "¡Hola! ";
+    const greeter = (state as any)?.greeterName || GREETER_NAME || "";
+    const who = greeter ? greeter : "del equipo";
+    const empresa = kbName ? kbName : "la clínica";
+
+    const hi = `Hola, ¿cómo estás? Te saluda ${who} de ${empresa}. `;
     return { text: `${hi}${text}`, greetedNow: true };
 }
 
@@ -531,7 +544,6 @@ async function buildBusinessRangesHuman(
     return { human, lastStart };
 }
 
-
 /* ===========================
    Persistencia + WhatsApp
    =========================== */
@@ -564,7 +576,6 @@ async function persistBotReply(opts: {
     const msg = await prisma.message.create({ data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId } });
     console.log('[persist] set estado ->', nuevoEstado, { conversationId, mode: 'normal' });
     await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
-
 
     let wamid: string | undefined;
     if (to && String(to).trim()) {
@@ -694,6 +705,17 @@ async function tagAsSchedulingNeeded(opts: { conversationId: number; empresaId: 
 }
 
 /* ===========================
+   NUEVO: Clasificador de MODO (educativo vs operativo)
+   =========================== */
+function isEducationalQuestion(text: string): boolean {
+    const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    if (/\b(que es|de que se trata|como funciona|como actua|beneficios?|riesgos?|efectos secundarios?|cuidados|contraindicaciones?)\b/.test(t)) return true;
+    if (/\b(b[óo]tox|toxina|acido hialuronico|peeling|hidratar|manchas|acne|rosacea|cicatrices|arrugas|poros|melasma|flacidez)\b/.test(t)) return true;
+    if (/\b(recomendable|conviene|sirve|me ayuda|me funciona)\b/.test(t) && /\b(rosacea|acne|melasma|hiperpigmentacion|cicatriz|flacidez|arrugas|manchas)\b/.test(t)) return true;
+    return false;
+}
+
+/* ===========================
    Núcleo
    =========================== */
 export async function handleEsteticaReply(args: {
@@ -787,6 +809,21 @@ export async function handleEsteticaReply(args: {
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
+    // —— NUEVO: Modo educativo vs operativo
+    const EDUCATIONAL_MODE = isEducationalQuestion(contenido);
+
+    // 👇 Autodetector de handoff por texto “te confirmo / verificar disponibilidad…”
+    if (shouldTriggerHandoff(contenido)) {
+        const texto = "Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* y te *confirmo por aquí*.";
+        await tagAsSchedulingNeeded({ conversationId, empresaId });
+        const saved = await persistBotReply({
+            conversationId, empresaId, texto, nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone, phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+        return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+
     // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
         const texto = intent === "cancel"
@@ -828,7 +865,6 @@ export async function handleEsteticaReply(args: {
                 ? `¿Tienes *algún día* en mente para tu cita?${human ? ` Trabajamos: ${human}${sufijoUltima}.` : ""} Yo recojo tu preferencia y nuestro equipo confirma por aquí.`
                 : `¿Tienes *algún día* en mente para tu cita?${human ? ` Trabajamos: ${human}.` : ""} Para este caso la *última cita* es a las ${lastStart ?? "…"}.`;
 
-
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: textoBase, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
@@ -848,7 +884,6 @@ export async function handleEsteticaReply(args: {
             const askHour = COLLECT_ONLY
                 ? `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm) o dame una *franja* como "mañana"/"tarde".${human ? ` Trabajamos: ${human}${sufijoUltima}.` : ""} Yo solo recojo la preferencia y el equipo confirma.`
                 : `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar "mañana"/"tarde".${human ? ` Trabajamos: ${human};` : ""} última cita ${lastStart ?? "…"}.`;
-
 
             let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askHour, state });
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
@@ -876,7 +911,6 @@ export async function handleEsteticaReply(args: {
             if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
-
 
         // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
         await patchState(conversationId, { lastIntent: "schedule", draft });
@@ -984,7 +1018,6 @@ export async function handleEsteticaReply(args: {
 
         let texto = clampLines(closeNicely(
             `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar${human ? ` (trabajamos: ${human}${sufijoUltima})` : ""}.`
-
         ));
         const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
         texto = greet.text;
@@ -1074,17 +1107,23 @@ export async function handleEsteticaReply(args: {
     /* ===== Respuesta libre con contexto ===== */
     const system = [
         `Eres asesor de una clínica estética (${kb.timezone}).`,
-        `Usa EXCLUSIVAMENTE la información del siguiente "Resumen operativo".`,
-        `Precios: toma SOLO los valores “desde” del catálogo (priceMin). NO confirmes precios exactos ni personalices costos por chat.`,
-        `Si el usuario pide precio exacto, aclara que se confirma en *valoración presencial* e invita a elegir *día y hora* y a compartir su *nombre completo* para agendar.`,
-        `No inventes promociones, ni confirmes citas, ni ofrezcas horarios específicos.`,
-        `En esta fase NO confirmes ni niegues disponibilidad ni digas que algún día está cerrado. Si preguntan por horarios, responde en términos generales, pide *día/hora o franja* y *nombre*, y aclara que el equipo humano confirma.`,
-        `En el primer mensaje puedes saludar brevemente; después NO repitas saludos.`,
-        `Responde directo, breve (2–5 líneas, 0–2 emojis).`,
+
+        // ——— Reglas por MODO
+        `MODOS DE RESPUESTA (OBLIGATORIO CUMPLIR):
+         • MODO OPERATIVO: usa EXCLUSIVAMENTE datos de BD/KB (horarios, precios "desde", staff, ubicación, medios de pago, políticas, disponibilidad). Si el usuario pide algo NO registrado (p. ej. “Addi”), responde: "No me aparece en nuestro catálogo" y ofrece solo lo que SÍ está en BD/KB.
+         • MODO EDUCATIVO: puedes dar explicaciones generales (qué es, cómo actúa, beneficios, cuidados, consideraciones) sin diagnosticar, sin prometer resultados, sin confirmar precios exactos ni promociones y sin afirmar que ofrecemos algo si no está en BD/KB. Cierra invitando a *valoración presencial* para personalizar y confirmar detalles.
+         • Si no hay datos suficientes en BD/KB para un punto operativo, dilo explícitamente y deriva a valoración para confirmación precisa.`,
+
+        // ——— Límites generales y estilo
+        `No inventes marcas, métodos de pago, promociones ni servicios. No confirmes disponibilidad específica. Precios SOLO "desde" si figura en KB.
+         En el primer mensaje puedes saludar; luego no repitas saludos. Responde breve (2–5 líneas, 0–2 emojis).`,
+
+        // ——— Contexto operativo compacto
         `Resumen operativo (OBLIGATORIO LEER Y RESPETAR):\n${compactContext}`,
     ].join("\n");
 
     const userCtx = [
+        `MODO: ${EDUCATIONAL_MODE ? "educativo" : "operativo"}`,
         service ? `Servicio en contexto: ${service.name}` : state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : "",
         `Usuario: ${contenido}`,
     ].filter(Boolean).join("\n");
@@ -1106,7 +1145,13 @@ export async function handleEsteticaReply(args: {
         messages.push({
             role: "user",
             content: [
-                { type: "text", text: [service ? `Servicio en contexto: ${service.name}` : state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : "", `Usuario: ${contenidoConNota}`].filter(Boolean).join("\n") },
+                {
+                    type: "text", text: [
+                        `MODO: ${EDUCATIONAL_MODE ? "educativo" : "operativo"}`,
+                        (service ? `Servicio en contexto: ${service.name}` : (state.lastServiceName ? `Servicio en contexto: ${state.lastServiceName}` : "")),
+                        `Usuario: ${contenidoConNota}`
+                    ].filter(Boolean).join("\n")
+                },
                 { type: "image_url", image_url: { url: effectiveImageUrl } },
             ],
         });
@@ -1123,6 +1168,14 @@ export async function handleEsteticaReply(args: {
         texto = (resp?.choices?.[0]?.message?.content || "").trim();
     } catch {
         texto = "Puedo ayudarte con tratamientos faciales (limpieza, peeling, toxina botulínica). ¿Sobre cuál quieres info?";
+    }
+
+    // —— Postfiltro de seguridad educativa (solo si es modo educativo)
+    if (EDUCATIONAL_MODE) {
+        const safeTail = " Para una recomendación personalizada y confirmar detalles, hacemos una *valoración presencial* con el equipo.";
+        texto = texto.replace(/\b(garantiza(?:mos)?|asegura(?:mos)?|sin\s*riesgo|resultados?\s*100%)/gi, "");
+        if (!/[.!?…]$/.test(texto.trim())) texto = texto.trim() + ".";
+        if (!/valoraci[oó]n/i.test(texto)) texto = texto + safeTail;
     }
 
     texto = clampLines(closeNicely(texto));
