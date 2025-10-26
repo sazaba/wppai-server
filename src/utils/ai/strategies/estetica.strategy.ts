@@ -561,32 +561,45 @@ function looksLikeGreetingHead(raw: string): boolean {
     const t = (raw || "").toLowerCase().trim();
     const head = t.slice(0, 220);
     return (
-        /^\s*[¡!"]?\s*(hola|buen[oa]s|buen día|buenas tardes|buenas noches)\b/i.test(head) ||
-        /\b(bienvenid[oa]s?)\b/.test(head) ||
+        /^\s*[¡!"]?\s*(hola|buen[oa]s|buen(?:\s*d[ií]a)|buenas\s+tardes|buenas\s+noches)\b/.test(head) ||
+        /\bbienvenid[oa]s?\b/.test(head) ||
         /\b(soy\s+tu\s+(asesor|asistente|bot)|soy\s+[a-záéíóúñ]+\s*(de|del)|te\s+saluda)\b/.test(head) ||
-        /\b(en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar)\b/.test(head) ||
-        /\b(gracias\s+por\s+escribir)\b/.test(head)
+        /\b¿?\s*en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar\b/.test(head) ||
+        /\bgracias\s+por\s+escribir\b/.test(head)
     );
 }
 
+
 /** Elimina cualquier intro/saludo al inicio (bienvenida, "soy tu asesor", etc.). */
+// Reemplaza tu stripIntro() por este:
 function stripIntro(raw: string): string {
     let t = (raw || "").trim();
-    // repetimos mientras siga encontrando intros al inicio (por seguridad)
+
+    // patrones típicos de intro/saludo del LLM
+    const INTRO_PATTERNS: RegExp[] = [
+        // hola / buenos días / buenas tardes / buenas noches...
+        /^\s*[¡!"]?\s*(hola|buen[oa]s|buen(?:\s*d[ií]a)|buenas\s+tardes|buenas\s+noches)\b[^\n.!?…]*[.!?…]?\s*/i,
+        // "bienvenido/a"
+        /^\s*¡?\s*bienvenid[oa]s?[^\n.!?…]*[.!?…]?\s*/i,
+        // "soy tu asesor/asistente ..." o "soy X de Y"
+        /^\s*soy\s+(tu\s+(asesor|asistente|bot)|[a-záéíóúñ\s]+?)(\s+de\s+[^\n.?!…]+)?[^\n.!?…]*[.!?…]?\s*/i,
+        // "estoy/estamos para ayudarte..."
+        /^\s*(estoy|estamos)\s+para\s+ayudarte[^\n.!?…]*[.!?…]?\s*/i,
+        // "¿en qué te/le puedo ayudar (hoy)?"
+        /^\s*¿?\s*en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar(?:\s+hoy)?\s*\??\s*/i,
+        // "gracias por escribir"
+        /^\s*gracias\s+por\s+escribir[^\n.!?…]*[.!?…]?\s*/i,
+    ];
+
+    // intenta limpiar hasta 3 veces por si hay más de una línea introductoria
     for (let i = 0; i < 3; i++) {
         const before = t;
-        t = t
-            // líneas típicas de bienvenida/presentación
-            .replace(/^\s*([¡!"]?\s*(hola|buen[oa]s|buen día|buenas tardes|buenas noches)[^.\n]*[.\n]+)\s*/i, "")
-            .replace(/^\s*(¡?\s*bienvenid[oa]s?[^.\n]*[.\n]+)\s*/i, "")
-            .replace(/^\s*(soy\s+(tu\s+(asesor|asistente|bot)|[a-záéíóúñ\s]+?)(\s+de\s+[^\n.]+)?[^.\n]*[.\n]+)\s*/i, "")
-            .replace(/^\s*((estoy|estamos)\s+para\s+ayudarte[^.\n]*[.\n]+)\s*/i, "")
-            .replace(/^\s*(en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar[^.\n]*[.\n]+)\s*/i, "")
-            .trim();
+        for (const re of INTRO_PATTERNS) t = t.replace(re, "").trim();
         if (t === before) break;
     }
     return t;
 }
+
 
 /**
  * Devuelve el texto final con, si corresponde, el saludo de Angélica.
@@ -969,8 +982,21 @@ export async function handleEsteticaReply(args: {
 
     /* ===== Interés en agendar (día → hora/franja → nombre → handoff) ===== */
     /* ===== Colecta flexible para agendar (no bloquea) ===== */
-    const wantsSchedule = detectScheduleAsk(contenido) || intent === "schedule";
+    /* ===== Interés en agendar (día → hora/franja → nombre → handoff) ===== */
+    /* ===== Colecta flexible para agendar (no bloquea) ===== */
+    // 🔴 “Pegadizo” (sticky): si ya veníamos en modo agenda o ya hay datos en el borrador,
+    // seguimos en este flujo aunque el nuevo mensaje no diga "agendar".
+    const hasDraftData =
+        !!(state.draft?.procedureId || state.draft?.procedureName ||
+            state.draft?.whenISO || state.draft?.timeHHMM ||
+            state.draft?.timeNote || state.draft?.whenText) ||
+        state.lastIntent === "schedule";
+
+    const wantsSchedule =
+        hasDraftData || detectScheduleAsk(contenido) || intent === "schedule";
+
     if (wantsSchedule) {
+
         const prev = state.draft ?? {};
         const whenAsk = extractWhen(contenido);
         const hourExact = extractHour(contenido);
