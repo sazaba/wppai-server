@@ -153,6 +153,7 @@ type ConversationLite = { id: number; phone: string; estado: ConversationEstado;
 
 type DraftStage = "idle" | "offer" | "confirm";
 type AgentState = {
+
     greeted?: boolean;
     lastIntent?: "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
     lastServiceId?: number | null;
@@ -525,6 +526,7 @@ function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
     return Array.from(new Set(list)).sort();
 }
 
+
 // --- NUEVO: detectores/limpiadores de agenda ---
 function isSchedulingCue(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
@@ -534,15 +536,63 @@ function isSchedulingCue(t: string): boolean {
     );
 }
 
+// ⬇️ AFINADO: incluye frases “no tengo acceso a la agenda/sistema de agendamiento…”
 function sanitizeNoAccessAgenda(t: string): { text: string; flagged: boolean } {
     const bad = /(no\s+(tengo|tenemos)\s+acceso\s+(directo\s+)?(al|a la)\s+(sistema\s+de\s+)?agend(a|amiento)|no\s+puedo\s+agend)/i;
-
     if (bad.test(t)) {
         const cleaned = t.replace(bad, "").replace(/\s{2,}/g, " ").trim();
         const tail = " Si te parece, cuéntame tu *día y hora* preferidos y el equipo confirma por aquí. 🗓️";
         return { text: (cleaned || "Puedo ayudarte a reservar.").trim() + tail, flagged: true };
     }
     return { text: t, flagged: false };
+}
+
+// ⬇️ NUEVOS detectores “informativos” de alta prioridad
+function isParkingQuestion(t: string): boolean {
+    const s = (t || "").toLowerCase();
+    return /\b(parqueadero|parqueo|estacionamiento|parking)\b/.test(s);
+}
+function isKidsQuestion(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return /\b(atienden?\s+ni(n|ñ)os|ni(n|ñ)os|menores|adolescentes?)\b/.test(s);
+}
+
+// ——— Corta el flujo de agenda cuando el texto es informativo/educativo ———
+function isShortQuestion(t: string): boolean {
+    const s = (t || "").trim();
+    const noSpaces = s.replace(/\s+/g, "");
+    const hasQM = /[?¿]$/.test(s) || s.includes("?") || s.includes("¿");
+    return hasQM && s.length <= 120 && noSpaces.length >= 2;
+}
+
+function containsDateOrTimeHints(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return (
+        /\b(hoy|manana|mañana|proxima|semana|lunes|martes|miercoles|jueves|viernes|sabado|sábado|domingo|am|pm|a las|hora|tarde|noche|mediodia|medio dia)\b/.test(s) ||
+        /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?\b/.test(s) ||
+        /\b(\d{1,2}:\d{2})\b/.test(s)
+    );
+}
+
+// Preguntas informativas comunes (ampliable sin romper)
+function isGeneralInfoQuestion(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return (
+        // qué/cómo/cuánto/puedo/hay/tienen/atienden... (sin agenda)
+        /\b(que es|de que se trata|como funciona|beneficios?|riesgos?|efectos secundarios?|contraindicaciones?|cuidados|pre|pos|post|cuanto dura|duracion|marcas?|quien lo hace|profesional|doctor(a)?)\b/.test(s) ||
+        /\b(hay|tienen|se puede|puedo|atienden|edad|minima|dolor|recuperaci[oó]n|cicatrices?|manchas|acne|rosacea|melasma|embarazo|lactancia)\b/.test(s) ||
+        isPaymentQuestion(t) ||
+        /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde|mapa|sede|como llego|parqueadero|parqueo|estacionamiento|parking)\b/.test(s)
+    );
+}
+
+// Regla maestro: ¿debemos saltarnos la agenda en este turno?
+function shouldBypassScheduling(t: string): boolean {
+    // Si tiene señales de agenda → NO bypass
+    if (isSchedulingCue(t) || containsDateOrTimeHints(t)) return false;
+    // Si es pregunta corta o entra en categoría informativa/educativa → bypass
+    if (isShortQuestion(t) || isGeneralInfoQuestion(t) || isEducationalQuestion(t)) return true;
+    return false;
 }
 
 
@@ -907,6 +957,8 @@ export async function handleEsteticaReply(args: {
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
+
+
     /* ===== Agenda: colecta flexible ===== */
     const hasDraftData =
         !!(state.draft?.procedureId || state.draft?.procedureName ||
@@ -915,9 +967,16 @@ export async function handleEsteticaReply(args: {
         state.lastIntent === "schedule";
 
     const isPay = isPaymentQuestion(contenido);
+
+    // Cortamos agenda si el turno actual es informativo/educativo (general)
+    const infoBreaker = shouldBypassScheduling(contenido);
+
+    // Solo activamos agenda cuando NO hay breaker informativo
     const wantsSchedule =
-        !EDUCATIONAL_MODE && !isPay &&
+        !infoBreaker &&
         (hasDraftData || detectScheduleAsk(contenido) || intent === "schedule");
+
+
 
     if (wantsSchedule) {
         const prev = state.draft ?? {};
@@ -1044,6 +1103,35 @@ export async function handleEsteticaReply(args: {
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
+    /* ===== NIÑOS / MENORES ===== */
+    if (isKidsQuestion(contenido)) {
+        // Intentamos leer de la KB si hay política registrada
+        const pol: any = (kb as any).policy || (kb as any).policies || {};
+        const kidsAllowed = pol.kidsAllowed ?? (kb as any).kidsAllowed;
+        const minAge = pol.minAge ?? (kb as any).minAge;
+        let texto = "";
+
+        if (kidsAllowed === true || typeof minAge === "number") {
+            texto = typeof minAge === "number"
+                ? `Atendemos *menores* a partir de *${minAge} años* y con *acudiente*. Antes realizamos una *valoración presencial*. ¿Te gustaría que te comparta horarios?`
+                : `Sí, *atendemos menores* con *acudiente*. Antes realizamos una *valoración presencial*. ¿Te paso horarios?`;
+        } else if (kidsAllowed === false) {
+            texto = "Por políticas internas *no atendemos menores* de edad. Si buscas alternativas, con gusto te orientamos.";
+        } else {
+            texto = "No tengo registrada en sistema la política sobre *atención a menores*. Puedo confirmarlo con el equipo o, si gustas, vemos horarios para una *valoración* y te orientamos.";
+        }
+
+        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
+        await patchState(conversationId, { lastIntent: "info" });
+
+        const saved = await persistBotReply({
+            conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
+            nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+        return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+
 
     /* ===== Quién realiza ===== */
     if (/\b(qu[ié]n|quien|persona|profesional|doctor|doctora|m[eé]dico|esteticista).*(hace|realiza|atiende|me va a hacer)\b/i.test(contenido)) {
@@ -1263,16 +1351,21 @@ export async function handleEsteticaReply(args: {
 
     {
         const detected = detectIntent(contenido);
-        const latest = (await loadState(conversationId)).lastIntent; // puede haber sido puesto en 'schedule' por isSchedulingCue
+        const latest = (await loadState(conversationId)).lastIntent;
+
+        // Si este turno fue informativo, no dejamos “pegado” schedule
+        const nextIntent =
+            shouldBypassScheduling(contenido)
+                ? "info"
+                : (latest === "schedule" || detected === "schedule" ? "schedule"
+                    : (detected === "other" ? state.lastIntent : detected));
 
         await patchState(conversationId, {
-            lastIntent:
-                latest === "schedule" || detected === "schedule"
-                    ? "schedule"
-                    : (detected === "other" ? state.lastIntent : detected),
+            lastIntent: nextIntent,
             ...(service ? { lastServiceId: service.id, lastServiceName: service.name } : {}),
         });
     }
+
 
 
     const saved = await persistBotReply({
