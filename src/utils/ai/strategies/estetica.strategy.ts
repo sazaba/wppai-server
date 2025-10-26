@@ -165,6 +165,7 @@ type AgentState = {
         whenISO?: string;
         timeHHMM?: string; // hora exacta (opcional)
         timeNote?: string; // franja: mañana/tarde/noche
+        whenText?: string;
         durationMin?: number;
         stage?: DraftStage;
     };
@@ -753,6 +754,22 @@ function fmtHourLabel(hhmm?: string): string | null {
     const hr12 = h % 12 === 0 ? 12 : h % 12;
     return `${hr12}:${String(m).padStart(2, "0")} ${suf}`;
 }
+function hasSomeDate(d?: AgentState["draft"]) {
+    return !!(d?.whenISO || d?.timeHHMM || d?.timeNote || d?.whenText);
+}
+function grabWhenFreeText(raw: string): string | null {
+    const t = (raw || "").toLowerCase();
+    const hints = [
+        "hoy", "mañana", "manana", "próxima", "proxima", "semana", "mes", "mediodia", "medio dia",
+        "lunes", "martes", "miércoles", "miercoles", "jueves", "viernes", "sábado", "sabado",
+        "am", "pm", "a las", "hora", "tarde", "noche", "domingo"
+    ];
+    const looksLikeDate = /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?/.test(t);
+    const hasHint = hints.some(h => t.includes(h));
+    return (looksLikeDate || hasHint) ? softTrim(raw, 120) : null;
+}
+
+
 function missingFieldsForSchedule(d: AgentState["draft"] | undefined) {
     const faltan: Array<"name" | "phone" | "procedure"> = [];
     if (!d?.name) faltan.push("name");
@@ -885,16 +902,16 @@ export async function handleEsteticaReply(args: {
     const EDUCATIONAL_MODE = isEducationalQuestion(contenido);
 
     // 👇 Autodetector de handoff por texto “te confirmo / verificar disponibilidad…”
-    if (shouldTriggerHandoff(contenido)) {
-        const texto = "Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* y te *confirmo por aquí*.";
-        await tagAsSchedulingNeeded({ conversationId, empresaId });
-        const saved = await persistBotReply({
-            conversationId, empresaId, texto, nuevoEstado: ConversationEstado.requiere_agente,
-            to: toPhone ?? conversacion.phone, phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-        return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-    }
+    // if (shouldTriggerHandoff(contenido)) {
+    //     const texto = "Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* y te *confirmo por aquí*.";
+    //     await tagAsSchedulingNeeded({ conversationId, empresaId });
+    //     const saved = await persistBotReply({
+    //         conversationId, empresaId, texto, nuevoEstado: ConversationEstado.requiere_agente,
+    //         to: toPhone ?? conversacion.phone, phoneNumberId,
+    //     });
+    //     if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+    //     return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    // }
 
     // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
@@ -911,121 +928,74 @@ export async function handleEsteticaReply(args: {
     }
 
     /* ===== Interés en agendar (día → hora/franja → nombre → handoff) ===== */
+    /* ===== Colecta flexible para agendar (no bloquea) ===== */
     const wantsSchedule = detectScheduleAsk(contenido) || intent === "schedule";
     if (wantsSchedule) {
         const prev = state.draft ?? {};
         const whenAsk = extractWhen(contenido);
-        const nameInText = extractName(contenido);
         const hourExact = extractHour(contenido);
         const hourPeriod = extractDayPeriod(contenido);
+        const whenFree = grabWhenFreeText(contenido);
+        const nameInText = extractName(contenido);
+        const proc = service ?? (state.lastServiceId ? kb.procedures.find(p => p.id === state.lastServiceId) ?? null : null);
 
-        const draft = {
+        const draft: AgentState["draft"] = {
             ...prev,
+            procedureId: prev.procedureId || (proc?.id ?? undefined),
+            procedureName: prev.procedureName || (proc?.name ?? undefined),
+            name: prev.name || nameInText || undefined,
             whenISO: prev.whenISO || whenAsk?.iso || undefined,
             timeHHMM: prev.timeHHMM || hourExact || undefined,
             timeNote: prev.timeNote || hourPeriod || undefined,
-            name: prev.name || nameInText || undefined,
-            procedureId: prev.procedureId || (service?.id ?? undefined),
-            procedureName: prev.procedureName || (service?.name ?? undefined),
+            whenText: prev.whenText || whenFree || undefined,
         };
 
-        // 1) Pedir día
-        if (!draft.whenISO) {
-            const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-            const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-            const textoBase = COLLECT_ONLY
-                ? `¿Tienes *algún día* en mente para tu cita?${human ? ` Trabajamos: ${human}${sufijoUltima}.` : ""} Yo recojo tu preferencia y nuestro equipo confirma por aquí.`
-                : `¿Tienes *algún día* en mente para tu cita?${human ? ` Trabajamos: ${human}.` : ""} Para este caso la *última cita* es a las ${lastStart ?? "…"}.`;
-
-            let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: textoBase, state });
-            if (greet.greetedNow) await patchState(conversationId, { greeted: true });
-
-            await patchState(conversationId, { lastIntent: "schedule", draft });
-            const saved = await persistBotReply({
-                conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
-                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
-            });
-            if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-            return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-        }
-
-        // 1.5) Con día, pedir hora si falta (hora o franja)
-        if (!draft.timeHHMM && !draft.timeNote) {
-            const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-            const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-            const askHour = COLLECT_ONLY
-                ? `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm) o dame una *franja* como "mañana"/"tarde".${human ? ` Trabajamos: ${human}${sufijoUltima}.` : ""} Yo solo recojo la preferencia y el equipo confirma.`
-                : `Genial. Para ese día, ¿qué *hora* te queda mejor? (Ej.: 10:30 am, 3 pm). También puedo tomar "mañana"/"tarde".${human ? ` Trabajamos: ${human};` : ""} última cita ${lastStart ?? "…"}.`;
-
-            let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askHour, state });
-            if (greet.greetedNow) await patchState(conversationId, { greeted: true });
-
-            await patchState(conversationId, { lastIntent: "schedule", draft });
-            const saved = await persistBotReply({
-                conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
-                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
-            });
-            if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-            return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-        }
-
-        // 2) Con día y hora/franja, pedir nombre
-        if (!draft.name) {
-            const askName = "Perfecto 👌 ¿Me regalas tu *nombre completo* para reservar?";
-            let greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: askName, state });
-            if (greet.greetedNow) await patchState(conversationId, { greeted: true });
-
-            await patchState(conversationId, { lastIntent: "schedule", draft });
-            const saved = await persistBotReply({
-                conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
-                nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
-            });
-            if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-            return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-        }
-
-        // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
         await patchState(conversationId, { lastIntent: "schedule", draft });
 
-        const preferencia =
-            draft.timeHHMM
-                ? `${new Date(draft.whenISO!).toLocaleDateString("es-CO")} · ${fmtHourLabel(draft.timeHHMM)}`
-                : draft.timeNote
-                    ? `${new Date(draft.whenISO!).toLocaleDateString("es-CO")} · ${draft.timeNote}`
-                    : "recibida";
+        const hasProcedure = !!(draft.procedureId || draft.procedureName);
+        const hasName = !!draft.name;
+        const hasDate = hasSomeDate(draft);
 
-        const piezas: string[] = [];
-        if (draft.procedureName) piezas.push(`Tratamiento: *${draft.procedureName}*`);
-        piezas.push(`Nombre: *${draft.name}*`);
-        piezas.push(`Preferencia: *${preferencia}*`);
+        if (hasProcedure && hasName && hasDate) {
+            const preferencia = draft.whenISO
+                ? `${new Date(draft.whenISO).toLocaleDateString("es-CO")}${draft.timeHHMM ? " · " + fmtHourLabel(draft.timeHHMM) : draft.timeNote ? " · " + draft.timeNote : ""}`
+                : (draft.whenText || "recibida");
 
-        const reply =
-            `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* de ese horario y te *confirmo por aquí*.\n${piezas.join(" · ")}`;
+            const piezas = [
+                `Tratamiento: *${draft.procedureName ?? "—"}*`,
+                `Nombre: *${draft.name}*`,
+                `Preferencia: *${preferencia}*`
+            ].join(" · ");
 
-        // 1) Marcar handoff y congelar el flujo
-        await tagAsSchedulingNeeded({ conversationId, empresaId });
+            const texto = `Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* y te *confirmo por aquí*.\n${piezas}`;
 
-        // 2) Persistir SIEMPRE como requiere_agente (no condicionarlo)
-        const savedHandoff = await persistBotReply({
-            conversationId,
-            empresaId,
-            texto: clampLines(closeNicely(reply)),
-            nuevoEstado: ConversationEstado.requiere_agente,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
+            await tagAsSchedulingNeeded({ conversationId, empresaId });
+            const saved = await persistBotReply({
+                conversationId, empresaId, texto: clampLines(closeNicely(texto)),
+                nuevoEstado: ConversationEstado.requiere_agente,
+                to: toPhone ?? conversacion.phone, phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+            return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        }
+
+        // Falta algo → pregunta solo lo faltante y NO bloquea
+        const asks: string[] = [];
+        if (!hasProcedure) asks.push("¿Para qué *tratamiento* deseas la cita?");
+        if (!hasDate) asks.push("¿Qué *día y hora* prefieres? (puede ser texto libre, ej.: “martes en la tarde” o “15/11 a las 3 pm”).");
+        if (!hasName) asks.push("¿Cuál es tu *nombre completo*?");
+
+        const texto = clampLines(closeNicely(asks.join(" ")));
+        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
+        const saved = await persistBotReply({
+            conversationId, empresaId, texto: greet.text,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone, phoneNumberId,
         });
-
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-
-        return {
-            estado: "requiere_agente",
-            mensaje: savedHandoff.texto,
-            messageId: savedHandoff.messageId,
-            wamid: savedHandoff.wamid,
-            media: [],
-        };
-
+        return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
+
     // --- PATCH: handler de métodos de pago ---
     if (isPaymentQuestion(contenido)) {
         const methods = readPaymentMethodsFromKB(kb);
