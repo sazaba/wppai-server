@@ -330,8 +330,7 @@ async function buildOrReuseSummary(args: {
     if (kb.location?.name) logistics.push(`Sede: ${kb.location.name}`);
     if (kb.location?.address) logistics.push(`Dirección: ${kb.location.address}`);
 
-    // --- PATCH NUEVO: línea de pagos para el resumen ---
-    // Soporta: kb.paymentMethods (string[] o {name}), kb.payments, y banderas simples (cash, card, transfer, pse, nequi, daviplata)
+    // Métodos de pago en resumen
     const paymentsFromArrays = (() => {
         const pm: any = (kb as any).paymentMethods ?? (kb as any).payments ?? [];
         const list: string[] = [];
@@ -344,7 +343,6 @@ async function buildOrReuseSummary(args: {
         }
         return list;
     })();
-
     const paymentFlags: Array<[string, any]> = [
         ["Efectivo", (kb as any).cash],
         ["Tarjeta débito/crédito", (kb as any).card || (kb as any).cards],
@@ -354,12 +352,9 @@ async function buildOrReuseSummary(args: {
         ["Daviplata", (kb as any).daviplata],
     ];
     const paymentsFromFlags = paymentFlags.filter(([_, v]) => v === true).map(([label]) => label);
-
     const paymentsSet = new Set<string>([...paymentsFromArrays, ...paymentsFromFlags].filter(Boolean));
     const paymentsList = Array.from(paymentsSet).sort();
     const paymentsLine = paymentsList.length ? `Pagos: ${paymentsList.join(" • ")}` : "";
-    // --- FIN PATCH NUEVO ---
-
 
     const base = [
         kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
@@ -367,7 +362,7 @@ async function buildOrReuseSummary(args: {
         logistics.length ? logistics.join(" | ") : "",
         rules.length ? rules.join(" | ") : "",
         services ? `Servicios: ${services}` : "",
-        paymentsLine, // <-- NUEVO: métodos de pago
+        paymentsLine,
         Object.entries(staffByRole).some(([_, arr]) => (arr?.length ?? 0) > 0)
             ? `Staff: ${[
                 staffByRole.medico?.length ? `Médicos: ${staffByRole.medico.join(", ")}` : "",
@@ -383,7 +378,6 @@ async function buildOrReuseSummary(args: {
             : "",
         `Historial breve: ${history.slice(-6).map((h) => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 100)).join(" | ")}`,
     ].filter(Boolean).join("\n");
-
 
     let compact = base;
     try {
@@ -503,13 +497,6 @@ function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
     return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
 }
-// === Auto-handoff detector (por texto)
-function shouldTriggerHandoff(text: string): boolean {
-    const t = (text || "").toLowerCase();
-    return /\b(verificar|revisar(?:á|a)?)\s+la\s+disponibilidad\b/.test(t)
-        || /\bte\s+confirmo\b/.test(t)
-        || /\bnuestro\s+equipo\s+te\s+confirm(a|ará)\b/.test(t);
-}
 // --- PATCH: detector métodos de pago ---
 function isPaymentQuestion(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
@@ -517,10 +504,7 @@ function isPaymentQuestion(t: string): boolean {
 }
 
 function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
-    // Soporta varias formas comunes en la KB
     const list: string[] = [];
-
-    // 1) kb.paymentMethods: string[] | {name:string, details?:string}[]
     const pm: any = (kb as any).paymentMethods ?? (kb as any).payments ?? [];
     if (Array.isArray(pm)) {
         for (const it of pm) {
@@ -529,8 +513,6 @@ function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
             else if (typeof it?.name === "string") list.push(it.name);
         }
     }
-
-    // 2) banderas simples comunes
     const flags: Array<[string, any]> = [
         ["Efectivo", (kb as any).cash],
         ["Tarjeta débito/crédito", (kb as any).card || (kb as any).cards],
@@ -540,58 +522,46 @@ function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
         ["Daviplata", (kb as any).daviplata],
     ];
     for (const [label, v] of flags) if (v === true) list.push(label);
-
-    // dedupe y orden alfabético simple
     return Array.from(new Set(list)).sort();
 }
-// --- END PATCH ---
 
-
-/* ===========================
-   Saludo + horarios humanos (DB, SOLO informativo)
-   =========================== */
-
-// --- PATCH: maybePrependGreeting (anti-doble saludo) ---
-const GREETER_NAME = process.env.GREETER_NAME ?? "Angélica";
-
-
-
-/** Detecta si un texto arranca con frases de saludo/introducción. */
-function looksLikeGreetingHead(raw: string): boolean {
-    const t = (raw || "").toLowerCase().trim();
-    const head = t.slice(0, 220);
+// --- NUEVO: detectores/limpiadores de agenda ---
+function isSchedulingCue(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
     return (
-        /^\s*[¡!"]?\s*(hola|buen[oa]s|buen(?:\s*d[ií]a)|buenas\s+tardes|buenas\s+noches)\b/.test(head) ||
-        /\bbienvenid[oa]s?\b/.test(head) ||
-        /\b(soy\s+tu\s+(asesor|asistente|bot)|soy\s+[a-záéíóúñ]+\s*(de|del)|te\s+saluda)\b/.test(head) ||
-        /\b¿?\s*en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar\b/.test(head) ||
-        /\bgracias\s+por\s+escribir\b/.test(head)
+        /\b(agendar|agenda|reservar|programar)\b/.test(s) ||
+        /quieres ver horarios|te paso horarios|dime el dia y hora|que dia y hora prefieres/.test(s)
     );
 }
 
+function sanitizeNoAccessAgenda(t: string): { text: string; flagged: boolean } {
+    const bad = /(no\s+(tengo|tenemos)\s+acceso\s+(directo\s+)?(al|a la)\s+(sistema\s+de\s+)?agend(a|amiento)|no\s+puedo\s+agend)/i;
 
-/** Elimina cualquier intro/saludo al inicio (bienvenida, "soy tu asesor", etc.). */
-// Reemplaza tu stripIntro() por este:
+    if (bad.test(t)) {
+        const cleaned = t.replace(bad, "").replace(/\s{2,}/g, " ").trim();
+        const tail = " Si te parece, cuéntame tu *día y hora* preferidos y el equipo confirma por aquí. 🗓️";
+        return { text: (cleaned || "Puedo ayudarte a reservar.").trim() + tail, flagged: true };
+    }
+    return { text: t, flagged: false };
+}
+
+
+/* ===========================
+   Saludo (anti-doble saludo)
+   =========================== */
+const GREETER_NAME = process.env.GREETER_NAME ?? "Angélica";
+
+/** Elimina cualquier intro/saludo al inicio del LLM (deja solo el nuestro). */
 function stripIntro(raw: string): string {
     let t = (raw || "").trim();
-
-    // patrones típicos de intro/saludo del LLM
     const INTRO_PATTERNS: RegExp[] = [
-        // hola / buenos días / buenas tardes / buenas noches...
         /^\s*[¡!"]?\s*(hola|buen[oa]s|buen(?:\s*d[ií]a)|buenas\s+tardes|buenas\s+noches)\b[^\n.!?…]*[.!?…]?\s*/i,
-        // "bienvenido/a"
         /^\s*¡?\s*bienvenid[oa]s?[^\n.!?…]*[.!?…]?\s*/i,
-        // "soy tu asesor/asistente ..." o "soy X de Y"
         /^\s*soy\s+(tu\s+(asesor|asistente|bot)|[a-záéíóúñ\s]+?)(\s+de\s+[^\n.?!…]+)?[^\n.!?…]*[.!?…]?\s*/i,
-        // "estoy/estamos para ayudarte..."
         /^\s*(estoy|estamos)\s+para\s+ayudarte[^\n.!?…]*[.!?…]?\s*/i,
-        // "¿en qué te/le puedo ayudar (hoy)?"
         /^\s*¿?\s*en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar(?:\s+hoy)?\s*\??\s*/i,
-        // "gracias por escribir"
         /^\s*gracias\s+por\s+escribir[^\n.!?…]*[.!?…]?\s*/i,
     ];
-
-    // intenta limpiar hasta 3 veces por si hay más de una línea introductoria
     for (let i = 0; i < 3; i++) {
         const before = t;
         for (const re of INTRO_PATTERNS) t = t.replace(re, "").trim();
@@ -600,40 +570,29 @@ function stripIntro(raw: string): string {
     return t;
 }
 
-
+/** ÚNICO saludo de Angélica (solo si es la primera respuesta del bot). */
 async function maybePrependGreeting(opts: {
     conversationId: number;
     kbName?: string | null;
     text: string;
     state: AgentState;
 }): Promise<{ text: string; greetedNow: boolean }> {
-    const { conversationId, kbName, state } = opts;
-    let text = stripIntro(opts.text); // 1) quitamos intros del modelo siempre
+    const { conversationId, state } = opts;
+    let text = stripIntro(opts.text);
 
-    // si ya saludamos en esta conversación → no repetir
     if (state.greeted) return { text, greetedNow: false };
 
-    // si ya existe cualquier mensaje previo del bot → no repetir
     const botPrev = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
         select: { id: true },
     });
     if (botPrev) return { text, greetedNow: false };
 
-
-    // agregar el ÚNICO saludo de Angélica
     const hi = `Hola, soy ${GREETER_NAME}. ¿En qué te puedo ayudar hoy? `;
     const finalText = `${hi}${text}`.trim();
-
-
-    // marcamos greeted=true aquí mismo (para no depender de cada rama)
     await patchState(conversationId, { greeted: true });
-
     return { text: finalText, greetedNow: true };
 }
-
-
-
 
 async function buildBusinessRangesHuman(
     empresaId: number,
@@ -649,10 +608,8 @@ async function buildBusinessRangesHuman(
         const ranges = byDow[d];
         if (ranges?.length) parts.push(`${dayShort[d]} ${ranges.map(r => `${r.start}–${r.end}`).join(", ")}`);
     }
-    // si no hay horas en BD, devolvemos vacío (no inventamos texto “referencial”)
     const human = parts.join("; ");
 
-    // última hora de *inicio* referencial (si hay horas), útil para copy
     const dur = Math.max(30, opts?.defaultDurMin ?? (kb.defaultServiceDurationMin ?? 60));
     const weekdays = [1, 2, 3, 4, 5];
     const endsWeekdays: string[] = [];
@@ -698,7 +655,6 @@ async function persistBotReply(opts: {
             console.log('[persist] set estado ->', nuevoEstado, { conversationId, mode: 'dedup' });
             await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
             return { messageId: prevBot.id, texto: prevBot.contenido, wamid: prevBot.externalId as any, estado: nuevoEstado };
-
         }
     }
 
@@ -722,7 +678,6 @@ async function persistBotReply(opts: {
         }
     }
     return { messageId: msg.id, texto, wamid, estado: nuevoEstado };
-
 }
 
 /* ===========================
@@ -731,13 +686,6 @@ async function persistBotReply(opts: {
 function detectScheduleAsk(t: string): boolean {
     const s = (t || "").toLowerCase();
     return /\b(agendar|reservar|programar|cita|agenda|horarios|disponibilidad)\b/.test(s);
-}
-function extractPhone(raw: string): string | null {
-    const t = String(raw || "");
-    const m = t.match(/(?:\+?57)?\D?(\d{9,13})/);
-    if (!m) return null;
-    const clean = normalizeToE164(m[0]);
-    return clean.length >= 10 && clean.length <= 13 ? clean : null;
 }
 function extractName(raw: string): string | null {
     const t = (raw || "").trim();
@@ -825,23 +773,6 @@ function grabWhenFreeText(raw: string): string | null {
     return (looksLikeDate || hasHint) ? softTrim(raw, 120) : null;
 }
 
-
-function missingFieldsForSchedule(d: AgentState["draft"] | undefined) {
-    const faltan: Array<"name" | "phone" | "procedure"> = [];
-    if (!d?.name) faltan.push("name");
-    if (!d?.phone) faltan.push("phone");
-    if (!(d?.procedureId || d?.procedureName)) faltan.push("procedure");
-    return faltan;
-}
-function friendlyAskForMissing(faltan: ReturnType<typeof missingFieldsForSchedule>) {
-    const asks: string[] = [];
-    if (faltan.includes("name")) asks.push("¿Cuál es tu *nombre*?");
-    if (faltan.includes("phone")) asks.push("¿Me confirmas tu *número de contacto* (WhatsApp)?");
-    if (faltan.includes("procedure")) asks.push("¿Para qué *tratamiento* deseas la cita?");
-    if (asks.length === 1) return asks[0];
-    if (asks.length === 2) return `${asks[0]} ${asks[1]}`;
-    return `Para agendar, necesito tres datos: *nombre*, *número de contacto* y *tratamiento*. ${asks.join(" ")}`;
-}
 async function tagAsSchedulingNeeded(opts: { conversationId: number; empresaId: number; label?: string }) {
     const { conversationId } = opts;
     console.log('[handoff] tagging requiere_agente ->', { conversationId });
@@ -850,7 +781,7 @@ async function tagAsSchedulingNeeded(opts: { conversationId: number; empresaId: 
 }
 
 /* ===========================
-   NUEVO: Clasificador de MODO (educativo vs operativo)
+   Clasificador de MODO
    =========================== */
 function isEducationalQuestion(text: string): boolean {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
@@ -954,9 +885,8 @@ export async function handleEsteticaReply(args: {
     let intent = detectIntent(contenido);
     if (intent === "other" && /servicio|tratamiento|procedimiento/i.test(contenido)) intent = "info";
 
-    // —— NUEVO: Modo educativo vs operativo
+    // Modo educativo vs operativo
     const EDUCATIONAL_MODE = isEducationalQuestion(contenido);
-
 
     // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
@@ -977,6 +907,7 @@ export async function handleEsteticaReply(args: {
         return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
+    /* ===== Agenda: colecta flexible ===== */
     const hasDraftData =
         !!(state.draft?.procedureId || state.draft?.procedureName ||
             state.draft?.whenISO || state.draft?.timeHHMM ||
@@ -984,13 +915,11 @@ export async function handleEsteticaReply(args: {
         state.lastIntent === "schedule";
 
     const isPay = isPaymentQuestion(contenido);
-
     const wantsSchedule =
         !EDUCATIONAL_MODE && !isPay &&
         (hasDraftData || detectScheduleAsk(contenido) || intent === "schedule");
 
     if (wantsSchedule) {
-
         const prev = state.draft ?? {};
         const whenAsk = extractWhen(contenido);
         const hourExact = extractHour(contenido);
@@ -1017,7 +946,6 @@ export async function handleEsteticaReply(args: {
         const hasDate = hasSomeDate(draft);
 
         if (hasProcedure && hasName && hasDate) {
-            // Fecha con día de la semana + fecha local; agrega hora exacta o franja si viene
             const fechaDet = draft.whenISO
                 ? new Intl.DateTimeFormat("es-CO", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })
                     .format(new Date(draft.whenISO))
@@ -1037,13 +965,11 @@ export async function handleEsteticaReply(args: {
 
             let texto = `¡Perfecto! ⏱️ Dame *unos minutos* para *verificar disponibilidad* 🗓️ y te *confirmo por aquí* ✅.\n${piezas}`;
 
-
             await tagAsSchedulingNeeded({ conversationId, empresaId });
 
             const saved = await persistBotReply({
                 conversationId,
                 empresaId,
-                // solo clampLines; ya termina en punto para que no agregue “…” 
                 texto: clampLines(texto),
                 nuevoEstado: ConversationEstado.requiere_agente,
                 to: toPhone ?? conversacion.phone,
@@ -1053,7 +979,6 @@ export async function handleEsteticaReply(args: {
             return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        // Falta algo → pregunta solo lo faltante y NO bloquea
         const asks: string[] = [];
         if (!hasProcedure) asks.push("¿Para qué *tratamiento* deseas la cita?");
         if (!hasDate) asks.push("¿Qué *día y hora* prefieres? (puede ser texto libre, ej.: “martes en la tarde” o “15/11 a las 3 pm”).");
@@ -1070,7 +995,7 @@ export async function handleEsteticaReply(args: {
         return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // --- PATCH: handler de métodos de pago ---
+    // Métodos de pago
     if (isPaymentQuestion(contenido)) {
         const methods = readPaymentMethodsFromKB(kb);
         let texto: string;
@@ -1092,7 +1017,6 @@ export async function handleEsteticaReply(args: {
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
         return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
-    // --- END PATCH ---
 
     /* ===== UBICACIÓN ===== */
     const isLocation = /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde\s+est[áa]n|mapa|c[oó]mo\s+llego|como\s+llego|sede|ubicados?)\b/i.test(contenido);
@@ -1135,9 +1059,11 @@ export async function handleEsteticaReply(args: {
         if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
         await patchState(conversationId, {
-            lastIntent: "info",
+            // Cambiamos a 'schedule' porque el propio mensaje invita a ver horarios
+            lastIntent: "schedule",
             ...(whoProc ? { lastServiceId: whoProc.id, lastServiceName: whoProc.name } : {}),
         });
+
         const saved = await persistBotReply({
             conversationId, empresaId, texto: clampLines(closeNicely(texto)),
             nuevoEstado: ConversationEstado.en_proceso, to: toPhone ?? conversacion.phone, phoneNumberId,
@@ -1195,24 +1121,25 @@ export async function handleEsteticaReply(args: {
             const priceLabel = service.priceMin ? `Desde ${formatCOP(service.priceMin)} (COP)` : null;
             const dur = service.durationMin ?? kb.defaultServiceDurationMin ?? 60;
             const staff = pickStaffForProcedure(kb, service);
-            // --- PATCH: price summary - evitar doble pregunta de horarios ---
             const piezas = [
                 `${varyPrefix("offer")} *${service.name}*`,
                 priceLabel ? `💵 ${priceLabel}` : "",
                 `⏱️ Aprox. ${dur} min`,
                 staff ? `👩‍⚕️ Profesional: ${staff.name}` : "",
             ].filter(Boolean);
-
-            // Deja UNA sola pregunta clara (sin varyPrefix para no duplicar)
             let texto = clampLines(closeNicely(`${piezas.join(" · ")}\n\n¿Quieres ver horarios cercanos? 🗓️`));
-            // --- END PATCH ---
-
 
             const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
             texto = greet.text;
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
-            await patchState(conversationId, { lastIntent: "price", lastServiceId: service.id, lastServiceName: service.name });
+            await patchState(conversationId, {
+                // Preguntamos por horarios ⇒ forzamos modo agenda "pegadizo"
+                lastIntent: "schedule",
+                lastServiceId: service.id,
+                lastServiceName: service.name
+            });
+
             const saved = await persistBotReply({
                 conversationId, empresaId, texto, nuevoEstado: ConversationEstado.en_proceso,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
@@ -1229,7 +1156,8 @@ export async function handleEsteticaReply(args: {
             ask = greet.text;
             if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
-            await patchState(conversationId, { lastIntent: "price" });
+            await patchState(conversationId, { lastIntent: "schedule" });
+
             const saved = await persistBotReply({
                 conversationId, empresaId, texto: ask, nuevoEstado: ConversationEstado.en_proceso,
                 to: toPhone ?? conversacion.phone, phoneNumberId,
@@ -1251,18 +1179,12 @@ export async function handleEsteticaReply(args: {
     /* ===== Respuesta libre con contexto ===== */
     const system = [
         `Eres asesor de una clínica estética (${kb.timezone}).`,
-
-        // ——— Reglas por MODO
         `MODOS DE RESPUESTA (OBLIGATORIO CUMPLIR):
-         • MODO OPERATIVO: usa EXCLUSIVAMENTE datos de BD/KB (horarios, precios "desde", staff, ubicación, medios de pago, políticas, disponibilidad). Si el usuario pide algo NO registrado (p. ej. “Addi”), responde: "No me aparece en nuestro catálogo" y ofrece solo lo que SÍ está en BD/KB.
-         • MODO EDUCATIVO: puedes dar explicaciones generales (qué es, cómo actúa, beneficios, cuidados, consideraciones) sin diagnosticar, sin prometer resultados, sin confirmar precios exactos ni promociones y sin afirmar que ofrecemos algo si no está en BD/KB. Cierra invitando a *valoración presencial* para personalizar y confirmar detalles.
-         • Si no hay datos suficientes en BD/KB para un punto operativo, dilo explícitamente y deriva a valoración para confirmación precisa.`,
-
-        // ——— Límites generales y estilo
+     • MODO OPERATIVO: usa EXCLUSIVAMENTE datos de BD/KB (horarios, precios "desde", staff, ubicación, medios de pago, políticas, disponibilidad). Si el usuario pide algo NO registrado (p. ej. “Addi”), responde: "No me aparece en nuestro catálogo" y ofrece solo lo que SÍ está en BD/KB.
+     • MODO EDUCATIVO: puedes dar explicaciones generales (qué es, cómo actúa, beneficios, cuidados, consideraciones) sin diagnosticar, sin prometer resultados, sin confirmar precios exactos ni promociones y sin afirmar que ofrecemos algo si no está en BD/KB. Cierra invitando a *valoración presencial* para personalizar y confirmar detalles.
+     • Si no hay datos suficientes en BD/KB para un punto operativo, dilo explícitamente y deriva a valoración para confirmación precisa.`,
         `No inventes marcas, métodos de pago, promociones ni servicios. No confirmes disponibilidad específica. Precios SOLO "desde" si figura en KB.
-         En el primer mensaje puedes saludar; luego no repitas saludos. Responde breve (2–5 líneas, 0–2 emojis).`,
-
-        // ——— Contexto operativo compacto
+     En el primer mensaje puedes saludar; luego no repitas saludos. Responde breve (2–5 líneas, 0–2 emojis).`,
         `Resumen operativo (OBLIGATORIO LEER Y RESPETAR):\n${compactContext}`,
     ].join("\n");
 
@@ -1322,15 +1244,36 @@ export async function handleEsteticaReply(args: {
         if (!/valoraci[oó]n/i.test(texto)) texto = texto + safeTail;
     }
 
+    // Limpiamos mensajes peligrosos sobre "no tengo acceso a la agenda"
+    {
+        const san = sanitizeNoAccessAgenda(texto);
+        texto = san.text;
+    }
+
+    // Si el propio bot invita a agenda en este texto, marcamos la intención como 'schedule' (modo pegadizo)
+    if (isSchedulingCue(texto)) {
+        await patchState(conversationId, { lastIntent: "schedule" });
+    }
+
+
     texto = clampLines(closeNicely(texto));
     const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
     texto = greet.text;
     if (greet.greetedNow) await patchState(conversationId, { greeted: true });
 
-    await patchState(conversationId, {
-        lastIntent: detectIntent(contenido) === "other" ? state.lastIntent : detectIntent(contenido),
-        ...(service ? { lastServiceId: service.id, lastServiceName: service.name } : {}),
-    });
+    {
+        const detected = detectIntent(contenido);
+        const latest = (await loadState(conversationId)).lastIntent; // puede haber sido puesto en 'schedule' por isSchedulingCue
+
+        await patchState(conversationId, {
+            lastIntent:
+                latest === "schedule" || detected === "schedule"
+                    ? "schedule"
+                    : (detected === "other" ? state.lastIntent : detected),
+            ...(service ? { lastServiceId: service.id, lastServiceName: service.name } : {}),
+        });
+    }
+
 
     const saved = await persistBotReply({
         conversationId, empresaId, texto, nuevoEstado: ConversationEstado.respondido,
