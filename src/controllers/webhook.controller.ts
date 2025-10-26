@@ -296,7 +296,16 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     where: { empresaId },
                     select: { aiMode: true, appointmentEnabled: true },
                 })
-                const isEstetica = (bca?.aiMode === 'estetica') || (bca?.appointmentEnabled === true)
+
+                const mode = (bca?.aiMode || '').toString().trim().toLowerCase()
+                let isEstetica = mode === 'estetica' || bca?.appointmentEnabled === true
+
+                // 👇 Fallback: si hay KB de estética disponible, forzamos el modo estética
+                try {
+                    const { loadEsteticaKB } = await import('../utils/ai/strategies/esteticaModules/domain/estetica.kb')
+                    const kb = await loadEsteticaKB({ empresaId })
+                    if (kb) isEstetica = true
+                } catch { /* no-op */ }
 
                 let delayMs = 0
                 if (!isEstetica) {
@@ -309,19 +318,22 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 }
 
                 if (process.env.DEBUG_AI === '1') {
-                    console.log('[WEBHOOK] delay humano ms =', delayMs, 'isEstetica?', isEstetica)
+                    console.log('[WEBHOOK] human-like delay ms =', delayMs, { mode, appointmentEnabled: bca?.appointmentEnabled, isEstetica })
                 }
                 await sleep(delayMs)
 
-                console.log('[IA] Llamando handleIAReply con:', {
+                console.log('[IA] Llamando handler con:', {
                     conversationId: conversation.id,
                     empresaId,
                     toPhone: conversation.phone,
                     phoneNumberId,
                     contenido,
+                    isEstetica,
+                    mode,
                 })
 
-                let result: Awaited<ReturnType<typeof handleIAReply>>
+                // Resultado (de estética o genérico)
+                let result: any
 
                 try {
                     if (isEstetica) {
@@ -343,7 +355,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         })
                     }
 
-
                     if (
                         skipEscalateForAudioNoTranscript &&
                         result?.estado === ConversationEstado.requiere_agente &&
@@ -356,7 +367,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         } as any
                     }
                 } catch (e: any) {
-                    console.error('[IA] handleIAReply lanzó error:', e?.response?.data || e?.message || e)
+                    console.error('[IA] handler lanzó error:', e?.response?.data || e?.message || e)
                     result = {
                         estado: ConversationEstado.en_proceso,
                         mensaje: 'Gracias por tu mensaje. ¿Podrías darme un poco más de contexto?',
@@ -364,7 +375,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     } as any
                 }
 
-                console.log('[IA] Resultado handleIAReply:', {
+                console.log('[IA] Resultado:', {
                     estado: result?.estado,
                     messageId: result?.messageId,
                     wamid: result?.wamid,
@@ -420,7 +431,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 // 5) Si el handler envió imágenes de productos, emítelas también
                 if (result?.media?.length) {
                     const wamids = result.media
-                        .map(m => m.wamid)
+                        .map((m: any) => m.wamid)
                         .filter(Boolean) as string[]
 
                     if (wamids.length) {

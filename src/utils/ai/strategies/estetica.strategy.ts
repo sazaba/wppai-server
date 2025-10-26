@@ -554,35 +554,77 @@ function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
 // --- PATCH: maybePrependGreeting (anti-doble saludo) ---
 const GREETER_NAME = process.env.GREETER_NAME ?? "Angélica";
 
+
+
+/** Detecta si un texto arranca con frases de saludo/introducción. */
+function looksLikeGreetingHead(raw: string): boolean {
+    const t = (raw || "").toLowerCase().trim();
+    const head = t.slice(0, 220);
+    return (
+        /^\s*[¡!"]?\s*(hola|buen[oa]s|buen día|buenas tardes|buenas noches)\b/i.test(head) ||
+        /\b(bienvenid[oa]s?)\b/.test(head) ||
+        /\b(soy\s+tu\s+(asesor|asistente|bot)|soy\s+[a-záéíóúñ]+\s*(de|del)|te\s+saluda)\b/.test(head) ||
+        /\b(en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar)\b/.test(head) ||
+        /\b(gracias\s+por\s+escribir)\b/.test(head)
+    );
+}
+
+/** Elimina cualquier intro/saludo al inicio (bienvenida, "soy tu asesor", etc.). */
+function stripIntro(raw: string): string {
+    let t = (raw || "").trim();
+    // repetimos mientras siga encontrando intros al inicio (por seguridad)
+    for (let i = 0; i < 3; i++) {
+        const before = t;
+        t = t
+            // líneas típicas de bienvenida/presentación
+            .replace(/^\s*([¡!"]?\s*(hola|buen[oa]s|buen día|buenas tardes|buenas noches)[^.\n]*[.\n]+)\s*/i, "")
+            .replace(/^\s*(¡?\s*bienvenid[oa]s?[^.\n]*[.\n]+)\s*/i, "")
+            .replace(/^\s*(soy\s+(tu\s+(asesor|asistente|bot)|[a-záéíóúñ\s]+?)(\s+de\s+[^\n.]+)?[^.\n]*[.\n]+)\s*/i, "")
+            .replace(/^\s*((estoy|estamos)\s+para\s+ayudarte[^.\n]*[.\n]+)\s*/i, "")
+            .replace(/^\s*(en\s+qu[eé]\s+(te|le)\s+puedo\s+ayudar[^.\n]*[.\n]+)\s*/i, "")
+            .trim();
+        if (t === before) break;
+    }
+    return t;
+}
+
+/**
+ * Devuelve el texto final con, si corresponde, el saludo de Angélica.
+ * - Solo saluda la PRIMERA vez que el bot responde en la conversación.
+ * - Quita intros del LLM para que el único saludo visible sea el de Angélica.
+ * - Marca greeted=true internamente para no repetir saludos más adelante.
+ */
 async function maybePrependGreeting(opts: {
     conversationId: number;
     kbName?: string | null;
     text: string;
     state: AgentState;
 }): Promise<{ text: string; greetedNow: boolean }> {
-    const { conversationId, kbName, text, state } = opts;
+    const { conversationId, kbName, state } = opts;
+    let text = stripIntro(opts.text); // 1) quitamos intros del modelo siempre
 
-    // 1) Si ya saludamos en esta conversación → no repetir
+    // si ya saludamos en esta conversación → no repetir
     if (state.greeted) return { text, greetedNow: false };
 
-    // 2) Si ya existe cualquier mensaje previo del bot → no repetir
+    // si ya existe cualquier mensaje previo del bot → no repetir
     const botPrev = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
         select: { id: true },
     });
     if (botPrev) return { text, greetedNow: false };
 
-    // 3) Si el texto ya comienza con un saludo → no repetir
-    const startsWithGreeting =
-        /^\s*[¡!"]?\s*(hola|buen[oa]s)\b/i.test(text) ||
-        /\bte\s+saluda\b/i.test(text);
-    if (startsWithGreeting) return { text, greetedNow: false };
+    // si aún así el texto arranca con saludo (por si quedó algo), lo dejamos sin agregar otro
+    if (looksLikeGreetingHead(text)) return { text, greetedNow: false };
 
-    // 4) Agregar saludo corto y natural solo la primera vez
-    const empresa = kbName || "la clínica";
-    const who = GREETER_NAME;
-    const hi = `Hola, soy ${who} de ${empresa}. ¿En qué te puedo ayudar hoy? `;
-    return { text: `${hi}${text}`, greetedNow: true };
+    // agregar el ÚNICO saludo de Angélica
+    const empresa = (kbName || "la clínica").trim();
+    const hi = `Hola, soy ${GREETER_NAME} de ${empresa}. ¿En qué te puedo ayudar hoy? `;
+    const finalText = `${hi}${text}`.trim();
+
+    // marcamos greeted=true aquí mismo (para no depender de cada rama)
+    await patchState(conversationId, { greeted: true });
+
+    return { text: finalText, greetedNow: true };
 }
 
 
@@ -910,17 +952,6 @@ export async function handleEsteticaReply(args: {
     // —— NUEVO: Modo educativo vs operativo
     const EDUCATIONAL_MODE = isEducationalQuestion(contenido);
 
-    // 👇 Autodetector de handoff por texto “te confirmo / verificar disponibilidad…”
-    // if (shouldTriggerHandoff(contenido)) {
-    //     const texto = "Perfecto, dame *unos minutos* ⏳ voy a *verificar la disponibilidad* y te *confirmo por aquí*.";
-    //     await tagAsSchedulingNeeded({ conversationId, empresaId });
-    //     const saved = await persistBotReply({
-    //         conversationId, empresaId, texto, nuevoEstado: ConversationEstado.requiere_agente,
-    //         to: toPhone ?? conversacion.phone, phoneNumberId,
-    //     });
-    //     if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-    //     return { estado: "requiere_agente", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-    // }
 
     // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
