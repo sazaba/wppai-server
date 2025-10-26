@@ -554,13 +554,17 @@ async function persistBotReply(opts: {
         const sameText = (prevBot.contenido || "").trim() === (texto || "").trim();
         const recent = Date.now() - new Date(prevBot.timestamp as any).getTime() <= 15_000;
         if (sameText && recent) {
+            console.log('[persist] set estado ->', nuevoEstado, { conversationId, mode: 'dedup' });
             await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
-            return { messageId: prevBot.id, texto: prevBot.contenido, wamid: prevBot.externalId as any };
+            return { messageId: prevBot.id, texto: prevBot.contenido, wamid: prevBot.externalId as any, estado: nuevoEstado };
+
         }
     }
 
     const msg = await prisma.message.create({ data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId } });
+    console.log('[persist] set estado ->', nuevoEstado, { conversationId, mode: 'normal' });
     await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
+
 
     let wamid: string | undefined;
     if (to && String(to).trim()) {
@@ -577,7 +581,8 @@ async function persistBotReply(opts: {
             console.error("[ESTETICA] WA send error:", (e as any)?.message || e);
         }
     }
-    return { messageId: msg.id, texto, wamid };
+    return { messageId: msg.id, texto, wamid, estado: nuevoEstado };
+
 }
 
 /* ===========================
@@ -683,6 +688,7 @@ function friendlyAskForMissing(faltan: ReturnType<typeof missingFieldsForSchedul
 }
 async function tagAsSchedulingNeeded(opts: { conversationId: number; empresaId: number; label?: string }) {
     const { conversationId } = opts;
+    console.log('[handoff] tagging requiere_agente ->', { conversationId });
     await prisma.conversation.update({ where: { id: conversationId }, data: { estado: ConversationEstado.requiere_agente } });
     await patchState(conversationId, { handoffLocked: true });
 }
@@ -871,7 +877,7 @@ export async function handleEsteticaReply(args: {
             return { estado: "en_proceso", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
 
-        // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
+
         // 3) Día + (hora o franja) + nombre → handoff inmediato (mensaje solicitado)
         await patchState(conversationId, { lastIntent: "schedule", draft });
 
@@ -894,7 +900,7 @@ export async function handleEsteticaReply(args: {
         await tagAsSchedulingNeeded({ conversationId, empresaId });
 
         // 2) Persistir SIEMPRE como requiere_agente (no condicionarlo)
-        const saved = await persistBotReply({
+        const savedHandoff = await persistBotReply({
             conversationId,
             empresaId,
             texto: clampLines(closeNicely(reply)),
@@ -907,13 +913,11 @@ export async function handleEsteticaReply(args: {
 
         return {
             estado: "requiere_agente",
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
+            mensaje: savedHandoff.texto,
+            messageId: savedHandoff.messageId,
+            wamid: savedHandoff.wamid,
             media: [],
         };
-
-
 
     }
 
