@@ -774,10 +774,14 @@ function mergeFaqs(
             list.push({ q: qq, a: aa });
         }
     };
-    (a ?? []).forEach(x => push(x?.q, x?.a));
-    (b ?? []).forEach(x => push(x?.q, x?.a));
+
+    // ✅ Validar tipo antes de iterar
+    if (Array.isArray(a)) a.forEach(x => push(x?.q, x?.a));
+    if (Array.isArray(b)) b.forEach(x => push(x?.q, x?.a));
+
     return list;
 }
+
 
 // Devuelve la mejor respuesta de FAQ si supera umbral
 function answerFromFAQs(
