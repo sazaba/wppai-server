@@ -297,13 +297,79 @@ async function buildOrReuseSummary(args: {
 }): Promise<string> {
     const { empresaId, conversationId, kb, history } = args;
 
+    // — Cache
     const cached = await loadState(conversationId);
     const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
     if (fresh) return cached.summary!.text;
 
-    const [hoursRows, exceptionsRows] = await Promise.all([
+    // — DB: horarios y excepciones
+    const [hoursRows, exceptionsRows, apptCfg] = await Promise.all([
         fetchAppointmentHours(empresaId),
         COLLECT_ONLY ? Promise.resolve([]) : fetchAppointmentExceptions(empresaId, 35),
+        prisma.businessConfigAppt.findUnique({
+            where: { empresaId },
+            select: {
+                // ===== Flags y parámetros base de agenda
+                appointmentEnabled: true,
+                appointmentVertical: true,
+                appointmentVerticalCustom: true,
+                appointmentTimezone: true,
+                appointmentBufferMin: true,
+                appointmentPolicies: true,
+                appointmentReminders: true,
+
+                // ===== Reglas operativas claras
+                appointmentMinNoticeHours: true,
+                appointmentMaxAdvanceDays: true,
+                allowSameDayBooking: true,
+                requireClientConfirmation: true,
+                cancellationAllowedHours: true,
+                rescheduleAllowedHours: true,
+                defaultServiceDurationMin: true,
+
+                // ===== Servicios
+                servicesText: true,
+                services: true,
+
+                // ===== Logística
+                locationName: true,
+                locationAddress: true,
+                locationMapsUrl: true,
+                parkingInfo: true,
+                virtualMeetingLink: true,
+                instructionsArrival: true,
+
+                // ===== Reglas operativas
+                cancellationWindowHours: true,
+                noShowPolicy: true,
+                depositRequired: true,
+                depositAmount: true,
+                maxDailyAppointments: true,
+                bookingWindowDays: true,
+                blackoutDates: true,
+                overlapStrategy: true,
+
+                // ===== Recordatorios / comunicaciones
+                reminderSchedule: true,
+                reminderTemplateId: true,
+                postBookingMessage: true,
+                prepInstructionsPerSvc: true,
+
+                // ===== Consentimiento / compliance
+                requireWhatsappOptIn: true,
+                allowSensitiveTopics: true,
+                minClientAge: true,
+
+                // ===== Knowledge Base libre
+                kbBusinessOverview: true,
+                kbFAQs: true,
+                kbServiceNotes: true,
+                kbEscalationRules: true,
+                kbDisclaimers: true,
+                kbMedia: true,
+                kbFreeText: true,
+            },
+        }),
     ]);
 
     const { human: hoursLine } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
@@ -311,28 +377,22 @@ async function buildOrReuseSummary(args: {
     let exceptionsLine = "";
     if (!COLLECT_ONLY) {
         const exceptions = normalizeExceptions(exceptionsRows);
-        const closedSoon = exceptions.filter(e => e.closed).slice(0, 6).map(e => e.date).join(", ");
+        const closedSoon = exceptions.filter(e => e.closed).slice(0, 10).map(e => e.date).join(", ");
         if (closedSoon) exceptionsLine = `Excepciones agenda (DB): ${closedSoon} (cerrado)`;
     }
 
-    const services = (kb.procedures ?? [])
-        .filter((s) => s.enabled !== false)
-        .map((s) => (s.priceMin ? `${s.name} (Desde ${formatCOP(s.priceMin)} COP)` : s.name))
+    // ====== Servicios del catálogo (de KB de estética)
+    const svcFromKB = (kb.procedures ?? [])
+        .filter(s => s.enabled !== false)
+        .map(s => (s.priceMin ? `${s.name} (Desde ${formatCOP(s.priceMin)} COP)` : s.name))
         .join(" • ");
 
+    // ====== Staff por rol
     const staffByRole: Record<StaffRole, string[]> = { esteticista: [], medico: [], profesional: [] } as any;
-    (kb.staff || []).forEach((s) => { if (s.active) (staffByRole[s.role] ||= []).push(s.name); });
+    (kb.staff || []).forEach(s => { if (s.active) (staffByRole[s.role] ||= []).push(s.name); });
 
-    const rules: string[] = [];
-    if (kb.bufferMin) rules.push(`Buffer ${kb.bufferMin} min`);
-    if (kb.defaultServiceDurationMin) rules.push(`Duración por defecto ${kb.defaultServiceDurationMin} min`);
-
-    const logistics: string[] = [];
-    if (kb.location?.name) logistics.push(`Sede: ${kb.location.name}`);
-    if (kb.location?.address) logistics.push(`Dirección: ${kb.location.address}`);
-
-    // Métodos de pago en resumen
-    const paymentsFromArrays = (() => {
+    // ====== Métodos de pago (de KB)
+    const pmFromArrays = (() => {
         const pm: any = (kb as any).paymentMethods ?? (kb as any).payments ?? [];
         const list: string[] = [];
         if (Array.isArray(pm)) {
@@ -344,7 +404,7 @@ async function buildOrReuseSummary(args: {
         }
         return list;
     })();
-    const paymentFlags: Array<[string, any]> = [
+    const pmFlags: Array<[string, any]> = [
         ["Efectivo", (kb as any).cash],
         ["Tarjeta débito/crédito", (kb as any).card || (kb as any).cards],
         ["Transferencia", (kb as any).transfer || (kb as any).wire],
@@ -352,34 +412,184 @@ async function buildOrReuseSummary(args: {
         ["Nequi", (kb as any).nequi],
         ["Daviplata", (kb as any).daviplata],
     ];
-    const paymentsFromFlags = paymentFlags.filter(([_, v]) => v === true).map(([label]) => label);
-    const paymentsSet = new Set<string>([...paymentsFromArrays, ...paymentsFromFlags].filter(Boolean));
-    const paymentsList = Array.from(paymentsSet).sort();
+    const pmFromFlags = pmFlags.filter(([_, v]) => v === true).map(([label]) => label);
+    const paymentsList = Array.from(new Set([...pmFromArrays, ...pmFromFlags].filter(Boolean))).sort();
     const paymentsLine = paymentsList.length ? `Pagos: ${paymentsList.join(" • ")}` : "";
 
-    const base = [
-        kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
-        `TZ: ${kb.timezone}`,
-        logistics.length ? logistics.join(" | ") : "",
-        rules.length ? rules.join(" | ") : "",
-        services ? `Servicios: ${services}` : "",
-        paymentsLine,
+    // ====== Secciones provenientes 100% de businessconfig_appt
+    const S = apptCfg || ({} as any);
+
+    // — Flags/params base
+    const flagsBase: string[] = [];
+    flagsBase.push(`Agenda: ${S.appointmentEnabled ? "habilitada" : "deshabilitada"}`);
+    flagsBase.push(`Vertical: ${String(S.appointmentVertical || "custom")}${S.appointmentVertical === "custom" && S.appointmentVerticalCustom ? ` (${S.appointmentVerticalCustom})` : ""}`);
+    flagsBase.push(`TZ: ${String(S.appointmentTimezone || kb.timezone)}`);
+    if (S.appointmentBufferMin != null) flagsBase.push(`Buffer ${S.appointmentBufferMin} min`);
+    if (S.defaultServiceDurationMin != null) flagsBase.push(`Duración por defecto ${S.defaultServiceDurationMin} min`);
+    if (S.appointmentPolicies) flagsBase.push(`Políticas: ${softTrim(String(S.appointmentPolicies), 220)}`);
+    flagsBase.push(`Recordatorios: ${S.appointmentReminders ? "sí" : "no"}`);
+
+    // — Reglas operativas claras
+    const reglasClaras: string[] = [];
+    if (S.allowSameDayBooking != null) reglasClaras.push(`Misma día: ${S.allowSameDayBooking ? "permitido" : "no"}`);
+    if (S.appointmentMinNoticeHours != null) reglasClaras.push(`Anticipación mínima ${S.appointmentMinNoticeHours} h`);
+    if (S.appointmentMaxAdvanceDays != null) reglasClaras.push(`Reserva hasta ${S.appointmentMaxAdvanceDays} días`);
+    if (S.requireClientConfirmation != null) reglasClaras.push(`Requiere confirmación cliente: ${S.requireClientConfirmation ? "sí" : "no"}`);
+    if (S.cancellationAllowedHours != null) reglasClaras.push(`Cancelación hasta ${S.cancellationAllowedHours} h`);
+    if (S.rescheduleAllowedHours != null) reglasClaras.push(`Reagendo hasta ${S.rescheduleAllowedHours} h`);
+
+    // — Servicios (texto libre + array)
+    const serviciosCfg: string[] = [];
+    if (S.servicesText) serviciosCfg.push(`Servicios (texto): ${softTrim(S.servicesText, 300)}`);
+    if (Array.isArray(S.services) && S.services.length) serviciosCfg.push(`Servicios (lista): ${S.services.join(" • ")}`);
+
+    // — Logística / ubicación
+    const logist: string[] = [];
+    if (S.locationName) logist.push(`Sede: ${S.locationName}`);
+    if (S.locationAddress) logist.push(`Dirección: ${S.locationAddress}`);
+    if (S.locationMapsUrl) logist.push(`Mapa: ${S.locationMapsUrl}`);
+    if (S.parkingInfo) logist.push(`Parqueadero: ${softTrim(S.parkingInfo, 160)}`);
+    if (S.virtualMeetingLink) logist.push(`Link virtual: ${S.virtualMeetingLink}`);
+    if (S.instructionsArrival) logist.push(`Indicaciones: ${softTrim(S.instructionsArrival, 220)}`);
+
+    // — Reglas operativas extra
+    const reglasOp: string[] = [];
+    if (S.cancellationWindowHours != null) reglasOp.push(`Ventana de cancelación: ${S.cancellationWindowHours} h`);
+    if (S.noShowPolicy) reglasOp.push(`No-show: ${softTrim(S.noShowPolicy, 220)}`);
+    if (S.depositRequired != null) reglasOp.push(`Depósito: ${S.depositRequired ? (S.depositAmount != null ? `sí (${formatCOP(Number(S.depositAmount))})` : "sí") : "no"}`);
+    if (S.maxDailyAppointments != null) reglasOp.push(`Máx. citas/día: ${S.maxDailyAppointments}`);
+    if (S.bookingWindowDays != null) reglasOp.push(`Ventana de reserva: ${S.bookingWindowDays} días`);
+    if (Array.isArray(S.blackoutDates) && S.blackoutDates.length) {
+        const blacks = (S.blackoutDates as any[]).map(d => (typeof d === "string" ? d : JSON.stringify(d))).slice(0, 10).join(", ");
+        reglasOp.push(`Fechas bloqueadas: ${blacks}${(S.blackoutDates as any[]).length > 10 ? "…" : ""}`);
+    }
+    if (S.overlapStrategy) reglasOp.push(`Solapamiento: ${S.overlapStrategy}`);
+
+    // — Recordatorios / comunicaciones
+    const comms: string[] = [];
+    if (Array.isArray(S.reminderSchedule) && S.reminderSchedule.length) {
+        const items = (S.reminderSchedule as any[])
+            .map((r: any) => {
+                const h = r?.offsetHours != null ? `${r.offsetHours} h` : "—";
+                const ch = r?.channel ? String(r.channel) : "—";
+                return `${h}/${ch}`;
+            }).slice(0, 8).join(" • ");
+        comms.push(`Recordatorios: ${items}`);
+    }
+    if (S.reminderTemplateId) comms.push(`Plantilla recordatorio: ${S.reminderTemplateId}`);
+    if (S.postBookingMessage) comms.push(`Mens. post-reserva: ${softTrim(S.postBookingMessage, 200)}`);
+    if (S.prepInstructionsPerSvc && typeof S.prepInstructionsPerSvc === "object") {
+        const keys = Object.keys(S.prepInstructionsPerSvc as any);
+        if (keys.length) {
+            const list = keys.slice(0, 8).map(k => `${k}: ${softTrim((S.prepInstructionsPerSvc as any)[k], 120)}`).join(" | ");
+            comms.push(`Prep x servicio: ${list}${keys.length > 8 ? "…" : ""}`);
+        }
+    }
+
+    // — Consentimiento / compliance
+    const compliance: string[] = [];
+    if (S.requireWhatsappOptIn != null) compliance.push(`WhatsApp opt-in: ${S.requireWhatsappOptIn ? "requerido" : "no"}`);
+    if (S.allowSensitiveTopics != null) compliance.push(`Temas sensibles: ${S.allowSensitiveTopics ? "permitidos" : "no"}`);
+    if (S.minClientAge != null) compliance.push(`Edad mínima: ${S.minClientAge}`);
+
+    // — Knowledge base libre
+    const kbLines: string[] = [];
+    if (S.kbBusinessOverview) kbLines.push(`Overview: ${softTrim(S.kbBusinessOverview, 260)}`);
+    if (Array.isArray(S.kbFAQs) && S.kbFAQs.length) {
+        const qs = (S.kbFAQs as any[]).map(f => (f?.q || f?.title || "")).filter(Boolean).slice(0, 8).join(" • ");
+        if (qs) kbLines.push(`FAQs: ${qs}${(S.kbFAQs as any[]).length > 8 ? "…" : ""}`);
+    }
+    if (S.kbServiceNotes && typeof S.kbServiceNotes === "object") {
+        const nkeys = Object.keys(S.kbServiceNotes as any);
+        if (nkeys.length) kbLines.push(`Notas por servicio: ${nkeys.slice(0, 10).join(" • ")}${nkeys.length > 10 ? "…" : ""}`);
+    }
+    if (S.kbEscalationRules) kbLines.push(`Reglas de escalamiento: ${softTrim(JSON.stringify(S.kbEscalationRules), 220)}`);
+    if (S.kbDisclaimers) kbLines.push(`Disclaimers: ${softTrim(S.kbDisclaimers, 240)}`);
+    if (Array.isArray(S.kbMedia) && S.kbMedia.length) kbLines.push(`Media (attachments): ${S.kbMedia.length} ítems`);
+    if (S.kbFreeText) kbLines.push(`Notas libres: ${softTrim(S.kbFreeText, 260)}`);
+
+    // ====== Reglas/Logística rápidas (de KB “ligero”)
+    const rulesQuick: string[] = [];
+    if (kb.bufferMin) rulesQuick.push(`Buffer ${kb.bufferMin} min`);
+    if (kb.defaultServiceDurationMin) rulesQuick.push(`Duración por defecto ${kb.defaultServiceDurationMin} min`);
+
+    const logisticsQuick: string[] = [];
+    if (kb.location?.name) logisticsQuick.push(`Sede: ${kb.location.name}`);
+    if (kb.location?.address) logisticsQuick.push(`Dirección: ${kb.location.address}`);
+
+    // ====== Staff line
+    const staffLine =
         Object.entries(staffByRole).some(([_, arr]) => (arr?.length ?? 0) > 0)
             ? `Staff: ${[
                 staffByRole.medico?.length ? `Médicos: ${staffByRole.medico.join(", ")}` : "",
                 staffByRole.esteticista?.length ? `Esteticistas: ${staffByRole.esteticista.join(", ")}` : "",
                 staffByRole.profesional?.length ? `Profesionales: ${staffByRole.profesional.join(", ")}` : "",
-            ].filter(Boolean).join(" | ")
-            }`
-            : "",
+            ].filter(Boolean).join(" | ")}`
+            : "";
+
+    // ====== Construcción del bloque base con TODO
+    const base = [
+        // Encabezado negocio
+        kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
+        `Zona horaria: ${S.appointmentTimezone || kb.timezone}`,
+
+        // Flags base agenda
+        flagsBase.join(" | "),
+
+        // Reglas operativas claras
+        reglasClaras.length ? `Reglas: ${reglasClaras.join(" | ")}` : "",
+
+        // Logística
+        logist.length ? `Logística: ${logist.join(" | ")}` : "",
+
+        // Reglas operativas extra
+        reglasOp.length ? `Operativa: ${reglasOp.join(" | ")}` : "",
+
+        // Catálogo / servicios
+        serviciosCfg.length ? serviciosCfg.join("\n") : "",
+        svcFromKB ? `Servicios (KB): ${svcFromKB}` : "",
+
+        // Medios de pago
+        paymentsLine,
+
+        // Staff
+        staffLine,
+
+        // Horario y excepciones
         hoursLine ? `Horario base (DB): ${hoursLine}` : "",
         exceptionsLine,
-        kb.exceptions?.length
-            ? `Excepciones próximas (KB): ${kb.exceptions.slice(0, 2).map((e) => `${e.dateISO}${e.isOpen === false ? " cerrado" : ""}`).join(", ")}`
-            : "",
-        `Historial breve: ${history.slice(-6).map((h) => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 100)).join(" | ")}`,
-    ].filter(Boolean).join("\n");
 
+        // Communications
+        comms.length ? `Comunicaciones: ${comms.join(" | ")}` : "",
+
+        // Compliance
+        compliance.length ? `Compliance: ${compliance.join(" | ")}` : "",
+
+        // Knowledge libre
+        kbLines.length ? kbLines.join("\n") : "",
+
+        // Reglas y logística rápidas (de KB)
+        rulesQuick.length ? rulesQuick.join(" | ") : "",
+        logisticsQuick.length ? logisticsQuick.join(" | ") : "",
+
+        // Excepciones definidas en KB (si existieran)
+        kb.exceptions?.length
+            ? `Excepciones próximas (KB): ${kb.exceptions
+                .slice(0, 3)
+                .map(e => `${e.dateISO}${e.isOpen === false ? " cerrado" : ""}`)
+                .join(", ")}`
+            : "",
+
+        // Historial para dar color
+        `Historial breve: ${history
+            .slice(-6)
+            .map(h => (h.role === "user" ? `U:` : `A:`) + softTrim(h.content, 100))
+            .join(" | ")}`,
+    ]
+        .filter(Boolean)
+        .join("\n");
+
+    // — Compactamos (pero pasamos TODO en "base" al prompt del resumen)
     let compact = base;
     try {
         const resp: any =
@@ -390,7 +600,7 @@ async function buildOrReuseSummary(args: {
                     max_tokens: 220,
                     messages: [
                         { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. Español neutro." },
-                        { role: "user", content: base.slice(0, 4000) },
+                        { role: "user", content: base.slice(0, 4000) }, // pasa TODO (capado a 4k chars)
                     ],
                 })
                 : await (openai as any).createChatCompletion({
@@ -403,11 +613,14 @@ async function buildOrReuseSummary(args: {
                     ],
                 });
         compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
-    } catch { /* fallback base */ }
+    } catch {
+        // fallback deja base tal cual
+    }
 
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
 }
+
 
 /* ===========================
    Intención / tono
