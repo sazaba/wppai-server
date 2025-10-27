@@ -495,10 +495,16 @@ async function buildOrReuseSummary(args: {
     // — Knowledge base libre
     const kbLines: string[] = [];
     if (S.kbBusinessOverview) kbLines.push(`Overview: ${softTrim(S.kbBusinessOverview, 260)}`);
-    if (Array.isArray(S.kbFAQs) && S.kbFAQs.length) {
-        const qs = (S.kbFAQs as any[]).map(f => (f?.q || f?.title || "")).filter(Boolean).slice(0, 8).join(" • ");
-        if (qs) kbLines.push(`FAQs: ${qs}${(S.kbFAQs as any[]).length > 8 ? "…" : ""}`);
+    const faqsParsed = toArraySafe<any>(S.kbFAQs);
+    if (faqsParsed.length) {
+        const qs = faqsParsed
+            .map((f: any) => (f?.q || f?.title || ""))
+            .filter(Boolean)
+            .slice(0, 8)
+            .join(" • ");
+        if (qs) kbLines.push(`FAQs: ${qs}${faqsParsed.length > 8 ? "…" : ""}`);
     }
+
     if (S.kbServiceNotes && typeof S.kbServiceNotes === "object") {
         const nkeys = Object.keys(S.kbServiceNotes as any);
         if (nkeys.length) kbLines.push(`Notas por servicio: ${nkeys.slice(0, 10).join(" • ")}${nkeys.length > 10 ? "…" : ""}`);
@@ -740,6 +746,21 @@ function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
 }
 
 // ==== FAQ HELPERS (BEGIN) ====
+// Convierte valores (array | string JSON | null) a array seguro
+function toArraySafe<T = any>(val: any): T[] {
+    if (!val) return [];
+    if (Array.isArray(val)) return val as T[];
+    if (typeof val === "string") {
+        try {
+            const parsed = JSON.parse(val);
+            return Array.isArray(parsed) ? (parsed as T[]) : [];
+        } catch {
+            return [];
+        }
+    }
+    return [];
+}
+
 // Normaliza texto a tokens limpias
 function normTokens(text: string): string[] {
     return (text || "")
@@ -760,27 +781,26 @@ function jaccard(a: Set<string>, b: Set<string>) {
     return inter / uni;
 }
 
-// Une FAQs de dos fuentes evitando duplicados por pregunta (q)
+// Une FAQs de dos fuentes evitando duplicados por pregunta (q) — acepta array o string JSON
 function mergeFaqs(
-    a?: Array<{ q: string; a: string }> | null,
-    b?: Array<{ q?: string; a?: string } | null> | null
+    a?: Array<{ q?: string; a?: string }> | string | null,
+    b?: Array<{ q?: string; a?: string }> | string | null
 ): Array<{ q: string; a: string }> {
     const list: Array<{ q: string; a: string }> = [];
     const push = (q?: string, a?: string) => {
         const qq = (q || "").trim();
         const aa = (a || "").trim();
         if (!qq || !aa) return;
-        if (!list.some(x => x.q.toLowerCase() === qq.toLowerCase())) {
-            list.push({ q: qq, a: aa });
-        }
+        if (!list.some(x => x.q.toLowerCase() === qq.toLowerCase())) list.push({ q: qq, a: aa });
     };
 
-    // ✅ Validar tipo antes de iterar
-    if (Array.isArray(a)) a.forEach(x => push(x?.q, x?.a));
-    if (Array.isArray(b)) b.forEach(x => push(x?.q, x?.a));
-
+    const A = toArraySafe<{ q?: string; a?: string }>(a);
+    const B = toArraySafe<{ q?: string; a?: string }>(b);
+    A.forEach(x => push(x?.q, x?.a));
+    B.forEach(x => push(x?.q, x?.a));
     return list;
 }
+
 
 
 // Devuelve la mejor respuesta de FAQ si supera umbral
@@ -838,15 +858,6 @@ function sanitizeNoAccessAgenda(t: string): { text: string; flagged: boolean } {
     return { text: t, flagged: false };
 }
 
-// ⬇️ NUEVOS detectores “informativos” de alta prioridad
-function isParkingQuestion(t: string): boolean {
-    const s = (t || "").toLowerCase();
-    return /\b(parqueadero|parqueo|estacionamiento|parking)\b/.test(s);
-}
-function isKidsQuestion(t: string): boolean {
-    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    return /\b(atienden?\s+ni(n|ñ)os|ni(n|ñ)os|menores|adolescentes?)\b/.test(s);
-}
 
 // ——— Corta el flujo de agenda cuando el texto es informativo/educativo ———
 function isShortQuestion(t: string): boolean {
@@ -1208,9 +1219,10 @@ export async function handleEsteticaReply(args: {
     });
     const allFaqs: Array<{ q: string; a: string }> = mergeFaqs(
         (kb as any).faqs || (kb as any).FAQ || (kb as any).kbFAQs || [],
-        (apptCfgForFaqs?.kbFAQs as any[]) || []
+        toArraySafe(apptCfgForFaqs?.kbFAQs)
     );
     // ==== LOAD EXTRA FAQs (END) ====
+
 
     if (!kb) {
         const txt = "Por ahora no tengo la configuración de la clínica. Te comunico con un asesor humano. 🙏";
@@ -1270,6 +1282,9 @@ export async function handleEsteticaReply(args: {
     }
     // ==== FAQ QUICK-ANSWER (END) ====
 
+
+
+
     // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
         let texto = intent === "cancel"
@@ -1298,7 +1313,7 @@ export async function handleEsteticaReply(args: {
             state.draft?.timeNote || state.draft?.whenText) ||
         state.lastIntent === "schedule";
 
-    const isPay = isPaymentQuestion(contenido);
+
 
     // Cortamos agenda si el turno actual es informativo/educativo (general)
     const infoBreaker = shouldBypassScheduling(contenido);
@@ -1313,8 +1328,11 @@ export async function handleEsteticaReply(args: {
     if (wantsSchedule) {
         const prev = state.draft ?? {};
         const whenAsk = extractWhen(contenido);
-        const hourExact = extractHour(contenido);
-        const hourPeriod = extractDayPeriod(contenido);
+        // ⛔️ Dejamos de usar extractHour / extractDayPeriod para no “normalizar” hora
+        // const hourExact = extractHour(contenido);
+        // const hourPeriod = extractDayPeriod(contenido);
+
+        // ✅ Solo texto libre del usuario (fecha/hora tal cual)
         const whenFree = grabWhenFreeText(contenido);
         const nameInText = extractName(contenido);
         const proc = service ?? (state.lastServiceId ? kb.procedures.find(p => p.id === state.lastServiceId) ?? null : null);
@@ -1324,11 +1342,18 @@ export async function handleEsteticaReply(args: {
             procedureId: prev.procedureId || (proc?.id ?? undefined),
             procedureName: prev.procedureName || (proc?.name ?? undefined),
             name: prev.name || nameInText || undefined,
+            // Fecha estructurada solo si viene (para mostrar día de semana si aplica),
+            // pero sin forzar hora.
             whenISO: prev.whenISO || whenAsk?.iso || undefined,
-            timeHHMM: prev.timeHHMM || hourExact || undefined,
-            timeNote: prev.timeNote || hourPeriod || undefined,
+
+            // ⛔️ No poblamos timeHHMM ni timeNote para no calcular hora
+            // timeHHMM: prev.timeHHMM || hourExact || undefined,
+            // timeNote: prev.timeNote || hourPeriod || undefined,
+
+            // ✅ Guardamos lo que el cliente escribió (fecha/hora/franja textual)
             whenText: prev.whenText || whenFree || undefined,
         };
+
 
         await patchState(conversationId, { lastIntent: "schedule", draft });
 
@@ -1342,11 +1367,16 @@ export async function handleEsteticaReply(args: {
                     .format(new Date(draft.whenISO))
                 : null;
 
-            const horaDet = draft.timeHHMM ? fmtHourLabel(draft.timeHHMM) : (draft.timeNote || null);
+            // ⛔️ No usamos timeHHMM/timeNote
+            // const horaDet = draft.timeHHMM ? fmtHourLabel(draft.timeHHMM) : (draft.timeNote || null);
 
-            const preferencia = fechaDet
-                ? `${fechaDet}${horaDet ? " · " + horaDet : ""}`
-                : (draft.whenText || (horaDet ? `(${horaDet})` : "recibida"));
+            // ✅ Preferencia construida con el texto original del cliente.
+            // Si hay whenText (ej. “viernes 3 pm” o “martes en la tarde”), lo mostramos tal cual.
+            // Si no hay whenText pero sí fecha, mostramos solo la fecha formateada (sin hora calculada).
+            const preferencia = draft.whenText
+                ? draft.whenText
+                : (fechaDet || "recibida");
+
 
             const piezas = [
                 `Tratamiento: *${draft.procedureName ?? "—"}*`,
@@ -1372,7 +1402,8 @@ export async function handleEsteticaReply(args: {
 
         const asks: string[] = [];
         if (!hasProcedure) asks.push("¿Para qué *tratamiento* deseas la cita?");
-        if (!hasDate) asks.push("¿Qué *día y hora* prefieres? (puede ser texto libre, ej.: “martes en la tarde” o “15/11 a las 3 pm”).");
+        if (!hasDate) asks.push("¿Qué *día y hora* prefieres? (texto libre, ej.: “martes en la tarde” o “15/11 a las 3 pm”).");
+
         if (!hasName) asks.push("¿Cuál es tu *nombre completo*?");
 
         const texto = clampLines(closeNicely(asks.join(" ")));
@@ -1386,28 +1417,7 @@ export async function handleEsteticaReply(args: {
         return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
 
-    // Métodos de pago
-    if (isPaymentQuestion(contenido)) {
-        const methods = readPaymentMethodsFromKB(kb);
-        let texto: string;
-        if (methods.length) {
-            texto = `Medios de pago disponibles: ${methods.map(m => `*${m}*`).join(" · ")}. Si deseas, puedo tomar tu preferencia de *día y hora* y el equipo confirma en sede.`;
-        } else {
-            texto = "No tengo los *métodos de pago* registrados en sistema. Podemos confirmarlos en sede durante la *valoración presencial* o por este medio con el equipo.";
-        }
 
-        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
-        texto = greet.text;
-        if (greet.greetedNow) await patchState(conversationId, { greeted: true });
-
-        await patchState(conversationId, { lastIntent: "info" });
-        const saved = await persistBotReply({
-            conversationId, empresaId, texto: clampLines(closeNicely(texto)),
-            nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-        return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-    }
 
     /* ===== UBICACIÓN ===== */
     const isLocation = /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde\s+est[áa]n|mapa|c[oó]mo\s+llego|como\s+llego|sede|ubicados?)\b/i.test(contenido);
@@ -1430,34 +1440,6 @@ export async function handleEsteticaReply(args: {
         await patchState(conversationId, { lastIntent: "info" });
         const saved = await persistBotReply({
             conversationId, empresaId, texto: clampLines(closeNicely(texto)),
-            nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
-        return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-    }
-    /* ===== NIÑOS / MENORES ===== */
-    if (isKidsQuestion(contenido)) {
-        // Intentamos leer de la KB si hay política registrada
-        const pol: any = (kb as any).policy || (kb as any).policies || {};
-        const kidsAllowed = pol.kidsAllowed ?? (kb as any).kidsAllowed;
-        const minAge = pol.minAge ?? (kb as any).minAge;
-        let texto = "";
-
-        if (kidsAllowed === true || typeof minAge === "number") {
-            texto = typeof minAge === "number"
-                ? `Atendemos *menores* a partir de *${minAge} años* y con *acudiente*. Antes realizamos una *valoración presencial*. ¿Te gustaría que te comparta horarios?`
-                : `Sí, *atendemos menores* con *acudiente*. Antes realizamos una *valoración presencial*. ¿Te paso horarios?`;
-        } else if (kidsAllowed === false) {
-            texto = "Por políticas internas *no atendemos menores* de edad. Si buscas alternativas, con gusto te orientamos.";
-        } else {
-            texto = "No tengo registrada en sistema la política sobre *atención a menores*. Puedo confirmarlo con el equipo o, si gustas, vemos horarios para una *valoración* y te orientamos.";
-        }
-
-        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state });
-        await patchState(conversationId, { lastIntent: "info" });
-
-        const saved = await persistBotReply({
-            conversationId, empresaId, texto: clampLines(closeNicely(greet.text)),
             nuevoEstado: ConversationEstado.respondido, to: toPhone ?? conversacion.phone, phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);

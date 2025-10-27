@@ -3,6 +3,21 @@
 import prisma from "../../../../../lib/prisma";
 import type { AppointmentVertical, StaffRole } from "@prisma/client";
 
+
+
+// Helper seguro (arriba del archivo o en utils):
+function toArraySafe<T = any>(val: any): T[] {
+    if (!val) return [];
+    if (Array.isArray(val)) return val as T[];
+    if (typeof val === "string") {
+        try {
+            const p = JSON.parse(val);
+            return Array.isArray(p) ? (p as T[]) : [];
+        } catch { return []; }
+    }
+    return [];
+}
+
 /** ==== Util precio COP ==== */
 export function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
@@ -24,6 +39,7 @@ export type EsteticaKB = {
     timezone: string;
     bufferMin: number;
     policies?: string | null;
+    faqs?: Array<{ q: string; a: string }>;
 
     location?: {
         name?: string | null;
@@ -109,6 +125,7 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
                 locationMapsUrl: true,
                 parkingInfo: true,
                 instructionsArrival: true,
+                kbFAQs: true,
             },
         }),
         prisma.esteticaProcedure.findMany({
@@ -127,6 +144,11 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
     ]);
 
     if (!empresa || !apptCfg) return null;
+    // === FAQs desde businessConfigAppt (parse seguro) ===
+    const faqsFromCfg = toArraySafe<{ q?: string; a?: string }>(apptCfg.kbFAQs)
+        .filter(f => (f?.q || "").trim() && (f?.a || "").trim())
+        .map(f => ({ q: String(f.q).trim(), a: String(f.a).trim() }));
+
 
     return {
         empresaId,
@@ -135,6 +157,8 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
         timezone: apptCfg.appointmentTimezone || "America/Bogota",
         bufferMin: apptCfg.appointmentBufferMin ?? 10,
         policies: apptCfg.appointmentPolicies ?? null,
+        faqs: faqsFromCfg,
+
 
         allowSameDay: !!apptCfg.allowSameDayBooking,
         minNoticeHours: apptCfg.appointmentMinNoticeHours ?? null,
@@ -161,6 +185,7 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
             reason: e.reason ?? null,
         })),
 
+
         procedures: procedures.map((p) => ({
             id: p.id,
             name: p.name,
@@ -178,6 +203,7 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
             notes: p.notes ?? null,
             pageUrl: p.pageUrl ?? null,
             requiredStaffIds: (p.requiredStaffIds as number[] | null) ?? null,
+
         })),
     };
 }
