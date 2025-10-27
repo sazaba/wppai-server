@@ -172,6 +172,7 @@ type AgentState = {
     };
     slotsCache?: { items: Array<{ startISO: string; endISO: string; label: string }>; expiresAt: string };
     summary?: { text: string; expiresAt: string };
+    faqsCache?: Array<{ q: string; a: string }>;
     expireAt?: string;
     handoffLocked?: boolean; // congela cuando pasa a requiere_agente
 };
@@ -190,6 +191,7 @@ async function loadState(conversationId: number): Promise<AgentState> {
         draft: raw.draft ?? {},
         slotsCache: raw.slotsCache ?? undefined,
         summary: raw.summary ?? undefined,
+        faqsCache: toArraySafe<{ q: string; a: string }>(raw.faqsCache),
         expireAt: raw.expireAt,
         handoffLocked: !!raw.handoffLocked,
     };
@@ -932,19 +934,24 @@ async function maybePrependGreeting(opts: {
     const { conversationId, state } = opts;
     let text = stripIntro(opts.text);
 
+    // Si ya saludó en esta conversación, no repite
     if (state.greeted) return { text, greetedNow: false };
 
-    const botPrev = await prisma.message.findFirst({
+    // Evitar saludos duplicados si ya hubo mensaje anterior del bot
+    const prevBotMsg = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
         select: { id: true },
     });
-    if (botPrev) return { text, greetedNow: false };
+    if (prevBotMsg) return { text, greetedNow: false };
 
-    const hi = `Hola, soy ${GREETER_NAME}. ¿En qué te puedo ayudar hoy? `;
-    const finalText = `${hi}${text}`.trim();
+    // Saludo más corto y natural
+    const hi = `Hola 👋 Soy ${GREETER_NAME}. `;
+    const greeting = `${hi}${text}`.trim();
+
     await patchState(conversationId, { greeted: true });
-    return { text: finalText, greetedNow: true };
+    return { text: greeting, greetedNow: true };
 }
+
 
 async function buildBusinessRangesHuman(
     empresaId: number,
@@ -1222,6 +1229,11 @@ export async function handleEsteticaReply(args: {
         toArraySafe(apptCfgForFaqs?.kbFAQs)
     );
     // ==== LOAD EXTRA FAQs (END) ====
+    // === PATCH: guardar FAQs en conversation_state para futuras referencias ===
+    await patchState(conversationId, {
+        faqsCache: allFaqs,
+    });
+
 
 
     if (!kb) {
@@ -1367,12 +1379,6 @@ export async function handleEsteticaReply(args: {
                     .format(new Date(draft.whenISO))
                 : null;
 
-            // ⛔️ No usamos timeHHMM/timeNote
-            // const horaDet = draft.timeHHMM ? fmtHourLabel(draft.timeHHMM) : (draft.timeNote || null);
-
-            // ✅ Preferencia construida con el texto original del cliente.
-            // Si hay whenText (ej. “viernes 3 pm” o “martes en la tarde”), lo mostramos tal cual.
-            // Si no hay whenText pero sí fecha, mostramos solo la fecha formateada (sin hora calculada).
             const preferencia = draft.whenText
                 ? draft.whenText
                 : (fechaDet || "recibida");
