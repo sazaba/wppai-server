@@ -739,6 +739,80 @@ function readPaymentMethodsFromKB(kb: EsteticaKB): string[] {
     return Array.from(new Set(list)).sort();
 }
 
+// ==== FAQ HELPERS (BEGIN) ====
+// Normaliza texto a tokens limpias
+function normTokens(text: string): string[] {
+    return (text || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/\p{Diacritic}/gu, "")
+        .replace(/[^a-z0-9\s¿?¡!áéíóúñ.-]/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .split(" ")
+        .filter(Boolean);
+}
+
+// Similaridad Jaccard simple entre conjuntos de tokens
+function jaccard(a: Set<string>, b: Set<string>) {
+    const inter = new Set([...a].filter(x => b.has(x))).size;
+    const uni = new Set([...a, ...b]).size || 1;
+    return inter / uni;
+}
+
+// Une FAQs de dos fuentes evitando duplicados por pregunta (q)
+function mergeFaqs(
+    a?: Array<{ q: string; a: string }> | null,
+    b?: Array<{ q?: string; a?: string } | null> | null
+): Array<{ q: string; a: string }> {
+    const list: Array<{ q: string; a: string }> = [];
+    const push = (q?: string, a?: string) => {
+        const qq = (q || "").trim();
+        const aa = (a || "").trim();
+        if (!qq || !aa) return;
+        if (!list.some(x => x.q.toLowerCase() === qq.toLowerCase())) {
+            list.push({ q: qq, a: aa });
+        }
+    };
+    (a ?? []).forEach(x => push(x?.q, x?.a));
+    (b ?? []).forEach(x => push(x?.q, x?.a));
+    return list;
+}
+
+// Devuelve la mejor respuesta de FAQ si supera umbral
+function answerFromFAQs(
+    faqs: Array<{ q: string; a: string }>,
+    userText: string
+): string | null {
+    if (!faqs?.length || !userText) return null;
+    const uSet = new Set(normTokens(userText));
+
+    // Peso extra si la pregunta aparece como substring
+    let best: { score: number; a: string } = { score: 0, a: "" };
+
+    for (const f of faqs) {
+        const q = (f.q || "").trim();
+        const a = (f.a || "").trim();
+        if (!q || !a) continue;
+
+        const qSet = new Set(normTokens(q));
+        let score = jaccard(uSet, qSet);
+
+        // Bonificación por substring directo
+        if (userText.toLowerCase().includes(q.toLowerCase())) score += 0.25;
+
+        // Bonificación leve por palabras clave obvias
+        const hints = ["metodo", "metodos", "pagos", "pago", "niños", "menores", "profesional", "esteticista", "doctor", "doctora", "tarjeta", "efectivo", "transferencia"];
+        if (hints.some(h => q.toLowerCase().includes(h) && userText.toLowerCase().includes(h))) score += 0.1;
+
+        if (score > best.score) best = { score, a };
+    }
+
+    // Umbral conservador (0.32) + posible boost por substring
+    return best.score >= 0.32 ? best.a : null;
+}
+// ==== FAQ HELPERS (END) ====
+
 
 // --- NUEVO: detectores/limpiadores de agenda ---
 function isSchedulingCue(t: string): boolean {
@@ -1123,6 +1197,17 @@ export async function handleEsteticaReply(args: {
 
     // KB
     const kb = await loadEsteticaKB({ empresaId });
+    // ==== LOAD EXTRA FAQs (BEGIN) ====
+    const apptCfgForFaqs = await prisma.businessConfigAppt.findUnique({
+        where: { empresaId },
+        select: { kbFAQs: true }
+    });
+    const allFaqs: Array<{ q: string; a: string }> = mergeFaqs(
+        (kb as any).faqs || (kb as any).FAQ || (kb as any).kbFAQs || [],
+        (apptCfgForFaqs?.kbFAQs as any[]) || []
+    );
+    // ==== LOAD EXTRA FAQs (END) ====
+
     if (!kb) {
         const txt = "Por ahora no tengo la configuración de la clínica. Te comunico con un asesor humano. 🙏";
         const saved = await persistBotReply({
@@ -1150,6 +1235,36 @@ export async function handleEsteticaReply(args: {
 
     // Modo educativo vs operativo
     const EDUCATIONAL_MODE = isEducationalQuestion(contenido);
+
+    // ==== FAQ QUICK-ANSWER (BEGIN) ====
+    // Si hay una FAQ que responda la pregunta, respóndela de una vez
+    const faqHit = answerFromFAQs(allFaqs, contenido);
+    if (faqHit) {
+        // Añade cierre amable orientado a agenda sin sonar "bot"
+        let texto = `${faqHit}`;
+        // Pequeña cola opcional para llevar a agenda sin forzar
+        if (!shouldBypassScheduling(contenido)) {
+            texto = `${texto} ¿Quieres que te comparta *horarios* para una *valoración* y así lo dejamos reservado?`;
+        }
+
+        const greet = await maybePrependGreeting({ conversationId, kbName: kb.businessName, text: texto, state: statePre });
+        texto = clampLines(closeNicely(greet.text));
+
+        await patchState(conversationId, { lastIntent: "info" });
+
+        const saved = await persistBotReply({
+            conversationId,
+            empresaId,
+            texto,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+
+        if (last?.timestamp) markActuallyReplied(conversationId, last.timestamp);
+        return { estado: "respondido", mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+    }
+    // ==== FAQ QUICK-ANSWER (END) ====
 
     // Reagendar / Cancelar -> Handoff inmediato
     if (intent === "reschedule" || intent === "cancel") {
