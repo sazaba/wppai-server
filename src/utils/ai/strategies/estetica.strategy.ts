@@ -2132,6 +2132,56 @@ async function buildOrReuseSummary(args: {
 
     const S = apptCfg || ({} as any);
 
+    // ==== Normalizar FAQs (acepta array de {q,a}, array de strings, o objeto mapa) ====
+    type FAQ = { q: string; a: string };
+    function toFaqArray(src: any): FAQ[] {
+        if (!src) return [];
+        if (Array.isArray(src)) {
+            if (src.length && typeof src[0] === "string") {
+                // ["¿Qué es X?|Respuesta...", ...]
+                return src
+                    .map((s: string) => {
+                        const [q, a] = String(s).split("|");
+                        return { q: (q || "").trim(), a: (a || "").trim() };
+                    })
+                    .filter(f => f.q && f.a);
+            }
+            if (src.length && typeof src[0] === "object") {
+                // [{ q, a }, ...]
+                return src
+                    .map((o: any) => ({ q: String(o?.q || "").trim(), a: String(o?.a || "").trim() }))
+                    .filter(f => f.q && f.a);
+            }
+        }
+        if (typeof src === "object") {
+            // { "¿Pregunta?": "Respuesta", ... }
+            return Object.entries(src)
+                .map(([q, a]) => ({ q: String(q).trim(), a: String(a ?? "").trim() }))
+                .filter(f => f.q && f.a);
+        }
+        if (typeof src === "string") {
+            // Bloque de texto "P|R\nP|R..."
+            return src
+                .split(/\r?\n/)
+                .map(l => {
+                    const [q, a] = l.split("|");
+                    return { q: (q || "").trim(), a: (a || "").trim() };
+                })
+                .filter(f => f.q && f.a);
+        }
+        return [];
+    }
+
+    const faqsArr = toFaqArray(S.kbFAQs);
+    const faqsLine = faqsArr.length
+        ? "FAQs: " +
+        faqsArr
+            .slice(0, 5) // solo las 5 más relevantes/primeras
+            .map(f => `${softTrim(f.q, 60)} → ${softTrim(f.a, 120)}`)
+            .join(" | ")
+        : "";
+
+
     const base = [
         kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
         `Zona horaria: ${S.appointmentTimezone || kb.timezone}`,
@@ -2158,6 +2208,7 @@ async function buildOrReuseSummary(args: {
         `Servicios (KB): ${svcFromKB || "—"}`,
         hoursLine ? `Horario base (DB): ${hoursLine}${lastStart ? `; última cita de referencia ${lastStart}` : ""}` : "",
         exceptionsLine,
+        faqsLine,
         S.kbBusinessOverview ? `Overview: ${softTrim(S.kbBusinessOverview, 260)}` : "",
         S.kbFreeText ? `Notas: ${softTrim(S.kbFreeText, 260)}` : "",
         `Historial breve: ${history || "—"}`,
