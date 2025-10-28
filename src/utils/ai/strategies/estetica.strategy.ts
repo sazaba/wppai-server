@@ -1962,6 +1962,61 @@ function normalizeExceptions(rows: any[]) {
 }
 
 /* ===== INTENT DETECTOR (no forzar agenda) ===== */
+
+/* ==== INFO / SCHEDULE GUARDS (del componente viejo) ==== */
+function isSchedulingCue(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return (
+        /\b(agendar|agenda|reservar|programar)\b/.test(s) ||
+        /quieres ver horarios|te paso horarios|dime el dia y hora|que dia y hora prefieres/.test(s)
+    );
+}
+
+function isShortQuestion(t: string): boolean {
+    const s = (t || "").trim();
+    const noSpaces = s.replace(/\s+/g, "");
+    const hasQM = /[?¿]/.test(s);
+    return hasQM && s.length <= 120 && noSpaces.length >= 2;
+}
+
+function containsDateOrTimeHints(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return (
+        /\b(hoy|manana|mañana|proxima|semana|lunes|martes|miercoles|jueves|viernes|sabado|sábado|domingo|am|pm|a las|hora|tarde|noche|mediodia|medio dia)\b/.test(s) ||
+        /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?\b/.test(s) ||
+        /\b(\d{1,2}:\d{2})\b/.test(s)
+    );
+}
+
+function isPaymentQuestion(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return /\b(pagos?|metodos? de pago|tarjeta|efectivo|transferencia|nequi|daviplata|pse)\b/.test(s);
+}
+
+function isGeneralInfoQuestion(t: string): boolean {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return (
+        /\b(que es|de que se trata|como funciona|beneficios?|riesgos?|efectos secundarios?|contraindicaciones?|cuidados|cuanto dura|duracion|quien lo hace|profesional|doctor(a)?)\b/.test(s) ||
+        /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde|mapa|sede|como llego|parqueadero)\b/.test(s) ||
+        isPaymentQuestion(t)
+    );
+}
+
+function isEducationalQuestion(text: string): boolean {
+    const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    if (/\b(que es|de que se trata|como funciona|como actua|beneficios?|riesgos?|efectos secundarios?|cuidados|contraindicaciones?)\b/.test(t)) return true;
+    if (/\b(b[óo]tox|toxina|acido hialuronico|peeling|manchas|acne|rosacea|melasma|flacidez)\b/.test(t)) return true;
+    if (/\b(recomendable|sirve|me ayuda)\b/.test(t) && /\b(rosacea|acne|melasma|cicatriz|flacidez|arrugas|manchas)\b/.test(t)) return true;
+    return false;
+}
+
+function shouldBypassScheduling(t: string): boolean {
+    if (isSchedulingCue(t) || containsDateOrTimeHints(t)) return false; // señales claras → sí agenda
+    if (isShortQuestion(t) || isGeneralInfoQuestion(t) || isEducationalQuestion(t)) return true; // informativo → NO agenda
+    return false;
+}
+
+
 type Intent = "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
 
 function detectIntent(text: string, draft: AgentState["draft"]): Intent {
@@ -2268,22 +2323,33 @@ function detectHandoffReady(t: string) {
 }
 
 /* ===== Extractores suaves para el borrador (sin normalizar hora) ===== */
+/* ===== Extractores suaves para el borrador (sin normalizar hora) ===== */
+function normalizeName(n: string) {
+    return n
+        .trim()
+        .replace(/\s+/g, " ")
+        .split(" ")
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(" ");
+}
+
 function extractName(raw: string): string | null {
     const t = (raw || "").trim();
 
-    // Debe venir con disparador explícito
-    const m = t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ\s]{2,80})/i);
+    // Patrones explícitos
+    let m =
+        t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\b/i) ||
+        t.match(/^\s*nombre\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\s*$/i);
+
     if (m && m[1]) {
-        const name = m[1].trim().replace(/\s+/g, " ");
-        // mínimo dos palabras para evitar “Hola”, “Gracias”, etc.
-        if (name.split(/\s+/).length >= 2) return name;
-        return null;
+        const name = normalizeName(m[1]);
+        // evita capturar palabras típicas de agenda
+        if (/\b(viernes|sábado|sabado|lunes|martes|miércoles|miercoles|jueves|hoy|mañana|manana)\b/i.test(name)) return null;
+        if (/\b(botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i.test(name)) return null;
+        return name;
     }
 
-    // Fallback SOLO si parecen 2–4 palabras (nombre y apellido)
-    const twoPlusWords = /^[A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3}$/;
-    if (twoPlusWords.test(t)) return t.replace(/\s+/g, " ");
-
+    // Sin disparador, NO asumir nombre (elimina falsos positivos tipo “Botox para este viernes”)
     return null;
 }
 
@@ -2610,6 +2676,39 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+    // ——— Respuesta directa a “qué servicios” (sin matar la conversación ni forzar agenda)
+    if (/\b(que\s+servicios|qué\s+servicios|servicios\s+ofreces?)\b/i.test(userText)) {
+        const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
+        const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
+        const items = (kb.procedures || []).slice(0, 6).map((p) => {
+            const desde = p.priceMin ? ` (desde ${formatCOP(p.priceMin)})` : "";
+            return `• ${p.name}${desde}`;
+        }).join("\n");
+
+        let texto = clampText(
+            `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar${human ? ` (trabajamos: ${human}${sufijoUltima})` : ""}.`
+        );
+        texto = addEmojiStable(texto, chatId);
+
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        await patchState(chatId, { lastIntent: "schedule" });
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
 
     // ===== Summary extendido (cacheado y persistido en conversation_state)
     const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
@@ -2621,11 +2720,13 @@ export async function handleEsteticaStrategy({
     const needName = !newDraft.name;
 
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
+    const infoBreaker = shouldBypassScheduling(userText);
 
     const shouldAskForAgendaPieces =
-        (state.lastIntent === "schedule" || inferredIntent === "schedule" || hasServiceOrWhen);
+        !infoBreaker && (state.lastIntent === "schedule" || inferredIntent === "schedule" || hasServiceOrWhen);
 
     if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
+
         const asks: string[] = [];
         if (needProcedure) {
             const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
