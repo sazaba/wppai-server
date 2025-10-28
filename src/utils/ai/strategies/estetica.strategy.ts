@@ -1961,6 +1961,38 @@ function normalizeExceptions(rows: any[]) {
     return items;
 }
 
+/* ===== INTENT DETECTOR (no forzar agenda) ===== */
+type Intent = "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
+
+function detectIntent(text: string, draft: AgentState["draft"]): Intent {
+    const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+
+    // señales de agenda explícita
+    const scheduleHints = [
+        "agendar", "agendo", "agendemos", "agenda", "cita", "programar", "reservar", "reserva",
+        "disponible", "disponibilidad", "horario", "hora", "dia", "fecha", "cuando atienden", "para el",
+        "quiero ir", "puedo ir", "mañana", "manana", "tarde", "noche", "am", "pm", "a las"
+    ];
+    if (scheduleHints.some(h => t.includes(h))) return "schedule";
+
+    // si ya trajo alguna pieza del borrador, seguimos en schedule
+    if (draft?.name || draft?.procedureId || draft?.procedureName || draft?.whenText || draft?.whenISO) return "schedule";
+
+    // precio/costo
+    if (/\b(precio|precios|costo|vale|cuanto|desde)\b/.test(t)) return "price";
+
+    // reprogramación / cancelación
+    if (/\b(reprogram|cambiar|mover)\b/.test(t)) return "reschedule";
+    if (/\b(cancelar|anular)\b/.test(t)) return "cancel";
+
+    // preguntas tipo “¿qué es?”, “¿cómo funciona?”
+    if (/\b(que es|como funciona|efectos|riesgos|duracion|contraindicaciones|recomendaciones)\b/.test(t)) return "info";
+
+    // saludo/otros → libre
+    return "other";
+}
+
+
 /* ===== Summary extendido con cache en conversation_state ===== */
 function softTrim(s: string | null | undefined, max = 240) {
     const t = (s || "").trim();
@@ -2207,12 +2239,28 @@ function clampText(t: string, lines = CONF.REPLY_MAX_LINES, chars = CONF.REPLY_M
     if (txt.length > chars) txt = txt.slice(0, chars - 3) + "…";
     return txt;
 }
-function addEmoji(t: string) {
-    const emojis = ["🙂", "💬", "✨", "👌", "🫶"];
-    if (/[a-z]/i.test(t) && !/[🙂✨💬🫶👌]/.test(t))
-        t += " " + emojis[Math.floor(Math.random() * emojis.length)];
-    return t;
+
+/** Normaliza texto para deduplicación (insensible a mayúsculas, tildes y espacios) */
+function normalizeForDedup(s: string) {
+    return (s || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/\p{Diacritic}/gu, "")     // quita tildes
+        .replace(/[\s\n\r]+/g, " ")         // colapsa espacios
+        .replace(/[^\p{L}\p{N}\s]/gu, "")   // quita signos/emoji para comparar
+        .trim();
 }
+
+/** Un solo emoji “estable” por conversación (misma conversación → mismo emoji) */
+function addEmojiStable(text: string, conversationId: number) {
+    const base = (Number.isFinite(conversationId) ? conversationId : 0) >>> 0;
+    const emojis = ["🙂", "💬", "✨", "👌", "🫶"];
+    const idx = base % emojis.length;
+    // Si ya trae uno de estos emojis, no agregues otro
+    if (/[🙂💬✨👌🫶]/.test(text)) return text;
+    return `${text} ${emojis[idx]}`;
+}
+
 
 /* ===== PERSISTENCIA ===== */
 function normalizeToE164(n: string) {
@@ -2233,7 +2281,8 @@ async function persistBotReply({
         select: { id: true, contenido: true, timestamp: true, externalId: true },
     });
     if (prevBot) {
-        const sameText = (prevBot.contenido || "").trim() === (texto || "").trim();
+        const sameText =
+            normalizeForDedup(prevBot.contenido || "") === normalizeForDedup(texto || "");
         const recent = Date.now() - new Date(prevBot.timestamp as any).getTime() <= 15_000;
         if (sameText && recent) {
             await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
@@ -2436,7 +2485,9 @@ export async function handleEsteticaStrategy({
         whenISO: prevDraft.whenISO || undefined,
         whenText: prevDraft.whenText || whenFree || undefined, // textual SIEMPRE
     };
-    await patchState(chatId, { draft: newDraft, lastIntent: "schedule" });
+    const inferredIntent = detectIntent(userText, newDraft);
+    await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
+
 
     // 2) Si el usuario ya trajo todo → handoff inmediato
     if (detectHandoffReady(userText) || (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft))) {
@@ -2492,11 +2543,16 @@ export async function handleEsteticaStrategy({
     const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
 
     // ===== Si aún faltan piezas para agenda, pedimos solo lo que falta (sin forzar hora)
+    // ===== Pedir piezas SOLO si hay intención de agenda o ya hay piezas
     const needProcedure = !newDraft.procedureId && !newDraft.procedureName;
     const needWhen = !hasSomeDateDraft(newDraft);
     const needName = !newDraft.name;
 
-    if (needProcedure || needWhen || needName) {
+    const shouldAskForAgendaPieces =
+        (state.lastIntent === "schedule" || inferredIntent === "schedule" ||
+            newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO || newDraft.name);
+
+    if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
         const asks: string[] = [];
         if (needProcedure) {
             const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
@@ -2509,7 +2565,7 @@ export async function handleEsteticaStrategy({
             asks.push(`¿Cuál es tu *nombre completo*?`);
         }
         let texto = clampText(asks.join(" "));
-        texto = addEmoji(texto);
+        texto = addEmojiStable(texto, chatId);
 
         const saved = await persistBotReply({
             conversationId: chatId,
@@ -2529,10 +2585,12 @@ export async function handleEsteticaStrategy({
         };
     }
 
+
     // ===== Respuesta libre (modo natural) usando el summary extendido
     let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
-    texto = clampText(texto || "¡Hola! ¿En qué puedo apoyarte? 🙂");
-    texto = addEmoji(texto);
+    texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
+    texto = addEmojiStable(texto, chatId);
+
 
     const saved = await persistBotReply({
         conversationId: chatId,
