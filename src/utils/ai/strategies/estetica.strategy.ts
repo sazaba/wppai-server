@@ -1975,8 +1975,10 @@ function detectIntent(text: string, draft: AgentState["draft"]): Intent {
     ];
     if (scheduleHints.some(h => t.includes(h))) return "schedule";
 
-    // si ya trajo alguna pieza del borrador, seguimos en schedule
-    if (draft?.name || draft?.procedureId || draft?.procedureName || draft?.whenText || draft?.whenISO) return "schedule";
+
+    // Si ya trajo alguna pieza REAL de agenda (servicio o fecha/hora), seguimos en schedule
+    if (draft?.procedureId || draft?.procedureName || draft?.whenText || draft?.whenISO) return "schedule";
+
 
     // precio/costo
     if (/\b(precio|precios|costo|vale|cuanto|desde)\b/.test(t)) return "price";
