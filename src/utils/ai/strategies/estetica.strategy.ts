@@ -2190,46 +2190,80 @@ async function buildOrReuseSummary(args: {
     const S = apptCfg || ({} as any);
 
     // ==== Normalizar FAQs (acepta array de {q,a}, array de strings, o objeto mapa) ====
+    // ==== Normalizar FAQs (acepta JSON string, array {q,a}, array<string> "P|R", u objeto mapa) ====
     type FAQ = { q: string; a: string };
+
+    // NEW: intenta parsear si viene como string JSON (tu caso)
+    function parseMaybeJson<T = any>(val: any): T | any {
+        if (typeof val === "string") {
+            try { return JSON.parse(val); } catch { /* deja pasar */ }
+        }
+        return val;
+    }
+
     function toFaqArray(src: any): FAQ[] {
-        if (!src) return [];
-        if (Array.isArray(src)) {
-            if (src.length && typeof src[0] === "string") {
-                // ["¿Qué es X?|Respuesta...", ...]
-                return src
-                    .map((s: string) => {
-                        const [q, a] = String(s).split("|");
-                        return { q: (q || "").trim(), a: (a || "").trim() };
-                    })
-                    .filter(f => f.q && f.a);
-            }
-            if (src.length && typeof src[0] === "object") {
-                // [{ q, a }, ...]
-                return src
-                    .map((o: any) => ({ q: String(o?.q || "").trim(), a: String(o?.a || "").trim() }))
-                    .filter(f => f.q && f.a);
-            }
-        }
-        if (typeof src === "object") {
-            // { "¿Pregunta?": "Respuesta", ... }
-            return Object.entries(src)
-                .map(([q, a]) => ({ q: String(q).trim(), a: String(a ?? "").trim() }))
-                .filter(f => f.q && f.a);
-        }
-        if (typeof src === "string") {
-            // Bloque de texto "P|R\nP|R..."
-            return src
-                .split(/\r?\n/)
-                .map(l => {
-                    const [q, a] = l.split("|");
+        const v = parseMaybeJson(src);
+        if (!v) return [];
+
+        if (Array.isArray(v)) {
+            if (v.length && typeof v[0] === "string") {
+                // ["Pregunta|Respuesta", ...]
+                return v.map((s: string) => {
+                    const [q, a] = String(s).split("|");
                     return { q: (q || "").trim(), a: (a || "").trim() };
-                })
-                .filter(f => f.q && f.a);
+                }).filter(f => f.q && f.a);
+            }
+            if (v.length && typeof v[0] === "object") {
+                // [{q, a}, ...]
+                return v.map((o: any) => ({
+                    q: String(o?.q || "").trim(),
+                    a: String(o?.a || "").trim(),
+                })).filter(f => f.q && f.a);
+            }
         }
+
+        if (typeof v === "object") {
+            // { "¿Pregunta?": "Respuesta", ... }
+            return Object.entries(v).map(([q, a]) => ({
+                q: String(q).trim(),
+                a: String(a ?? "").trim(),
+            })).filter(f => f.q && f.a);
+        }
+
+        if (typeof v === "string") {
+            // Texto plano "P|R\nP|R..."
+            return v.split(/\r?\n/).map(l => {
+                const [q, a] = l.split("|");
+                return { q: (q || "").trim(), a: (a || "").trim() };
+            }).filter(f => f.q && f.a);
+        }
+
         return [];
     }
 
-    const faqsArr = toFaqArray(S.kbFAQs || (kb as any).kbFAQs || (kb as any).faqs);
+    // NEW: fusiona fuentes y deduplica por pregunta
+    const faqsFromCfg = toFaqArray(S.kbFAQs);            // <- viene de DB (puede ser string JSON)
+    const faqsFromKB1 = toFaqArray((kb as any).kbFAQs);  // <- por si tu loader también lo trajo
+    const faqsFromKB2 = toFaqArray((kb as any).faqs);    // <- loader ya parseado
+
+    const seen = new Set<string>();
+    const faqsArr = [...faqsFromCfg, ...faqsFromKB1, ...faqsFromKB2]
+        .filter(f => f && f.q && f.a)
+        .filter(f => {
+            const k = f.q.trim().toLowerCase();
+            if (seen.has(k)) return false;
+            seen.add(k);
+            return true;
+        });
+
+    // (opcional) debug
+    console.log("FAQs sizes =>", {
+        cfg: faqsFromCfg.length,
+        kb1: faqsFromKB1.length,
+        kb2: faqsFromKB2.length,
+        merged: faqsArr.length,
+    });
+
 
 
     const faqsLine = faqsArr.length
@@ -2410,6 +2444,15 @@ function sanitizeGreeting(text: string) {
     s = s.replace(/^(?:¡\s*)?hola[!\s,.:;¡¿?–—-]*/i, "").trim();
 
     return s || text;
+}
+
+function prependFirstGreeting(text: string, greeted?: boolean, conversationId?: number) {
+    if (greeted) return text;
+    const base = "¡Hola! ¿En qué puedo ayudarte?";
+    // Reusa tu emoji estable
+    const withEmoji = addEmojiStable(base, conversationId ?? 0);
+    const clean = sanitizeGreeting(text || "");
+    return `${withEmoji}\n${clean}`.trim();
 }
 
 
