@@ -1722,8 +1722,6 @@
 
 
 
-
-
 // utils/ai/strategies/estetica.strategy.ts
 import axios from "axios";
 import prisma from "../../../lib/prisma";
@@ -1770,7 +1768,6 @@ function seenInboundRecently(mid: number, windowMs = REPLY_DEDUP_WINDOW_MS) {
     return false;
 }
 
-/** Detecta si el mensaje es nota de voz o audio */
 function isVoiceInbound(last: { isVoiceNote?: boolean | null; mediaType?: any; mimeType?: string | null; }) {
     if (last?.isVoiceNote) return true;
     const mt = String(last?.mediaType ?? "").toLowerCase();
@@ -1816,28 +1813,67 @@ async function pickImageForContext({
     return { url: null, noteToAppend: "" };
 }
 
-/** Detección de handoff listo (nombre + fecha + hora + procedimiento) */
+/** Detección de handoff listo: nombre + fecha + procedimiento (hora opcional, NO calculamos) */
 function detectHandoffReady(t: string) {
-    const text = t.toLowerCase();
+    const text = (t || "").toLowerCase();
     const hasName =
         /\bmi\s+nombre\s+es\s+[a-záéíóúñü\s]{3,}/i.test(t) ||
         /\bsoy\s+[a-záéíóúñü\s]{3,}/i.test(t);
     const hasDate =
-        /\b(\d{1,2}\s+de\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|lunes|martes|miércoles|jueves|viernes|sábado|domingo)\b/.test(
-            text
-        );
-    const hasTime =
-        /\b(\d{1,2}[:.]\d{2}\s*(am|pm)?|\d{1,2}\s*(am|pm)|mañana|tarde|mediod[ií]a)\b/.test(
+        /\b(\d{1,2}\s+de\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\b/.test(
             text
         );
     const hasProc =
-        /\b(botox|relleno|peeling|hidra|limpieza|depilaci[oó]n|laser|plasma|hilos|armonizaci[oó]n|mesoterapia)\b/.test(
+        /\b(botox|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|l[aá]ser|plasma|hilos|armonizaci[oó]n|mesoterapia|facial|corporal)\b/.test(
             text
         );
-    return hasName && hasDate && hasTime && hasProc;
+    // hora NO obligatoria (si viene, la aceptamos como texto libre)
+    return hasName && hasDate && hasProc;
 }
 
-/* ===== SUMMARY BUILDER (única fuente) ===== */
+/* ===== Detectores de intención ===== */
+function isPaymentQuestion(t: string) {
+    const s = (t || "").toLowerCase();
+    return /\b(pagos?|m[eé]todos?\s+de\s+pag|tarjeta|efectivo|transferen|nequi|daviplata|cuotas?)\b/.test(s);
+}
+
+function isEducationalQuestion(t: string) {
+    const s = (t || "").toLowerCase();
+    return (
+        /\b(qu[eé]\s+es|c[oó]mo\s+funciona|beneficios?|riesgos?|contraindicaciones?|cuidados?|resultados?)\b/.test(s) &&
+        /\b(botox|toxina\s+botul[ií]nica|relleno|hialur[oó]nico|peeling|laser|l[aá]ser|hilos|plasma|mesoterapia|armonizaci[oó]n|hidra|limpieza|facial|corporal)\b/.test(s)
+    );
+}
+
+/* ===== SUMMARY PERSISTENTE ===== */
+async function upsertConversationSummary(conversationId: number, summary: string) {
+    // Upsert resiliente según schema más común: { conversationId (unique), summary (Text), updatedAt }
+    try {
+        await prisma.conversationState.upsert({
+            where: { conversationId },
+            update: {
+                summary,
+                updatedAt: new Date(),
+                // Opcional: expiresAt si tu schema lo incluye
+            } as any,
+            create: {
+                conversationId,
+                summary,
+                updatedAt: new Date(),
+            } as any,
+        });
+    } catch (e) {
+        // Si el schema difiere (e.g., summary dentro de JSON), intenta un plan B mínimo
+        try {
+            await prisma.conversationState.update({
+                where: { conversationId },
+                data: { summary: summary as any, updatedAt: new Date() } as any,
+            });
+        } catch { }
+    }
+}
+
+/* ===== SUMMARY BUILDER (única fuente textual + persistencia) ===== */
 async function buildSummary({
     empresaId,
     conversationId,
@@ -1906,12 +1942,14 @@ async function buildSummary({
         .filter(Boolean)
         .join("\n");
 
+    // Persistir en conversation_state
+    await upsertConversationSummary(conversationId, summary);
     return summary;
 }
 
 /* ===== FORMATO / RESPUESTA ===== */
-function clampText(t: string, lines = 5, chars = 900) {
-    let txt = t.trim();
+function clampText(t: string, lines = CONF.REPLY_MAX_LINES, chars = CONF.REPLY_MAX_CHARS) {
+    let txt = (t || "").trim();
     if (!txt) return txt;
     const arr = txt.split("\n").filter(Boolean);
     if (arr.length > lines) txt = arr.slice(0, lines).join("\n");
@@ -1980,7 +2018,6 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
 /* ===== OOT (fuera de alcance) ===== */
 function isOutOfScope(text: string) {
     const t = (text || "").toLowerCase();
-    // Permite temas estéticos; bloquea otros (bancarios, técnicos, temas no relacionados)
     const allowed =
         /(est[eé]tica|cl[ií]nica|botox|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|l[aá]ser|plasma|hilos|armonizaci[oó]n|mesoterapia|facial|corporal|agenda|cita|precio|valoraci[oó]n)/i;
     const disallowed =
@@ -1989,15 +2026,34 @@ function isOutOfScope(text: string) {
 }
 
 /* ===== LLM ===== */
-async function runLLM({ summary, userText, imageUrl }: any) {
-    const sys = [
+async function runLLM({
+    summary,
+    userText,
+    imageUrl,
+    educationalMode,
+}: {
+    summary: string;
+    userText: string;
+    imageUrl?: string | null;
+    educationalMode?: boolean;
+}) {
+    const baseRules = [
         "Eres el asistente de una clínica estética.",
         "Tono humano, cálido y breve. Saludo corto, sin información extra.",
         "Usa como máximo un emoji natural.",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela textual; no calcules.",
         "Si el usuario pregunta temas fuera de estética, redirígelo amablemente al ámbito de servicios y agendamiento.",
-        "Tu única fuente es el RESUMEN a continuación.",
+    ];
+
+    // En modo educativo permitimos conocimiento general del dominio estético.
+    const scopeLine = educationalMode
+        ? "Puedes usar conocimiento general sobre procedimientos estéticos (qué es, cómo funciona, cuidados, contraindicaciones comunes). Evita promesas absolutas. Para recomendaciones personalizadas, indica que se requiere valoración presencial."
+        : "Tu única fuente es el RESUMEN a continuación. No inventes información fuera del resumen.";
+
+    const sys = [
+        ...baseRules,
+        scopeLine,
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
 
@@ -2018,9 +2074,20 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         model: CONF.MODEL,
         messages,
         temperature: CONF.TEMPERATURE,
-        max_tokens: 120,
+        max_tokens: 160,
     });
-    return r?.choices?.[0]?.message?.content?.trim() || "";
+    let out = r?.choices?.[0]?.message?.content?.trim() || "";
+
+    if (educationalMode) {
+        // Quitar claims absolutos y añadir recordatorio de valoración si falta
+        out = out.replace(/\b(garantiza(?:mos)?|asegura(?:mos)?|sin\s*riesgo|resultados?\s*100%)/gi, "");
+        if (!/[.!?…]$/.test(out.trim())) out = out.trim() + ".";
+        if (!/valoraci[oó]n/i.test(out)) {
+            out += " Para una orientación personalizada y confirmar detalles, realizamos una *valoración presencial*.";
+        }
+    }
+
+    return out;
 }
 
 /* ===== MAIN STRATEGY ===== */
@@ -2042,6 +2109,11 @@ export async function handleEsteticaStrategy({
         select: { id: true, phone: true, estado: true },
     });
     if (!conversacion) return null;
+
+    // Si ya está en handoff, no responder
+    if (conversacion.estado === ConversationEstado.requiere_agente) {
+        return { estado: ConversationEstado.pendiente, mensaje: "", media: [] };
+    }
 
     const last = await prisma.message.findFirst({
         where: { conversationId: chatId, from: MessageFrom.client },
@@ -2090,9 +2162,22 @@ export async function handleEsteticaStrategy({
     });
     if (noteToAppend) userText += noteToAppend;
 
-    // Handoff: nombre + fecha + hora + procedimiento
+    // Handoff: nombre + fecha + procedimiento (hora opcional)
     if (detectHandoffReady(userText)) {
-        const msg = "Perfecto, dame unos minutos mientras confirmo la disponibilidad. 🙌";
+        const piezas: string[] = [];
+        // Esfuerzo simple por extraer eco textual (sin cálculos)
+        const nameMatch = userText.match(/\b(?:mi\s+nombre\s+es|soy)\s+([a-záéíóúñü\s]{3,})/i);
+        const dateMatch = userText.match(/\b(\d{1,2}\s+de\s+(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|lunes|martes|mi[eé]rcoles|miércoles|jueves|viernes|s[áa]bado|domingo)\b/i);
+        const procMatch = userText.match(/\b(botox|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|l[aá]ser|plasma|hilos|armonizaci[oó]n|mesoterapia|facial|corporal)\b/i);
+
+        if (procMatch) piezas.push(`Tratamiento: *${procMatch[1]}*`);
+        if (nameMatch) piezas.push(`Nombre: *${nameMatch[1].trim()}*`);
+        if (dateMatch) piezas.push(`Fecha preferida: *${dateMatch[1]}*`);
+
+        const msg =
+            `¡Perfecto! ⏱️ Dame *unos minutos* para *verificar disponibilidad* 🗓️ y te *confirmo por aquí*.` +
+            (piezas.length ? `\n${piezas.join(" · ")}` : "");
+
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId,
@@ -2133,10 +2218,32 @@ export async function handleEsteticaStrategy({
         };
     }
 
+    // Interceptar preguntas de pago
+    if (isPaymentQuestion(userText)) {
+        const txt = "El detalle de *formas de pago* se confirma durante la *valoración* o directamente en la clínica. 🙌";
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: txt,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
     const summary = await buildSummary({ empresaId, conversationId: chatId, kb });
 
-    let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
-    texto = clampText(texto || "¡Hola! ¿En qué puedo apoyarte? 🙂");
+    const educationalMode = isEducationalQuestion(userText);
+    let texto = await runLLM({ summary, userText, imageUrl, educationalMode }).catch(() => "");
+    texto = clampText(texto || "¡Hola! ¿En qué puedo apoyarte?");
     texto = addEmoji(texto);
 
     const saved = await persistBotReply({
@@ -2197,9 +2304,7 @@ export async function handleEsteticaReply(args: {
     if (!res) return { estado: "pendiente", mensaje: "" };
 
     return {
-        estado:
-            (res.estado as any) ||
-            ConversationEstado.respondido,
+        estado: (res.estado as any) || ConversationEstado.respondido,
         mensaje: res.mensaje || "",
         messageId: res.messageId,
         wamid: res.wamid,
