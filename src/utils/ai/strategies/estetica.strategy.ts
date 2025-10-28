@@ -1920,7 +1920,7 @@ function clampText(t: string, lines = 5, chars = 900) {
 }
 function addEmoji(t: string) {
     const emojis = ["🙂", "💬", "✨", "👌", "🫶"];
-    if (/[a-z]/i.test(t) && !/[🙂✨💬]/.test(t))
+    if (/[a-z]/i.test(t) && !/[🙂✨💬🫶👌✨]/.test(t))
         t += " " + emojis[Math.floor(Math.random() * emojis.length)];
     return t;
 }
@@ -1977,14 +1977,27 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
     return false;
 }
 
+/* ===== OOT (fuera de alcance) ===== */
+function isOutOfScope(text: string) {
+    const t = (text || "").toLowerCase();
+    // Permite temas estéticos; bloquea otros (bancarios, técnicos, temas no relacionados)
+    const allowed =
+        /(est[eé]tica|cl[ií]nica|botox|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|l[aá]ser|plasma|hilos|armonizaci[oó]n|mesoterapia|facial|corporal|agenda|cita|precio|valoraci[oó]n)/i;
+    const disallowed =
+        /(finanzas|banco|cript|programaci[oó]n|servidor|vercel|render|pol[ií]tica|relig|tarea de colegio|matem[aá]ticas|qu[ií]mica|f[úu]tbol|tr[aá]mite|veh[ií]culo)/i;
+    return !allowed.test(t) && disallowed.test(t);
+}
+
 /* ===== LLM ===== */
 async function runLLM({ summary, userText, imageUrl }: any) {
     const sys = [
-        "Asistente de una clínica estética.",
-        "Habla en tono humano, cálido y claro.",
-        "Usa un emoji natural (1 máx).",
-        "No des precios exactos, solo rangos o 'desde'.",
-        "Tu única fuente de información es el siguiente resumen.",
+        "Eres el asistente de una clínica estética.",
+        "Tono humano, cálido y breve. Saludo corto, sin información extra.",
+        "Usa como máximo un emoji natural.",
+        "No des precios exactos; usa 'desde' si existe priceMin.",
+        "No infieras horas: si el cliente escribe la hora, repítela textual; no calcules.",
+        "Si el usuario pregunta temas fuera de estética, redirígelo amablemente al ámbito de servicios y agendamiento.",
+        "Tu única fuente es el RESUMEN a continuación.",
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
 
@@ -2005,7 +2018,7 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         model: CONF.MODEL,
         messages,
         temperature: CONF.TEMPERATURE,
-        max_tokens: 100,
+        max_tokens: 120,
     });
     return r?.choices?.[0]?.message?.content?.trim() || "";
 }
@@ -2047,7 +2060,9 @@ export async function handleEsteticaStrategy({
     });
     if (last?.id && seenInboundRecently(last.id)) return null;
 
-    let userText = mensajeArg.trim();
+    let userText = (mensajeArg || "").trim();
+
+    // Voz → transcribir
     if (!userText && isVoiceInbound(last || {})) {
         let tr = last?.transcription?.trim() || "";
         if (!tr && last?.mediaUrl) {
@@ -2075,7 +2090,7 @@ export async function handleEsteticaStrategy({
     });
     if (noteToAppend) userText += noteToAppend;
 
-    // Si ya está listo para agendamiento
+    // Handoff: nombre + fecha + hora + procedimiento
     if (detectHandoffReady(userText)) {
         const msg = "Perfecto, dame unos minutos mientras confirmo la disponibilidad. 🙌";
         const saved = await persistBotReply({
@@ -2087,13 +2102,41 @@ export async function handleEsteticaStrategy({
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return { estado: ConversationEstado.requiere_agente, mensaje: saved.texto };
+        return {
+            estado: ConversationEstado.requiere_agente,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
+    // Fuera de alcance → redirigir
+    if (isOutOfScope(userText)) {
+        const txt =
+            "Puedo ayudarte con información de nuestros servicios estéticos y agendar tu cita. ¿Qué procedimiento te interesa o para qué fecha te gustaría programar? 🙂";
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: txt,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
     }
 
     const summary = await buildSummary({ empresaId, conversationId: chatId, kb });
 
     let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
-    texto = clampText(texto || "Gracias por tu mensaje, ¿cómo puedo ayudarte hoy?");
+    texto = clampText(texto || "¡Hola! ¿En qué puedo apoyarte? 🙂");
     texto = addEmoji(texto);
 
     const saved = await persistBotReply({
@@ -2113,6 +2156,54 @@ export async function handleEsteticaStrategy({
         messageId: saved.messageId,
         wamid: saved.wamid,
         media: [],
+    };
+}
+
+/* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR ===== */
+export async function handleEsteticaReply(args: {
+    chatId?: number;
+    conversationId?: number;
+    empresaId: number;
+    contenido?: string;
+    toPhone?: string;
+    phoneNumberId?: string;
+}): Promise<{
+    estado: "pendiente" | "respondido" | "en_proceso" | "requiere_agente";
+    mensaje: string;
+    messageId?: number;
+    wamid?: string;
+    media?: any[];
+}> {
+    const {
+        chatId,
+        conversationId: conversationIdArg,
+        empresaId,
+        contenido,
+        toPhone,
+        phoneNumberId,
+    } = args;
+
+    const conversationId = conversationIdArg ?? chatId;
+    if (!conversationId) return { estado: "pendiente", mensaje: "" };
+
+    const res = await handleEsteticaStrategy({
+        chatId: conversationId,
+        empresaId,
+        mensajeArg: (contenido || "").trim(),
+        toPhone,
+        phoneNumberId,
+    });
+
+    if (!res) return { estado: "pendiente", mensaje: "" };
+
+    return {
+        estado:
+            (res.estado as any) ||
+            ConversationEstado.respondido,
+        mensaje: res.mensaje || "",
+        messageId: res.messageId,
+        wamid: res.wamid,
+        media: res.media || [],
     };
 }
 
