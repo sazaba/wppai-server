@@ -2229,7 +2229,9 @@ async function buildOrReuseSummary(args: {
         return [];
     }
 
-    const faqsArr = toFaqArray(S.kbFAQs);
+    const faqsArr = toFaqArray(S.kbFAQs || (kb as any).kbFAQs || (kb as any).faqs);
+
+
     const faqsLine = faqsArr.length
         ? "FAQs: " +
         faqsArr
@@ -2395,19 +2397,21 @@ function hasSomeDateDraft(d?: AgentState["draft"]) {
     return !!(d?.whenISO || d?.whenText);
 }
 function sanitizeGreeting(text: string) {
-    let s = (text || "").trim();
+    // Quita signos iniciales y espacios antes del saludo
+    let s = (text || "").replace(/^[\s¡!¿?'"()\-–—]+/g, "").trim();
 
-    // elimina saludos al inicio tipo “hola,” “buen día,” “buenas tardes,” + variantes
+    // Saludos típicos al inicio, con o sin signos
     const patterns = [
-        /^(hola|buen(?:os|as)?\s+(?:d[ií]as|tardes|noches)|hey|qué tal|que tal|hola hola)[,:\-–—\s]*/i,
+        /^(?:hola|holi|hey|buen(?:os|as)?\s+(?:d[ií]as|tardes|noches)|qué tal|que tal|hola hola)[\s,.:;!¡¿?–—-]*/i,
     ];
-    for (const rx of patterns) {
-        s = s.replace(rx, "").trim();
-    }
+    for (const rx of patterns) s = s.replace(rx, "").trim();
 
-    // si quedó vacío por completo, devuelve igual el original
+    // Si todavía arranca con un segundo “¡Hola!” (ej. LLM), intenta de nuevo
+    s = s.replace(/^(?:¡\s*)?hola[!\s,.:;¡¿?–—-]*/i, "").trim();
+
     return s || text;
 }
+
 
 
 /* ===== FORMATO / RESPUESTA ===== */
@@ -2511,7 +2515,7 @@ function isOutOfScope(text: string) {
 async function runLLM({ summary, userText, imageUrl }: any) {
     const sys = [
         "Eres el asistente de una clínica estética.",
-        "Tono humano, cálido y breve. Saludo de 3–5 palabras, sin información extra.",
+        "Tono humano, cálido y breve. **No inicies con saludos (no ‘hola’, ‘buen día’, etc.)**.",
         "Usa como máximo un emoji natural (solo uno).",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela tal cual; no calcules ni conviertas.",
@@ -2689,12 +2693,12 @@ export async function handleEsteticaStrategy({
             newDraft.whenText ? `Preferencia: *${newDraft.whenText}*` : (newDraft.whenISO ? `Fecha: *${new Date(newDraft.whenISO).toLocaleDateString("es-CO", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })}*` : "")
         ].filter(Boolean).join(" · ");
 
-        const msg = `Perfecto, dame *unos minutos* voy a *verificar la disponibilidad* de este horario para *confirmarte por aquí*. 🗓️\n${piezas}`;
-        const cleaned = sanitizeGreeting(msg);     // ← NUEVO
+        const msg = `Perfecto, dame *unos minutos* voy a *verificar la disponibilidad* ...\n${piezas}`;
+        const cleaned = sanitizeGreeting(msg);
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId,
-            texto: clampText(cleaned), // ← usar cleaned aquí
+            texto: clampText(cleaned),           // ← usar cleaned
             nuevoEstado: ConversationEstado.requiere_agente,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
