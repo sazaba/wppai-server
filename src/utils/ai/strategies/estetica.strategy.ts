@@ -2352,6 +2352,33 @@ function extractName(raw: string): string | null {
     // Sin disparador, NO asumir nombre (elimina falsos positivos tipo “Botox para este viernes”)
     return null;
 }
+function looksLikeLooseName(raw: string): string | null {
+    const t = (raw || "").trim();
+
+    // descartar si trae números o símbolos fuertes
+    if (/[0-9@#]/.test(t)) return null;
+
+    // 1–4 palabras, solo letras y espacios
+    const parts = t.split(/\s+/).filter(Boolean);
+    if (parts.length < 2 || parts.length > 4) return null;
+
+    // evitar falsos positivos: días, horarios, procedimientos comunes
+    const bad = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|a las|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i;
+    if (bad.test(t.toLowerCase())) return null;
+
+    // solo letras (con tildes) y espacios
+    if (!/^[A-Za-zÁÉÍÓÚÑáéíóúñü\s]+$/.test(t)) return null;
+
+    // capitaliza
+    const normalized = t
+        .replace(/\s+/g, " ")
+        .split(" ")
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(" ");
+
+    return normalized;
+}
+
 
 function grabWhenFreeText(raw: string): string | null {
     const t = (raw || "").toLowerCase();
@@ -2367,6 +2394,21 @@ function grabWhenFreeText(raw: string): string | null {
 function hasSomeDateDraft(d?: AgentState["draft"]) {
     return !!(d?.whenISO || d?.whenText);
 }
+function sanitizeGreeting(text: string) {
+    let s = (text || "").trim();
+
+    // elimina saludos al inicio tipo “hola,” “buen día,” “buenas tardes,” + variantes
+    const patterns = [
+        /^(hola|buen(?:os|as)?\s+(?:d[ií]as|tardes|noches)|hey|qué tal|que tal|hola hola)[,:\-–—\s]*/i,
+    ];
+    for (const rx of patterns) {
+        s = s.replace(rx, "").trim();
+    }
+
+    // si quedó vacío por completo, devuelve igual el original
+    return s || text;
+}
+
 
 /* ===== FORMATO / RESPUESTA ===== */
 function clampText(t: string, lines = CONF.REPLY_MAX_LINES, chars = CONF.REPLY_MAX_CHARS) {
@@ -2469,15 +2511,17 @@ function isOutOfScope(text: string) {
 async function runLLM({ summary, userText, imageUrl }: any) {
     const sys = [
         "Eres el asistente de una clínica estética.",
-        "Tono humano, cálido y breve. Saludo corto, sin información extra.",
-        "Usa como máximo un emoji natural.",
+        "Tono humano, cálido y breve. Saludo de 3–5 palabras, sin información extra.",
+        "Usa como máximo un emoji natural (solo uno).",
         "No des precios exactos; usa 'desde' si existe priceMin.",
-        "No infieras horas: si el cliente escribe la hora, repítela textual; no calcules.",
+        "No infieras horas: si el cliente escribe la hora, repítela tal cual; no calcules ni conviertas.",
+        "Prohibido preguntar '¿te paso precios u horarios?'. En su lugar, si corresponde, pide solo el *día y hora* preferidos.",
         "Si el usuario pregunta fuera de estética, reencausa al ámbito de servicios y agendamiento.",
         "Si faltan datos operativos (pagos/promos/etc.), responde: 'esa información se confirma en la valoración o directamente en la clínica'.",
         "Tu única fuente es el RESUMEN a continuación.",
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
+
 
     const messages: any[] = [{ role: "system", content: sys }];
     if (imageUrl) {
@@ -2496,7 +2540,7 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         model: CONF.MODEL,
         messages,
         temperature: CONF.TEMPERATURE,
-        max_tokens: 120,
+        max_tokens: 220,
     });
     return r?.choices?.[0]?.message?.content?.trim() || "";
 }
@@ -2595,7 +2639,17 @@ export async function handleEsteticaStrategy({
     // ====== Agendamiento flexible (colecta progresiva sin calcular hora) ======
     // 1) Actualiza draft con lo que venga en texto
     let state = await loadState(chatId);
-    const nameInText = extractName(userText);
+    let nameInText = extractName(userText);
+    // Fallback: si aún falta nombre y el usuario envía solo “Juan Camilo López”, tómalos como nombre.
+    if (!nameInText) {
+        const stateNow = await loadState(chatId);
+        const needNameNow = !(stateNow.draft?.name);
+        if (needNameNow) {
+            const loose = looksLikeLooseName(userText);
+            if (loose) nameInText = loose;
+        }
+    }
+
     const whenFree = grabWhenFreeText(userText);
     let match = resolveServiceName(kb, userText || "");
     if (!match.procedure) {
@@ -2635,11 +2689,12 @@ export async function handleEsteticaStrategy({
             newDraft.whenText ? `Preferencia: *${newDraft.whenText}*` : (newDraft.whenISO ? `Fecha: *${new Date(newDraft.whenISO).toLocaleDateString("es-CO", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })}*` : "")
         ].filter(Boolean).join(" · ");
 
-        const msg = `¡Perfecto! Dame *unos minutos* para *verificar disponibilidad* 🗓️ y te *confirmo por aquí* ✅.\n${piezas}`;
+        const msg = `Perfecto, dame *unos minutos* voy a *verificar la disponibilidad* de este horario para *confirmarte por aquí*. 🗓️\n${piezas}`;
+        const cleaned = sanitizeGreeting(msg);     // ← NUEVO
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId,
-            texto: clampText(msg),
+            texto: clampText(cleaned), // ← usar cleaned aquí
             nuevoEstado: ConversationEstado.requiere_agente,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
@@ -2762,6 +2817,7 @@ export async function handleEsteticaStrategy({
 
     // ===== Respuesta libre (modo natural) usando el summary extendido
     let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
+    texto = sanitizeGreeting(texto);           // ← NUEVO
     texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
     texto = addEmojiStable(texto, chatId);
 
