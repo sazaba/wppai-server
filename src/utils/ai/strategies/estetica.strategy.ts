@@ -1721,7 +1721,6 @@
 
 
 
-
 // utils/ai/strategies/estetica.strategy.ts
 import axios from "axios";
 import prisma from "../../../lib/prisma";
@@ -1768,6 +1767,20 @@ function seenInboundRecently(mid: number, windowMs = REPLY_DEDUP_WINDOW_MS) {
     return false;
 }
 
+/** Conversational dedup (double-reply window per conversation) */
+const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>();
+function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = 120_000) {
+    const now = Date.now();
+    const prev = recentReplies.get(conversationId);
+    if (prev && prev.afterMs >= clientTs.getTime() && now - prev.repliedAtMs <= windowMs) return true;
+    recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now });
+    return false;
+}
+function markActuallyReplied(conversationId: number, clientTs: Date) {
+    recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: Date.now() });
+}
+
+/** Detecta si el mensaje es nota de voz o audio */
 function isVoiceInbound(last: { isVoiceNote?: boolean | null; mediaType?: any; mimeType?: string | null; }) {
     if (last?.isVoiceNote) return true;
     const mt = String(last?.mediaType ?? "").toLowerCase();
@@ -1813,102 +1826,266 @@ async function pickImageForContext({
     return { url: null, noteToAppend: "" };
 }
 
-/** Detección de handoff listo: nombre + fecha + procedimiento (hora opcional, NO calculamos) */
-function detectHandoffReady(t: string) {
-    const text = (t || "").toLowerCase();
-    const hasName =
-        /\bmi\s+nombre\s+es\s+[a-záéíóúñü\s]{3,}/i.test(t) ||
-        /\bsoy\s+[a-záéíóúñü\s]{3,}/i.test(t);
-    const hasDate =
-        /\b(\d{1,2}\s+de\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\b/.test(
-            text
-        );
-    const hasProc =
-        /\b(botox|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|l[aá]ser|plasma|hilos|armonizaci[oó]n|mesoterapia|facial|corporal)\b/.test(
-            text
-        );
-    // hora NO obligatoria (si viene, la aceptamos como texto libre)
-    return hasName && hasDate && hasProc;
+/* ======= STATE (conversation_state) ======= */
+type AgentState = {
+    greeted?: boolean;
+    lastIntent?: "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
+    lastServiceId?: number | null;
+    lastServiceName?: string | null;
+    draft?: {
+        name?: string;
+        phone?: string;
+        procedureId?: number;
+        procedureName?: string;
+        whenISO?: string;
+        whenText?: string; // fecha/hora “tal cual” que escribió el cliente (sin calcular)
+        // NOTA: no usamos timeHHMM ni timeNote para no “inferir” horas
+    };
+    summary?: { text: string; expiresAt: string };
+    expireAt?: string;
+    handoffLocked?: boolean;
+};
+function nowPlusMin(min: number) {
+    return new Date(Date.now() + min * 60_000).toISOString();
+}
+async function loadState(conversationId: number): Promise<AgentState> {
+    const row = await prisma.conversationState.findUnique({
+        where: { conversationId },
+        select: { data: true },
+    });
+    const raw = (row?.data as any) || {};
+    const data: AgentState = {
+        greeted: !!raw.greeted,
+        lastIntent: raw.lastIntent,
+        lastServiceId: raw.lastServiceId ?? null,
+        lastServiceName: raw.lastServiceName ?? null,
+        draft: raw.draft ?? {},
+        summary: raw.summary ?? undefined,
+        expireAt: raw.expireAt,
+        handoffLocked: !!raw.handoffLocked,
+    };
+    const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
+    if (expired) return { greeted: data.greeted, handoffLocked: data.handoffLocked, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
+    return data;
+}
+async function saveState(conversationId: number, data: AgentState) {
+    const next: AgentState = { ...data, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
+    await prisma.conversationState.upsert({
+        where: { conversationId },
+        create: { conversationId, data: next as any },
+        update: { data: next as any },
+    });
+}
+async function patchState(conversationId: number, patch: Partial<AgentState>) {
+    const prev = await loadState(conversationId);
+    await saveState(conversationId, { ...prev, ...patch });
 }
 
-/* ===== Detectores de intención ===== */
-function isPaymentQuestion(t: string) {
-    const s = (t || "").toLowerCase();
-    return /\b(pagos?|m[eé]todos?\s+de\s+pag|tarjeta|efectivo|transferen|nequi|daviplata|cuotas?)\b/.test(s);
+/* ===== Helpers para agenda (DB) ===== */
+function pad2(n: number) { return String(n).padStart(2, "0"); }
+function hhmmFrom(raw?: string | null) {
+    if (!raw) return null;
+    const m = raw.match(/^(\d{1,2})(?::?(\d{2}))?/);
+    if (!m) return null;
+    const hh = Math.min(23, Number(m[1] ?? 0));
+    const mm = Math.min(59, Number(m[2] ?? 0));
+    return `${pad2(hh)}:${pad2(mm)}`;
 }
-
-function isEducationalQuestion(t: string) {
-    const s = (t || "").toLowerCase();
-    return (
-        /\b(qu[eé]\s+es|c[oó]mo\s+funciona|beneficios?|riesgos?|contraindicaciones?|cuidados?|resultados?)\b/.test(s) &&
-        /\b(botox|toxina\s+botul[ií]nica|relleno|hialur[oó]nico|peeling|laser|l[aá]ser|hilos|plasma|mesoterapia|armonizaci[oó]n|hidra|limpieza|facial|corporal)\b/.test(s)
-    );
+function weekdayToDow(day: any): number | null {
+    const key = String(day || "").toUpperCase();
+    const map: Record<string, number> = {
+        SUNDAY: 0, DOMINGO: 0,
+        MONDAY: 1, LUNES: 1,
+        TUESDAY: 2, MARTES: 2,
+        WEDNESDAY: 3, MIERCOLES: 3, MIÉRCOLES: 3,
+        THURSDAY: 4, JUEVES: 4,
+        FRIDAY: 5, VIERNES: 5,
+        SATURDAY: 6, SABADO: 6, SÁBADO: 6,
+    };
+    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
 }
-
-/* ===== SUMMARY PERSISTENTE ===== */
-async function upsertConversationSummary(conversationId: number, summary: string) {
-    // Upsert resiliente según schema más común: { conversationId (unique), summary (Text), updatedAt }
+async function fetchAppointmentHours(empresaId: number) {
+    const rows = await prisma.appointmentHour.findMany({
+        where: { empresaId },
+        orderBy: [{ day: "asc" }],
+        select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
+    });
+    return rows;
+}
+async function fetchAppointmentExceptions(empresaId: number, horizonDays = 35) {
+    const now = new Date();
+    const end = new Date(now);
+    end.setDate(end.getDate() + horizonDays);
     try {
-        await prisma.conversationState.upsert({
-            where: { conversationId },
-            update: {
-                summary,
-                updatedAt: new Date(),
-                // Opcional: expiresAt si tu schema lo incluye
-            } as any,
-            create: {
-                conversationId,
-                summary,
-                updatedAt: new Date(),
-            } as any,
+        const rows: any[] = await (prisma as any).appointment_exeption.findMany({
+            where: { empresaId, date: { gte: now, lte: end } },
+            orderBy: [{ date: "asc" }],
+            select: { date: true, dateISO: true, isOpen: true, open: true, closed: true, motivo: true, reason: true, tz: true },
         });
-    } catch (e) {
-        // Si el schema difiere (e.g., summary dentro de JSON), intenta un plan B mínimo
+        return rows;
+    } catch {
         try {
-            await prisma.conversationState.update({
-                where: { conversationId },
-                data: { summary: summary as any, updatedAt: new Date() } as any,
+            const rows: any[] = await (prisma as any).appointment_exception.findMany({
+                where: { empresaId, date: { gte: now, lte: end } },
+                orderBy: [{ date: "asc" }],
+                select: { date: true, dateISO: true, isOpen: true, open: true, closed: true, motivo: true, reason: true, tz: true },
             });
-        } catch { }
+            return rows;
+        } catch {
+            return [];
+        }
     }
 }
+function normalizeHours(rows: any[]) {
+    const byDow: Record<number, Array<{ start: string; end: string }>> = {};
+    for (const r of rows || []) {
+        if (!r) continue;
+        if (r.isOpen === false) continue;
+        const dow = weekdayToDow(r.day);
+        if (dow == null) continue;
+        const s1 = hhmmFrom(r.start1), e1 = hhmmFrom(r.end1);
+        const s2 = hhmmFrom(r.start2), e2 = hhmmFrom(r.end2);
+        if (s1 && e1) (byDow[dow] ||= []).push({ start: s1, end: e1 });
+        if (s2 && e2) (byDow[dow] ||= []).push({ start: s2, end: e2 });
+    }
+    return byDow;
+}
+function normalizeExceptions(rows: any[]) {
+    const items: Array<{ date: string; closed: boolean; motivo?: string }> = [];
+    for (const r of rows || []) {
+        const closed = (r.isOpen === false) || (r.closed === true) || (r.open === false);
+        const date = r.dateISO ?? (r.date ? new Date(r.date).toISOString().slice(0, 10) : null);
+        if (!date) continue;
+        items.push({ date, closed, motivo: r.motivo ?? r.reason });
+    }
+    return items;
+}
 
-/* ===== SUMMARY BUILDER (única fuente textual + persistencia) ===== */
-async function buildSummary({
-    empresaId,
-    conversationId,
-    kb,
-}: {
+/* ===== Summary extendido con cache en conversation_state ===== */
+function softTrim(s: string | null | undefined, max = 240) {
+    const t = (s || "").trim();
+    if (!t) return "";
+    return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
+}
+function formatCOP(value?: number | null): string | null {
+    if (value == null || isNaN(Number(value))) return null;
+    return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
+}
+async function buildBusinessRangesHuman(
+    empresaId: number,
+    kb: EsteticaKB,
+    opts?: { defaultDurMin?: number; rows?: any[] }
+): Promise<{ human: string; lastStart?: string }> {
+    const rows = opts?.rows ?? await fetchAppointmentHours(empresaId);
+    const byDow = normalizeHours(rows);
+    const dayShort = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+
+    const parts: string[] = [];
+    for (let d = 0; d < 7; d++) {
+        const ranges = byDow[d];
+        if (ranges?.length) parts.push(`${dayShort[d]} ${ranges.map(r => `${r.start}–${r.end}`).join(", ")}`);
+    }
+    const human = parts.join("; ");
+
+    const dur = Math.max(30, opts?.defaultDurMin ?? (kb.defaultServiceDurationMin ?? 60));
+    const weekdays = [1, 2, 3, 4, 5];
+    const endsWeekdays: string[] = [];
+    const endsAll: string[] = [];
+
+    for (const d of weekdays) for (const r of (byDow[d] || [])) if (r.end) endsWeekdays.push(r.end);
+    for (let d = 0; d < 7; d++) for (const r of (byDow[d] || [])) if (r.end) endsAll.push(r.end);
+    const pool = endsWeekdays.length ? endsWeekdays : endsAll;
+    if (!pool.length) return { human, lastStart: undefined };
+
+    const maxEnd = pool.sort()[pool.length - 1];
+    const [eh, em] = maxEnd.split(":").map(Number);
+    const startMins = eh * 60 + em - dur;
+    const sh = Math.max(0, Math.floor(startMins / 60));
+    const sm = Math.max(0, startMins % 60);
+    const lastStart = `${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}`;
+
+    return { human, lastStart };
+}
+function paymentMethodsFromKB(kb: EsteticaKB): string[] {
+    const list: string[] = [];
+    const pm: any = (kb as any).paymentMethods ?? (kb as any).payments ?? [];
+    if (Array.isArray(pm)) {
+        for (const it of pm) {
+            if (!it) continue;
+            if (typeof it === "string") list.push(it);
+            else if (typeof it?.name === "string") list.push(it.name);
+        }
+    }
+    const flags: Array<[string, any]> = [
+        ["Efectivo", (kb as any).cash],
+        ["Tarjeta débito/crédito", (kb as any).card || (kb as any).cards],
+        ["Transferencia", (kb as any).transfer || (kb as any).wire],
+        ["PSE", (kb as any).pse],
+        ["Nequi", (kb as any).nequi],
+        ["Daviplata", (kb as any).daviplata],
+    ];
+    for (const [label, v] of flags) if (v === true) list.push(label);
+    return Array.from(new Set(list)).sort();
+}
+
+async function buildOrReuseSummary(args: {
     empresaId: number;
     conversationId: number;
     kb: EsteticaKB;
-}) {
-    const empresa = await prisma.empresa.findUnique({
-        where: { id: empresaId },
-        select: { nombre: true },
-    });
+}): Promise<string> {
+    const { empresaId, conversationId, kb } = args;
 
-    const apptCfg = await prisma.businessConfigAppt.findUnique({
-        where: { empresaId },
-        select: {
-            appointmentTimezone: true,
-            appointmentPolicies: true,
-            appointmentBufferMin: true,
-            allowSameDayBooking: true,
-            appointmentMinNoticeHours: true,
-            appointmentMaxAdvanceDays: true,
-            defaultServiceDurationMin: true,
-            locationName: true,
-            locationAddress: true,
-            locationMapsUrl: true,
-            parkingInfo: true,
-            instructionsArrival: true,
-            noShowPolicy: true,
-            depositRequired: true,
-            depositAmount: true,
-            kbFreeText: true,
-        },
-    });
+    const cached = await loadState(conversationId);
+    const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
+    if (fresh) return cached.summary!.text;
+
+    const [hoursRows, exceptionsRows, apptCfg] = await Promise.all([
+        fetchAppointmentHours(empresaId),
+        fetchAppointmentExceptions(empresaId, 35),
+        prisma.businessConfigAppt.findUnique({
+            where: { empresaId },
+            select: {
+                appointmentEnabled: true,
+                appointmentTimezone: true,
+                appointmentBufferMin: true,
+                appointmentMinNoticeHours: true,
+                appointmentMaxAdvanceDays: true,
+                allowSameDayBooking: true,
+                defaultServiceDurationMin: true,
+                appointmentPolicies: true,
+                locationName: true,
+                locationAddress: true,
+                locationMapsUrl: true,
+                parkingInfo: true,
+                instructionsArrival: true,
+                noShowPolicy: true,
+                depositRequired: true,
+                depositAmount: true,
+                servicesText: true,
+                services: true,
+                kbBusinessOverview: true,
+                kbFAQs: true,
+                kbServiceNotes: true,
+                kbEscalationRules: true,
+                kbDisclaimers: true,
+                kbMedia: true,
+                kbFreeText: true,
+            },
+        }),
+    ]);
+
+    const { human: hoursLine, lastStart } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
+    const exceptions = normalizeExceptions(exceptionsRows);
+    const exLine = exceptions.filter(e => e.closed).slice(0, 10).map(e => e.date).join(", ");
+    const exceptionsLine = exLine ? `Excepciones (cerrado): ${exLine}` : "";
+
+    const svcFromKB = (kb.procedures ?? [])
+        .filter(s => s.enabled !== false)
+        .map(s => (s.priceMin ? `${s.name} (Desde ${formatCOP(s.priceMin)})` : s.name))
+        .join(" • ");
+
+    const payments = paymentMethodsFromKB(kb);
+    const paymentsLine = payments.length ? `Pagos: ${payments.join(" • ")}` : "";
 
     const msgs = await prisma.message.findMany({
         where: { conversationId },
@@ -1916,35 +2093,109 @@ async function buildSummary({
         take: 10,
         select: { from: true, contenido: true },
     });
-
     const history = msgs
         .reverse()
-        .map((m) => `${m.from === MessageFrom.client ? "U" : "A"}: ${m.contenido?.slice(0, 100)}`)
+        .map((m) => `${m.from === MessageFrom.client ? "U" : "A"}: ${softTrim(m.contenido || "", 100)}`)
         .join(" | ");
 
-    const svcList = kb.procedures
-        .slice(0, 10)
-        .map((p) => `${p.name}${p.priceMin ? ` desde $${p.priceMin.toLocaleString()}` : ""}`)
-        .join(" · ");
+    const S = apptCfg || ({} as any);
 
-    const summary = [
-        `Negocio: ${empresa?.nombre || kb.businessName}`,
-        `Zona horaria: ${apptCfg?.appointmentTimezone || kb.timezone}`,
-        `Servicios disponibles: ${svcList}`,
-        `Duración base: ${apptCfg?.defaultServiceDurationMin || kb.defaultServiceDurationMin || 60} min`,
-        `Políticas: ${apptCfg?.appointmentPolicies || kb.policies || "Consultar en valoración"}`,
-        `Sede: ${apptCfg?.locationName || kb.location?.name || ""}`,
-        `Dirección: ${apptCfg?.locationAddress || kb.location?.address || ""}`,
-        `Mapa: ${apptCfg?.locationMapsUrl || kb.location?.mapsUrl || ""}`,
-        `Notas: ${apptCfg?.kbFreeText || ""}`,
-        `Historial reciente: ${history}`,
-    ]
-        .filter(Boolean)
-        .join("\n");
+    const base = [
+        kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
+        `Zona horaria: ${S.appointmentTimezone || kb.timezone}`,
+        `Agenda: ${S.appointmentEnabled ? "habilitada" : "deshabilitada"} | Buffer ${S.appointmentBufferMin ?? kb.bufferMin ?? "-"} min`,
+        `Reglas: ${[
+            S.allowSameDayBooking != null ? `mismo día ${S.allowSameDayBooking ? "sí" : "no"}` : "",
+            S.appointmentMinNoticeHours != null ? `anticipación ${S.appointmentMinNoticeHours} h` : "",
+            S.appointmentMaxAdvanceDays != null ? `hasta ${S.appointmentMaxAdvanceDays} días` : "",
+        ].filter(Boolean).join(" | ")}`,
+        `Logística: ${[
+            S.locationName ? `Sede ${S.locationName}` : "",
+            S.locationAddress ? `Dir. ${S.locationAddress}` : "",
+            S.locationMapsUrl ? `Mapa ${S.locationMapsUrl}` : "",
+            S.parkingInfo ? `Parqueadero ${softTrim(S.parkingInfo, 120)}` : "",
+            S.instructionsArrival ? `Indicaciones ${softTrim(S.instructionsArrival, 120)}` : "",
+        ].filter(Boolean).join(" | ")}`,
+        (S.noShowPolicy || S.depositRequired != null)
+            ? `Políticas: ${[
+                S.noShowPolicy ? `No-show ${softTrim(S.noShowPolicy, 120)}` : "",
+                S.depositRequired ? `Depósito ${S.depositAmount ? formatCOP(Number(S.depositAmount)) : "sí"}` : "Depósito no",
+            ].filter(Boolean).join(" | ")}`
+            : "",
+        paymentsLine,
+        `Servicios (KB): ${svcFromKB || "—"}`,
+        hoursLine ? `Horario base (DB): ${hoursLine}${lastStart ? `; última cita de referencia ${lastStart}` : ""}` : "",
+        exceptionsLine,
+        S.kbBusinessOverview ? `Overview: ${softTrim(S.kbBusinessOverview, 260)}` : "",
+        S.kbFreeText ? `Notas: ${softTrim(S.kbFreeText, 260)}` : "",
+        `Historial breve: ${history || "—"}`,
+    ].filter(Boolean).join("\n");
 
-    // Persistir en conversation_state
-    await upsertConversationSummary(conversationId, summary);
-    return summary;
+    // Compacto (pero incluyendo TODO en el prompt):
+    let compact = base;
+    try {
+        const resp = await openai.chat.completions.create({
+            model: CONF.MODEL,
+            temperature: 0.1,
+            max_tokens: 220,
+            messages: [
+                { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. Español neutro." },
+                { role: "user", content: base.slice(0, 4000) },
+            ],
+        });
+        compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
+    } catch {
+        // Dejar base si falla
+    }
+
+    await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
+    return compact;
+}
+
+/* ===== Detección de handoff listo (nombre + fecha/hora textual + procedimiento) ===== */
+function detectHandoffReady(t: string) {
+    const text = (t || "").toLowerCase();
+
+    const hasName =
+        /\bmi\s+nombre\s+es\s+[a-záéíóúñü\s]{3,}/i.test(t) ||
+        /\bsoy\s+[a-záéíóúñü\s]{3,}/i.test(t);
+
+    const hasDateOrTimeText =
+        /\b(hoy|mañana|manana|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|am|pm|tarde|mañana|manana|noche|mediod[ií]a|medio\s+dia)\b/.test(text) ||
+        /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?\b/.test(text) ||
+        /\b(\d{1,2}[:.]\d{2}\s*(am|pm)?)\b/.test(text);
+
+    const hasProc =
+        /\b(botox|toxina|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|laser|plasma|hilos|armonizaci[oó]n|mesoterapia)\b/.test(
+            text
+        );
+
+    return hasName && hasDateOrTimeText && hasProc;
+}
+
+/* ===== Extractores suaves para el borrador (sin normalizar hora) ===== */
+function extractName(raw: string): string | null {
+    const t = (raw || "").trim();
+    let m =
+        t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ\s]{2,50})/i);
+    if (m && m[1]) return m[1].trim().replace(/\s+/g, " ");
+    const onlyLetters = /^[A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2}$/;
+    if (onlyLetters.test(t) && t.length >= 3 && t.length <= 60) return t.replace(/\s+/g, " ");
+    return null;
+}
+function grabWhenFreeText(raw: string): string | null {
+    const t = (raw || "").toLowerCase();
+    const hints = [
+        "hoy", "mañana", "manana", "próxima", "proxima", "semana", "mes", "mediodia", "medio dia",
+        "lunes", "martes", "miércoles", "miercoles", "jueves", "viernes", "sábado", "sabado",
+        "am", "pm", "a las", "hora", "tarde", "noche", "domingo"
+    ];
+    const looksLikeDate = /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?/.test(t);
+    const hasHint = hints.some(h => t.includes(h));
+    return (looksLikeDate || hasHint) ? softTrim(raw, 120) : null;
+}
+function hasSomeDateDraft(d?: AgentState["draft"]) {
+    return !!(d?.whenISO || d?.whenText);
 }
 
 /* ===== FORMATO / RESPUESTA ===== */
@@ -1958,12 +2209,15 @@ function clampText(t: string, lines = CONF.REPLY_MAX_LINES, chars = CONF.REPLY_M
 }
 function addEmoji(t: string) {
     const emojis = ["🙂", "💬", "✨", "👌", "🫶"];
-    if (/[a-z]/i.test(t) && !/[🙂✨💬🫶👌✨]/.test(t))
+    if (/[a-z]/i.test(t) && !/[🙂✨💬🫶👌]/.test(t))
         t += " " + emojis[Math.floor(Math.random() * emojis.length)];
     return t;
 }
 
 /* ===== PERSISTENCIA ===== */
+function normalizeToE164(n: string) {
+    return String(n || "").replace(/[^\d]/g, "");
+}
 async function persistBotReply({
     conversationId,
     empresaId,
@@ -1972,6 +2226,21 @@ async function persistBotReply({
     to,
     phoneNumberId,
 }: any) {
+    // dedup suave con el último del bot:
+    const prevBot = await prisma.message.findFirst({
+        where: { conversationId, from: MessageFrom.bot },
+        orderBy: { timestamp: "desc" },
+        select: { id: true, contenido: true, timestamp: true, externalId: true },
+    });
+    if (prevBot) {
+        const sameText = (prevBot.contenido || "").trim() === (texto || "").trim();
+        const recent = Date.now() - new Date(prevBot.timestamp as any).getTime() <= 15_000;
+        if (sameText && recent) {
+            await prisma.conversation.update({ where: { id: conversationId }, data: { estado: nuevoEstado } });
+            return { messageId: prevBot.id, texto: prevBot.contenido, wamid: prevBot.externalId as any, estado: nuevoEstado };
+        }
+    }
+
     const msg = await prisma.message.create({
         data: { conversationId, from: MessageFrom.bot, contenido: texto, empresaId },
     });
@@ -1979,12 +2248,12 @@ async function persistBotReply({
         where: { id: conversationId },
         data: { estado: nuevoEstado },
     });
-    let wamid;
+    let wamid: string | undefined;
     if (to) {
         try {
             const r = await Wam.sendWhatsappMessage({
                 empresaId,
-                to,
+                to: normalizeToE164(to),
                 body: texto,
                 phoneNumberIdHint: phoneNumberId,
             });
@@ -1999,22 +2268,6 @@ async function persistBotReply({
     return { texto, wamid, messageId: msg.id };
 }
 
-function markActuallyReplied(conversationId: number, clientTs: Date) {
-    recentReplies.set(conversationId, {
-        afterMs: clientTs.getTime(),
-        repliedAtMs: Date.now(),
-    });
-}
-const recentReplies = new Map<number, { afterMs: number; repliedAtMs: number }>();
-function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs = 120_000) {
-    const now = Date.now();
-    const prev = recentReplies.get(conversationId);
-    if (prev && prev.afterMs >= clientTs.getTime() && now - prev.repliedAtMs <= windowMs)
-        return true;
-    recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now });
-    return false;
-}
-
 /* ===== OOT (fuera de alcance) ===== */
 function isOutOfScope(text: string) {
     const t = (text || "").toLowerCase();
@@ -2026,34 +2279,16 @@ function isOutOfScope(text: string) {
 }
 
 /* ===== LLM ===== */
-async function runLLM({
-    summary,
-    userText,
-    imageUrl,
-    educationalMode,
-}: {
-    summary: string;
-    userText: string;
-    imageUrl?: string | null;
-    educationalMode?: boolean;
-}) {
-    const baseRules = [
+async function runLLM({ summary, userText, imageUrl }: any) {
+    const sys = [
         "Eres el asistente de una clínica estética.",
         "Tono humano, cálido y breve. Saludo corto, sin información extra.",
         "Usa como máximo un emoji natural.",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela textual; no calcules.",
-        "Si el usuario pregunta temas fuera de estética, redirígelo amablemente al ámbito de servicios y agendamiento.",
-    ];
-
-    // En modo educativo permitimos conocimiento general del dominio estético.
-    const scopeLine = educationalMode
-        ? "Puedes usar conocimiento general sobre procedimientos estéticos (qué es, cómo funciona, cuidados, contraindicaciones comunes). Evita promesas absolutas. Para recomendaciones personalizadas, indica que se requiere valoración presencial."
-        : "Tu única fuente es el RESUMEN a continuación. No inventes información fuera del resumen.";
-
-    const sys = [
-        ...baseRules,
-        scopeLine,
+        "Si el usuario pregunta fuera de estética, reencausa al ámbito de servicios y agendamiento.",
+        "Si faltan datos operativos (pagos/promos/etc.), responde: 'esa información se confirma en la valoración o directamente en la clínica'.",
+        "Tu única fuente es el RESUMEN a continuación.",
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
 
@@ -2074,23 +2309,12 @@ async function runLLM({
         model: CONF.MODEL,
         messages,
         temperature: CONF.TEMPERATURE,
-        max_tokens: 160,
+        max_tokens: 120,
     });
-    let out = r?.choices?.[0]?.message?.content?.trim() || "";
-
-    if (educationalMode) {
-        // Quitar claims absolutos y añadir recordatorio de valoración si falta
-        out = out.replace(/\b(garantiza(?:mos)?|asegura(?:mos)?|sin\s*riesgo|resultados?\s*100%)/gi, "");
-        if (!/[.!?…]$/.test(out.trim())) out = out.trim() + ".";
-        if (!/valoraci[oó]n/i.test(out)) {
-            out += " Para una orientación personalizada y confirmar detalles, realizamos una *valoración presencial*.";
-        }
-    }
-
-    return out;
+    return r?.choices?.[0]?.message?.content?.trim() || "";
 }
 
-/* ===== MAIN STRATEGY ===== */
+/* ===== Núcleo (estrategia) ===== */
 export async function handleEsteticaStrategy({
     chatId,
     empresaId,
@@ -2110,9 +2334,10 @@ export async function handleEsteticaStrategy({
     });
     if (!conversacion) return null;
 
-    // Si ya está en handoff, no responder
-    if (conversacion.estado === ConversationEstado.requiere_agente) {
-        return { estado: ConversationEstado.pendiente, mensaje: "", media: [] };
+    // Guard si ya está bloqueado por handoff
+    const statePre = await loadState(chatId);
+    if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
+        return { estado: "pendiente", mensaje: "" };
     }
 
     const last = await prisma.message.findFirst({
@@ -2131,6 +2356,7 @@ export async function handleEsteticaStrategy({
         },
     });
     if (last?.id && seenInboundRecently(last.id)) return null;
+    if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp)) return null;
 
     let userText = (mensajeArg || "").trim();
 
@@ -2150,34 +2376,8 @@ export async function handleEsteticaStrategy({
     if (!userText) userText = last?.contenido?.trim() || "";
 
     const kb = await loadEsteticaKB({ empresaId });
-    if (!kb) return null;
-
-    if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp)) return null;
-
-    const { url: imageUrl, noteToAppend } = await pickImageForContext({
-        conversationId: chatId,
-        userText,
-        caption: last?.caption || "",
-        referenceTs: last?.timestamp || new Date(),
-    });
-    if (noteToAppend) userText += noteToAppend;
-
-    // Handoff: nombre + fecha + procedimiento (hora opcional)
-    if (detectHandoffReady(userText)) {
-        const piezas: string[] = [];
-        // Esfuerzo simple por extraer eco textual (sin cálculos)
-        const nameMatch = userText.match(/\b(?:mi\s+nombre\s+es|soy)\s+([a-záéíóúñü\s]{3,})/i);
-        const dateMatch = userText.match(/\b(\d{1,2}\s+de\s+(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|lunes|martes|mi[eé]rcoles|miércoles|jueves|viernes|s[áa]bado|domingo)\b/i);
-        const procMatch = userText.match(/\b(botox|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|l[aá]ser|plasma|hilos|armonizaci[oó]n|mesoterapia|facial|corporal)\b/i);
-
-        if (procMatch) piezas.push(`Tratamiento: *${procMatch[1]}*`);
-        if (nameMatch) piezas.push(`Nombre: *${nameMatch[1].trim()}*`);
-        if (dateMatch) piezas.push(`Fecha preferida: *${dateMatch[1]}*`);
-
-        const msg =
-            `¡Perfecto! ⏱️ Dame *unos minutos* para *verificar disponibilidad* 🗓️ y te *confirmo por aquí*.` +
-            (piezas.length ? `\n${piezas.join(" · ")}` : "");
-
+    if (!kb) {
+        const msg = "Por ahora no tengo la configuración de la clínica. Te comunico con un asesor humano. 🙏";
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId,
@@ -2187,6 +2387,7 @@ export async function handleEsteticaStrategy({
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        await patchState(chatId, { handoffLocked: true });
         return {
             estado: ConversationEstado.requiere_agente,
             mensaje: saved.texto,
@@ -2196,7 +2397,76 @@ export async function handleEsteticaStrategy({
         };
     }
 
-    // Fuera de alcance → redirigir
+    const { url: imageUrl, noteToAppend } = await pickImageForContext({
+        conversationId: chatId,
+        userText,
+        caption: last?.caption || "",
+        referenceTs: last?.timestamp || new Date(),
+    });
+    if (noteToAppend) userText += noteToAppend;
+
+    // ====== Agendamiento flexible (colecta progresiva sin calcular hora) ======
+    // 1) Actualiza draft con lo que venga en texto
+    let state = await loadState(chatId);
+    const nameInText = extractName(userText);
+    const whenFree = grabWhenFreeText(userText);
+    let match = resolveServiceName(kb, userText || "");
+    if (!match.procedure) {
+        // sinónimos mínimos
+        const t = (userText || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+        if (/\bbotox|toxina\b/.test(t)) {
+            const tox = kb.procedures.find((p) => /toxina\s*botul/i.test(p.name));
+            if (tox) match = { procedure: tox, matched: tox.name };
+        } else if (/\blimpieza\b/.test(t)) {
+            const limp = kb.procedures.find((p) => /limpieza/i.test(p.name));
+            if (limp) match = { procedure: limp, matched: limp.name };
+        } else if (/\bpeeling\b/.test(t)) {
+            const pe = kb.procedures.find((p) => /peeling/i.test(p.name));
+            if (pe) match = { procedure: pe, matched: pe.name };
+        }
+    }
+
+    const prevDraft = state.draft ?? {};
+    const newDraft = {
+        ...prevDraft,
+        name: prevDraft.name || nameInText || undefined,
+        procedureId: prevDraft.procedureId || (match.procedure?.id ?? undefined),
+        procedureName: prevDraft.procedureName || (match.procedure?.name ?? undefined),
+        // whenISO: opcional—solo si detectas una fecha explícita tipo 12/11; aquí no forzamos
+        whenISO: prevDraft.whenISO || undefined,
+        whenText: prevDraft.whenText || whenFree || undefined, // textual SIEMPRE
+    };
+    await patchState(chatId, { draft: newDraft, lastIntent: "schedule" });
+
+    // 2) Si el usuario ya trajo todo → handoff inmediato
+    if (detectHandoffReady(userText) || (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft))) {
+        const piezas = [
+            `Tratamiento: *${newDraft.procedureName ?? "—"}*`,
+            `Nombre: *${newDraft.name}*`,
+            newDraft.whenText ? `Preferencia: *${newDraft.whenText}*` : (newDraft.whenISO ? `Fecha: *${new Date(newDraft.whenISO).toLocaleDateString("es-CO", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })}*` : "")
+        ].filter(Boolean).join(" · ");
+
+        const msg = `¡Perfecto! Dame *unos minutos* para *verificar disponibilidad* 🗓️ y te *confirmo por aquí* ✅.\n${piezas}`;
+        const saved = await persistBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: clampText(msg),
+            nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        await patchState(chatId, { handoffLocked: true });
+        return {
+            estado: ConversationEstado.requiere_agente,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
+    // 3) Si está fuera de alcance → redirige suave
     if (isOutOfScope(userText)) {
         const txt =
             "Puedo ayudarte con información de nuestros servicios estéticos y agendar tu cita. ¿Qué procedimiento te interesa o para qué fecha te gustaría programar? 🙂";
@@ -2218,13 +2488,33 @@ export async function handleEsteticaStrategy({
         };
     }
 
-    // Interceptar preguntas de pago
-    if (isPaymentQuestion(userText)) {
-        const txt = "El detalle de *formas de pago* se confirma durante la *valoración* o directamente en la clínica. 🙌";
+    // ===== Summary extendido (cacheado y persistido en conversation_state)
+    const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
+
+    // ===== Si aún faltan piezas para agenda, pedimos solo lo que falta (sin forzar hora)
+    const needProcedure = !newDraft.procedureId && !newDraft.procedureName;
+    const needWhen = !hasSomeDateDraft(newDraft);
+    const needName = !newDraft.name;
+
+    if (needProcedure || needWhen || needName) {
+        const asks: string[] = [];
+        if (needProcedure) {
+            const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
+            asks.push(`¿Para qué *tratamiento* deseas la cita? (Ej.: ${sample})`);
+        }
+        if (needWhen) {
+            asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “martes en la tarde” o “15/11 a las 3 pm”).`);
+        }
+        if (needName) {
+            asks.push(`¿Cuál es tu *nombre completo*?`);
+        }
+        let texto = clampText(asks.join(" "));
+        texto = addEmoji(texto);
+
         const saved = await persistBotReply({
             conversationId: chatId,
             empresaId,
-            texto: txt,
+            texto,
             nuevoEstado: ConversationEstado.respondido,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
@@ -2239,11 +2529,9 @@ export async function handleEsteticaStrategy({
         };
     }
 
-    const summary = await buildSummary({ empresaId, conversationId: chatId, kb });
-
-    const educationalMode = isEducationalQuestion(userText);
-    let texto = await runLLM({ summary, userText, imageUrl, educationalMode }).catch(() => "");
-    texto = clampText(texto || "¡Hola! ¿En qué puedo apoyarte?");
+    // ===== Respuesta libre (modo natural) usando el summary extendido
+    let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
+    texto = clampText(texto || "¡Hola! ¿En qué puedo apoyarte? 🙂");
     texto = addEmoji(texto);
 
     const saved = await persistBotReply({
@@ -2311,4 +2599,3 @@ export async function handleEsteticaReply(args: {
         media: res.media || [],
     };
 }
-
