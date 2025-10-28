@@ -2215,14 +2215,15 @@ async function buildOrReuseSummary(args: {
     ].filter(Boolean).join("\n");
 
     // Compacto (pero incluyendo TODO en el prompt):
+    // Compacto (pero incluyendo TODO en el prompt) + FAQs garantizadas
     let compact = base;
     try {
         const resp = await openai.chat.completions.create({
             model: CONF.MODEL,
             temperature: 0.1,
-            max_tokens: 220,
+            max_tokens: 300,
             messages: [
-                { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. Español neutro." },
+                { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. NO omitas la sección de FAQs si está disponible." },
                 { role: "user", content: base.slice(0, 4000) },
             ],
         });
@@ -2230,6 +2231,14 @@ async function buildOrReuseSummary(args: {
     } catch {
         // Dejar base si falla
     }
+
+    // Asegurar FAQs explícitas al final del summary
+    const faqsBlock = faqsArr.length
+        ? "\nFAQs:\n- " + faqsArr.slice(0, 5).map(f => `${softTrim(f.q, 60)} → ${softTrim(f.a, 140)}`).join("\n- ")
+        : "";
+
+    compact = (compact + faqsBlock).trim();
+
 
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
@@ -2259,13 +2268,23 @@ function detectHandoffReady(t: string) {
 /* ===== Extractores suaves para el borrador (sin normalizar hora) ===== */
 function extractName(raw: string): string | null {
     const t = (raw || "").trim();
-    let m =
-        t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ\s]{2,50})/i);
-    if (m && m[1]) return m[1].trim().replace(/\s+/g, " ");
-    const onlyLetters = /^[A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,2}$/;
-    if (onlyLetters.test(t) && t.length >= 3 && t.length <= 60) return t.replace(/\s+/g, " ");
+
+    // Debe venir con disparador explícito
+    const m = t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ][\wÁÉÍÓÚÑáéíóúñ\s]{2,80})/i);
+    if (m && m[1]) {
+        const name = m[1].trim().replace(/\s+/g, " ");
+        // mínimo dos palabras para evitar “Hola”, “Gracias”, etc.
+        if (name.split(/\s+/).length >= 2) return name;
+        return null;
+    }
+
+    // Fallback SOLO si parecen 2–4 palabras (nombre y apellido)
+    const twoPlusWords = /^[A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3}$/;
+    if (twoPlusWords.test(t)) return t.replace(/\s+/g, " ");
+
     return null;
 }
+
 function grabWhenFreeText(raw: string): string | null {
     const t = (raw || "").toLowerCase();
     const hints = [
@@ -2599,9 +2618,10 @@ export async function handleEsteticaStrategy({
     const needWhen = !hasSomeDateDraft(newDraft);
     const needName = !newDraft.name;
 
+    const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
+
     const shouldAskForAgendaPieces =
-        (state.lastIntent === "schedule" || inferredIntent === "schedule" ||
-            newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO || newDraft.name);
+        (state.lastIntent === "schedule" || inferredIntent === "schedule" || hasServiceOrWhen);
 
     if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
         const asks: string[] = [];
