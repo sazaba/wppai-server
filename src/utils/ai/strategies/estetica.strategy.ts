@@ -2274,68 +2274,142 @@ async function buildOrReuseSummary(args: {
             .join(" | ")
         : "";
 
-
-    const base = [
-        kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
-        `Zona horaria: ${S.appointmentTimezone || kb.timezone}`,
-        `Agenda: ${S.appointmentEnabled ? "habilitada" : "deshabilitada"} | Buffer ${S.appointmentBufferMin ?? kb.bufferMin ?? "-"} min`,
-        `Reglas: ${[
-            S.allowSameDayBooking != null ? `mismo día ${S.allowSameDayBooking ? "sí" : "no"}` : "",
-            S.appointmentMinNoticeHours != null ? `anticipación ${S.appointmentMinNoticeHours} h` : "",
-            S.appointmentMaxAdvanceDays != null ? `hasta ${S.appointmentMaxAdvanceDays} días` : "",
-        ].filter(Boolean).join(" | ")}`,
-        `Logística: ${[
-            S.locationName ? `Sede ${S.locationName}` : "",
-            S.locationAddress ? `Dir. ${S.locationAddress}` : "",
-            S.locationMapsUrl ? `Mapa ${S.locationMapsUrl}` : "",
-            S.parkingInfo ? `Parqueadero ${softTrim(S.parkingInfo, 120)}` : "",
-            S.instructionsArrival ? `Indicaciones ${softTrim(S.instructionsArrival, 120)}` : "",
-        ].filter(Boolean).join(" | ")}`,
-        (S.noShowPolicy || S.depositRequired != null)
-            ? `Políticas: ${[
-                S.noShowPolicy ? `No-show ${softTrim(S.noShowPolicy, 120)}` : "",
-                S.depositRequired ? `Depósito ${S.depositAmount ? formatCOP(Number(S.depositAmount)) : "sí"}` : "Depósito no",
-            ].filter(Boolean).join(" | ")}`
-            : "",
-        paymentsLine,
-        `Servicios (KB): ${svcFromKB || "—"}`,
-        hoursLine ? `Horario base (DB): ${hoursLine}${lastStart ? `; última cita de referencia ${lastStart}` : ""}` : "",
-        exceptionsLine,
-        faqsLine,
-        S.kbBusinessOverview ? `Overview: ${softTrim(S.kbBusinessOverview, 260)}` : "",
-        S.kbFreeText ? `Notas: ${softTrim(S.kbFreeText, 260)}` : "",
-        `Historial breve: ${history || "—"}`,
-    ].filter(Boolean).join("\n");
-
-    // Compacto (pero incluyendo TODO en el prompt):
-    // Compacto (pero incluyendo TODO en el prompt) + FAQs garantizadas
-    let compact = base;
-    try {
-        const resp = await openai.chat.completions.create({
-            model: CONF.MODEL,
-            temperature: 0.1,
-            max_tokens: 300,
-            messages: [
-                { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. NO omitas la sección de FAQs si está disponible." },
-                { role: "user", content: base.slice(0, 4000) },
-            ],
-        });
-        compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
-    } catch {
-        // Dejar base si falla
+    // ——— PREMIUM SUMMARY BUILDER ———
+    function icon(label: "biz" | "tz" | "agenda" | "rules" | "log" | "pol" | "pay" | "svc" | "hrs" | "exc" | "faq" | "note" | "hist") {
+        const map = {
+            biz: "🏥", tz: "🌐", agenda: "⏰", rules: "📋", log: "📍", pol: "🧾",
+            pay: "💳", svc: "✨", hrs: "🕒", exc: "🚫", faq: "💬", note: "📝", hist: "🧠"
+        } as const;
+        return map[label];
     }
 
-    // Asegurar FAQs explícitas al final del summary
-    const faqsBlock = faqsArr.length
-        ? "\nFAQs:\n- " + faqsArr.slice(0, 5).map(f => `${softTrim(f.q, 60)} → ${softTrim(f.a, 140)}`).join("\n- ")
-        : "";
+    // 1) Secciones con bullets bonitos y líneas cortas
+    const lines: string[] = [];
+    lines.push(`${icon("biz")} *${kb.businessName || "Clínica estética"}*`);
+    lines.push(`${icon("tz")} Zona horaria: ${S.appointmentTimezone || kb.timezone}`);
 
-    compact = (compact + faqsBlock).trim();
+    const rulesArr = [
+        S.appointmentEnabled != null ? `Agenda: ${S.appointmentEnabled ? "habilitada" : "deshabilitada"}` : "",
+        (S.appointmentBufferMin ?? kb.bufferMin) != null ? `Buffer: ${S.appointmentBufferMin ?? kb.bufferMin} min` : "",
+        S.allowSameDayBooking != null ? `Mismo día: ${S.allowSameDayBooking ? "sí" : "no"}` : "",
+        S.appointmentMinNoticeHours != null ? `Anticipación: ${S.appointmentMinNoticeHours} h` : "",
+        S.appointmentMaxAdvanceDays != null ? `Hasta: ${S.appointmentMaxAdvanceDays} días` : "",
+    ].filter(Boolean);
+    if (rulesArr.length) lines.push(`${icon("rules")} ${rulesArr.join(" · ")}`);
 
+    const logArr = [
+        S.locationName ? `Sede: ${S.locationName}` : "",
+        S.locationAddress ? `Dir: ${S.locationAddress}` : "",
+        S.locationMapsUrl ? `Mapa: ${S.locationMapsUrl}` : "",
+        S.parkingInfo ? `Parqueadero: ${softTrim(S.parkingInfo, 120)}` : "",
+        S.instructionsArrival ? `Ingreso: ${softTrim(S.instructionsArrival, 120)}` : "",
+    ].filter(Boolean);
+    if (logArr.length) lines.push(`${icon("log")} ${logArr.join(" · ")}`);
+
+    if (S.noShowPolicy || S.depositRequired != null) {
+        const pols = [
+            S.noShowPolicy ? `No-show: ${softTrim(S.noShowPolicy, 120)}` : "",
+            S.depositRequired ? `Depósito: ${S.depositAmount ? formatCOP(Number(S.depositAmount)) : "sí"}` : "Depósito: no",
+        ].filter(Boolean);
+        lines.push(`${icon("pol")} ${pols.join(" · ")}`);
+    }
+
+    if (payments.length) lines.push(`${icon("pay")} Pagos: ${payments.join(" • ")}`);
+
+    const svcList = (kb.procedures ?? [])
+        .filter(s => s.enabled !== false)
+        .slice(0, 6)
+        .map(s => s.priceMin ? `${s.name} (desde ${formatCOP(s.priceMin)})` : s.name)
+        .join(" • ");
+    if (svcList) lines.push(`${icon("svc")} Servicios: ${svcList}`);
+
+    if (hoursLine) lines.push(`${icon("hrs")} Horario: ${hoursLine}${lastStart ? `; última cita ref. ${lastStart}` : ""}`);
+    if (exceptionsLine) lines.push(`${icon("exc")} ${exceptionsLine}`);
+
+    // FAQs (máx 5) en bullets de 1 línea
+    if (faqsArr.length) {
+        lines.push(`${icon("faq")} *FAQs rápidas*`);
+        for (const f of faqsArr.slice(0, 5)) {
+            lines.push(`• ${softTrim(f.q, 60)} → ${softTrim(f.a, 140)}`);
+        }
+    }
+
+    if (S.kbBusinessOverview) lines.push(`${icon("note")} ${softTrim(S.kbBusinessOverview, 260)}`);
+    if (S.kbFreeText) lines.push(`${icon("note")} ${softTrim(S.kbFreeText, 260)}`);
+
+    // Historial ultra breve
+    lines.push(`${icon("hist")} Historial: ${history || "—"}`);
+
+    // Compacta y recorta
+    let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n");
+    compact = softTrim(compact, 1000); // seguridad para no crecer demasiado
 
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
 }
+
+
+//     const base = [
+//         kb.businessName ? `Negocio: ${kb.businessName}` : "Negocio: Clínica estética",
+//         `Zona horaria: ${S.appointmentTimezone || kb.timezone}`,
+//         `Agenda: ${S.appointmentEnabled ? "habilitada" : "deshabilitada"} | Buffer ${S.appointmentBufferMin ?? kb.bufferMin ?? "-"} min`,
+//         `Reglas: ${[
+//             S.allowSameDayBooking != null ? `mismo día ${S.allowSameDayBooking ? "sí" : "no"}` : "",
+//             S.appointmentMinNoticeHours != null ? `anticipación ${S.appointmentMinNoticeHours} h` : "",
+//             S.appointmentMaxAdvanceDays != null ? `hasta ${S.appointmentMaxAdvanceDays} días` : "",
+//         ].filter(Boolean).join(" | ")}`,
+//         `Logística: ${[
+//             S.locationName ? `Sede ${S.locationName}` : "",
+//             S.locationAddress ? `Dir. ${S.locationAddress}` : "",
+//             S.locationMapsUrl ? `Mapa ${S.locationMapsUrl}` : "",
+//             S.parkingInfo ? `Parqueadero ${softTrim(S.parkingInfo, 120)}` : "",
+//             S.instructionsArrival ? `Indicaciones ${softTrim(S.instructionsArrival, 120)}` : "",
+//         ].filter(Boolean).join(" | ")}`,
+//         (S.noShowPolicy || S.depositRequired != null)
+//             ? `Políticas: ${[
+//                 S.noShowPolicy ? `No-show ${softTrim(S.noShowPolicy, 120)}` : "",
+//                 S.depositRequired ? `Depósito ${S.depositAmount ? formatCOP(Number(S.depositAmount)) : "sí"}` : "Depósito no",
+//             ].filter(Boolean).join(" | ")}`
+//             : "",
+//         paymentsLine,
+//         `Servicios (KB): ${svcFromKB || "—"}`,
+//         hoursLine ? `Horario base (DB): ${hoursLine}${lastStart ? `; última cita de referencia ${lastStart}` : ""}` : "",
+//         exceptionsLine,
+//         faqsLine,
+//         S.kbBusinessOverview ? `Overview: ${softTrim(S.kbBusinessOverview, 260)}` : "",
+//         S.kbFreeText ? `Notas: ${softTrim(S.kbFreeText, 260)}` : "",
+//         `Historial breve: ${history || "—"}`,
+//     ].filter(Boolean).join("\n");
+
+//     // Compacto (pero incluyendo TODO en el prompt):
+//     // Compacto (pero incluyendo TODO en el prompt) + FAQs garantizadas
+//     let compact = base;
+//     try {
+//         const resp = await openai.chat.completions.create({
+//             model: CONF.MODEL,
+//             temperature: 0.1,
+//             max_tokens: 300,
+//             messages: [
+//                 { role: "system", content: "Resume en 400–700 caracteres, bullets cortos y datos operativos. NO omitas la sección de FAQs si está disponible." },
+//                 { role: "user", content: base.slice(0, 4000) },
+//             ],
+//         });
+//         compact = (resp?.choices?.[0]?.message?.content || base).trim().replace(/\n{3,}/g, "\n\n");
+//     } catch {
+//         // Dejar base si falla
+//     }
+
+//     // Asegurar FAQs explícitas al final del summary
+//     const faqsBlock = faqsArr.length
+//         ? "\nFAQs:\n- " + faqsArr.slice(0, 5).map(f => `${softTrim(f.q, 60)} → ${softTrim(f.a, 140)}`).join("\n- ")
+//         : "";
+
+//     compact = (compact + faqsBlock).trim();
+
+
+//     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
+//     return compact;
+// }
 
 /* ===== Detección de handoff listo (nombre + fecha/hora textual + procedimiento) ===== */
 function detectHandoffReady(t: string) {
@@ -2478,15 +2552,16 @@ function normalizeForDedup(s: string) {
         .trim();
 }
 
-/** Un solo emoji “estable” por conversación (misma conversación → mismo emoji) */
+
+/** Un solo emoji “premium” por conversación (estable) */
 function addEmojiStable(text: string, conversationId: number) {
     const base = (Number.isFinite(conversationId) ? conversationId : 0) >>> 0;
-    const emojis = ["🙂", "💬", "✨", "👌", "🫶"];
+    const emojis = ["✨", "👌", "🙂", "🫶", "💬"]; // paleta más sobria
     const idx = base % emojis.length;
-    // Si ya trae uno de estos emojis, no agregues otro
-    if (/[🙂💬✨👌🫶]/.test(text)) return text;
+    if (/[✨👌🙂🫶💬]/.test(text)) return text; // ya hay uno de la paleta
     return `${text} ${emojis[idx]}`;
 }
+
 
 
 /* ===== PERSISTENCIA ===== */
@@ -2558,7 +2633,7 @@ function isOutOfScope(text: string) {
 async function runLLM({ summary, userText, imageUrl }: any) {
     const sys = [
         "Eres el asistente de una clínica estética.",
-        "Tono humano, cálido y breve. **No inicies con saludos (no ‘hola’, ‘buen día’, etc.)**.",
+        "Tono humano, cálido y breve. Puedes iniciar con un saludo corto y natural (una sola línea) al inicio de la conversacion y no en inguna otra parte.",
         "Usa como máximo un emoji natural (solo uno).",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela tal cual; no calcules ni conviertas.",
