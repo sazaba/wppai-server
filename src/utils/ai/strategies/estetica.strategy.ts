@@ -445,6 +445,43 @@ function renderDayRangesHuman(ranges: Array<{ start: string; end: string }>): st
     return ranges.map(renderHumanRange).join("; ");
 }
 
+/** Lista bonita de servicios con emojis y saltos de línea */
+function formatServicesPretty(kb: EsteticaKB, max = 8): string {
+    const items = (kb.procedures ?? [])
+        .filter(p => p?.enabled !== false)
+        .slice(0, max)
+        .map(p => {
+            const desde = p?.priceMin ? ` — *desde* ${formatCOP(p.priceMin)}` : "";
+            return `• ✨ ${p.name}${desde}`;
+        });
+    return items.length ? items.join("\n") : "• ✨ (Aún no hay servicios configurados)";
+}
+
+/** Convierte rangos por día en una lista con emojis por día */
+function renderHoursAsList(byDow: Record<number, Array<{ start: string; end: string }>>): string {
+    const dayFull = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+    const dayIcon = ["🛌", "🗓️", "🗓️", "🗓️", "🗓️", "🗓️", "🗓️"];
+    const lines: string[] = [];
+    for (let d = 0; d < 7; d++) {
+        const ranges = byDow[d];
+        if (ranges?.length) {
+            const human = ranges.map(r => `${toAmPm(r.start)} – ${toAmPm(r.end)}`).join(" • ");
+            lines.push(`${dayIcon[d]} *${dayFull[d]}*: ${human}`);
+        }
+    }
+    return lines.join("\n");
+}
+
+/** Construye lista bonita de horarios desde la BD */
+async function buildBusinessHoursList(empresaId: number): Promise<{ list: string; note: string }> {
+    const rows = await fetchAppointmentHours(empresaId);
+    const byDow = normalizeHours(rows);
+    const list = renderHoursAsList(byDow);
+    const note = "📝 Nota: si un día *no aparece*, ese día no se atiende.";
+    return { list: list || "Por ahora no tengo registrado el horario en el sistema.", note };
+}
+
+
 
 async function buildBusinessRangesHuman(
     empresaId: number,
@@ -798,17 +835,42 @@ function looksLikeLooseName(raw: string): string | null {
     return normalized;
 }
 
-function grabWhenFreeText(raw: string): string | null {
-    const t = (raw || "").toLowerCase();
-    const hints = [
-        "hoy", "mañana", "manana", "próxima", "proxima", "semana", "mes", "mediodia", "medio dia",
-        "lunes", "martes", "miércoles", "miercoles", "jueves", "viernes", "sábado", "sabado",
-        "am", "pm", "a las", "hora", "tarde", "noche", "domingo"
+/** Extrae *solo* la preferencia temporal (día/fecha + hora) del texto del cliente */
+function extractWhenPreference(raw: string): string | null {
+    const t = String(raw || "");
+
+    // Patrones comunes (ordenados de más específicos a más generales)
+    const patterns: RegExp[] = [
+        // "jueves a las 3 pm", "viernes 2:30 pm", "lun 11 am", "jueves 15:00"
+        /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s*(?:\d{1,2}[:.]\d{2})?\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi,
+        // "el jueves a las 3 pm"
+        /\bel\s*(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi,
+        // "15/11 a las 3 pm", "15-11 3 pm", "15/11"
+        /\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?(?:\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/gi,
+        // "mañana a las 3 pm", "hoy 11 am", "próximo jueves en la tarde"
+        /\b(hoy|mañana|manana|pr[oó]ximo\s+(?:lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)|esta\s+semana|la\s+pr[oó]xima\s+semana)\b(?:.*?\b(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?/gi,
+        // "jueves en la tarde", "martes en la mañana"
+        /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s+en\s+la\s+(mañana|manana|tarde|noche)\b/gi,
     ];
-    const looksLikeDate = /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?/.test(t);
-    const hasHint = hints.some(h => t.includes(h));
-    return (looksLikeDate || hasHint) ? softTrim(raw, 120) : null;
+
+    for (const rx of patterns) {
+        const m = t.match(rx);
+        if (m && m[0]) {
+            // Limpia doble espacios y deja solo el segmento temporal
+            return m[0].replace(/\s+/g, " ").trim();
+        }
+    }
+
+    // Fallback muy suave: si el texto está lleno de pistas de fecha/hora, corta la frase alrededor de ellas
+    const hasHints =
+        /\b(hoy|mañana|manana|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|am|pm|a\s*las|semana|mes)\b/i.test(t) ||
+        /\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\b/.test(t) ||
+        /\b\d{1,2}[:.]\d{2}\b/.test(t);
+
+    if (hasHints) return softTrim(raw, 60);
+    return null;
 }
+
 function hasSomeDateDraft(d?: AgentState["draft"]) {
     return !!(d?.whenISO || d?.whenText);
 }
@@ -1158,7 +1220,7 @@ export async function handleEsteticaStrategy({
     }
 
     const prevDraft = state.draft ?? {};
-    const whenFreeCandidate = grabWhenFreeText(userText);
+    const whenFreeCandidate = extractWhenPreference(userText);
     const clsForWhen = await classifyTurnLLM(userText);
     const canCaptureWhen =
         hasBookingIntent(userText) ||
@@ -1247,22 +1309,9 @@ export async function handleEsteticaStrategy({
     // ——— Respuesta directa a “qué servicios”
     // ——— Respuesta directa a “qué servicios”
     if (/\b(que\s+servicios|qué\s+servicios|servicios\s+ofreces?)\b/i.test(userText)) {
-        const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
-        const svcLine = summaryPickLine(summary, "✨ Servicios:");
-        const hrsLine = summaryPickLine(summary, "🕒 Horario:");
-        const servicios = svcLine ? svcLine.replace(/^✨\s*Servicios:\s*/i, "") : "";
+        const serviciosBonitos = formatServicesPretty(kb, 8);
 
-        // Fallback mínimo si por alguna razón no hay línea de servicios en el summary:
-        const fallbackItems = (kb.procedures || []).slice(0, 6).map((p) => {
-            const desde = p.priceMin ? ` (desde ${formatCOP(p.priceMin)})` : "";
-            return `• ${p.name}${desde}`;
-        }).join("\n");
-
-        const items = servicios || fallbackItems;
-
-        let texto = `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar${hrsLine ? ` (trabajamos: ${hrsLine.replace(/^🕒\s*Horario:\s*/i, "")})` : ""
-            }.`;
-
+        let texto = `${serviciosBonitos}\n\nSi alguno te interesa, dime el *día y hora* que prefieres para agendar y lo verifico.`;
         texto = clampText(addEmojiStable(texto, chatId));
 
         const saved = await sendBotReply({
@@ -1285,6 +1334,7 @@ export async function handleEsteticaStrategy({
     }
 
 
+
     // ===== Summary extendido (cacheado y persistido en conversation_state)
     const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
 
@@ -1304,18 +1354,13 @@ export async function handleEsteticaStrategy({
 
 
     // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
+    // ——— PREGUNTA PURA de horarios/días → lista bonita (sin mezclar servicios)
     if (onlyHoursQuestion) {
-        const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
-        const hoursLine = summaryPickLine(summary, "🕒 Horario:");
-        let textHours = hoursLine
-            ? hoursLine.replace(/^🕒\s*Horario:\s*/i, "")
-            : "Por ahora no tengo registrado el horario en el sistema.";
+        const { list, note } = await buildBusinessHoursList(empresaId);
 
-        // Nota operativa ya está en el summary, pero la reforzamos en esta salida corta:
-        textHours += `\n\n📝 Nota: Si un día no aparece, ese día no se atiende.`;
-        textHours += `\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
-
+        let textHours = `${list}\n\n${note}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
         textHours = clampText(addEmojiStable(textHours, chatId));
+
         const saved = await sendBotReply({
             conversationId: chatId,
             empresaId,
@@ -1333,6 +1378,7 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
 
 
 
