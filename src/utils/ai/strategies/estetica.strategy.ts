@@ -293,8 +293,9 @@ function hasConcreteTimeAnchor(t: string): boolean {
 /** Pregunta pura de horarios (informativa, sin intención de reservar) */
 function looksLikeHoursQuestion(t: string): boolean {
     const s = (t || "").toLowerCase().replace(/[¡!¿?.,]/g, "").trim();
-    return /^(de que hora a que hora trabajan|que dias tienen servicio|cuales son los horarios|que horario manejan|cuando atienden)$/.test(s);
+    return /^(de que hora a que hora trabajan|que dias tienen servicio|cuales son los horarios|que horario manejan|cuando atienden|trabajan todos los dias|atienden sabados|atienden domingos)$/.test(s);
 }
+
 
 
 function isEducationalQuestion(text: string): boolean {
@@ -743,29 +744,20 @@ function grabWhenFreeText(raw: string): string | null {
 function hasSomeDateDraft(d?: AgentState["draft"]) {
     return !!(d?.whenISO || d?.whenText);
 }
-function sanitizeGreeting(text: string) {
-    // Quita signos iniciales y espacios antes del saludo
-    let s = (text || "").replace(/^[\s¡!¿?'"()\-–—]+/g, "").trim();
+function sanitizeGreeting(text: string, opts?: { allowFirstGreeting?: boolean }) {
+    const allow = !!opts?.allowFirstGreeting;
+    if (allow) return (text || "").trim(); // en el primer turno dejamos el saludo libre de la IA
 
-    // Saludos típicos al inicio, con o sin signos
+    // En turnos posteriores, limpiamos saludos repetidos al inicio
+    let s = (text || "").replace(/^[\s¡!¿?'"()\-–—]+/g, "").trim();
     const patterns = [
         /^(?:hola|holi|hey|buen(?:os|as)?\s+(?:d[ií]as|tardes|noches)|qué tal|que tal|hola hola)[\s,.:;!¡¿?–—-]*/i,
     ];
     for (const rx of patterns) s = s.replace(rx, "").trim();
-
-    // Si todavía arranca con un segundo “¡Hola!” (ej. LLM), intenta de nuevo
     s = s.replace(/^(?:¡\s*)?hola[!\s,.:;¡¿?–—-]*/i, "").trim();
-
     return s || text;
 }
 
-function prependFirstGreeting(text: string, greeted?: boolean, conversationId?: number) {
-    if (greeted) return text;
-    const base = "¡Hola! ¿En qué puedo ayudarte?";
-    const withEmoji = addEmojiStable(base, conversationId ?? 0);
-    const clean = sanitizeGreeting(text || "");
-    return `${withEmoji}\n${clean}`.trim();
-}
 
 /* ===== FORMATO / RESPUESTA ===== */
 function clampText(t: string, lines = CONF.REPLY_MAX_LINES, chars = CONF.REPLY_MAX_CHARS) {
@@ -868,21 +860,24 @@ async function sendBotReply({
     to?: string | null;
     phoneNumberId?: string | null;
 }) {
-    const st = await loadState(conversationId);
-    const withGreetingOnce = prependFirstGreeting(texto, st.greeted, conversationId);
+    // Enviamos el texto tal cual (la IA se encarga del saludo del primer turno)
     const saved = await persistBotReply({
         conversationId,
         empresaId,
-        texto: withGreetingOnce,
+        texto,
         nuevoEstado,
         to,
         phoneNumberId,
     });
+
+    // Marcamos 'greeted' tras el primer envío si aún no estaba
+    const st = await loadState(conversationId);
     if (!st.greeted) {
         await patchState(conversationId, { greeted: true });
     }
     return saved;
 }
+
 
 /* ===== OOT (fuera de alcance) ===== */
 function isOutOfScope(text: string) {
@@ -898,7 +893,7 @@ function isOutOfScope(text: string) {
 async function runLLM({ summary, userText, imageUrl }: any) {
     const sys = [
         "Eres el asistente de una clínica estética.",
-        "Tono humano, cálido y breve. Puedes iniciar con un saludo corto y natural (una sola línea) al inicio de la conversacion y no en inguna otra parte.",
+        "Tono humano, cálido y breve. Puedes iniciar con un saludo corto y natural (una sola línea) al inicio de la conversacion y no en ninguna otra parte.",
         "Usa como máximo un emoji natural (solo uno).",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela tal cual; no calcules ni conviertas.",
@@ -1134,7 +1129,7 @@ export async function handleEsteticaStrategy({
 
         let cleaned = `Perfecto ✨, dame *unos minutos* mientras *verifico la disponibilidad* para ese horario y te confirmo por aquí.\n\n${piezasBonitas}`;
 
-        cleaned = sanitizeGreeting(cleaned);
+        cleaned = sanitizeGreeting(cleaned, { allowFirstGreeting: false });
         cleaned = cleaned.replace(/\bmi\s+nombre\s+es\s+[A-ZÁÉÍÓÚÑa-záéíóúñü\s]+/gi, "").trim();
         cleaned = addEmojiStable(cleaned, chatId);
 
@@ -1228,7 +1223,38 @@ export async function handleEsteticaStrategy({
 
     const shouldAskForAgendaPieces =
         !infoBreaker && !onlyHoursQuestion &&
-        (state.lastIntent === "schedule" || inferredIntent === "schedule" || hasServiceOrWhen);
+        (inferredIntent === "schedule" || hasServiceOrWhen);
+
+
+    // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
+    if (onlyHoursQuestion) {
+        const { human: hoursHuman } = await buildBusinessRangesHuman(empresaId, kb);
+        let textHours = hoursHuman
+            ? `Atendemos: ${hoursHuman}.`
+            : `Por ahora no tengo registrado el horario en el sistema.`;
+
+        // Sugerencia suave para continuar (sin forzar agenda)
+        textHours += `\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
+
+        textHours = clampText(addEmojiStable(textHours, chatId));
+        const saved = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: textHours,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
 
     if (/\b(hora|horario|dias?|fecha)\b/i.test(userText) && inferredIntent !== "schedule") {
         const clarify = addEmojiStable(
@@ -1290,7 +1316,9 @@ export async function handleEsteticaStrategy({
 
     // ===== Respuesta libre (modo natural) usando el summary extendido
     let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
-    texto = sanitizeGreeting(texto);
+    const wasGreeted = (await loadState(chatId)).greeted; // ya tenemos 'state', pero aseguramos valor fresco
+    texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
+
     texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
     texto = addEmojiStable(texto, chatId);
 
