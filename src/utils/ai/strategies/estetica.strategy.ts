@@ -420,6 +420,11 @@ function softTrim(s: string | null | undefined, max = 240) {
     if (!t) return "";
     return t.length <= max ? t : t.slice(0, max).replace(/\s+[^\s]*$/, "") + "…";
 }
+function summaryPickLine(summary: string, startsWith: string): string | null {
+    const line = summary.split(/\r?\n/).find(l => l.trim().startsWith(startsWith));
+    return line ? line.trim() : null;
+}
+
 function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
     return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
@@ -1240,18 +1245,25 @@ export async function handleEsteticaStrategy({
     }
 
     // ——— Respuesta directa a “qué servicios”
+    // ——— Respuesta directa a “qué servicios”
     if (/\b(que\s+servicios|qué\s+servicios|servicios\s+ofreces?)\b/i.test(userText)) {
-        const { human, lastStart } = await buildBusinessRangesHuman(empresaId, kb);
-        const sufijoUltima = lastStart ? `; última cita de referencia ${lastStart}` : "";
-        const items = (kb.procedures || []).slice(0, 6).map((p) => {
+        const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
+        const svcLine = summaryPickLine(summary, "✨ Servicios:");
+        const hrsLine = summaryPickLine(summary, "🕒 Horario:");
+        const servicios = svcLine ? svcLine.replace(/^✨\s*Servicios:\s*/i, "") : "";
+
+        // Fallback mínimo si por alguna razón no hay línea de servicios en el summary:
+        const fallbackItems = (kb.procedures || []).slice(0, 6).map((p) => {
             const desde = p.priceMin ? ` (desde ${formatCOP(p.priceMin)})` : "";
             return `• ${p.name}${desde}`;
         }).join("\n");
 
-        let texto = clampText(
-            `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar${human ? ` (trabajamos: ${human}${sufijoUltima})` : ""}.`
-        );
-        texto = addEmojiStable(texto, chatId);
+        const items = servicios || fallbackItems;
+
+        let texto = `${items}\n\nSi alguno te interesa, dime el *día y hora* que prefieres agendar${hrsLine ? ` (trabajamos: ${hrsLine.replace(/^🕒\s*Horario:\s*/i, "")})` : ""
+            }.`;
+
+        texto = clampText(addEmojiStable(texto, chatId));
 
         const saved = await sendBotReply({
             conversationId: chatId,
@@ -1271,6 +1283,7 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
 
     // ===== Summary extendido (cacheado y persistido en conversation_state)
     const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
@@ -1292,12 +1305,14 @@ export async function handleEsteticaStrategy({
 
     // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
     if (onlyHoursQuestion) {
-        const { human: hoursHuman } = await buildBusinessRangesHuman(empresaId, kb);
-        let textHours = hoursHuman
-            ? `Atendemos: ${hoursHuman}.`
-            : `Por ahora no tengo registrado el horario en el sistema.`;
+        const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
+        const hoursLine = summaryPickLine(summary, "🕒 Horario:");
+        let textHours = hoursLine
+            ? hoursLine.replace(/^🕒\s*Horario:\s*/i, "")
+            : "Por ahora no tengo registrado el horario en el sistema.";
 
-        // Sugerencia suave para continuar (sin forzar agenda)
+        // Nota operativa ya está en el summary, pero la reforzamos en esta salida corta:
+        textHours += `\n\n📝 Nota: Si un día no aparece, ese día no se atiende.`;
         textHours += `\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
 
         textHours = clampText(addEmojiStable(textHours, chatId));
@@ -1318,6 +1333,7 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
 
 
     if (/\b(hora|horario|dias?|fecha)\b/i.test(userText) && inferredIntent !== "schedule") {
