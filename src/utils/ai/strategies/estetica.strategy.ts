@@ -424,6 +424,23 @@ function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
     return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
 }
+
+// ==== Helpers: HH:MM -> "h[:mm] am/pm" y rangos "de X a Y" ====
+function toAmPm(hhmm: string): string {
+    const [H, M] = hhmm.split(":").map(Number);
+    const h12 = ((H % 12) || 12);
+    const mm = (M ?? 0) === 0 ? "" : `:${String(M).padStart(2, "0")}`;
+    const suf = H < 12 ? "am" : "pm";
+    return `${h12}${mm} ${suf}`;
+}
+function renderHumanRange(r: { start: string; end: string }): string {
+    return `de ${toAmPm(r.start)} a ${toAmPm(r.end)}`;
+}
+function renderDayRangesHuman(ranges: Array<{ start: string; end: string }>): string {
+    return ranges.map(renderHumanRange).join("; ");
+}
+
+
 async function buildBusinessRangesHuman(
     empresaId: number,
     kb: EsteticaKB,
@@ -431,15 +448,20 @@ async function buildBusinessRangesHuman(
 ): Promise<{ human: string; lastStart?: string }> {
     const rows = opts?.rows ?? await fetchAppointmentHours(empresaId);
     const byDow = normalizeHours(rows);
-    const dayShort = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
 
+    const dayFull = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+
+    // Construcción "humana": "Lunes de 9 am a 1 pm; de 2 pm a 6 pm"
     const parts: string[] = [];
     for (let d = 0; d < 7; d++) {
         const ranges = byDow[d];
-        if (ranges?.length) parts.push(`${dayShort[d]} ${ranges.map(r => `${r.start}–${r.end}`).join(", ")}`);
+        if (ranges?.length) {
+            parts.push(`${dayFull[d]} ${renderDayRangesHuman(ranges)}`);
+        }
     }
     const human = parts.join("; ");
 
+    // Cálculo de "última cita de referencia" (idem a tu lógica previa)
     const dur = Math.max(30, opts?.defaultDurMin ?? (kb.defaultServiceDurationMin ?? 60));
     const weekdays = [1, 2, 3, 4, 5];
     const endsWeekdays: string[] = [];
@@ -459,6 +481,7 @@ async function buildBusinessRangesHuman(
 
     return { human, lastStart };
 }
+
 function paymentMethodsFromKB(kb: EsteticaKB): string[] {
     const list: string[] = [];
     const pm: any = (kb as any).paymentMethods ?? (kb as any).payments ?? [];
@@ -675,7 +698,11 @@ async function buildOrReuseSummary(args: {
         .join(" • ");
     if (svcList) lines.push(`${icon("svc")} Servicios: ${svcList}`);
 
-    if (hoursLine) lines.push(`${icon("hrs")} Horario: ${hoursLine}${lastStart ? `; última cita ref. ${lastStart}` : ""}`);
+    if (hoursLine) {
+        lines.push(`${icon("hrs")} Horario: ${hoursLine}${lastStart ? `; última cita ref. ${lastStart}` : ""}`);
+        lines.push(`📝 Nota: Si un día no aparece arriba, ese día no se atiende en la clínica.`);
+    }
+
     if (exceptionsLine) lines.push(`${icon("exc")} ${exceptionsLine}`);
 
     if (faqsArr.length) {
@@ -933,6 +960,7 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         "Usa como máximo un emoji natural (solo uno).",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela tal cual; no calcules ni conviertas.",
+        "Cuando menciones horarios, usa el mismo formato humano del RESUMEN (por ejemplo: “de 9 am a 1 pm”). Si un día no aparece en el RESUMEN, asume que ese día no se trabaja en la clínica.",
         "Prohibido preguntar '¿te paso precios u horarios?'. En su lugar, si corresponde, pide solo el *día y hora* preferidos.",
         "Si el usuario pregunta fuera de estética, reencausa al ámbito de servicios y agendamiento.",
         "Si faltan datos operativos (pagos/promos/etc.), responde: 'esa información se confirma en la valoración o directamente en la clínica'.",
