@@ -162,25 +162,74 @@ async function patchState(conversationId: number, patch: Partial<AgentState>) {
 function pad2(n: number) { return String(n).padStart(2, "0"); }
 function hhmmFrom(raw?: string | null) {
     if (!raw) return null;
-    const m = raw.match(/^(\d{1,2})(?::?(\d{2}))?/);
+    const txt = String(raw).trim();            // 👈 asegura quitar espacios
+    const m = txt.match(/^(\d{1,2})(?::?(\d{2}))?/);
     if (!m) return null;
     const hh = Math.min(23, Number(m[1] ?? 0));
     const mm = Math.min(59, Number(m[2] ?? 0));
-    return `${pad2(hh)}:${pad2(mm)}`;
+    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
 }
+
 function weekdayToDow(day: any): number | null {
-    const key = String(day || "").toUpperCase();
+    if (day == null) return null;
+
+    // 1) Números directos
+    if (typeof day === "number" && Number.isFinite(day)) {
+        const n = Math.trunc(day);
+        if (n >= 0 && n <= 6) return n;        // 0=Dom … 6=Sab
+        if (n >= 1 && n <= 7) return n === 7 ? 0 : n; // 1=Lun … 7=Dom
+        return null;
+    }
+
+    // 2) Strings (ES/EN, largos y abreviados)
+    const key = String(day || "")
+        .normalize("NFD").replace(/\p{Diacritic}/gu, "")
+        .toUpperCase()
+        .trim();
+
     const map: Record<string, number> = {
-        SUNDAY: 0, DOMINGO: 0,
-        MONDAY: 1, LUNES: 1,
-        TUESDAY: 2, MARTES: 2,
-        WEDNESDAY: 3, MIERCOLES: 3, MIÉRCOLES: 3,
-        THURSDAY: 4, JUEVES: 4,
-        FRIDAY: 5, VIERNES: 5,
-        SATURDAY: 6, SABADO: 6, SÁBADO: 6,
+        // EN largo y corto
+        SUNDAY: 0, SUN: 0,
+        MONDAY: 1, MON: 1,
+        TUESDAY: 2, TUE: 2,
+        WEDNESDAY: 3, WED: 3,
+        THURSDAY: 4, THU: 4,
+        FRIDAY: 5, FRI: 5,
+        SATURDAY: 6, SAT: 6,
+
+        // ES largo y corto
+        DOMINGO: 0, DOM: 0,
+        LUNES: 1, LUN: 1,
+        MARTES: 2, MAR: 2,
+        MIERCOLES: 3, MIE: 3, MIER: 3,
+        JUEVES: 4, JUE: 4,
+        VIERNES: 5, VIE: 5,
+        SABADO: 6, SAB: 6,
     };
+
     return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
 }
+
+
+function normalizeHours(rows: any[]) {
+    const byDow: Record<number, Array<{ start: string; end: string }>> = {};
+    for (const r of rows || []) {
+        if (!r) continue;
+        // Si isOpen viene null/undefined, lo consideramos abierto
+        if (r.isOpen === false) continue;
+
+        const dow = weekdayToDow(r.day);
+        if (dow == null) continue;
+
+        const s1 = hhmmFrom(r.start1), e1 = hhmmFrom(r.end1);
+        const s2 = hhmmFrom(r.start2), e2 = hhmmFrom(r.end2);
+
+        if (s1 && e1) (byDow[dow] ||= []).push({ start: s1, end: e1 });
+        if (s2 && e2) (byDow[dow] ||= []).push({ start: s2, end: e2 });
+    }
+    return byDow;
+}
+
 async function fetchAppointmentHours(empresaId: number) {
     const rows = await prisma.appointmentHour.findMany({
         where: { empresaId },
@@ -213,20 +262,7 @@ async function fetchAppointmentExceptions(empresaId: number, horizonDays = 35) {
         }
     }
 }
-function normalizeHours(rows: any[]) {
-    const byDow: Record<number, Array<{ start: string; end: string }>> = {};
-    for (const r of rows || []) {
-        if (!r) continue;
-        if (r.isOpen === false) continue;
-        const dow = weekdayToDow(r.day);
-        if (dow == null) continue;
-        const s1 = hhmmFrom(r.start1), e1 = hhmmFrom(r.end1);
-        const s2 = hhmmFrom(r.start2), e2 = hhmmFrom(r.end2);
-        if (s1 && e1) (byDow[dow] ||= []).push({ start: s1, end: e1 });
-        if (s2 && e2) (byDow[dow] ||= []).push({ start: s2, end: e2 });
-    }
-    return byDow;
-}
+
 function normalizeExceptions(rows: any[]) {
     const items: Array<{ date: string; closed: boolean; motivo?: string }> = [];
     for (const r of rows || []) {
