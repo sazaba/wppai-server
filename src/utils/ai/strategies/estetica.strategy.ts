@@ -121,6 +121,9 @@ type AgentState = {
     summary?: { text: string; expiresAt: string };
     expireAt?: string;
     handoffLocked?: boolean;
+    ctaNudges?: number;           // cuántas veces se le pidió "día y hora"
+    lastNudgeAt?: string;         // ISO de la última vez que se nudgueó
+
 };
 function inSchedulingFlow(st: AgentState, d?: AgentState["draft"]) {
     const draft = d || st.draft || {};
@@ -131,6 +134,20 @@ function inSchedulingFlow(st: AgentState, d?: AgentState["draft"]) {
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
+function canNudgeScheduling(st: AgentState, windowMin = 360) {
+    const last = st.lastNudgeAt ? Date.parse(st.lastNudgeAt) : 0;
+    const ageOk = !last || (Date.now() - last) >= windowMin * 60_000; // 6h por defecto
+    const budgetOk = (st.ctaNudges ?? 0) < 2; // como máximo 2 nudges por conversación
+    return ageOk && budgetOk && !st.handoffLocked;
+}
+async function markNudged(conversationId: number) {
+    const st = await loadState(conversationId);
+    await patchState(conversationId, {
+        ctaNudges: (st.ctaNudges ?? 0) + 1,
+        lastNudgeAt: new Date().toISOString(),
+    });
+}
+
 async function loadState(conversationId: number): Promise<AgentState> {
     const row = await prisma.conversationState.findUnique({
         where: { conversationId },
@@ -146,6 +163,9 @@ async function loadState(conversationId: number): Promise<AgentState> {
         summary: raw.summary ?? undefined,
         expireAt: raw.expireAt,
         handoffLocked: !!raw.handoffLocked,
+        ctaNudges: raw.ctaNudges ?? 0,
+        lastNudgeAt: raw.lastNudgeAt ?? undefined,
+
     };
     const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
     if (expired) return { greeted: data.greeted, handoffLocked: data.handoffLocked, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
@@ -1383,6 +1403,13 @@ export async function handleEsteticaStrategy({
             if (pe) match = { procedure: pe, matched: pe.name };
         }
     }
+    // Memoriza el último procedimiento detectado para contexto (sin forzar agenda)
+    if (match?.procedure?.id) {
+        await patchState(chatId, {
+            lastServiceId: match.procedure.id,
+            lastServiceName: match.procedure.name,
+        });
+    }
 
     const prevDraft = state.draft ?? {};
     const whenFreeCandidate = extractWhenPreference(userText);
@@ -1525,7 +1552,7 @@ export async function handleEsteticaStrategy({
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        await patchState(chatId, { lastIntent: "schedule" });
+        await patchState(chatId, { lastIntent: "info" }); // no empujes agenda aquí
         return {
             estado: ConversationEstado.respondido,
             mensaje: saved.texto,
@@ -1599,6 +1626,9 @@ export async function handleEsteticaStrategy({
         !infoBreaker &&
         !onlyHoursQuestion &&
         (wantBookHard || hasTimeAnchor || isAvailabilityQuestion(userText));
+    const stForPieces = await loadState(chatId);
+    const allowNudgePieces = canNudgeScheduling(stForPieces);
+
 
 
 
@@ -1607,20 +1637,20 @@ export async function handleEsteticaStrategy({
     // Si ya estamos en flujo de agenda y el usuario hace una pregunta informativa breve,
     // respondemos breve y recordamos pedir *día y hora* para no romper el flujo.
     if (schedulingGate && infoBreaker) {
-        // Respuesta breve con el LLM usando el summary (máximo 1–2 líneas ya lo tienes con clampText)
+        // 1) Responde breve (info)
         let breve = await runLLM({ summary, userText, imageUrl }).catch(() => "");
         breve = sanitizeGreeting(breve, { allowFirstGreeting: false });
         breve = clampText(breve, 3, 260);
 
-        // Vuelve a la agenda de forma natural
-        const faltan: string[] = [];
-        if (needProcedure) faltan.push("tratamiento");
-        if (needWhen) faltan.push("día y hora");
-        if (needName) faltan.push("nombre completo");
+        // 2) ¿Conviene nudguear? Solo si hay señales REALES
+        const stForNudge = await loadState(chatId);
+        const wantBook = hasBookingIntent(userText) || clsGate.label === "book";
+        const hasPieces = !!(newDraft.whenText || newDraft.whenISO || newDraft.procedureName || newDraft.procedureId);
+        const allowNudge = canNudgeScheduling(stForNudge) && (wantBook || hasPieces || isAvailabilityQuestion(userText));
 
-        const cola = faltan.length
-            ? `\n\nPara avanzar con la cita, ¿me confirmas ${faltan.join(", ")}?`
-            : `\n\nSi te parece bien, dime el *día y hora* exactos y verifico disponibilidad.`;
+        const cola = allowNudge
+            ? `\n\nSi deseas, dime *día y hora* y verifico disponibilidad.`
+            : ""; // sin coletilla si solo quería info
 
         const textoMix = addEmojiStable(`${breve}${cola}`, chatId);
 
@@ -1632,8 +1662,8 @@ export async function handleEsteticaStrategy({
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
         });
+        if (allowNudge) await markNudged(chatId);
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        // Nota: NO limpiamos draft ni cambiamos lastIntent; seguimos en "schedule".
         return {
             estado: ConversationEstado.respondido,
             mensaje: savedMix.texto,
@@ -1642,6 +1672,7 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
     // —— hasta aquí: INFO corta dentro del flujo de agenda ——
 
 
@@ -1669,7 +1700,8 @@ export async function handleEsteticaStrategy({
         // Opcional: si no hay horarios cargados, añade la nota
         if (list.includes("Aún no hay horarios")) txt += `\n${note}`;
 
-        txt += `\n\n¿Te ayudo a *verificar disponibilidad* o prefieres *proponer un día y hora* para agendar?`;
+        txt += `\n\nSi te parece, cuando tengas *día y hora* me avisas y lo verifico.`;
+
 
         const saved = await sendBotReply({
             conversationId: chatId,
@@ -1692,7 +1724,8 @@ export async function handleEsteticaStrategy({
 
 
 
-    if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
+    if (shouldAskForAgendaPieces && allowNudgePieces && (needProcedure || needWhen || needName)) {
+
         const asks: string[] = [];
         if (needProcedure) {
             const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
@@ -1716,6 +1749,7 @@ export async function handleEsteticaStrategy({
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        await markNudged(chatId);
         return {
             estado: ConversationEstado.respondido,
             mensaje: saved.texto,
