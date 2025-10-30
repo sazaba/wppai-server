@@ -472,14 +472,140 @@ function renderHoursAsList(byDow: Record<number, Array<{ start: string; end: str
     return lines.join("\n");
 }
 
+/* ====== Compactación y consultas inteligentes de horarios ====== */
+
+// Etiquetas cortas de días
+const DOW_SHORT = ["D", "L", "M", "X", "J", "V", "S"];
+const DOW_LONG = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+
+// Devuelve "09:00-13:00|14:00-18:00" para agrupar por patrón
+function canonicalRanges(ranges: Array<{ start: string; end: string }>) {
+    return (ranges || []).map(r => `${r.start}-${r.end}`).join("|") || "—";
+}
+
+// 09:00 -> "9 am", 14:30 -> "2:30 pm"
+function toAmPmTerse(hhmm: string): string {
+    const [H, M] = hhmm.split(":").map(Number);
+    const h12 = (H % 12) || 12;
+    const mm = M ? `:${String(M).padStart(2, "0")}` : "";
+    const suf = H < 12 ? "am" : "pm";
+    return `${h12}${mm} ${suf}`;
+}
+
+// "de 9 am a 1 pm / 2 pm a 6 pm"
+function rangesHumanTerse(ranges: Array<{ start: string; end: string }>) {
+    return (ranges || []).map(r => `${toAmPmTerse(r.start)} – ${toAmPmTerse(r.end)}`).join(" / ");
+}
+
+// Compacta por grupos de días contiguos con el mismo patrón de rangos.
+// Resultado listo para WhatsApp, 1 línea por grupo.
+function renderHoursCompressed(byDow: Record<number, Array<{ start: string; end: string }>>): string {
+    const groups: Array<{ from: number; to: number; pattern: string }> = [];
+    let curFrom = 0, curPat = canonicalRanges(byDow[0] || []);
+    for (let d = 1; d < 7; d++) {
+        const pat = canonicalRanges(byDow[d] || []);
+        if (pat !== curPat) {
+            groups.push({ from: curFrom, to: d - 1, pattern: curPat });
+            curFrom = d; curPat = pat;
+        }
+    }
+    groups.push({ from: curFrom, to: 6, pattern: curPat });
+
+    const lines: string[] = [];
+    for (const g of groups) {
+        if (g.pattern === "—") {
+            // día(s) cerrados (no listar si son muchos, mantenlo corto)
+            continue;
+        }
+        const label = g.from === g.to
+            ? `${DOW_SHORT[g.from]}:`
+            : `${DOW_SHORT[g.from]}–${DOW_SHORT[g.to]}:`;
+        const human = rangesHumanTerse((byDow[g.from] || []));
+        lines.push(`${label} ${human}`);
+    }
+
+    // Agrega nota corta de cerrados si aplica
+    const closed: string[] = [];
+    for (let d = 0; d < 7; d++) {
+        if (!byDow[d]?.length) closed.push(DOW_SHORT[d]);
+    }
+    if (closed.length) lines.push(`Cerrado: ${closed.join(" · ")}`);
+
+    return lines.join("\n");
+}
+
+// Extrae un día de la semana del texto (0=Dom … 6=Sáb) o null
+function parseWeekdayFromText(t: string): number | null {
+    const s = (t || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+    const map: Record<string, number> = {
+        domingo: 0, dom: 0,
+        lunes: 1, lun: 1,
+        martes: 2, mar: 2,
+        miercoles: 3, mier: 3, mie: 3,
+        jueves: 4, jue: 4,
+        viernes: 5, vie: 5,
+        sabado: 6, sab: 6
+    };
+    const hit = Object.keys(map).find(k => new RegExp(`\\b${k}\\b`).test(s));
+    return hit ? map[hit] : null;
+}
+
+// Devuelve minutos absolutos consultados si pregunta "después de las 7 pm", "a las 19:30", etc.
+function parseAfterTimeQuestion(t: string): number | null {
+    const s = (t || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+
+    // solo si hay pista semántica de comparación horaria
+    if (!/(despues|después|hasta|mas tarde|tarde|noche|a las|\d{1,2}\s*(am|pm))/.test(s)) return null;
+
+    // 1) formatos con am/pm
+    const ampm = s.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+    if (ampm) {
+        let h = Number(ampm[1]); const m = Number(ampm[2] || 0);
+        const suf = ampm[3];
+        if (suf === "pm" && h < 12) h += 12;
+        if (suf === "am" && h === 12) h = 0;
+        return h * 60 + m;
+    }
+
+    // 2) solo hora "19" o "19:30" o "7:30" con palabra "pm"
+    const hhmm = s.match(/\b(\d{1,2})(?::(\d{2}))?\b/);
+    if (hhmm) {
+        let h = Number(hhmm[1]); const m = Number(hhmm[2] || 0);
+        // Si menciona 'pm' en la frase y h <= 12, conviértelo.
+        if (/pm\b/.test(s) && h <= 12) h += 12;
+        return h * 60 + m;
+    }
+
+    return null;
+}
+
+// ¿Está abierto ese día y/o después de cierta hora?
+function isOpenOnDay(byDow: Record<number, Array<{ start: string; end: string }>>, dow: number): boolean {
+    return !!(byDow[dow]?.length);
+}
+function isOpenAfterTime(byDow: Record<number, Array<{ start: string; end: string }>>, minutes: number): boolean {
+    for (let d = 0; d < 7; d++) {
+        for (const r of (byDow[d] || [])) {
+            const [sh, sm] = r.start.split(":").map(Number);
+            const [eh, em] = r.end.split(":").map(Number);
+            const sMin = sh * 60 + sm, eMin = eh * 60 + em;
+            if (eMin > minutes) return true; // hay atención más tarde que esa hora
+        }
+    }
+    return false;
+}
+
+
 /** Construye lista bonita de horarios desde la BD */
-async function buildBusinessHoursList(empresaId: number): Promise<{ list: string; note: string }> {
+/** Construye lista *compacta* de horarios para WhatsApp */
+async function buildBusinessHoursList(empresaId: number): Promise<{ list: string; note: string; byDow: Record<number, Array<{ start: string; end: string }>> }> {
     const rows = await fetchAppointmentHours(empresaId);
     const byDow = normalizeHours(rows);
-    const list = renderHoursAsList(byDow);
-    const note = "📝 Nota: si un día *no aparece*, ese día no se atiende.";
-    return { list: list || "Por ahora no tengo registrado el horario en el sistema.", note };
+    const list = renderHoursCompressed(byDow);
+    const note = "Si un día no aparece en la lista, ese día no se atiende.";
+    return { list: list || "Aún no hay horarios cargados en el sistema.", note, byDow };
 }
+
 
 
 
@@ -760,7 +886,7 @@ async function buildOrReuseSummary(args: {
     lines.push(`${icon("hist")} Historial: ${history || "—"}`);
 
     let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n");
-    compact = softTrim(compact, 1000);
+    compact = softTrim(compact, 2400);
 
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
@@ -1353,11 +1479,81 @@ export async function handleEsteticaStrategy({
         (inferredIntent === "schedule" || hasServiceOrWhen);
 
 
-    // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
-    // ——— PREGUNTA PURA de horarios/días → lista bonita (sin mezclar servicios)
-    if (onlyHoursQuestion) {
-        const { list, note } = await buildBusinessHoursList(empresaId);
+    // ===== Consultas inteligentes de horario por día/hora =====
+    {
+        const { list, note, byDow } = await buildBusinessHoursList(empresaId);
 
+        // A) "¿El viernes no hay servicio?" / "¿Atienden sábado?"
+        const askedDow = parseWeekdayFromText(userText);
+        if (askedDow !== null) {
+            if (!isOpenOnDay(byDow, askedDow)) {
+                let txt = `El *${DOW_LONG[askedDow]}* no atendemos.`;
+                // tip corto: muestra resumen global compacto
+                txt += `\n\n${list}`;
+                const saved = await sendBotReply({
+                    conversationId: chatId,
+                    empresaId,
+                    texto: clampText(addEmojiStable(txt, chatId)),
+                    nuevoEstado: ConversationEstado.respondido,
+                    to: toPhone ?? conversacion.phone,
+                    phoneNumberId,
+                });
+                if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            } else {
+                const human = rangesHumanTerse(byDow[askedDow] || []);
+                const txt = addEmojiStable(`El *${DOW_LONG[askedDow]}* atendemos: ${human}`, chatId);
+                const saved = await sendBotReply({
+                    conversationId: chatId,
+                    empresaId,
+                    texto: clampText(txt),
+                    nuevoEstado: ConversationEstado.respondido,
+                    to: toPhone ?? conversacion.phone,
+                    phoneNumberId,
+                });
+                if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            }
+        }
+
+        // B) "¿Trabajan después de las 7 pm?" / "¿Atienden hasta las 20:00?"
+        const afterMin = parseAfterTimeQuestion(userText);
+        if (afterMin !== null) {
+            const ok = isOpenAfterTime(byDow, afterMin);
+            // Para responder claro, toma el "máximo fin" por bloques (entre semana y sábado) si quieres:
+            const maxEnds: string[] = [];
+            for (let d = 0; d < 7; d++) {
+                const ends = (byDow[d] || []).map(r => r.end).sort();
+                if (ends.length) maxEnds.push(ends[ends.length - 1]);
+            }
+            const lastEnd = maxEnds.length ? maxEnds.sort()[maxEnds.length - 1] : null;
+
+            let txt = ok
+                ? `Sí, tenemos atención en algunos días después de esa hora.`
+                : `No, nuestras últimas franjas terminan antes de esa hora.`;
+
+            if (lastEnd) txt += ` (cierre más tarde de referencia: ${toAmPmTerse(lastEnd)})`;
+
+            // Añade el resumen compacto para que el usuario vea opciones
+            txt += `\n\n${list}`;
+
+            const saved = await sendBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: clampText(addEmojiStable(txt, chatId)),
+                nuevoEstado: ConversationEstado.respondido,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        }
+    }
+
+
+    if (onlyHoursQuestion) {
+        // ——— PREGUNTA PURA de horarios/días → lista compacta (móvil)
+        const { list, note } = await buildBusinessHoursList(empresaId);
         let textHours = `${list}\n\n${note}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
         textHours = clampText(addEmojiStable(textHours, chatId));
 
@@ -1378,6 +1574,7 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
 
 
 
