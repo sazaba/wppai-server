@@ -723,7 +723,7 @@ async function buildOrReuseSummary(args: {
         }),
     ]);
 
-    const { human: hoursLine, lastStart } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
+
     const exceptions = normalizeExceptions(exceptionsRows);
     const exLine = exceptions.filter(e => e.closed).slice(0, 10).map(e => e.date).join(", ");
     const exceptionsLine = exLine ? `Excepciones (cerrado): ${exLine}` : "";
@@ -871,10 +871,20 @@ async function buildOrReuseSummary(args: {
         .join(" • ");
     if (svcList) lines.push(`${icon("svc")} Servicios: ${svcList}`);
 
-    if (hoursLine) {
-        lines.push(`${icon("hrs")} Horario: ${hoursLine}${lastStart ? `; última cita ref. ${lastStart}` : ""}`);
-        lines.push(`📝 Nota: Si un día no aparece arriba, ese día no se atiende en la clínica.`);
+    // ——— Horario corto desde BD
+    // ——— Horario corto desde BD
+    const byDowForSummary = normalizeHours(hoursRows);
+    const hoursShort = renderHoursCompressed(byDowForSummary);
+    const { lastStart: lastStartRef } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
+
+    if (hoursShort) {
+        lines.push(
+            `${icon("hrs")} Horario: ${hoursShort}${lastStartRef ? ` (cierre ref.: ${lastStartRef})` : ""}`
+        );
+        // sin nota adicional
     }
+
+
 
     if (exceptionsLine) lines.push(`${icon("exc")} ${exceptionsLine}`);
 
@@ -1483,108 +1493,43 @@ export async function handleEsteticaStrategy({
         hasBookingIntent(userText) || clsGate.label === "book";
     const hasTimeAnchor = hasConcreteTimeAnchor(userText);
 
-    const shouldAskForAgendaPieces =
-        !infoBreaker &&
-        !onlyHoursQuestion &&
-        (wantBookHard || hasTimeAnchor);
-
-
-
-    // ===== Consultas inteligentes de horario por día/hora =====
-    {
-        const { list, note, byDow } = await buildBusinessHoursList(empresaId);
-
-        // A) "¿El viernes no hay servicio?" / "¿Atienden sábado?"
-        const askedDow = parseWeekdayFromText(userText);
-        if (askedDow !== null) {
-            if (!isOpenOnDay(byDow, askedDow)) {
-                let txt = `El *${DOW_LONG[askedDow]}* no atendemos.`;
-                // tip corto: muestra resumen global compacto
-                txt += `\n\n${list}`;
-                const saved = await sendBotReply({
-                    conversationId: chatId,
-                    empresaId,
-                    texto: clampText(addEmojiStable(txt, chatId)),
-                    nuevoEstado: ConversationEstado.respondido,
-                    to: toPhone ?? conversacion.phone,
-                    phoneNumberId,
-                });
-                if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-            } else {
-                const human = rangesHumanTerse(byDow[askedDow] || []);
-                const txt = addEmojiStable(`El *${DOW_LONG[askedDow]}* atendemos: ${human}`, chatId);
-                const saved = await sendBotReply({
-                    conversationId: chatId,
-                    empresaId,
-                    texto: clampText(txt),
-                    nuevoEstado: ConversationEstado.respondido,
-                    to: toPhone ?? conversacion.phone,
-                    phoneNumberId,
-                });
-                if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-                return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-            }
-        }
-
-        // B) "¿Trabajan después de las 7 pm?" / "¿Atienden hasta las 20:00?"
-        const afterMin = parseAfterTimeQuestion(userText);
-        if (afterMin !== null) {
-            const ok = isOpenAfterTime(byDow, afterMin);
-            // Para responder claro, toma el "máximo fin" por bloques (entre semana y sábado) si quieres:
-            const maxEnds: string[] = [];
-            for (let d = 0; d < 7; d++) {
-                const ends = (byDow[d] || []).map(r => r.end).sort();
-                if (ends.length) maxEnds.push(ends[ends.length - 1]);
-            }
-            const lastEnd = maxEnds.length ? maxEnds.sort()[maxEnds.length - 1] : null;
-
-            let txt = ok
-                ? `Sí, tenemos atención en algunos días después de esa hora.`
-                : `No, nuestras últimas franjas terminan antes de esa hora.`;
-
-            if (lastEnd) txt += ` (cierre más tarde de referencia: ${toAmPmTerse(lastEnd)})`;
-
-            // Añade el resumen compacto para que el usuario vea opciones
-            txt += `\n\n${list}`;
-
-            const saved = await sendBotReply({
-                conversationId: chatId,
-                empresaId,
-                texto: clampText(addEmojiStable(txt, chatId)),
-                nuevoEstado: ConversationEstado.respondido,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
-            });
-            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
-        }
+    function isAvailabilityQuestion(t: string): boolean {
+        const s = (t || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+        return /\b(disponible|disponibilidad|tienes cupo|puedes agendar|confirmame|reservame|hay espacio|tienes cita|tienes lugar|puedo agendar|agenda una cita|quiero una cita)\b/.test(s);
     }
 
 
+    const shouldAskForAgendaPieces =
+        !infoBreaker &&
+        !onlyHoursQuestion &&
+        (wantBookHard || hasTimeAnchor || isAvailabilityQuestion(userText));
+
+
+
+
+
+
+    // ——— PREGUNTA PURA de horarios o días → se responde con el resumen corto
     if (onlyHoursQuestion) {
-        // ——— PREGUNTA PURA de horarios/días → lista compacta (móvil)
-        const { list, note } = await buildBusinessHoursList(empresaId);
-        let textHours = `${list}\n\n${note}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
-        textHours = clampText(addEmojiStable(textHours, chatId));
+        const horarioLinea = summaryPickLine(summary, "🕒 Horario:");
+        let txt = horarioLinea
+            ? `🕒 ${horarioLinea.replace("🕒 Horario:", "").trim()}`
+            : "Nuestro horario está disponible en la información principal de la clínica.";
+
+        txt += `\n\n¿Te gustaría que te ayude a verificar disponibilidad o agendar una cita? 😊`;
 
         const saved = await sendBotReply({
             conversationId: chatId,
             empresaId,
-            texto: textHours,
+            texto: clampText(addEmojiStable(txt, chatId)),
             nuevoEstado: ConversationEstado.respondido,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        };
+        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
     }
+
 
 
 
