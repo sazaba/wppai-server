@@ -1412,6 +1412,8 @@ export async function handleEsteticaStrategy({
     }
 
     const prevDraft = state.draft ?? {};
+
+
     const whenFreeCandidate = extractWhenPreference(userText);
     const clsForWhen = await classifyTurnLLM(userText);
     const canCaptureWhen =
@@ -1430,10 +1432,6 @@ export async function handleEsteticaStrategy({
         // textual SIEMPRE
     };
     const inferredIntent = await detectIntentSmart(userText, newDraft);
-
-    const stateNowBeforePatch = await loadState(chatId);
-    const schedulingMode = inSchedulingFlow(stateNowBeforePatch, newDraft);
-
 
     await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
 
@@ -1572,39 +1570,8 @@ export async function handleEsteticaStrategy({
     const needWhen = !hasSomeDateDraft(newDraft);
     const needName = !newDraft.name;
 
-    // 🚧 Si ya estamos en flujo de agenda, prioriza recolectar piezas y no te vayas a "info"
-    const stateNowForGate = await loadState(chatId);
-    const schedulingGate = inSchedulingFlow(stateNowForGate, newDraft);
 
-    if (schedulingGate && (needProcedure || needWhen || needName)) {
-        const asks: string[] = [];
-        if (needProcedure) {
-            const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
-            asks.push(`¿Para qué *tratamiento* deseas la cita? (Ej.: ${sample})`);
-        }
-        if (needWhen) asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “viernes 3 pm” o “15/11 a las 3 pm”).`);
-        if (needName) asks.push(`¿Cuál es tu *nombre completo*?`);
 
-        let textoAsk = clampText(asks.join(" "));
-        textoAsk = addEmojiStable(textoAsk, chatId);
-
-        const savedAsk = await sendBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto: textoAsk,
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: savedAsk.texto,
-            messageId: savedAsk.messageId,
-            wamid: savedAsk.wamid,
-            media: [],
-        };
-    }
 
 
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
@@ -1620,6 +1587,9 @@ export async function handleEsteticaStrategy({
         const s = (t || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
         return /\b(disponible|disponibilidad|tienes cupo|puedes agendar|confirmame|reservame|hay espacio|tienes cita|tienes lugar|puedo agendar|agenda una cita|quiero una cita)\b/.test(s);
     }
+    // Evalúa si seguimos en flujo de agenda (usar el draft ya construido)
+    const stForGate = await loadState(chatId);
+    const schedulingGate = inSchedulingFlow(stForGate, newDraft);
 
 
     const shouldAskForAgendaPieces =
@@ -1631,53 +1601,6 @@ export async function handleEsteticaStrategy({
 
 
 
-
-
-    // —— desde aquí: INFO corta dentro del flujo de agenda ——
-    // Si ya estamos en flujo de agenda y el usuario hace una pregunta informativa breve,
-    // respondemos breve y recordamos pedir *día y hora* para no romper el flujo.
-    if (schedulingGate && infoBreaker) {
-        // 1) Responde breve (info)
-        let breve = await runLLM({ summary, userText, imageUrl }).catch(() => "");
-        breve = sanitizeGreeting(breve, { allowFirstGreeting: false });
-        breve = clampText(breve, 3, 260);
-
-        // 2) ¿Conviene nudguear? Solo si hay señales REALES
-        const stForNudge = await loadState(chatId);
-        const wantBook = hasBookingIntent(userText) || clsGate.label === "book";
-        const hasPieces = !!(newDraft.whenText || newDraft.whenISO || newDraft.procedureName || newDraft.procedureId);
-        const allowNudge = canNudgeScheduling(stForNudge) && (wantBook || hasPieces || isAvailabilityQuestion(userText));
-
-        const cola = allowNudge
-            ? `\n\nSi deseas, dime *día y hora* y verifico disponibilidad.`
-            : ""; // sin coletilla si solo quería info
-
-        const textoMix = addEmojiStable(`${breve}${cola}`, chatId);
-
-        const savedMix = await sendBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto: textoMix,
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        });
-        if (allowNudge) await markNudged(chatId);
-        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: savedMix.texto,
-            messageId: savedMix.messageId,
-            wamid: savedMix.wamid,
-            media: [],
-        };
-    }
-
-    // —— hasta aquí: INFO corta dentro del flujo de agenda ——
-
-
-    // ——— PREGUNTA PURA de horarios o días → se responde con el resumen corto
-    // ——— PREGUNTA PURA de horarios o días → usar buildBusinessHoursList (compacto) + hint contextual
     if (onlyHoursQuestion) {
         const { list, note, byDow } = await buildBusinessHoursList(empresaId);
 
@@ -1721,7 +1644,48 @@ export async function handleEsteticaStrategy({
         };
     }
 
+    // —— desde aquí: INFO corta dentro del flujo de agenda ——
+    // Si ya estamos en flujo de agenda y el usuario hace una pregunta informativa breve,
+    // respondemos breve y recordamos pedir *día y hora* para no romper el flujo.
+    if (schedulingGate && infoBreaker) {
+        // 1) Responde breve (info)
+        let breve = await runLLM({ summary, userText, imageUrl }).catch(() => "");
+        breve = sanitizeGreeting(breve, { allowFirstGreeting: false });
+        breve = clampText(breve, 3, 260);
 
+        // 2) ¿Conviene nudguear? Solo si hay señales REALES
+        const stForNudge = await loadState(chatId);
+        const wantBook = hasBookingIntent(userText) || clsGate.label === "book";
+        const hasPieces = !!(newDraft.whenText || newDraft.whenISO || newDraft.procedureName || newDraft.procedureId);
+        const allowNudge = canNudgeScheduling(stForNudge) && (wantBook || hasConcreteTimeAnchor(userText) || isAvailabilityQuestion(userText));
+
+
+        const cola = allowNudge
+            ? `\n\nSi deseas, dime *día y hora* y verifico disponibilidad.`
+            : ""; // sin coletilla si solo quería info
+
+        const textoMix = addEmojiStable(`${breve}${cola}`, chatId);
+
+        const savedMix = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: textoMix,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (allowNudge) await markNudged(chatId);
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: savedMix.texto,
+            messageId: savedMix.messageId,
+            wamid: savedMix.wamid,
+            media: [],
+        };
+    }
+
+    // —— hasta aquí: INFO corta dentro del flujo de agenda ——
 
 
     if (shouldAskForAgendaPieces && allowNudgePieces && (needProcedure || needWhen || needName)) {
