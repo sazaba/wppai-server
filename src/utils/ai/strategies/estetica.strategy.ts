@@ -288,9 +288,10 @@ function isSchedulingCue(t: string): boolean {
 function isShortQuestion(t: string): boolean {
     const s = (t || "").trim();
     const noSpaces = s.replace(/\s+/g, "");
-    const hasQM = /[?¿]/.test(s);
-    return hasQM && s.length <= 120 && noSpaces.length >= 2;
+    const looksQuestion = /[?¿]/.test(s) || /\b(hacen|tienen|hay|puedo|me cubre|sirve|marca|usan|utilizan)\b/i.test(s); // 👈 añade verbos típicos
+    return looksQuestion && s.length <= 120 && noSpaces.length >= 2;
 }
+
 
 function containsDateOrTimeHints(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
@@ -303,7 +304,9 @@ function containsDateOrTimeHints(t: string): boolean {
 
 function isPaymentQuestion(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    return /\b(pagos?|metodos? de pago|tarjeta|efectivo|transferencia|nequi|daviplata|pse)\b/.test(s);
+    return /\b(pagos?|pago|pagar|metodos? de pago|tarjeta|efectivo|transferencia|nequi|daviplata|pse|anticipo|dep[oó]sito|excedente)\b/.test(s);
+
+
 }
 
 function isGeneralInfoQuestion(t: string): boolean {
@@ -311,7 +314,9 @@ function isGeneralInfoQuestion(t: string): boolean {
     return (
         /\b(que es|de que se trata|como funciona|beneficios?|riesgos?|efectos secundarios?|contraindicaciones?|cuidados|cuanto dura|duracion|quien lo hace|profesional|doctor(a)?)\b/.test(s) ||
         /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde|mapa|sede|como llego|parqueadero)\b/.test(s) ||
+        /\b(marca|retoc|garant[ií]a|garantia|cubre|excedente|sesiones?|dolor|recuperaci[oó]n|requisitos?)\b/.test(s) ||   // 👈 NUEVO
         isPaymentQuestion(t)
+
     );
 }
 /** Verbos/expresiones de intención de reservar (no hardcode de negocio; solo intención lingüística) */
@@ -1474,9 +1479,15 @@ export async function handleEsteticaStrategy({
     const clsGate = await classifyTurnLLM(userText);
     const onlyHoursQuestion = (clsGate.label === "ask_hours") || looksLikeHoursQuestion(userText);
 
+    const wantBookHard =
+        hasBookingIntent(userText) || clsGate.label === "book";
+    const hasTimeAnchor = hasConcreteTimeAnchor(userText);
+
     const shouldAskForAgendaPieces =
-        !infoBreaker && !onlyHoursQuestion &&
-        (inferredIntent === "schedule" || hasServiceOrWhen);
+        !infoBreaker &&
+        !onlyHoursQuestion &&
+        (wantBookHard || hasTimeAnchor);
+
 
 
     // ===== Consultas inteligentes de horario por día/hora =====
