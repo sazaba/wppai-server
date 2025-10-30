@@ -122,6 +122,12 @@ type AgentState = {
     expireAt?: string;
     handoffLocked?: boolean;
 };
+function inSchedulingFlow(st: AgentState, d?: AgentState["draft"]) {
+    const draft = d || st.draft || {};
+    return st.lastIntent === "schedule" ||
+        !!(draft?.procedureId || draft?.procedureName || draft?.whenText || draft?.whenISO);
+}
+
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
@@ -275,6 +281,23 @@ function normalizeExceptions(rows: any[]) {
 }
 
 /* ===== INTENT DETECTOR (no forzar agenda) ===== */
+// —— desde aquí: SOFT EXIT detector —— 
+function isSoftExit(text: string): boolean {
+    const s = (text || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase().trim();
+    const exits = [
+        // desiste por ahora
+        /\b(por ahora no|luego te confirmo|mas tarde te confirmo|despues te confirmo|despues hablamos|solo estaba preguntando|solo preguntaba|solo queria saber)\b/,
+        // no desea agendar
+        /\b(no quiero agendar|no deseo agendar|no agendemos|dejemos asi|dejalo asi)\b/,
+        // posponer sin pedir reprogramar
+        /\b(en otro momento|mas adelante|quiza despues|quizas despues)\b/,
+        // cierre cortés
+        /\b(gracias? igualmente|gracias? por la info|listo gracias|ok gracias)\b/,
+    ];
+    return exits.some(rx => rx.test(s));
+}
+// —— hasta aquí: SOFT EXIT detector ——
+
 
 /* ==== INFO / SCHEDULE GUARDS (del componente viejo) ==== */
 function isSchedulingCue(t: string): boolean {
@@ -607,7 +630,8 @@ async function buildBusinessHoursList(empresaId: number): Promise<{ list: string
     const rows = await fetchAppointmentHours(empresaId);
     const byDow = normalizeHours(rows);
     const list = renderHoursCompressed(byDow);
-    const note = "Si un día no aparece en la lista, ese día no se atiende.";
+    const note = "Los días no listados no tienen atención.";
+
     return { list: list || "Aún no hay horarios cargados en el sistema.", note, byDow };
 }
 
@@ -1380,7 +1404,44 @@ export async function handleEsteticaStrategy({
     };
     const inferredIntent = await detectIntentSmart(userText, newDraft);
 
+    const stateNowBeforePatch = await loadState(chatId);
+    const schedulingMode = inSchedulingFlow(stateNowBeforePatch, newDraft);
+
+
     await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
+
+    // —— desde aquí: manejo de SOFT EXIT (salida amable del flujo) ——
+    if (isSoftExit(userText)) {
+        // Limpia piezas de agenda y vuelve a modo informativo
+        await patchState(chatId, {
+            lastIntent: "info",
+            draft: { name: undefined, phone: undefined, procedureId: undefined, procedureName: undefined, whenISO: undefined, whenText: undefined }
+        });
+
+        let msg = [
+            "¡Claro! 💬 No hay problema.",
+            "Si más adelante deseas *agendar*, dime por ejemplo: “quiero una cita” o “resérvame para el viernes 3 pm” y retomamos desde donde quedamos."
+        ].join(" ");
+
+        const saved = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: clampText(addEmojiStable(msg, chatId)),
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+    // —— hasta aquí: manejo de SOFT EXIT ——
+
 
     // 2) Si el usuario ya trajo todo → handoff inmediato
     if (detectHandoffReady(userText) || (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft))) {
@@ -1484,6 +1545,41 @@ export async function handleEsteticaStrategy({
     const needWhen = !hasSomeDateDraft(newDraft);
     const needName = !newDraft.name;
 
+    // 🚧 Si ya estamos en flujo de agenda, prioriza recolectar piezas y no te vayas a "info"
+    const stateNowForGate = await loadState(chatId);
+    const schedulingGate = inSchedulingFlow(stateNowForGate, newDraft);
+
+    if (schedulingGate && (needProcedure || needWhen || needName)) {
+        const asks: string[] = [];
+        if (needProcedure) {
+            const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
+            asks.push(`¿Para qué *tratamiento* deseas la cita? (Ej.: ${sample})`);
+        }
+        if (needWhen) asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “viernes 3 pm” o “15/11 a las 3 pm”).`);
+        if (needName) asks.push(`¿Cuál es tu *nombre completo*?`);
+
+        let textoAsk = clampText(asks.join(" "));
+        textoAsk = addEmojiStable(textoAsk, chatId);
+
+        const savedAsk = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: textoAsk,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: savedAsk.texto,
+            messageId: savedAsk.messageId,
+            wamid: savedAsk.wamid,
+            media: [],
+        };
+    }
+
+
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
     const infoBreaker = shouldBypassScheduling(userText);
     const clsGate = await classifyTurnLLM(userText);
@@ -1507,43 +1603,78 @@ export async function handleEsteticaStrategy({
 
 
 
+    // —— desde aquí: INFO corta dentro del flujo de agenda ——
+    // Si ya estamos en flujo de agenda y el usuario hace una pregunta informativa breve,
+    // respondemos breve y recordamos pedir *día y hora* para no romper el flujo.
+    if (schedulingGate && infoBreaker) {
+        // Respuesta breve con el LLM usando el summary (máximo 1–2 líneas ya lo tienes con clampText)
+        let breve = await runLLM({ summary, userText, imageUrl }).catch(() => "");
+        breve = sanitizeGreeting(breve, { allowFirstGreeting: false });
+        breve = clampText(breve, 3, 260);
 
+        // Vuelve a la agenda de forma natural
+        const faltan: string[] = [];
+        if (needProcedure) faltan.push("tratamiento");
+        if (needWhen) faltan.push("día y hora");
+        if (needName) faltan.push("nombre completo");
 
-    // ——— PREGUNTA PURA de horarios o días → se responde con el resumen corto
-    if (onlyHoursQuestion) {
-        const horarioLinea = summaryPickLine(summary, "🕒 Horario:");
-        let txt = horarioLinea
-            ? `🕒 ${horarioLinea.replace("🕒 Horario:", "").trim()}`
-            : "Nuestro horario está disponible en la información principal de la clínica.";
+        const cola = faltan.length
+            ? `\n\nPara avanzar con la cita, ¿me confirmas ${faltan.join(", ")}?`
+            : `\n\nSi te parece bien, dime el *día y hora* exactos y verifico disponibilidad.`;
 
-        txt += `\n\n¿Te gustaría que te ayude a verificar disponibilidad o agendar una cita? 😊`;
+        const textoMix = addEmojiStable(`${breve}${cola}`, chatId);
 
-        const saved = await sendBotReply({
+        const savedMix = await sendBotReply({
             conversationId: chatId,
             empresaId,
-            texto: clampText(addEmojiStable(txt, chatId)),
+            texto: textoMix,
             nuevoEstado: ConversationEstado.respondido,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        // Nota: NO limpiamos draft ni cambiamos lastIntent; seguimos en "schedule".
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: savedMix.texto,
+            messageId: savedMix.messageId,
+            wamid: savedMix.wamid,
+            media: [],
+        };
     }
+    // —— hasta aquí: INFO corta dentro del flujo de agenda ——
 
 
+    // ——— PREGUNTA PURA de horarios o días → se responde con el resumen corto
+    // ——— PREGUNTA PURA de horarios o días → usar buildBusinessHoursList (compacto) + hint contextual
+    if (onlyHoursQuestion) {
+        const { list, note, byDow } = await buildBusinessHoursList(empresaId);
 
+        // Hints contextuales (opcionales, en una línea)
+        const askedDow = parseWeekdayFromText(userText);            // 0..6 | null
+        const afterMin = parseAfterTimeQuestion(userText);          // minutos | null
 
+        const hints: string[] = [];
+        if (askedDow != null) {
+            const openThatDay = isOpenOnDay(byDow, askedDow);
+            if (!openThatDay) hints.push(`Ese día no tenemos atención.`);
+        }
+        if (afterMin != null) {
+            const openAfter = isOpenAfterTime(byDow, afterMin);
+            if (!openAfter) hints.push(`No atendemos más tarde que esa hora.`);
+        }
 
+        let txt = `🕒 Horario:\n${list}`;
+        if (hints.length) txt += `\n${hints.join(" ")}`;
+        // Opcional: si no hay horarios cargados, añade la nota
+        if (list.includes("Aún no hay horarios")) txt += `\n${note}`;
 
-    if (/\b(hora|horario|dias?|fecha)\b/i.test(userText) && inferredIntent !== "schedule") {
-        const clarify = addEmojiStable(
-            "¿Deseas conocer nuestros *horarios de atención* o prefieres que tomemos *un horario concreto* para agendar?",
-            chatId
-        );
+        txt += `\n\n¿Te ayudo a *verificar disponibilidad* o prefieres *proponer un día y hora* para agendar?`;
+
         const saved = await sendBotReply({
             conversationId: chatId,
             empresaId,
-            texto: clampText(clarify),
+            texto: clampText(addEmojiStable(txt, chatId)),
             nuevoEstado: ConversationEstado.respondido,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
@@ -1557,6 +1688,7 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
 
 
 
