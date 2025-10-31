@@ -32,6 +32,10 @@ const IMAGE_LOOKBACK_MS = 300_000;
 const REPLY_DEDUP_WINDOW_MS = 120_000;
 
 /* ===== UTILS ===== */
+
+/** Feature flag: NO consultar horarios/turnos en BD en tiempo de respuesta */
+const USE_DB_HOURS = false;
+
 function sleep(ms: number) {
     return new Promise((r) => setTimeout(r, ms));
 }
@@ -425,6 +429,16 @@ function summaryPickLine(summary: string, startsWith: string): string | null {
     return line ? line.trim() : null;
 }
 
+/** Extrae una línea de horario “simple” desde el RESUMEN */
+function extractHoursFromSummary(summary: string): string | null {
+    // Busca la línea que comienza con el ícono de horario del resumen
+    const line = summaryPickLine(summary, "🕒 Horario:");
+    if (!line) return null;
+    // Quitamos el icono y la etiqueta
+    return line.replace(/^🕒\s*Horario:\s*/i, "").trim();
+}
+
+
 function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
     return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
@@ -788,6 +802,12 @@ function detectHandoffReady(t: string) {
 }
 
 /* ====== NAME EXTRACTION (robusto) ====== */
+// Palabras y frases que NO son nombre aunque sean un solo token válido
+const NON_NAME_SINGLETONS = new Set([
+    "hola", "holi", "hey", "buenos", "buenas", "dias", "días", "tardes", "noches",
+    "gracias", "ok", "vale", "listo", "listos", "perfecto", "bien", "buen", "buenas!"
+]);
+
 
 // Stopwords y listas para corte/validación
 const NAME_PARTICLES = new Set([
@@ -901,6 +921,11 @@ function extractName(raw: string): string | null {
     if (EMAIL_OR_URL.test(cleaned)) return null;
 
     const tokens = cleaned.split(/\s+/).filter(Boolean);
+    // Evita tomar saludos/ruido como nombre (ej.: "hola")
+    if (tokens.length === 1 && NON_NAME_SINGLETONS.has(tokens[0].toLowerCase())) {
+        return null;
+    }
+
     if (tokens.length >= 1 && tokens.length <= 6) {
         let seq = tokens.join(" ");
         if (!looksValidNameSequence(seq)) {
@@ -923,6 +948,10 @@ function looksLikeLooseName(raw: string): string | null {
     if (CONTEXT_STOPS.test(t)) return null;
 
     const tokens = t.split(/\s+/).filter(Boolean);
+    if (tokens.length === 1 && NON_NAME_SINGLETONS.has(tokens[0].toLowerCase())) {
+        return null;
+    }
+
     if (tokens.length < 1 || tokens.length > 6) return null;
 
     const pretty = normalizeNamePretty(t);
@@ -1129,6 +1158,10 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         "Si el usuario pregunta fuera de estética, reencausa al ámbito de servicios y agendamiento.",
         "Si faltan datos operativos (pagos/promos/etc.), responde: 'esa información se confirma en la valoración o directamente en la clínica'.",
         "Tu única fuente es el RESUMEN a continuación.",
+        "NO muestres horarios a menos que el usuario lo pida explícitamente (palabras como 'horario', 'días', 'abren', 'atienden', 'trabajan').",
+        "Si preguntan por *servicios* o *precios*, NO incluyas horarios en la respuesta.",
+        "Cuando debas mostrar horario, usa SOLO lo que esté en el RESUMEN (no inventes, no calcules, no asumas).",
+
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
 
@@ -1441,7 +1474,7 @@ export async function handleEsteticaStrategy({
 
 
     // ===== Summary extendido (cacheado y persistido en conversation_state)
-    const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
+
 
     // ===== Pedir piezas SOLO si hay intención de agenda o ya hay piezas
     const needProcedure = !newDraft.procedureId && !newDraft.procedureName;
@@ -1450,6 +1483,8 @@ export async function handleEsteticaStrategy({
 
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
     const infoBreaker = shouldBypassScheduling(userText);
+
+    const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
     const clsGate = await classifyTurnLLM(userText);
     const onlyHoursQuestion = (clsGate.label === "ask_hours") || looksLikeHoursQuestion(userText);
 
@@ -1459,30 +1494,53 @@ export async function handleEsteticaStrategy({
 
 
     // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
-    // ——— PREGUNTA PURA de horarios/días → lista bonita (sin mezclar servicios)
     if (onlyHoursQuestion) {
-        const { list, note } = await buildBusinessHoursList(empresaId);
+        let hoursLine = extractHoursFromSummary(summary);
+        if (!hoursLine || USE_DB_HOURS === false) {
+            // Si no hay línea en el resumen o el flag pide NO usar BD, respondemos solo con lo disponible
+            hoursLine = hoursLine || "Por ahora no tengo el horario detallado en el sistema.";
+            let textHours = `${hoursLine}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
+            textHours = clampText(addEmojiStable(textHours, chatId));
 
-        let textHours = `${list}\n\n${note}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
-        textHours = clampText(addEmojiStable(textHours, chatId));
-
-        const saved = await sendBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto: textHours,
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        };
+            const saved = await sendBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: textHours,
+                nuevoEstado: ConversationEstado.respondido,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+            return {
+                estado: ConversationEstado.respondido,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
+        } else {
+            // (opcional) si quisieras permitir BD cuando USE_DB_HOURS===true, aquí podrías llamar a buildBusinessHoursList
+            let textHours = `${hoursLine}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
+            textHours = clampText(addEmojiStable(textHours, chatId));
+            const saved = await sendBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: textHours,
+                nuevoEstado: ConversationEstado.respondido,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+            return {
+                estado: ConversationEstado.respondido,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
+        }
     }
+
 
 
 
