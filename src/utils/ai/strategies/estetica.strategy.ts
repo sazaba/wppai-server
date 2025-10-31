@@ -20,7 +20,7 @@ const CONF = {
     MEM_TTL_MIN: 60,
     GRAN_MIN: 15,
     MAX_HISTORY: 20,
-    REPLY_MAX_LINES: 5,
+    REPLY_MAX_LINES: 7,
     REPLY_MAX_CHARS: 2200,
     TEMPERATURE: 0.3,
     MODEL: process.env.IA_TEXT_MODEL || "gpt-4o-mini",
@@ -109,6 +109,7 @@ type AgentState = {
     lastIntent?: "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
     lastServiceId?: number | null;
     lastServiceName?: string | null;
+    nameRequested?: boolean;
     draft?: {
         name?: string;
         phone?: string;
@@ -952,31 +953,15 @@ async function buildOrReuseSummary(args: {
 }
 
 /* ===== Detección de handoff listo (nombre + fecha/hora textual + procedimiento) ===== */
-function detectHandoffReady(t: string) {
-    const text = (t || "").toLowerCase();
-
-    const hasName =
-        /\bmi\s+nombre\s+es\s+[a-záéíóúñü\s]{3,}/i.test(t) ||
-        /\bsoy\s+[a-záéíóúñü\s]{3,}/i.test(t);
-
-    const hasDateOrTimeText =
-        /\b(hoy|mañana|manana|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|am|pm|tarde|mañana|manana|noche|mediod[ií]a|medio\s+dia)\b/.test(text) ||
-        /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?\b/.test(text) ||
-        /\b(\d{1,2}[:.]\d{2}\s*(am|pm)?)\b/.test(text);
-
-    const hasProc =
-        /\b(botox|toxina|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|laser|plasma|hilos|armonizaci[oó]n|mesoterapia)\b/.test(
-            text
-        );
-
-    return hasName && hasDateOrTimeText && hasProc;
+// Reemplaza función:
+function detectHandoffReadyDraft(d?: AgentState["draft"]) {
+    const dft = d || {};
+    return !!(dft.name && (dft.whenText || dft.whenISO) && (dft.procedureId || dft.procedureName));
 }
 
 /* ===== Extractores suaves para el borrador (sin normalizar hora) ===== */
 function normalizeName(n: string) {
-    return n
-        .trim()
-        .replace(/\s+/g, " ")
+    return n.trim().replace(/\s+/g, " ")
         .split(" ")
         .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
         .join(" ");
@@ -985,40 +970,20 @@ function normalizeName(n: string) {
 function extractName(raw: string): string | null {
     const t = (raw || "").trim();
 
-    // Patrones explícitos
-    let m =
-        t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\b/i) ||
-        t.match(/^\s*nombre\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\s*$/i);
+    // SOLO cuando el usuario se autoidentifica explícitamente
+    const m =
+        t.match(/\b(?:soy|me\s+llamo|mi\s+nombre\s+es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñü]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñü]+){1,3})\b/i);
 
-    if (m && m[1]) {
-        const name = normalizeName(m[1]);
-        if (/\b(viernes|sábado|sabado|lunes|martes|miércoles|miercoles|jueves|hoy|mañana|manana)\b/i.test(name)) return null;
-        if (/\b(botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i.test(name)) return null;
-        return name;
-    }
-    return null;
+    if (!m || !m[1]) return null;
+
+    const name = normalizeName(m[1]);
+    // Palabras que nunca son nombre
+    const blacklist = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico|quiero|agendar|cita|programar|reservar)\b/i;
+    if (blacklist.test(name.toLowerCase())) return null;
+
+    return name;
 }
-function looksLikeLooseName(raw: string): string | null {
-    const t = (raw || "").trim();
 
-    if (/[0-9@#]/.test(t)) return null;
-
-    const parts = t.split(/\s+/).filter(Boolean);
-    if (parts.length < 2 || parts.length > 4) return null;
-
-    const bad = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|a las|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i;
-    if (bad.test(t.toLowerCase())) return null;
-
-    if (!/^[A-Za-zÁÉÍÓÚÑáéíóúñü\s]+$/.test(t)) return null;
-
-    const normalized = t
-        .replace(/\s+/g, " ")
-        .split(" ")
-        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-        .join(" ");
-
-    return normalized;
-}
 
 /** Extrae *solo* la preferencia temporal (día/fecha + hora) del texto del cliente */
 function extractWhenPreference(raw: string): string | null {
@@ -1237,7 +1202,7 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         model: CONF.MODEL,
         messages,
         temperature: CONF.TEMPERATURE,
-        max_tokens: 220,
+        max_tokens: 320,
     });
     return r?.choices?.[0]?.message?.content?.trim() || "";
 }
@@ -1379,13 +1344,24 @@ export async function handleEsteticaStrategy({
     let nameInText = extractName(userText);
     // Fallback: si aún falta nombre y el usuario envía solo “Juan Camilo López”, tómalos como nombre.
     if (!nameInText) {
-        const stateNow = await loadState(chatId);
-        const needNameNow = !(stateNow.draft?.name);
-        if (needNameNow) {
-            const loose = looksLikeLooseName(userText);
-            if (loose) nameInText = loose;
+        const stNow = await loadState(chatId);
+        if (stNow.nameRequested && !(stNow.draft?.name)) {
+            // acepta nombre suelto SOLO si lo pedimos antes
+            const parts = await (async () => {
+                // reusa la lógica de loose-name con acceso a state:
+                const t = (userText || "").trim();
+                if (/[0-9@#]/.test(t)) return null;
+                const words = t.split(/\s+/).filter(Boolean);
+                if (words.length < 2 || words.length > 4) return null;
+                const bad = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|a las|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico|quiero|agendar|cita|programar|reservar)\b/i;
+                if (bad.test(t.toLowerCase())) return null;
+                if (!/^[A-Za-zÁÉÍÓÚÑáéíóúñü\s]+$/.test(t)) return null;
+                return t;
+            })();
+            if (parts) nameInText = normalizeName(parts);
         }
     }
+    if (nameInText) await patchState(chatId, { nameRequested: false });
 
 
     let match = resolveServiceName(kb, userText || "");
@@ -1469,7 +1445,7 @@ export async function handleEsteticaStrategy({
 
 
     // 2) Si el usuario ya trajo todo → handoff inmediato
-    if (detectHandoffReady(userText) || (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft))) {
+    if (detectHandoffReadyDraft(newDraft)) {
         const piezasBonitas = [
             `💆 *Tratamiento:* ${newDraft.procedureName ?? "—"}`,
             `👤 *Nombre:* ${newDraft.name}`,
@@ -1597,7 +1573,7 @@ export async function handleEsteticaStrategy({
         !onlyHoursQuestion &&
         (wantBookHard || hasTimeAnchor || isAvailabilityQuestion(userText));
     const stForPieces = await loadState(chatId);
-    const allowNudgePieces = canNudgeScheduling(stForPieces);
+    const allowNudgePieces = (wantBookHard ? true : canNudgeScheduling(stForPieces));
 
 
 
@@ -1689,7 +1665,6 @@ export async function handleEsteticaStrategy({
 
 
     if (shouldAskForAgendaPieces && allowNudgePieces && (needProcedure || needWhen || needName)) {
-
         const asks: string[] = [];
         if (needProcedure) {
             const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
@@ -1699,8 +1674,12 @@ export async function handleEsteticaStrategy({
             asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “martes en la tarde” o “15/11 a las 3 pm”).`);
         }
         if (needName) {
-            asks.push(`¿Cuál es tu *nombre completo*?`);
+            asks.push(`¿Cuál es tu *nombre completo*? (por ejemplo: “Mi nombre es Ana María Pérez”)`);
         }
+
+        // << marca que estamos pidiendo nombre
+        await patchState(chatId, { nameRequested: needName ? true : (state.nameRequested ?? false) });
+
         let texto = clampText(asks.join(" "));
         texto = addEmojiStable(texto, chatId);
 
