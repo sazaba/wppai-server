@@ -787,53 +787,149 @@ function detectHandoffReady(t: string) {
     return hasName && hasDateOrTimeText && hasProc;
 }
 
-/* ===== Extractores suaves para el borrador (sin normalizar hora) ===== */
-function normalizeName(n: string) {
-    return n
-        .trim()
-        .replace(/\s+/g, " ")
-        .split(" ")
-        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-        .join(" ");
+/* ====== NAME EXTRACTION (robusto) ====== */
+
+// Stopwords y listas para corte/validación
+const NAME_PARTICLES = new Set([
+    "de", "del", "la", "las", "los", "da", "di", "do", "dos", "das", "van", "von"
+]);
+
+const HARD_STOPS = [
+    ",", ".", ";", ":", "|", "/", "\\", " - ", " — ", " – ", "(", ")", "[", "]", "{", "}", "\n", "\r"
+];
+
+const CONTEXT_STOPS = new RegExp(
+    [
+        "\\b(para|por|con|sin|y|o|pero|aunque|porque|ya|listo|gracias|ok)\\b",
+        "\\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|a\\s*las|semana|mes)\\b",
+        "\\b(botox|toxina|relleno|hialuronico|hialurónico|peeling|hidra|limpieza|depilación|depilacion|laser|plasma|hilos|armonización|armonizacion|mesoterapia)\\b",
+        "\\b\\d{1,2}[:h\\.:-]?\\d{0,2}\\b",
+        "\\b\\d{1,2}[\\/\\-]\\d{1,2}(?:[\\/\\-]\\d{2,4})?\\b"
+    ].join("|"),
+    "i"
+);
+
+const EMAIL_OR_URL = /\b([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|https?:\/\/\S+)\b/i;
+const NON_NAME_CHARS = /[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ'\-\s]/g;
+
+// token de nombre válido (letras con acentos, admite ' y -)
+const NAME_TOKEN = /^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'\-]*$/;
+
+// Normaliza espacios, quita emojis/ruido evidente
+function stripJunk(s: string): string {
+    let t = s.replace(EMAIL_OR_URL, " ");
+    t = t.replace(/[0-9#*_~^`]+/g, " ");
+    t = t.replace(NON_NAME_CHARS, " ");
+    t = t.replace(/\s+/g, " ").trim();
+    return t;
 }
 
-function extractName(raw: string): string | null {
-    const t = (raw || "").trim();
-
-    // Patrones explícitos
-    let m =
-        t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\b/i) ||
-        t.match(/^\s*nombre\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\s*$/i);
-
-    if (m && m[1]) {
-        const name = normalizeName(m[1]);
-        if (/\b(viernes|sábado|sabado|lunes|martes|miércoles|miercoles|jueves|hoy|mañana|manana)\b/i.test(name)) return null;
-        if (/\b(botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i.test(name)) return null;
-        return name;
+// Recorta en el primer delimitador fuerte o contexto sospechoso
+function cutAtStops(s: string): string {
+    for (const stop of HARD_STOPS) {
+        const i = s.indexOf(stop);
+        if (i > -1) s = s.slice(0, i);
     }
+    const m = s.match(CONTEXT_STOPS);
+    if (m && m.index !== undefined) s = s.slice(0, m.index);
+    return s.trim();
+}
+
+// Capitaliza a Nombre Apellido (respetando partículas de/ del/…)
+function normalizeNamePretty(n: string): string {
+    const parts = n.split(/\s+/).filter(Boolean);
+    const out: string[] = [];
+    for (const p of parts) {
+        const low = p.toLowerCase();
+        if (NAME_PARTICLES.has(low)) { out.push(low); continue; }
+        const sub = p.split(/([-'])/).map(seg => {
+            if (seg === "-" || seg === "'") return seg;
+            return seg.charAt(0).toUpperCase() + seg.slice(1).toLowerCase();
+        }).join("");
+        out.push(sub);
+    }
+    return out.join(" ");
+}
+
+// Valida que la secuencia parezca un nombre real
+function looksValidNameSequence(seq: string): boolean {
+    const parts = seq.split(/\s+/).filter(Boolean);
+    if (!parts.length) return false;
+
+    if (parts.length === 1) {
+        const p = parts[0];
+        if (!NAME_TOKEN.test(p)) return false;
+        if (p.length < 2) return false;
+        return true;
+    }
+
+    if (parts.length > 6) return false;
+
+    let validTokens = 0;
+    for (const p of parts) {
+        if (NAME_PARTICLES.has(p.toLowerCase())) continue;
+        if (NAME_TOKEN.test(p)) validTokens++;
+    }
+    return validTokens >= 2;
+}
+
+// Intenta extraer el span a partir de un trigger (soy|me llamo|mi nombre es|nombre:)
+function spanAfterTrigger(text: string): string | null {
+    const rx = /\b(?:soy|me\s+llamo|mi\s+nombre\s+es|nombre\s*:?)\s+(.{1,80})$/i;
+    const m = text.match(rx);
+    if (!m || !m[1]) return null;
+    let span = m[1].trim();
+    span = cutAtStops(span);
+    span = stripJunk(span);
+    if (!span) return null;
+    return span;
+}
+
+// (REEMPLAZA) — extractor principal
+function extractName(raw: string): string | null {
+    if (!raw) return null;
+    // 1) intenta por trigger explícito
+    const t1 = spanAfterTrigger(raw);
+    if (t1) {
+        const pretty = normalizeNamePretty(t1);
+        if (looksValidNameSequence(pretty)) return pretty;
+    }
+
+    // 2) fallback: si el mensaje entero parece ser solo el nombre
+    const cleaned = cutAtStops(stripJunk(raw));
+    if (CONTEXT_STOPS.test(cleaned)) return null;
+    if (EMAIL_OR_URL.test(cleaned)) return null;
+
+    const tokens = cleaned.split(/\s+/).filter(Boolean);
+    if (tokens.length >= 1 && tokens.length <= 6) {
+        let seq = tokens.join(" ");
+        if (!looksValidNameSequence(seq)) {
+            while (tokens.length > 1 && !NAME_TOKEN.test(tokens[tokens.length - 1])) tokens.pop();
+            seq = tokens.join(" ");
+        }
+        const pretty = normalizeNamePretty(seq);
+        if (looksValidNameSequence(pretty)) return pretty;
+    }
+
     return null;
 }
+
+// (REEMPLAZA) — fallback “nombre suelto”
 function looksLikeLooseName(raw: string): string | null {
-    const t = (raw || "").trim();
+    if (!raw) return null;
+    let t = cutAtStops(stripJunk(raw));
+    if (!t) return null;
 
-    if (/[0-9@#]/.test(t)) return null;
+    if (CONTEXT_STOPS.test(t)) return null;
 
-    const parts = t.split(/\s+/).filter(Boolean);
-    if (parts.length < 2 || parts.length > 4) return null;
+    const tokens = t.split(/\s+/).filter(Boolean);
+    if (tokens.length < 1 || tokens.length > 6) return null;
 
-    const bad = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|a las|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i;
-    if (bad.test(t.toLowerCase())) return null;
-
-    if (!/^[A-Za-zÁÉÍÓÚÑáéíóúñü\s]+$/.test(t)) return null;
-
-    const normalized = t
-        .replace(/\s+/g, " ")
-        .split(" ")
-        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-        .join(" ");
-
-    return normalized;
+    const pretty = normalizeNamePretty(t);
+    if (!looksValidNameSequence(pretty)) return null;
+    return pretty;
 }
+
 
 /** Extrae *solo* la preferencia temporal (día/fecha + hora) del texto del cliente */
 function extractWhenPreference(raw: string): string | null {
@@ -1023,17 +1119,19 @@ function isOutOfScope(text: string) {
 async function runLLM({ summary, userText, imageUrl }: any) {
     const sys = [
         "Eres el asistente de una clínica estética.",
-        "Tono humano, cálido y breve. Puedes iniciar con un saludo corto y natural (una sola línea) al inicio de la conversacion y no en ninguna otra parte.",
-        "Usa como máximo un emoji natural (solo uno).",
+        "Tono humano, cálido y breve. Un solo saludo corto solo en el primer turno y como máximo un emoji.",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela tal cual; no calcules ni conviertas.",
-        "Cuando menciones horarios, usa el mismo formato humano del RESUMEN (por ejemplo: “de 9 am a 1 pm”). Si un día no aparece en el RESUMEN, asume que ese día no se trabaja en la clínica.",
-        "Prohibido preguntar '¿te paso precios u horarios?'. En su lugar, si corresponde, pide solo el *día y hora* preferidos.",
+        "Al mostrar horarios, usa SIEMPRE el formato simplificado del RESUMEN si existe (bloque HORARIO_SIMPLE). Ejemplo: 'Lun 9 am–1pm; 2pm–6pm'.",
+        "Si te preguntan por un día específico y ese día NO aparece en HORARIO_SIMPLE ni en HORARIO, responde claramente que ese día NO se trabaja.",
+        "Orden de preferencia para horarios: 1) HORARIO_SIMPLE; 2) HORARIO; si no existe ninguno, di que no tengo el horario en el sistema.",
+        "Prohibido preguntar '¿te paso precios u horarios?'. Si corresponde, pide solo el *día y hora* preferidos.",
         "Si el usuario pregunta fuera de estética, reencausa al ámbito de servicios y agendamiento.",
         "Si faltan datos operativos (pagos/promos/etc.), responde: 'esa información se confirma en la valoración o directamente en la clínica'.",
         "Tu única fuente es el RESUMEN a continuación.",
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
+
 
     const messages: any[] = [{ role: "system", content: sys }];
     if (imageUrl) {
@@ -1060,18 +1158,25 @@ async function runLLM({ summary, userText, imageUrl }: any) {
 /** Clasificador semántico breve (responde SOLO JSON) */
 async function classifyTurnLLM(userText: string): Promise<{ label: "book" | "ask_hours" | "ask_info" | "price" | "other"; confidence: number; }> {
     const sys = [
-        "Eres un clasificador. Respondes SOLO JSON.",
-        "Etiquetas:",
-        "- book: el usuario expresa intención de AGENDAR o propone horario/fecha.",
-        "- ask_hours: PREGUNTA horarios/días de atención sin pedir agendar.",
-        "- ask_info: pregunta informativa (tratamientos, ubicación, etc.).",
-        "- price: pregunta de precios/costos.",
-        "- other: otra cosa.",
+        "Eres un clasificador de intenciones de mensajes de clientes para una clínica estética.",
+        "Tu respuesta debe ser SOLO un JSON en minúsculas con este formato exacto:",
+        '{"label":"...", "confidence":0.0}',
+        "Etiquetas posibles:",
+        "- book: el usuario quiere AGENDAR o propone horario/fecha (ej.: 'quiero cita', 'puedo ir el viernes').",
+        "- ask_hours: el usuario pregunta los horarios o días de atención (ej.: '¿qué días trabajan?', 'abren los domingos?').",
+        "- ask_info: el usuario hace preguntas informativas sobre tratamientos, ubicación, precios, métodos de pago, duración, profesionales, riesgos, cuidados, etc.",
+        "- price: el usuario pregunta directamente el precio o costo de un servicio.",
+        "- other: cualquier otro mensaje que no tenga relación con estética o no pueda clasificarse.",
         "Reglas:",
-        "- Si SOLO pregunta 'de qué hora a qué hora' o 'qué días', es ask_hours.",
-        "- Si dice 'quiero agendar', 'reserva', 'para el viernes 3 pm', es book.",
-        'Devuelve {"label":"...","confidence":0..1}. Nada más.'
+        "- Si menciona 'agendar', 'cita', 'horario', 'reserva', 'puedo ir', 'quiero ir', 'agenda', 'programar' o 'día + hora', clasifica como 'book'.",
+        "- Si pregunta solo 'qué días' o 'de qué hora a qué hora', clasifica como 'ask_hours'.",
+        "- Si pregunta 'qué es', 'cómo funciona', 'beneficios', 'riesgos', 'contraindicaciones', 'dónde están', 'cómo pagar', clasifica como 'ask_info'.",
+        "- Si menciona 'precio', 'cuánto vale', 'cuánto cuesta', 'desde', 'valor', clasifica como 'price'.",
+        "- Si es un saludo, agradecimiento, emoji o texto vacío, devuelve 'other'.",
+        "- Si el mensaje combina precio + cita, prioriza 'book'.",
+        "Nunca devuelvas texto adicional, comentarios ni formato distinto al JSON. Ningún texto fuera del JSON."
     ].join("\n");
+
 
     const r = await openai.chat.completions.create({
         model: CONF.MODEL,
