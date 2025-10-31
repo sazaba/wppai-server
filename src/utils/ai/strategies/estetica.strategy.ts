@@ -21,7 +21,7 @@ const CONF = {
     GRAN_MIN: 15,
     MAX_HISTORY: 20,
     REPLY_MAX_LINES: 5,
-    REPLY_MAX_CHARS: 900,
+    REPLY_MAX_CHARS: 2200,
     TEMPERATURE: 0.3,
     MODEL: process.env.IA_TEXT_MODEL || "gpt-4o-mini",
 };
@@ -945,7 +945,7 @@ async function buildOrReuseSummary(args: {
     lines.push(`${icon("hist")} Historial: ${history || "—"}`);
 
     let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n");
-    compact = softTrim(compact, 2400);
+    compact = softTrim(compact, 5000);
 
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
