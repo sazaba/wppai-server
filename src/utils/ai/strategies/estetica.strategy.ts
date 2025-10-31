@@ -1754,6 +1754,7 @@ type Conf = {
     NAME_ACCEPT_STRICT: boolean;
     NAME_LLM_ENABLED: boolean;
     NAME_LLM_CONF_MIN: number;
+
 };
 
 const CONF: Conf = {
@@ -1769,6 +1770,8 @@ const CONF: Conf = {
     NAME_ACCEPT_STRICT: true,   // acepta solo con gatillo (soy/me llamo/mi nombre es)
     NAME_LLM_ENABLED: true,     // permite NER por LLM como sugerencia
     NAME_LLM_CONF_MIN: 0.85,    // umbral de confianza para sugerir
+
+
 };
 
 const IMAGE_WAIT_MS = 1000;
@@ -2024,7 +2027,7 @@ type Intent = "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
 function detectIntent(text: string, draft: AgentState["draft"]): Intent {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
 
-    // señales de agenda explícita
+    // explícitos
     const scheduleHints = [
         "agendar", "agendo", "agendemos", "agenda", "cita", "programar", "reservar", "reserva",
         "disponible", "disponibilidad", "horario", "hora", "dia", "fecha", "cuando atienden", "para el",
@@ -2032,54 +2035,42 @@ function detectIntent(text: string, draft: AgentState["draft"]): Intent {
     ];
     if (scheduleHints.some(h => t.includes(h))) return "schedule";
 
-    // Si ya trajo alguna pieza REAL de agenda (servicio o fecha/hora), seguimos en schedule
-    if (draft?.procedureId || draft?.procedureName || draft?.whenText || draft?.whenISO) return "schedule";
+    // ⚠️ ya NO activamos schedule por el solo hecho de tener procedure en el draft
+    // (solo será schedule si hay intención explícita o ancla temporal)
+    if (hasConcreteTimeAnchor(t) && hasBookingIntent(t)) return "schedule";
 
-    // precio/costo
     if (/\b(precio|precios|costo|vale|cuanto|desde)\b/.test(t)) return "price";
-
-    // reprogramación / cancelación
     if (/\b(reprogram|cambiar|mover)\b/.test(t)) return "reschedule";
     if (/\b(cancelar|anular)\b/.test(t)) return "cancel";
-
-    // preguntas tipo “¿qué es?”, “¿cómo funciona?”
     if (/\b(que es|como funciona|efectos|riesgos|duracion|contraindicaciones|recomendaciones)\b/.test(t)) return "info";
 
-    // saludo/otros → libre
     return "other";
 }
+
 
 async function detectIntentSmart(text: string, draft: AgentState["draft"]): Promise<Intent> {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
 
-    // Price / cambios / cancelación
     if (/\b(precio|precios|costo|vale|cuanto|desde)\b/.test(t)) return "price";
     if (/\b(reprogram|cambiar|mover)\b/.test(t)) return "reschedule";
     if (/\b(cancelar|anular)\b/.test(t)) return "cancel";
 
-    // IA semántica
     const cls = await classifyTurnLLM(text);
+    const wantBook = hasBookingIntent(t) || cls.label === "book";
+    const hasTimeAnchor = hasConcreteTimeAnchor(t);
 
-    // Consulta pura de horarios → info
+    if (wantBook && hasTimeAnchor) return "schedule";
+
+    // Si pregunta “horarios”, trátalo como info (no agenda)
     if (cls.label === "ask_hours") return "info";
 
-    // Doble señal para activar agenda
-    const wantBook = hasBookingIntent(t) || cls.label === "book";
-    const draftHasPieces = !!(draft?.procedureId || draft?.procedureName || draft?.whenText || draft?.whenISO);
-    const hasTime = hasConcreteTimeAnchor(t) || draftHasPieces;
-
-    if (wantBook && hasTime) return "schedule";
-
-    // Si hay “hora/día/fecha” pero sin intención explícita → info (evita falsos positivos)
-    if (/\b(hora|horario|dia|fecha|am|pm)\b/.test(t) && !wantBook) return "info";
-
-    // Info general/educativa
     if (/\b(que es|como funciona|efectos|riesgos|duracion|contraindicaciones|recomendaciones|ubicacion|direccion|donde|mapa|sede|parqueadero)\b/.test(t)) {
         return "info";
     }
 
     return "other";
 }
+
 
 /* ===== Summary extendido con cache en conversation_state ===== */
 function softTrim(s: string | null | undefined, max = 240) {
@@ -3194,7 +3185,8 @@ export async function handleEsteticaStrategy({
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        await patchState(chatId, { lastIntent: "schedule" });
+        await patchState(chatId, { lastIntent: "info" });
+
         return {
             estado: ConversationEstado.respondido,
             mensaje: saved.texto,
@@ -3217,8 +3209,12 @@ export async function handleEsteticaStrategy({
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
     const infoBreaker = shouldBypassScheduling(
         userText,
-        hasServiceOrWhen || inferredIntent === "schedule" || state.lastIntent === "schedule"
+        (inferredIntent === "schedule") ||
+        state.lastIntent === "schedule" ||
+        hasConcreteTimeAnchor(userText) ||
+        hasBookingIntent(userText)
     );
+
 
     const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
 
@@ -3230,16 +3226,21 @@ export async function handleEsteticaStrategy({
 
         // Si estamos (o parecemos estar) en flujo de agenda y faltan piezas, pídelas al final
         // Política: si pidió agendar o ya hay slots parciales, pide SOLO 1 pieza faltante
-        if (hasServiceOrWhen || inferredIntent === "schedule" || state.lastIntent === "schedule") {
+        // DESPUÉS: solo pedimos piezas si hay clara intención de agendar
+        const clsSoft = await classifyTurnLLM(userText);
+        const wantBookSoft = hasBookingIntent(userText) || clsSoft.label === "book" || hasConcreteTimeAnchor(userText);
+
+        if (wantBookSoft) {
             if (needProcedure || needWhen || needName) {
                 const tail = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
                 if (tail) texto = `${texto}\n\n${tail}`;
             }
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
-            // Invitación suave en respuestas informativas (sin forzar agenda)
-            texto = `${texto}\n\nSi deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.`;
+            // invitación suave, sin pregunta directa
+            texto = `${texto}\n\nSi luego quieres agendar, cuéntame *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.`;
         }
+
 
 
         texto = addEmojiStable(clampText(texto), chatId);
@@ -3262,8 +3263,13 @@ export async function handleEsteticaStrategy({
         };
     }
 
-    const shouldAskForAgendaPieces =
-        !infoBreaker && (inferredIntent === "schedule" || hasServiceOrWhen);
+    const wantBookSoft =
+        hasBookingIntent(userText) ||
+        clsForWhen.label === "book" ||
+        hasConcreteTimeAnchor(userText);
+
+    const shouldAskForAgendaPieces = !infoBreaker && wantBookSoft;
+
 
     if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
         let texto = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
