@@ -1196,15 +1196,6 @@ export async function handleEsteticaStrategy({
     let state = await loadState(chatId);
     let nameInText = extractName(userText);
 
-    if (!nameInText) {
-        const stateNow = await loadState(chatId);
-        const needNameNow = !(stateNow.draft?.name);
-        if (needNameNow) {
-            const loose = looksLikeLooseName(userText);
-            if (loose) nameInText = loose;
-        }
-    }
-
 
     let match = resolveServiceName(kb, userText || "");
     if (!match.procedure) {
