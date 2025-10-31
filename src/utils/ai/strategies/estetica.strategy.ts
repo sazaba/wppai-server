@@ -33,8 +33,6 @@ const REPLY_DEDUP_WINDOW_MS = 120_000;
 
 /* ===== UTILS ===== */
 
-/** Feature flag: NO consultar horarios/turnos en BD en tiempo de respuesta */
-const USE_DB_HOURS = false;
 
 function sleep(ms: number) {
     return new Promise((r) => setTimeout(r, ms));
@@ -162,122 +160,6 @@ async function patchState(conversationId: number, patch: Partial<AgentState>) {
     await saveState(conversationId, { ...prev, ...patch });
 }
 
-/* ===== Helpers para agenda (DB) ===== */
-function pad2(n: number) { return String(n).padStart(2, "0"); }
-function hhmmFrom(raw?: string | null) {
-    if (!raw) return null;
-    const txt = String(raw).trim();            // 👈 asegura quitar espacios
-    const m = txt.match(/^(\d{1,2})(?::?(\d{2}))?/);
-    if (!m) return null;
-    const hh = Math.min(23, Number(m[1] ?? 0));
-    const mm = Math.min(59, Number(m[2] ?? 0));
-    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-}
-
-function weekdayToDow(day: any): number | null {
-    if (day == null) return null;
-
-    // 1) Números directos
-    if (typeof day === "number" && Number.isFinite(day)) {
-        const n = Math.trunc(day);
-        if (n >= 0 && n <= 6) return n;        // 0=Dom … 6=Sab
-        if (n >= 1 && n <= 7) return n === 7 ? 0 : n; // 1=Lun … 7=Dom
-        return null;
-    }
-
-    // 2) Strings (ES/EN, largos y abreviados)
-    const key = String(day || "")
-        .normalize("NFD").replace(/\p{Diacritic}/gu, "")
-        .toUpperCase()
-        .trim();
-
-    const map: Record<string, number> = {
-        // EN largo y corto
-        SUNDAY: 0, SUN: 0,
-        MONDAY: 1, MON: 1,
-        TUESDAY: 2, TUE: 2,
-        WEDNESDAY: 3, WED: 3,
-        THURSDAY: 4, THU: 4,
-        FRIDAY: 5, FRI: 5,
-        SATURDAY: 6, SAT: 6,
-
-        // ES largo y corto
-        DOMINGO: 0, DOM: 0,
-        LUNES: 1, LUN: 1,
-        MARTES: 2, MAR: 2,
-        MIERCOLES: 3, MIE: 3, MIER: 3,
-        JUEVES: 4, JUE: 4,
-        VIERNES: 5, VIE: 5,
-        SABADO: 6, SAB: 6,
-    };
-
-    return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
-}
-
-
-function normalizeHours(rows: any[]) {
-    const byDow: Record<number, Array<{ start: string; end: string }>> = {};
-    for (const r of rows || []) {
-        if (!r) continue;
-        // Si isOpen viene null/undefined, lo consideramos abierto
-        if (r.isOpen === false) continue;
-
-        const dow = weekdayToDow(r.day);
-        if (dow == null) continue;
-
-        const s1 = hhmmFrom(r.start1), e1 = hhmmFrom(r.end1);
-        const s2 = hhmmFrom(r.start2), e2 = hhmmFrom(r.end2);
-
-        if (s1 && e1) (byDow[dow] ||= []).push({ start: s1, end: e1 });
-        if (s2 && e2) (byDow[dow] ||= []).push({ start: s2, end: e2 });
-    }
-    return byDow;
-}
-
-async function fetchAppointmentHours(empresaId: number) {
-    const rows = await prisma.appointmentHour.findMany({
-        where: { empresaId },
-        orderBy: [{ day: "asc" }],
-        select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
-    });
-    return rows;
-}
-async function fetchAppointmentExceptions(empresaId: number, horizonDays = 35) {
-    const now = new Date();
-    const end = new Date(now);
-    end.setDate(end.getDate() + horizonDays);
-    try {
-        const rows: any[] = await (prisma as any).appointment_exeption.findMany({
-            where: { empresaId, date: { gte: now, lte: end } },
-            orderBy: [{ date: "asc" }],
-            select: { date: true, dateISO: true, isOpen: true, open: true, closed: true, motivo: true, reason: true, tz: true },
-        });
-        return rows;
-    } catch {
-        try {
-            const rows: any[] = await (prisma as any).appointment_exception.findMany({
-                where: { empresaId, date: { gte: now, lte: end } },
-                orderBy: [{ date: "asc" }],
-                select: { date: true, dateISO: true, isOpen: true, open: true, closed: true, motivo: true, reason: true, tz: true },
-            });
-            return rows;
-        } catch {
-            return [];
-        }
-    }
-}
-
-function normalizeExceptions(rows: any[]) {
-    const items: Array<{ date: string; closed: boolean; motivo?: string }> = [];
-    for (const r of rows || []) {
-        const closed = (r.isOpen === false) || (r.closed === true) || (r.open === false);
-        const date = r.dateISO ?? (r.date ? new Date(r.date).toISOString().slice(0, 10) : null);
-        if (!date) continue;
-        items.push({ date, closed, motivo: r.motivo ?? r.reason });
-    }
-    return items;
-}
-
 /* ===== INTENT DETECTOR (no forzar agenda) ===== */
 
 /* ==== INFO / SCHEDULE GUARDS (del componente viejo) ==== */
@@ -328,12 +210,6 @@ function hasBookingIntent(t: string): boolean {
 function hasConcreteTimeAnchor(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
     return /\b(\d{1,2}([:.]\d{2})?\s*(am|pm)?)\b/.test(s) || /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?\b/.test(s);
-}
-
-/** Pregunta pura de horarios (informativa, sin intención de reservar) */
-function looksLikeHoursQuestion(t: string): boolean {
-    const s = (t || "").toLowerCase().replace(/[¡!¿?.,]/g, "").trim();
-    return /^(de que hora a que hora trabajan|que dias tienen servicio|cuales son los horarios|que horario manejan|cuando atienden|trabajan todos los dias|atienden sabados|atienden domingos)$/.test(s);
 }
 
 
@@ -397,7 +273,8 @@ async function detectIntentSmart(text: string, draft: AgentState["draft"]): Prom
     const cls = await classifyTurnLLM(text);
 
     // Consulta pura de horarios → info
-    if (cls.label === "ask_hours" || looksLikeHoursQuestion(text)) return "info";
+    if (cls.label === "ask_hours") return "info";
+
 
     // Doble señal para activar agenda
     const wantBook = hasBookingIntent(t) || cls.label === "book";
@@ -429,48 +306,6 @@ function summaryPickLine(summary: string, startsWith: string): string | null {
     return line ? line.trim() : null;
 }
 
-/** Extrae una línea de horario “simple” desde el RESUMEN */
-function extractHoursFromSummary(summary: string): string | null {
-    // Busca la línea que comienza con el ícono de horario del resumen
-    const line = summaryPickLine(summary, "🕒 Horario:");
-    if (!line) return null;
-    // Quitamos el icono y la etiqueta
-    return line.replace(/^🕒\s*Horario:\s*/i, "").trim();
-}
-// ——— Detecta si el texto pregunta por un día específico
-function pickDayFromText(t: string): number | null {
-    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    const map: Record<string, number> = {
-        domingo: 0, dom: 0,
-        lunes: 1, lun: 1,
-        martes: 2, mar: 2,
-        miercoles: 3, miércoles: 3, mie: 3,
-        jueves: 4, jue: 4,
-        viernes: 5, vie: 5,
-        sabado: 6, sábado: 6, sab: 6,
-    };
-    for (const k of Object.keys(map)) {
-        if (new RegExp(`\\b${k}\\b`, "i").test(s)) return map[k];
-    }
-    return null;
-}
-
-// ——— Extrae del HORARIO (línea del resumen) solo el tramo de un día
-function extractDayHoursFromSummary(hoursLine: string, dow: number): string | null {
-    if (!hoursLine) return null;
-    const days = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
-    const dName = days[dow];
-
-    // Buscamos el segmento "Día ..." hasta el próximo "Día ..." o fin de línea
-    const pattern = new RegExp(`${dName}\\s+([^;]*?(?:;\\s*[^A-ZÁÉÍÓÚÑ]*?)?)(?=(?:\\s*(?:Domingo|Lunes|Martes|Miércoles|Jueves|Viernes|Sábado)\\b)|$)`, "i");
-    const m = hoursLine.match(pattern);
-    if (!m) return null;
-
-    // Limpieza: quita el nombre del día si viene incluido
-    let seg = m[0].replace(new RegExp(`^${dName}\\s*`, "i"), "").trim();
-    seg = seg.replace(/^\:\s*/, "").trim();
-    return seg || null;
-}
 
 
 function formatCOP(value?: number | null): string | null {
@@ -478,20 +313,6 @@ function formatCOP(value?: number | null): string | null {
     return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(Number(value));
 }
 
-// ==== Helpers: HH:MM -> "h[:mm] am/pm" y rangos "de X a Y" ====
-function toAmPm(hhmm: string): string {
-    const [H, M] = hhmm.split(":").map(Number);
-    const h12 = ((H % 12) || 12);
-    const mm = (M ?? 0) === 0 ? "" : `:${String(M).padStart(2, "0")}`;
-    const suf = H < 12 ? "am" : "pm";
-    return `${h12}${mm} ${suf}`;
-}
-function renderHumanRange(r: { start: string; end: string }): string {
-    return `de ${toAmPm(r.start)} a ${toAmPm(r.end)}`;
-}
-function renderDayRangesHuman(ranges: Array<{ start: string; end: string }>): string {
-    return ranges.map(renderHumanRange).join("; ");
-}
 
 /** Lista bonita de servicios con emojis y saltos de línea */
 function formatServicesPretty(kb: EsteticaKB, max = 8): string {
@@ -505,72 +326,10 @@ function formatServicesPretty(kb: EsteticaKB, max = 8): string {
     return items.length ? items.join("\n") : "• ✨ (Aún no hay servicios configurados)";
 }
 
-/** Convierte rangos por día en una lista con emojis por día */
-function renderHoursAsList(byDow: Record<number, Array<{ start: string; end: string }>>): string {
-    const dayFull = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
-    const dayIcon = ["🛌", "🗓️", "🗓️", "🗓️", "🗓️", "🗓️", "🗓️"];
-    const lines: string[] = [];
-    for (let d = 0; d < 7; d++) {
-        const ranges = byDow[d];
-        if (ranges?.length) {
-            const human = ranges.map(r => `${toAmPm(r.start)} – ${toAmPm(r.end)}`).join(" • ");
-            lines.push(`${dayIcon[d]} *${dayFull[d]}*: ${human}`);
-        }
-    }
-    return lines.join("\n");
-}
-
-/** Construye lista bonita de horarios desde la BD */
-async function buildBusinessHoursList(empresaId: number): Promise<{ list: string; note: string }> {
-    const rows = await fetchAppointmentHours(empresaId);
-    const byDow = normalizeHours(rows);
-    const list = renderHoursAsList(byDow);
-    const note = "📝 Nota: si un día *no aparece*, ese día no se atiende.";
-    return { list: list || "Por ahora no tengo registrado el horario en el sistema.", note };
-}
 
 
 
-async function buildBusinessRangesHuman(
-    empresaId: number,
-    kb: EsteticaKB,
-    opts?: { defaultDurMin?: number; rows?: any[] }
-): Promise<{ human: string; lastStart?: string }> {
-    const rows = opts?.rows ?? await fetchAppointmentHours(empresaId);
-    const byDow = normalizeHours(rows);
 
-    const dayFull = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
-
-    // Construcción "humana": "Lunes de 9 am a 1 pm; de 2 pm a 6 pm"
-    const parts: string[] = [];
-    for (let d = 0; d < 7; d++) {
-        const ranges = byDow[d];
-        if (ranges?.length) {
-            parts.push(`${dayFull[d]} ${renderDayRangesHuman(ranges)}`);
-        }
-    }
-    const human = parts.join("; ");
-
-    // Cálculo de "última cita de referencia" (idem a tu lógica previa)
-    const dur = Math.max(30, opts?.defaultDurMin ?? (kb.defaultServiceDurationMin ?? 60));
-    const weekdays = [1, 2, 3, 4, 5];
-    const endsWeekdays: string[] = [];
-    const endsAll: string[] = [];
-
-    for (const d of weekdays) for (const r of (byDow[d] || [])) if (r.end) endsWeekdays.push(r.end);
-    for (let d = 0; d < 7; d++) for (const r of (byDow[d] || [])) if (r.end) endsAll.push(r.end);
-    const pool = endsWeekdays.length ? endsWeekdays : endsAll;
-    if (!pool.length) return { human, lastStart: undefined };
-
-    const maxEnd = pool.sort()[pool.length - 1];
-    const [eh, em] = maxEnd.split(":").map(Number);
-    const startMins = eh * 60 + em - dur;
-    const sh = Math.max(0, Math.floor(startMins / 60));
-    const sm = Math.max(0, startMins % 60);
-    const lastStart = `${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}`;
-
-    return { human, lastStart };
-}
 
 function paymentMethodsFromKB(kb: EsteticaKB): string[] {
     const list: string[] = [];
@@ -605,54 +364,42 @@ async function buildOrReuseSummary(args: {
     const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
     if (fresh) return cached.summary!.text;
 
-    const [hoursRows, exceptionsRows, apptCfg] = await Promise.all([
-        fetchAppointmentHours(empresaId),
-        fetchAppointmentExceptions(empresaId, 35),
-        prisma.businessConfigAppt.findUnique({
-            where: { empresaId },
-            select: {
-                appointmentEnabled: true,
-                appointmentTimezone: true,
-                appointmentBufferMin: true,
-                appointmentMinNoticeHours: true,
-                appointmentMaxAdvanceDays: true,
-                allowSameDayBooking: true,
-                defaultServiceDurationMin: true,
-                appointmentPolicies: true,
-                locationName: true,
-                locationAddress: true,
-                locationMapsUrl: true,
-                parkingInfo: true,
-                instructionsArrival: true,
-                noShowPolicy: true,
-                depositRequired: true,
-                depositAmount: true,
-                servicesText: true,
-                services: true,
-                kbBusinessOverview: true,
-                kbFAQs: true,
-                kbServiceNotes: true,
-                kbEscalationRules: true,
-                kbDisclaimers: true,
-                kbMedia: true,
-                kbFreeText: true,
-            },
-        }),
-    ]);
+    // Solo config general; NADA de appointmentHours/Exceptions
+    const apptCfg = await prisma.businessConfigAppt.findUnique({
+        where: { empresaId },
+        select: {
+            appointmentEnabled: true,
+            appointmentTimezone: true,
+            appointmentBufferMin: true,
+            appointmentMinNoticeHours: true,
+            appointmentMaxAdvanceDays: true,
+            allowSameDayBooking: true,
+            defaultServiceDurationMin: true,
+            appointmentPolicies: true,
+            locationName: true,
+            locationAddress: true,
+            locationMapsUrl: true,
+            parkingInfo: true,
+            instructionsArrival: true,
+            noShowPolicy: true,
+            depositRequired: true,
+            depositAmount: true,
+            servicesText: true,
+            services: true,
+            kbBusinessOverview: true,
+            kbFAQs: true,
+            kbServiceNotes: true,
+            kbEscalationRules: true,
+            kbDisclaimers: true,
+            kbMedia: true,
+            kbFreeText: true,
+        },
+    });
 
-    const { human: hoursLine, lastStart } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
-    const exceptions = normalizeExceptions(exceptionsRows);
-    const exLine = exceptions.filter(e => e.closed).slice(0, 10).map(e => e.date).join(", ");
-    const exceptionsLine = exLine ? `Excepciones (cerrado): ${exLine}` : "";
-
-    const svcFromKB = (kb.procedures ?? [])
-        .filter(s => s.enabled !== false)
-        .map(s => (s.priceMin ? `${s.name} (Desde ${formatCOP(s.priceMin)})` : s.name))
-        .join(" • ");
-
+    // Pagos (opcional)
     const payments = paymentMethodsFromKB(kb);
-    const paymentsLine = payments.length ? `Pagos: ${payments.join(" • ")}` : "";
 
+    // Historial compacto
     const msgs = await prisma.message.findMany({
         where: { conversationId },
         orderBy: { timestamp: "desc" },
@@ -664,22 +411,26 @@ async function buildOrReuseSummary(args: {
         .map((m) => `${m.from === MessageFrom.client ? "U" : "A"}: ${softTrim(m.contenido || "", 100)}`)
         .join(" | ");
 
-    const S = apptCfg || ({} as any);
+    // Intento de extraer un horario "tal cual" desde KB/config, sin calcular
+    let hoursLine: string | null = null;
+    const hoursFromKB = (kb as any).hoursSimple || (kb as any).hours || null;
+    if (hoursFromKB) hoursLine = String(hoursFromKB).trim();
 
-    // ==== Normalizar FAQs =====
-    type FAQ = { q: string; a: string };
-
-    function parseMaybeJson<T = any>(val: any): T | any {
-        if (typeof val === "string") {
-            try { return JSON.parse(val); } catch { /* noop */ }
-        }
-        return val;
+    // También permitimos que lo hayas escrito en kbFreeText como: "🕒 Horario: L–V 9–1; 2–6"
+    if (!hoursLine && apptCfg?.kbFreeText) {
+        const m = String(apptCfg.kbFreeText).match(/🕒\s*Horario:\s*([^\n]+)/i);
+        if (m) hoursLine = m[1].trim();
     }
 
+    // FAQs (mismo parser que ya tenías)
+    type FAQ = { q: string; a: string };
+    function parseMaybeJson<T = any>(val: any): T | any {
+        if (typeof val === "string") { try { return JSON.parse(val); } catch { } }
+        return val;
+    }
     function toFaqArray(src: any): FAQ[] {
         const v = parseMaybeJson(src);
         if (!v) return [];
-
         if (Array.isArray(v)) {
             if (v.length && typeof v[0] === "string") {
                 return v.map((s: string) => {
@@ -694,28 +445,23 @@ async function buildOrReuseSummary(args: {
                 })).filter(f => f.q && f.a);
             }
         }
-
         if (typeof v === "object") {
             return Object.entries(v).map(([q, a]) => ({
                 q: String(q).trim(),
                 a: String(a ?? "").trim(),
             })).filter(f => f.q && f.a);
         }
-
         if (typeof v === "string") {
             return v.split(/\r?\n/).map(l => {
                 const [q, a] = l.split("|");
                 return { q: (q || "").trim(), a: (a || "").trim() };
             }).filter(f => f.q && f.a);
         }
-
         return [];
     }
-
-    const faqsFromCfg = toFaqArray(S.kbFAQs);
+    const faqsFromCfg = toFaqArray(apptCfg?.kbFAQs);
     const faqsFromKB1 = toFaqArray((kb as any).kbFAQs);
     const faqsFromKB2 = toFaqArray((kb as any).faqs);
-
     const seen = new Set<string>();
     const faqsArr = [...faqsFromCfg, ...faqsFromKB1, ...faqsFromKB2]
         .filter(f => f && f.q && f.a)
@@ -726,29 +472,12 @@ async function buildOrReuseSummary(args: {
             return true;
         });
 
-    console.log("FAQs sizes =>", {
-        cfg: faqsFromCfg.length,
-        kb1: faqsFromKB1.length,
-        kb2: faqsFromKB2.length,
-        merged: faqsArr.length,
-    });
-
-    const faqsLine = faqsArr.length
-        ? "FAQs: " +
-        faqsArr
-            .slice(0, 5)
-            .map(f => `${softTrim(f.q, 60)} → ${softTrim(f.a, 120)}`)
-            .join(" | ")
-        : "";
-
-    function icon(label: "biz" | "tz" | "agenda" | "rules" | "log" | "pol" | "pay" | "svc" | "hrs" | "exc" | "faq" | "note" | "hist") {
-        const map = {
-            biz: "🏥", tz: "🌐", agenda: "⏰", rules: "📋", log: "📍", pol: "🧾",
-            pay: "💳", svc: "✨", hrs: "🕒", exc: "🚫", faq: "💬", note: "📝", hist: "🧠"
-        } as const;
+    function icon(label: "biz" | "tz" | "rules" | "log" | "pol" | "pay" | "svc" | "hrs" | "faq" | "note" | "hist") {
+        const map = { biz: "🏥", tz: "🌐", rules: "📋", log: "📍", pol: "🧾", pay: "💳", svc: "✨", hrs: "🕒", faq: "💬", note: "📝", hist: "🧠" } as const;
         return map[label];
     }
 
+    const S = apptCfg || ({} as any);
     const lines: string[] = [];
     lines.push(`${icon("biz")} *${kb.businessName || "Clínica estética"}*`);
     lines.push(`${icon("tz")} Zona horaria: ${S.appointmentTimezone || kb.timezone}`);
@@ -788,24 +517,19 @@ async function buildOrReuseSummary(args: {
         .join(" • ");
     if (svcList) lines.push(`${icon("svc")} Servicios: ${svcList}`);
 
-    if (hoursLine) {
-        lines.push(`${icon("hrs")} Horario: ${hoursLine}${lastStart ? `; última cita ref. ${lastStart}` : ""}`);
-        lines.push(`📝 Nota: Si un día no aparece arriba, ese día no se atiende en la clínica.`);
-    }
-
-    if (exceptionsLine) lines.push(`${icon("exc")} ${exceptionsLine}`);
+    if (hoursLine) lines.push(`${icon("hrs")} Horario: ${hoursLine}`);
 
     if (faqsArr.length) {
-        lines.push(`${icon("faq")} *FAQs rápidas*`);
+        lines.push(`💬 *FAQs rápidas*`);
         for (const f of faqsArr.slice(0, 5)) {
             lines.push(`• ${softTrim(f.q, 60)} → ${softTrim(f.a, 140)}`);
         }
     }
 
-    if (S.kbBusinessOverview) lines.push(`${icon("note")} ${softTrim(S.kbBusinessOverview, 260)}`);
-    if (S.kbFreeText) lines.push(`${icon("note")} ${softTrim(S.kbFreeText, 260)}`);
+    if (S.kbBusinessOverview) lines.push(`📝 ${softTrim(S.kbBusinessOverview, 260)}`);
+    if (S.kbFreeText) lines.push(`📝 ${softTrim(S.kbFreeText, 260)}`);
 
-    lines.push(`${icon("hist")} Historial: ${history || "—"}`);
+    lines.push(`🧠 Historial: ${history || "—"}`);
 
     let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n");
     compact = softTrim(compact, 2400);
@@ -813,6 +537,7 @@ async function buildOrReuseSummary(args: {
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
 }
+
 
 /* ===== Detección de handoff listo (nombre + fecha/hora textual + procedimiento) ===== */
 function detectHandoffReady(t: string) {
@@ -982,37 +707,60 @@ function looksLikeLooseName(raw: string): string | null {
 function extractWhenPreference(raw: string): string | null {
     const t = String(raw || "");
 
-    // Patrones comunes (ordenados de más específicos a más generales)
+    // Día + parte del día, con y sin "el"
     const patterns: RegExp[] = [
-        // "jueves a las 3 pm", "viernes 2:30 pm", "lun 11 am", "jueves 15:00"
-        /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s*(?:\d{1,2}[:.]\d{2})?\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi,
-        // "el jueves a las 3 pm"
-        /\bel\s*(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi,
-        // "15/11 a las 3 pm", "15-11 3 pm", "15/11"
+        // "el sábado en la mañana", "el martes en la tarde"
+        /\bel\s+(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s+en\s+la\s+(mañana|manana|tarde|noche)\b/gi,
+        // "sábado en la mañana"
+        /\b(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s+en\s+la\s+(mañana|manana|tarde|noche)\b/gi,
+
+        // Día + hora (ya existentes)
+        /\b(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s*(?:\d{1,2}[:.]\d{2})?\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi,
+        /\bel\s*(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi,
+
+        // Fecha numérica (ya existente)
         /\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?(?:\s*(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/gi,
-        // "mañana a las 3 pm", "hoy 11 am", "próximo jueves en la tarde"
-        /\b(hoy|mañana|manana|pr[oó]ximo\s+(?:lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)|esta\s+semana|la\s+pr[oó]xima\s+semana)\b(?:.*?\b(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?/gi,
-        // "jueves en la tarde", "martes en la mañana"
-        /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\s+en\s+la\s+(mañana|manana|tarde|noche)\b/gi,
+
+        // Expresiones sueltas mejoradas
+        /\b(sobre\s+las|tipo)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi,              // "sobre las 3", "tipo 4 pm"
+        /\bentre\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+y\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi, // "entre 3 y 4 pm"
+        /\b(a\s+primera\s+hora|al\s+mediod[ií]a|al\s+medio\s+dia)\b/gi,           // "a primera hora", "al mediodía"
+
+        // Contexto relativo + posible hora (deja al final)
+        /\b(hoy|mañana|manana|pr[oó]ximo\s+(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)|esta\s+semana|la\s+pr[oó]xima\s+semana)\b(?:.*?\b(?:a\s*las)?\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?/gi,
     ];
 
+    const matches: string[] = [];
     for (const rx of patterns) {
-        const m = t.match(rx);
-        if (m && m[0]) {
-            // Limpia doble espacios y deja solo el segmento temporal
-            return m[0].replace(/\s+/g, " ").trim();
+        let m: RegExpExecArray | null;
+        const copy = new RegExp(rx, rx.flags); // resettable
+        while ((m = copy.exec(t)) !== null) {
+            matches.push(m[0].replace(/\s+/g, " ").trim());
         }
     }
 
-    // Fallback muy suave: si el texto está lleno de pistas de fecha/hora, corta la frase alrededor de ellas
+    if (matches.length) {
+        // 1) Si alguna contiene día de la semana, priorízala
+        const dayRx = /\b(lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo)\b/i;
+        const withDay = matches.filter(x => dayRx.test(x));
+        if (withDay.length) {
+            // Devuelve la más larga (más contexto)
+            return withDay.sort((a, b) => b.length - a.length)[0];
+        }
+        // 2) Si no hay día, devuelve la más larga
+        return matches.sort((a, b) => b.length - a.length)[0];
+    }
+
+    // Fallback suave (evita devolver solo "mañana" si el texto tenía más)
     const hasHints =
-        /\b(hoy|mañana|manana|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|am|pm|a\s*las|semana|mes)\b/i.test(t) ||
+        /\b(hoy|mañana|manana|lunes|martes|mi[eé]rcoles|miercoles|jueves|viernes|s[áa]bado|sabado|domingo|am|pm|a\s*las|semana|mes|mañana|manana)\b/i.test(t) ||
         /\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\b/.test(t) ||
         /\b\d{1,2}[:.]\d{2}\b/.test(t);
 
     if (hasHints) return softTrim(raw, 60);
     return null;
 }
+
 
 function hasSomeDateDraft(d?: AgentState["draft"]) {
     return !!(d?.whenISO || d?.whenText);
@@ -1166,23 +914,21 @@ function isOutOfScope(text: string) {
 async function runLLM({ summary, userText, imageUrl }: any) {
     const sys = [
         "Eres el asistente de una clínica estética.",
-        "Tono humano, cálido y breve. Un solo saludo corto solo en el primer turno y como máximo un emoji.",
+        "Tono humano, cálido y breve. Un solo saludo (solo en el primer turno) y a lo sumo un emoji.",
         "No des precios exactos; usa 'desde' si existe priceMin.",
         "No infieras horas: si el cliente escribe la hora, repítela tal cual; no calcules ni conviertas.",
-        "Al mostrar horarios, usa SIEMPRE el formato simplificado del RESUMEN si existe (bloque HORARIO_SIMPLE). Ejemplo: 'Lun 9 am–1pm; 2pm–6pm'.",
-        "Si te preguntan por un día específico y ese día NO aparece en HORARIO_SIMPLE ni en HORARIO, responde claramente que ese día NO se trabaja.",
-        "Orden de preferencia para horarios: 1) HORARIO_SIMPLE; 2) HORARIO; si no existe ninguno, di que no tengo el horario en el sistema.",
-        "Prohibido preguntar '¿te paso precios u horarios?'. Si corresponde, pide solo el *día y hora* preferidos.",
-        "Si el usuario pregunta fuera de estética, reencausa al ámbito de servicios y agendamiento.",
+        // === REGLAS DE HORARIOS ===
+        "NO muestres horarios a menos que el usuario lo pida explícitamente (palabras como: horario, horarios, días, abren, atienden, trabajan, ‘¿de qué hora a qué hora?’).",
+        "Si el usuario pregunta por servicios o precios, NO incluyas horarios en esa respuesta.",
+        "Al mostrar horarios, usa SOLO lo que esté en el RESUMEN (no inventes, no completes, no asumas).",
+        "Prefiere el bloque HORARIO_SIMPLE; si no existe, usa HORARIO. Si no hay ninguno, dilo de forma clara: 'Por ahora no tengo el horario en el sistema.'",
+        "Formato corto de ejemplo (NO hardcodees): 'L 9am–1pm, 2pm–6pm; M 9am–1pm, 2pm–6pm; …'. Puedes usar abreviaturas L, M, X, J, V, S, D si el RESUMEN lo permite; si el RESUMEN ya trae otro formato, respétalo.",
+        "Si preguntan por un día específico y ese día NO aparece en HORARIO_SIMPLE ni en HORARIO, responde claramente: 'Ese día no trabajamos en la clínica.'",
+        // === ALCANCE Y FUENTES ===
         "Si faltan datos operativos (pagos/promos/etc.), responde: 'esa información se confirma en la valoración o directamente en la clínica'.",
         "Tu única fuente es el RESUMEN a continuación.",
-        "NO muestres horarios a menos que el usuario lo pida explícitamente (palabras como 'horario', 'días', 'abren', 'atienden', 'trabajan').",
-        "Si preguntan por *servicios* o *precios*, NO incluyas horarios en la respuesta.",
-        "Cuando debas mostrar horario, usa SOLO lo que esté en el RESUMEN (no inventes, no calcules, no asumas).",
-
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
-
 
     const messages: any[] = [{ role: "system", content: sys }];
     if (imageUrl) {
@@ -1348,32 +1094,44 @@ export async function handleEsteticaStrategy({
     // 1) Actualiza draft con lo que venga en texto
     let state = await loadState(chatId);
     let nameInText = extractName(userText);
-    // Fallback: si aún falta nombre y el usuario envía solo “Juan Camilo López”, tómalos como nombre.
-    // if (!nameInText) {
-    //     const stateNow = await loadState(chatId);
-    //     const needNameNow = !(stateNow.draft?.name);
-    //     if (needNameNow) {
-    //         const loose = looksLikeLooseName(userText);
-    //         if (loose) nameInText = loose;
-    //     }
-    // }
+
+    if (!nameInText) {
+        const stateNow = await loadState(chatId);
+        const needNameNow = !(stateNow.draft?.name);
+        if (needNameNow) {
+            const loose = looksLikeLooseName(userText);
+            if (loose) nameInText = loose;
+        }
+    }
 
 
     let match = resolveServiceName(kb, userText || "");
     if (!match.procedure) {
-        // sinónimos mínimos
         const t = (userText || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-        if (/\bbotox|toxina\b/.test(t)) {
-            const tox = kb.procedures.find((p) => /toxina\s*botul/i.test(p.name));
-            if (tox) match = { procedure: tox, matched: tox.name };
-        } else if (/\blimpieza\b/.test(t)) {
-            const limp = kb.procedures.find((p) => /limpieza/i.test(p.name));
-            if (limp) match = { procedure: limp, matched: limp.name };
-        } else if (/\bpeeling\b/.test(t)) {
-            const pe = kb.procedures.find((p) => /peeling/i.test(p.name));
-            if (pe) match = { procedure: pe, matched: pe.name };
+        // Diccionario muy corto de palabras-clave → chequeo por nombre/alias
+        const hints = [
+            { kw: /\b(botox|toxina)\b/, pick: /toxina|b[oó]tox/ },
+            { kw: /\blimpieza\b/, pick: /limpieza|hydra|hidra/ },
+            { kw: /\bpeeling\b/, pick: /peeling/ },
+            { kw: /\b(hialuron|relleno)\b/, pick: /hialur[oó]nico|relleno/ },
+            { kw: /\b(l[aá]ser|laser)\b/, pick: /laser|l[aá]ser/ },
+            { kw: /\b(meso|mesoterapia)\b/, pick: /mesoterapia/ },
+        ];
+        const tryPick = (rxPick: RegExp) => {
+            return kb.procedures.find(p => {
+                const name = (p.name || "").toLowerCase();
+                const aliases = Array.isArray(p.aliases) ? p.aliases.join(" ").toLowerCase() : "";
+                return rxPick.test(name) || rxPick.test(aliases);
+            }) || null;
+        };
+        for (const h of hints) {
+            if (h.kw.test(t)) {
+                const found = tryPick(h.pick);
+                if (found) { match = { procedure: found, matched: found.name }; break; }
+            }
         }
     }
+
 
     const prevDraft = state.draft ?? {};
     const whenFreeCandidate = extractWhenPreference(userText);
@@ -1463,7 +1221,6 @@ export async function handleEsteticaStrategy({
     }
 
     // ——— Respuesta directa a “qué servicios”
-    // ——— Respuesta directa a “qué servicios”
     if (/\b(que\s+servicios|qué\s+servicios|servicios\s+ofreces?)\b/i.test(userText)) {
         const serviciosBonitos = formatServicesPretty(kb, 8);
 
@@ -1489,11 +1246,6 @@ export async function handleEsteticaStrategy({
         };
     }
 
-
-
-    // ===== Summary extendido (cacheado y persistido en conversation_state)
-
-
     // ===== Pedir piezas SOLO si hay intención de agenda o ya hay piezas
     const needProcedure = !newDraft.procedureId && !newDraft.procedureName;
     const needWhen = !hasSomeDateDraft(newDraft);
@@ -1503,125 +1255,10 @@ export async function handleEsteticaStrategy({
     const infoBreaker = shouldBypassScheduling(userText);
 
     const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
-    const clsGate = await classifyTurnLLM(userText);
-    const onlyHoursQuestion = (clsGate.label === "ask_hours") || looksLikeHoursQuestion(userText);
+
 
     const shouldAskForAgendaPieces =
-        !infoBreaker && !onlyHoursQuestion &&
-        (inferredIntent === "schedule" || hasServiceOrWhen);
-
-    // ——— Si el usuario pregunta por un DÍA puntual ("¿trabajan el domingo?")
-    const askedDow = pickDayFromText(userText);
-    if (askedDow !== null) {
-        const hoursLine = extractHoursFromSummary(summary); // SIEMPRE desde el RESUMEN
-        let reply: string;
-        if (!hoursLine) {
-            reply = "Por ahora no tengo el horario en el sistema. Si deseas, dime el *día y hora* que prefieres y verifico disponibilidad.";
-        } else {
-            const seg = extractDayHoursFromSummary(hoursLine, askedDow);
-            if (!seg) {
-                // Ese día no figura en el resumen → no se atiende
-                reply = "Ese día *no atendemos* en la clínica. Si gustas, dime otro *día y hora* y verifico disponibilidad.";
-            } else {
-                const days = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
-                reply = `*${days[askedDow]}*: ${seg}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
-            }
-        }
-        const texto = clampText(addEmojiStable(reply, chatId));
-        const saved = await sendBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto,
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        };
-    }
-
-
-    // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
-    if (onlyHoursQuestion) {
-        let hoursLine = extractHoursFromSummary(summary);
-        if (!hoursLine || USE_DB_HOURS === false) {
-            // Si no hay línea en el resumen o el flag pide NO usar BD, respondemos solo con lo disponible
-            hoursLine = hoursLine || "Por ahora no tengo el horario detallado en el sistema.";
-            let textHours = `${hoursLine}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
-            textHours = clampText(addEmojiStable(textHours, chatId));
-
-            const saved = await sendBotReply({
-                conversationId: chatId,
-                empresaId,
-                texto: textHours,
-                nuevoEstado: ConversationEstado.respondido,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
-            });
-            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-            return {
-                estado: ConversationEstado.respondido,
-                mensaje: saved.texto,
-                messageId: saved.messageId,
-                wamid: saved.wamid,
-                media: [],
-            };
-        } else {
-            // (opcional) si quisieras permitir BD cuando USE_DB_HOURS===true, aquí podrías llamar a buildBusinessHoursList
-            let textHours = `${hoursLine}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
-            textHours = clampText(addEmojiStable(textHours, chatId));
-            const saved = await sendBotReply({
-                conversationId: chatId,
-                empresaId,
-                texto: textHours,
-                nuevoEstado: ConversationEstado.respondido,
-                to: toPhone ?? conversacion.phone,
-                phoneNumberId,
-            });
-            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-            return {
-                estado: ConversationEstado.respondido,
-                mensaje: saved.texto,
-                messageId: saved.messageId,
-                wamid: saved.wamid,
-                media: [],
-            };
-        }
-    }
-
-
-
-
-
-    if (/\b(hora|horario|dias?|fecha)\b/i.test(userText) && inferredIntent !== "schedule") {
-        const clarify = addEmojiStable(
-            "¿Deseas conocer nuestros *horarios de atención* o prefieres que tomemos *un horario concreto* para agendar?",
-            chatId
-        );
-        const saved = await sendBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto: clampText(clarify),
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        };
-    }
-
+        !infoBreaker && (inferredIntent === "schedule" || hasServiceOrWhen);
 
 
     if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
