@@ -20,8 +20,8 @@ const CONF = {
     MEM_TTL_MIN: 60,
     GRAN_MIN: 15,
     MAX_HISTORY: 20,
-    REPLY_MAX_LINES: 7,
-    REPLY_MAX_CHARS: 2200,
+    REPLY_MAX_LINES: 5,
+    REPLY_MAX_CHARS: 900,
     TEMPERATURE: 0.3,
     MODEL: process.env.IA_TEXT_MODEL || "gpt-4o-mini",
 };
@@ -109,7 +109,6 @@ type AgentState = {
     lastIntent?: "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
     lastServiceId?: number | null;
     lastServiceName?: string | null;
-    nameRequested?: boolean;
     draft?: {
         name?: string;
         phone?: string;
@@ -122,33 +121,10 @@ type AgentState = {
     summary?: { text: string; expiresAt: string };
     expireAt?: string;
     handoffLocked?: boolean;
-    ctaNudges?: number;           // cuántas veces se le pidió "día y hora"
-    lastNudgeAt?: string;         // ISO de la última vez que se nudgueó
-
 };
-function inSchedulingFlow(st: AgentState, d?: AgentState["draft"]) {
-    const draft = d || st.draft || {};
-    return st.lastIntent === "schedule" ||
-        !!(draft?.procedureId || draft?.procedureName || draft?.whenText || draft?.whenISO);
-}
-
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
-function canNudgeScheduling(st: AgentState, windowMin = 360) {
-    const last = st.lastNudgeAt ? Date.parse(st.lastNudgeAt) : 0;
-    const ageOk = !last || (Date.now() - last) >= windowMin * 60_000; // 6h por defecto
-    const budgetOk = (st.ctaNudges ?? 0) < 2; // como máximo 2 nudges por conversación
-    return ageOk && budgetOk && !st.handoffLocked;
-}
-async function markNudged(conversationId: number) {
-    const st = await loadState(conversationId);
-    await patchState(conversationId, {
-        ctaNudges: (st.ctaNudges ?? 0) + 1,
-        lastNudgeAt: new Date().toISOString(),
-    });
-}
-
 async function loadState(conversationId: number): Promise<AgentState> {
     const row = await prisma.conversationState.findUnique({
         where: { conversationId },
@@ -164,9 +140,6 @@ async function loadState(conversationId: number): Promise<AgentState> {
         summary: raw.summary ?? undefined,
         expireAt: raw.expireAt,
         handoffLocked: !!raw.handoffLocked,
-        ctaNudges: raw.ctaNudges ?? 0,
-        lastNudgeAt: raw.lastNudgeAt ?? undefined,
-
     };
     const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
     if (expired) return { greeted: data.greeted, handoffLocked: data.handoffLocked, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
@@ -302,23 +275,6 @@ function normalizeExceptions(rows: any[]) {
 }
 
 /* ===== INTENT DETECTOR (no forzar agenda) ===== */
-// —— desde aquí: SOFT EXIT detector —— 
-function isSoftExit(text: string): boolean {
-    const s = (text || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase().trim();
-    const exits = [
-        // desiste por ahora
-        /\b(por ahora no|luego te confirmo|mas tarde te confirmo|despues te confirmo|despues hablamos|solo estaba preguntando|solo preguntaba|solo queria saber)\b/,
-        // no desea agendar
-        /\b(no quiero agendar|no deseo agendar|no agendemos|dejemos asi|dejalo asi)\b/,
-        // posponer sin pedir reprogramar
-        /\b(en otro momento|mas adelante|quiza despues|quizas despues)\b/,
-        // cierre cortés
-        /\b(gracias? igualmente|gracias? por la info|listo gracias|ok gracias)\b/,
-    ];
-    return exits.some(rx => rx.test(s));
-}
-// —— hasta aquí: SOFT EXIT detector ——
-
 
 /* ==== INFO / SCHEDULE GUARDS (del componente viejo) ==== */
 function isSchedulingCue(t: string): boolean {
@@ -332,10 +288,9 @@ function isSchedulingCue(t: string): boolean {
 function isShortQuestion(t: string): boolean {
     const s = (t || "").trim();
     const noSpaces = s.replace(/\s+/g, "");
-    const looksQuestion = /[?¿]/.test(s) || /\b(hacen|tienen|hay|puedo|me cubre|sirve|marca|usan|utilizan)\b/i.test(s); // 👈 añade verbos típicos
-    return looksQuestion && s.length <= 120 && noSpaces.length >= 2;
+    const hasQM = /[?¿]/.test(s);
+    return hasQM && s.length <= 120 && noSpaces.length >= 2;
 }
-
 
 function containsDateOrTimeHints(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
@@ -348,9 +303,7 @@ function containsDateOrTimeHints(t: string): boolean {
 
 function isPaymentQuestion(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    return /\b(pagos?|pago|pagar|metodos? de pago|tarjeta|efectivo|transferencia|nequi|daviplata|pse|anticipo|dep[oó]sito|excedente)\b/.test(s);
-
-
+    return /\b(pagos?|metodos? de pago|tarjeta|efectivo|transferencia|nequi|daviplata|pse)\b/.test(s);
 }
 
 function isGeneralInfoQuestion(t: string): boolean {
@@ -358,9 +311,7 @@ function isGeneralInfoQuestion(t: string): boolean {
     return (
         /\b(que es|de que se trata|como funciona|beneficios?|riesgos?|efectos secundarios?|contraindicaciones?|cuidados|cuanto dura|duracion|quien lo hace|profesional|doctor(a)?)\b/.test(s) ||
         /\b(ubicaci[oó]n|direcci[oó]n|d[oó]nde|mapa|sede|como llego|parqueadero)\b/.test(s) ||
-        /\b(marca|retoc|garant[ií]a|garantia|cubre|excedente|sesiones?|dolor|recuperaci[oó]n|requisitos?)\b/.test(s) ||   // 👈 NUEVO
         isPaymentQuestion(t)
-
     );
 }
 /** Verbos/expresiones de intención de reservar (no hardcode de negocio; solo intención lingüística) */
@@ -521,141 +472,14 @@ function renderHoursAsList(byDow: Record<number, Array<{ start: string; end: str
     return lines.join("\n");
 }
 
-/* ====== Compactación y consultas inteligentes de horarios ====== */
-
-// Etiquetas cortas de días
-const DOW_SHORT = ["D", "L", "M", "X", "J", "V", "S"];
-const DOW_LONG = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
-
-// Devuelve "09:00-13:00|14:00-18:00" para agrupar por patrón
-function canonicalRanges(ranges: Array<{ start: string; end: string }>) {
-    return (ranges || []).map(r => `${r.start}-${r.end}`).join("|") || "—";
-}
-
-// 09:00 -> "9 am", 14:30 -> "2:30 pm"
-function toAmPmTerse(hhmm: string): string {
-    const [H, M] = hhmm.split(":").map(Number);
-    const h12 = (H % 12) || 12;
-    const mm = M ? `:${String(M).padStart(2, "0")}` : "";
-    const suf = H < 12 ? "am" : "pm";
-    return `${h12}${mm} ${suf}`;
-}
-
-// "de 9 am a 1 pm / 2 pm a 6 pm"
-function rangesHumanTerse(ranges: Array<{ start: string; end: string }>) {
-    return (ranges || []).map(r => `${toAmPmTerse(r.start)} – ${toAmPmTerse(r.end)}`).join(" / ");
-}
-
-// Compacta por grupos de días contiguos con el mismo patrón de rangos.
-// Resultado listo para WhatsApp, 1 línea por grupo.
-function renderHoursCompressed(byDow: Record<number, Array<{ start: string; end: string }>>): string {
-    const groups: Array<{ from: number; to: number; pattern: string }> = [];
-    let curFrom = 0, curPat = canonicalRanges(byDow[0] || []);
-    for (let d = 1; d < 7; d++) {
-        const pat = canonicalRanges(byDow[d] || []);
-        if (pat !== curPat) {
-            groups.push({ from: curFrom, to: d - 1, pattern: curPat });
-            curFrom = d; curPat = pat;
-        }
-    }
-    groups.push({ from: curFrom, to: 6, pattern: curPat });
-
-    const lines: string[] = [];
-    for (const g of groups) {
-        if (g.pattern === "—") {
-            // día(s) cerrados (no listar si son muchos, mantenlo corto)
-            continue;
-        }
-        const label = g.from === g.to
-            ? `${DOW_SHORT[g.from]}:`
-            : `${DOW_SHORT[g.from]}–${DOW_SHORT[g.to]}:`;
-        const human = rangesHumanTerse((byDow[g.from] || []));
-        lines.push(`${label} ${human}`);
-    }
-
-    // Agrega nota corta de cerrados si aplica
-    const closed: string[] = [];
-    for (let d = 0; d < 7; d++) {
-        if (!byDow[d]?.length) closed.push(DOW_SHORT[d]);
-    }
-    if (closed.length) lines.push(`Cerrado: ${closed.join(" · ")}`);
-
-    return lines.join("\n");
-}
-
-// Extrae un día de la semana del texto (0=Dom … 6=Sáb) o null
-function parseWeekdayFromText(t: string): number | null {
-    const s = (t || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
-    const map: Record<string, number> = {
-        domingo: 0, dom: 0,
-        lunes: 1, lun: 1,
-        martes: 2, mar: 2,
-        miercoles: 3, mier: 3, mie: 3,
-        jueves: 4, jue: 4,
-        viernes: 5, vie: 5,
-        sabado: 6, sab: 6
-    };
-    const hit = Object.keys(map).find(k => new RegExp(`\\b${k}\\b`).test(s));
-    return hit ? map[hit] : null;
-}
-
-// Devuelve minutos absolutos consultados si pregunta "después de las 7 pm", "a las 19:30", etc.
-function parseAfterTimeQuestion(t: string): number | null {
-    const s = (t || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
-
-    // solo si hay pista semántica de comparación horaria
-    if (!/(despues|después|hasta|mas tarde|tarde|noche|a las|\d{1,2}\s*(am|pm))/.test(s)) return null;
-
-    // 1) formatos con am/pm
-    const ampm = s.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
-    if (ampm) {
-        let h = Number(ampm[1]); const m = Number(ampm[2] || 0);
-        const suf = ampm[3];
-        if (suf === "pm" && h < 12) h += 12;
-        if (suf === "am" && h === 12) h = 0;
-        return h * 60 + m;
-    }
-
-    // 2) solo hora "19" o "19:30" o "7:30" con palabra "pm"
-    const hhmm = s.match(/\b(\d{1,2})(?::(\d{2}))?\b/);
-    if (hhmm) {
-        let h = Number(hhmm[1]); const m = Number(hhmm[2] || 0);
-        // Si menciona 'pm' en la frase y h <= 12, conviértelo.
-        if (/pm\b/.test(s) && h <= 12) h += 12;
-        return h * 60 + m;
-    }
-
-    return null;
-}
-
-// ¿Está abierto ese día y/o después de cierta hora?
-function isOpenOnDay(byDow: Record<number, Array<{ start: string; end: string }>>, dow: number): boolean {
-    return !!(byDow[dow]?.length);
-}
-function isOpenAfterTime(byDow: Record<number, Array<{ start: string; end: string }>>, minutes: number): boolean {
-    for (let d = 0; d < 7; d++) {
-        for (const r of (byDow[d] || [])) {
-            const [sh, sm] = r.start.split(":").map(Number);
-            const [eh, em] = r.end.split(":").map(Number);
-            const sMin = sh * 60 + sm, eMin = eh * 60 + em;
-            if (eMin > minutes) return true; // hay atención más tarde que esa hora
-        }
-    }
-    return false;
-}
-
-
 /** Construye lista bonita de horarios desde la BD */
-/** Construye lista *compacta* de horarios para WhatsApp */
-async function buildBusinessHoursList(empresaId: number): Promise<{ list: string; note: string; byDow: Record<number, Array<{ start: string; end: string }>> }> {
+async function buildBusinessHoursList(empresaId: number): Promise<{ list: string; note: string }> {
     const rows = await fetchAppointmentHours(empresaId);
     const byDow = normalizeHours(rows);
-    const list = renderHoursCompressed(byDow);
-    const note = "Los días no listados no tienen atención.";
-
-    return { list: list || "Aún no hay horarios cargados en el sistema.", note, byDow };
+    const list = renderHoursAsList(byDow);
+    const note = "📝 Nota: si un día *no aparece*, ese día no se atiende.";
+    return { list: list || "Por ahora no tengo registrado el horario en el sistema.", note };
 }
-
 
 
 
@@ -768,7 +592,7 @@ async function buildOrReuseSummary(args: {
         }),
     ]);
 
-
+    const { human: hoursLine, lastStart } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
     const exceptions = normalizeExceptions(exceptionsRows);
     const exLine = exceptions.filter(e => e.closed).slice(0, 10).map(e => e.date).join(", ");
     const exceptionsLine = exLine ? `Excepciones (cerrado): ${exLine}` : "";
@@ -916,20 +740,10 @@ async function buildOrReuseSummary(args: {
         .join(" • ");
     if (svcList) lines.push(`${icon("svc")} Servicios: ${svcList}`);
 
-    // ——— Horario corto desde BD
-    // ——— Horario corto desde BD
-    const byDowForSummary = normalizeHours(hoursRows);
-    const hoursShort = renderHoursCompressed(byDowForSummary);
-    const { lastStart: lastStartRef } = await buildBusinessRangesHuman(empresaId, kb, { rows: hoursRows });
-
-    if (hoursShort) {
-        lines.push(
-            `${icon("hrs")} Horario: ${hoursShort}${lastStartRef ? ` (cierre ref.: ${lastStartRef})` : ""}`
-        );
-        // sin nota adicional
+    if (hoursLine) {
+        lines.push(`${icon("hrs")} Horario: ${hoursLine}${lastStart ? `; última cita ref. ${lastStart}` : ""}`);
+        lines.push(`📝 Nota: Si un día no aparece arriba, ese día no se atiende en la clínica.`);
     }
-
-
 
     if (exceptionsLine) lines.push(`${icon("exc")} ${exceptionsLine}`);
 
@@ -946,22 +760,38 @@ async function buildOrReuseSummary(args: {
     lines.push(`${icon("hist")} Historial: ${history || "—"}`);
 
     let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n");
-    compact = softTrim(compact, 5000);
+    compact = softTrim(compact, 2400);
 
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
 }
 
 /* ===== Detección de handoff listo (nombre + fecha/hora textual + procedimiento) ===== */
-// Reemplaza función:
-function detectHandoffReadyDraft(d?: AgentState["draft"]) {
-    const dft = d || {};
-    return !!(dft.name && (dft.whenText || dft.whenISO) && (dft.procedureId || dft.procedureName));
+function detectHandoffReady(t: string) {
+    const text = (t || "").toLowerCase();
+
+    const hasName =
+        /\bmi\s+nombre\s+es\s+[a-záéíóúñü\s]{3,}/i.test(t) ||
+        /\bsoy\s+[a-záéíóúñü\s]{3,}/i.test(t);
+
+    const hasDateOrTimeText =
+        /\b(hoy|mañana|manana|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|am|pm|tarde|mañana|manana|noche|mediod[ií]a|medio\s+dia)\b/.test(text) ||
+        /\b\d{1,2}[\/\-]\d{1,2}([\/\-]\d{2,4})?\b/.test(text) ||
+        /\b(\d{1,2}[:.]\d{2}\s*(am|pm)?)\b/.test(text);
+
+    const hasProc =
+        /\b(botox|toxina|relleno|hialur[oó]nico|peeling|hidra|limpieza|depilaci[oó]n|laser|plasma|hilos|armonizaci[oó]n|mesoterapia)\b/.test(
+            text
+        );
+
+    return hasName && hasDateOrTimeText && hasProc;
 }
 
 /* ===== Extractores suaves para el borrador (sin normalizar hora) ===== */
 function normalizeName(n: string) {
-    return n.trim().replace(/\s+/g, " ")
+    return n
+        .trim()
+        .replace(/\s+/g, " ")
         .split(" ")
         .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
         .join(" ");
@@ -970,20 +800,40 @@ function normalizeName(n: string) {
 function extractName(raw: string): string | null {
     const t = (raw || "").trim();
 
-    // SOLO cuando el usuario se autoidentifica explícitamente
-    const m =
-        t.match(/\b(?:soy|me\s+llamo|mi\s+nombre\s+es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñü]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñü]+){1,3})\b/i);
+    // Patrones explícitos
+    let m =
+        t.match(/\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\b/i) ||
+        t.match(/^\s*nombre\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){1,3})\s*$/i);
 
-    if (!m || !m[1]) return null;
-
-    const name = normalizeName(m[1]);
-    // Palabras que nunca son nombre
-    const blacklist = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico|quiero|agendar|cita|programar|reservar)\b/i;
-    if (blacklist.test(name.toLowerCase())) return null;
-
-    return name;
+    if (m && m[1]) {
+        const name = normalizeName(m[1]);
+        if (/\b(viernes|sábado|sabado|lunes|martes|miércoles|miercoles|jueves|hoy|mañana|manana)\b/i.test(name)) return null;
+        if (/\b(botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i.test(name)) return null;
+        return name;
+    }
+    return null;
 }
+function looksLikeLooseName(raw: string): string | null {
+    const t = (raw || "").trim();
 
+    if (/[0-9@#]/.test(t)) return null;
+
+    const parts = t.split(/\s+/).filter(Boolean);
+    if (parts.length < 2 || parts.length > 4) return null;
+
+    const bad = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|a las|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico)\b/i;
+    if (bad.test(t.toLowerCase())) return null;
+
+    if (!/^[A-Za-zÁÉÍÓÚÑáéíóúñü\s]+$/.test(t)) return null;
+
+    const normalized = t
+        .replace(/\s+/g, " ")
+        .split(" ")
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(" ");
+
+    return normalized;
+}
 
 /** Extrae *solo* la preferencia temporal (día/fecha + hora) del texto del cliente */
 function extractWhenPreference(raw: string): string | null {
@@ -1202,7 +1052,7 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         model: CONF.MODEL,
         messages,
         temperature: CONF.TEMPERATURE,
-        max_tokens: 320,
+        max_tokens: 220,
     });
     return r?.choices?.[0]?.message?.content?.trim() || "";
 }
@@ -1344,24 +1194,13 @@ export async function handleEsteticaStrategy({
     let nameInText = extractName(userText);
     // Fallback: si aún falta nombre y el usuario envía solo “Juan Camilo López”, tómalos como nombre.
     if (!nameInText) {
-        const stNow = await loadState(chatId);
-        if (stNow.nameRequested && !(stNow.draft?.name)) {
-            // acepta nombre suelto SOLO si lo pedimos antes
-            const parts = await (async () => {
-                // reusa la lógica de loose-name con acceso a state:
-                const t = (userText || "").trim();
-                if (/[0-9@#]/.test(t)) return null;
-                const words = t.split(/\s+/).filter(Boolean);
-                if (words.length < 2 || words.length > 4) return null;
-                const bad = /\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|hoy|mañana|manana|tarde|noche|am|pm|a las|botox|toxina|peeling|limpieza|relleno|hialuronico|hialurónico|quiero|agendar|cita|programar|reservar)\b/i;
-                if (bad.test(t.toLowerCase())) return null;
-                if (!/^[A-Za-zÁÉÍÓÚÑáéíóúñü\s]+$/.test(t)) return null;
-                return t;
-            })();
-            if (parts) nameInText = normalizeName(parts);
+        const stateNow = await loadState(chatId);
+        const needNameNow = !(stateNow.draft?.name);
+        if (needNameNow) {
+            const loose = looksLikeLooseName(userText);
+            if (loose) nameInText = loose;
         }
     }
-    if (nameInText) await patchState(chatId, { nameRequested: false });
 
 
     let match = resolveServiceName(kb, userText || "");
@@ -1379,17 +1218,8 @@ export async function handleEsteticaStrategy({
             if (pe) match = { procedure: pe, matched: pe.name };
         }
     }
-    // Memoriza el último procedimiento detectado para contexto (sin forzar agenda)
-    if (match?.procedure?.id) {
-        await patchState(chatId, {
-            lastServiceId: match.procedure.id,
-            lastServiceName: match.procedure.name,
-        });
-    }
 
     const prevDraft = state.draft ?? {};
-
-
     const whenFreeCandidate = extractWhenPreference(userText);
     const clsForWhen = await classifyTurnLLM(userText);
     const canCaptureWhen =
@@ -1411,41 +1241,8 @@ export async function handleEsteticaStrategy({
 
     await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
 
-    // —— desde aquí: manejo de SOFT EXIT (salida amable del flujo) ——
-    if (isSoftExit(userText)) {
-        // Limpia piezas de agenda y vuelve a modo informativo
-        await patchState(chatId, {
-            lastIntent: "info",
-            draft: { name: undefined, phone: undefined, procedureId: undefined, procedureName: undefined, whenISO: undefined, whenText: undefined }
-        });
-
-        let msg = [
-            "¡Claro! 💬 No hay problema.",
-            "Si más adelante deseas *agendar*, dime por ejemplo: “quiero una cita” o “resérvame para el viernes 3 pm” y retomamos desde donde quedamos."
-        ].join(" ");
-
-        const saved = await sendBotReply({
-            conversationId: chatId,
-            empresaId,
-            texto: clampText(addEmojiStable(msg, chatId)),
-            nuevoEstado: ConversationEstado.respondido,
-            to: toPhone ?? conversacion.phone,
-            phoneNumberId,
-        });
-        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        return {
-            estado: ConversationEstado.respondido,
-            mensaje: saved.texto,
-            messageId: saved.messageId,
-            wamid: saved.wamid,
-            media: [],
-        };
-    }
-    // —— hasta aquí: manejo de SOFT EXIT ——
-
-
     // 2) Si el usuario ya trajo todo → handoff inmediato
-    if (detectHandoffReadyDraft(newDraft)) {
+    if (detectHandoffReady(userText) || (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft))) {
         const piezasBonitas = [
             `💆 *Tratamiento:* ${newDraft.procedureName ?? "—"}`,
             `👤 *Nombre:* ${newDraft.name}`,
@@ -1526,7 +1323,7 @@ export async function handleEsteticaStrategy({
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        await patchState(chatId, { lastIntent: "info" }); // no empujes agenda aquí
+        await patchState(chatId, { lastIntent: "schedule" });
         return {
             estado: ConversationEstado.respondido,
             mensaje: saved.texto,
@@ -1546,66 +1343,28 @@ export async function handleEsteticaStrategy({
     const needWhen = !hasSomeDateDraft(newDraft);
     const needName = !newDraft.name;
 
-
-
-
-
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
     const infoBreaker = shouldBypassScheduling(userText);
     const clsGate = await classifyTurnLLM(userText);
     const onlyHoursQuestion = (clsGate.label === "ask_hours") || looksLikeHoursQuestion(userText);
 
-    const wantBookHard =
-        hasBookingIntent(userText) || clsGate.label === "book";
-    const hasTimeAnchor = hasConcreteTimeAnchor(userText);
-
-    function isAvailabilityQuestion(t: string): boolean {
-        const s = (t || "").normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
-        return /\b(disponible|disponibilidad|tienes cupo|puedes agendar|confirmame|reservame|hay espacio|tienes cita|tienes lugar|puedo agendar|agenda una cita|quiero una cita)\b/.test(s);
-    }
-    // Evalúa si seguimos en flujo de agenda (usar el draft ya construido)
-    const stForGate = await loadState(chatId);
-    const schedulingGate = inSchedulingFlow(stForGate, newDraft);
-
-
     const shouldAskForAgendaPieces =
-        !infoBreaker &&
-        !onlyHoursQuestion &&
-        (wantBookHard || hasTimeAnchor || isAvailabilityQuestion(userText));
-    const stForPieces = await loadState(chatId);
-    const allowNudgePieces = (wantBookHard ? true : canNudgeScheduling(stForPieces));
+        !infoBreaker && !onlyHoursQuestion &&
+        (inferredIntent === "schedule" || hasServiceOrWhen);
 
 
-
+    // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
+    // ——— PREGUNTA PURA de horarios/días → lista bonita (sin mezclar servicios)
     if (onlyHoursQuestion) {
-        const { list, note, byDow } = await buildBusinessHoursList(empresaId);
+        const { list, note } = await buildBusinessHoursList(empresaId);
 
-        // Hints contextuales (opcionales, en una línea)
-        const askedDow = parseWeekdayFromText(userText);            // 0..6 | null
-        const afterMin = parseAfterTimeQuestion(userText);          // minutos | null
-
-        const hints: string[] = [];
-        if (askedDow != null) {
-            const openThatDay = isOpenOnDay(byDow, askedDow);
-            if (!openThatDay) hints.push(`Ese día no tenemos atención.`);
-        }
-        if (afterMin != null) {
-            const openAfter = isOpenAfterTime(byDow, afterMin);
-            if (!openAfter) hints.push(`No atendemos más tarde que esa hora.`);
-        }
-
-        let txt = `🕒 Horario:\n${list}`;
-        if (hints.length) txt += `\n${hints.join(" ")}`;
-        // Opcional: si no hay horarios cargados, añade la nota
-        if (list.includes("Aún no hay horarios")) txt += `\n${note}`;
-
-        txt += `\n\nSi te parece, cuando tengas *día y hora* me avisas y lo verifico.`;
-
+        let textHours = `${list}\n\n${note}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
+        textHours = clampText(addEmojiStable(textHours, chatId));
 
         const saved = await sendBotReply({
             conversationId: chatId,
             empresaId,
-            texto: clampText(addEmojiStable(txt, chatId)),
+            texto: textHours,
             nuevoEstado: ConversationEstado.respondido,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
@@ -1620,51 +1379,35 @@ export async function handleEsteticaStrategy({
         };
     }
 
-    // —— desde aquí: INFO corta dentro del flujo de agenda ——
-    // Si ya estamos en flujo de agenda y el usuario hace una pregunta informativa breve,
-    // respondemos breve y recordamos pedir *día y hora* para no romper el flujo.
-    if (schedulingGate && infoBreaker) {
-        // 1) Responde breve (info)
-        let breve = await runLLM({ summary, userText, imageUrl }).catch(() => "");
-        breve = sanitizeGreeting(breve, { allowFirstGreeting: false });
-        breve = clampText(breve, 3, 260);
-
-        // 2) ¿Conviene nudguear? Solo si hay señales REALES
-        const stForNudge = await loadState(chatId);
-        const wantBook = hasBookingIntent(userText) || clsGate.label === "book";
-        const hasPieces = !!(newDraft.whenText || newDraft.whenISO || newDraft.procedureName || newDraft.procedureId);
-        const allowNudge = canNudgeScheduling(stForNudge) && (wantBook || hasConcreteTimeAnchor(userText) || isAvailabilityQuestion(userText));
 
 
-        const cola = allowNudge
-            ? `\n\nSi deseas, dime *día y hora* y verifico disponibilidad.`
-            : ""; // sin coletilla si solo quería info
 
-        const textoMix = addEmojiStable(`${breve}${cola}`, chatId);
-
-        const savedMix = await sendBotReply({
+    if (/\b(hora|horario|dias?|fecha)\b/i.test(userText) && inferredIntent !== "schedule") {
+        const clarify = addEmojiStable(
+            "¿Deseas conocer nuestros *horarios de atención* o prefieres que tomemos *un horario concreto* para agendar?",
+            chatId
+        );
+        const saved = await sendBotReply({
             conversationId: chatId,
             empresaId,
-            texto: textoMix,
+            texto: clampText(clarify),
             nuevoEstado: ConversationEstado.respondido,
             to: toPhone ?? conversacion.phone,
             phoneNumberId,
         });
-        if (allowNudge) await markNudged(chatId);
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
         return {
             estado: ConversationEstado.respondido,
-            mensaje: savedMix.texto,
-            messageId: savedMix.messageId,
-            wamid: savedMix.wamid,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
             media: [],
         };
     }
 
-    // —— hasta aquí: INFO corta dentro del flujo de agenda ——
 
 
-    if (shouldAskForAgendaPieces && allowNudgePieces && (needProcedure || needWhen || needName)) {
+    if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
         const asks: string[] = [];
         if (needProcedure) {
             const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
@@ -1674,12 +1417,8 @@ export async function handleEsteticaStrategy({
             asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “martes en la tarde” o “15/11 a las 3 pm”).`);
         }
         if (needName) {
-            asks.push(`¿Cuál es tu *nombre completo*? (por ejemplo: “Mi nombre es Ana María Pérez”)`);
+            asks.push(`¿Cuál es tu *nombre completo*?`);
         }
-
-        // << marca que estamos pidiendo nombre
-        await patchState(chatId, { nameRequested: needName ? true : (state.nameRequested ?? false) });
-
         let texto = clampText(asks.join(" "));
         texto = addEmojiStable(texto, chatId);
 
@@ -1692,7 +1431,6 @@ export async function handleEsteticaStrategy({
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-        await markNudged(chatId);
         return {
             estado: ConversationEstado.respondido,
             mensaje: saved.texto,
