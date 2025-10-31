@@ -437,6 +437,40 @@ function extractHoursFromSummary(summary: string): string | null {
     // Quitamos el icono y la etiqueta
     return line.replace(/^🕒\s*Horario:\s*/i, "").trim();
 }
+// ——— Detecta si el texto pregunta por un día específico
+function pickDayFromText(t: string): number | null {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    const map: Record<string, number> = {
+        domingo: 0, dom: 0,
+        lunes: 1, lun: 1,
+        martes: 2, mar: 2,
+        miercoles: 3, miércoles: 3, mie: 3,
+        jueves: 4, jue: 4,
+        viernes: 5, vie: 5,
+        sabado: 6, sábado: 6, sab: 6,
+    };
+    for (const k of Object.keys(map)) {
+        if (new RegExp(`\\b${k}\\b`, "i").test(s)) return map[k];
+    }
+    return null;
+}
+
+// ——— Extrae del HORARIO (línea del resumen) solo el tramo de un día
+function extractDayHoursFromSummary(hoursLine: string, dow: number): string | null {
+    if (!hoursLine) return null;
+    const days = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+    const dName = days[dow];
+
+    // Buscamos el segmento "Día ..." hasta el próximo "Día ..." o fin de línea
+    const pattern = new RegExp(`${dName}\\s+([^;]*?(?:;\\s*[^A-ZÁÉÍÓÚÑ]*?)?)(?=(?:\\s*(?:Domingo|Lunes|Martes|Miércoles|Jueves|Viernes|Sábado)\\b)|$)`, "i");
+    const m = hoursLine.match(pattern);
+    if (!m) return null;
+
+    // Limpieza: quita el nombre del día si viene incluido
+    let seg = m[0].replace(new RegExp(`^${dName}\\s*`, "i"), "").trim();
+    seg = seg.replace(/^\:\s*/, "").trim();
+    return seg || null;
+}
 
 
 function formatCOP(value?: number | null): string | null {
@@ -906,38 +940,22 @@ function spanAfterTrigger(text: string): string | null {
 }
 
 // (REEMPLAZA) — extractor principal
+// ——— SOLO acepta nombre con gatillo explícito; no intenta adivinar
 function extractName(raw: string): string | null {
     if (!raw) return null;
-    // 1) intenta por trigger explícito
-    const t1 = spanAfterTrigger(raw);
-    if (t1) {
-        const pretty = normalizeNamePretty(t1);
-        if (looksValidNameSequence(pretty)) return pretty;
-    }
+    const rx = /\b(?:soy|me\s+llamo|mi\s+nombre\s+es|nombre\s*:?)\s+(.{1,80})$/i;
+    const m = raw.match(rx);
+    if (!m || !m[1]) return null;
 
-    // 2) fallback: si el mensaje entero parece ser solo el nombre
-    const cleaned = cutAtStops(stripJunk(raw));
-    if (CONTEXT_STOPS.test(cleaned)) return null;
-    if (EMAIL_OR_URL.test(cleaned)) return null;
+    let span = m[1].trim();
+    span = cutAtStops(span);
+    span = stripJunk(span);
+    if (!span) return null;
 
-    const tokens = cleaned.split(/\s+/).filter(Boolean);
-    // Evita tomar saludos/ruido como nombre (ej.: "hola")
-    if (tokens.length === 1 && NON_NAME_SINGLETONS.has(tokens[0].toLowerCase())) {
-        return null;
-    }
-
-    if (tokens.length >= 1 && tokens.length <= 6) {
-        let seq = tokens.join(" ");
-        if (!looksValidNameSequence(seq)) {
-            while (tokens.length > 1 && !NAME_TOKEN.test(tokens[tokens.length - 1])) tokens.pop();
-            seq = tokens.join(" ");
-        }
-        const pretty = normalizeNamePretty(seq);
-        if (looksValidNameSequence(pretty)) return pretty;
-    }
-
-    return null;
+    const pretty = normalizeNamePretty(span);
+    return looksValidNameSequence(pretty) ? pretty : null;
 }
+
 
 // (REEMPLAZA) — fallback “nombre suelto”
 function looksLikeLooseName(raw: string): string | null {
@@ -1331,14 +1349,14 @@ export async function handleEsteticaStrategy({
     let state = await loadState(chatId);
     let nameInText = extractName(userText);
     // Fallback: si aún falta nombre y el usuario envía solo “Juan Camilo López”, tómalos como nombre.
-    if (!nameInText) {
-        const stateNow = await loadState(chatId);
-        const needNameNow = !(stateNow.draft?.name);
-        if (needNameNow) {
-            const loose = looksLikeLooseName(userText);
-            if (loose) nameInText = loose;
-        }
-    }
+    // if (!nameInText) {
+    //     const stateNow = await loadState(chatId);
+    //     const needNameNow = !(stateNow.draft?.name);
+    //     if (needNameNow) {
+    //         const loose = looksLikeLooseName(userText);
+    //         if (loose) nameInText = loose;
+    //     }
+    // }
 
 
     let match = resolveServiceName(kb, userText || "");
@@ -1379,8 +1397,8 @@ export async function handleEsteticaStrategy({
 
     await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
 
-    // 2) Si el usuario ya trajo todo → handoff inmediato
-    if (detectHandoffReady(userText) || (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft))) {
+    // 2) Handoff solo si tenemos las 3 piezas EN EL DRAFT (sin regex del texto)
+    if (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft)) {
         const piezasBonitas = [
             `💆 *Tratamiento:* ${newDraft.procedureName ?? "—"}`,
             `👤 *Nombre:* ${newDraft.name}`,
@@ -1491,6 +1509,42 @@ export async function handleEsteticaStrategy({
     const shouldAskForAgendaPieces =
         !infoBreaker && !onlyHoursQuestion &&
         (inferredIntent === "schedule" || hasServiceOrWhen);
+
+    // ——— Si el usuario pregunta por un DÍA puntual ("¿trabajan el domingo?")
+    const askedDow = pickDayFromText(userText);
+    if (askedDow !== null) {
+        const hoursLine = extractHoursFromSummary(summary); // SIEMPRE desde el RESUMEN
+        let reply: string;
+        if (!hoursLine) {
+            reply = "Por ahora no tengo el horario en el sistema. Si deseas, dime el *día y hora* que prefieres y verifico disponibilidad.";
+        } else {
+            const seg = extractDayHoursFromSummary(hoursLine, askedDow);
+            if (!seg) {
+                // Ese día no figura en el resumen → no se atiende
+                reply = "Ese día *no atendemos* en la clínica. Si gustas, dime otro *día y hora* y verifico disponibilidad.";
+            } else {
+                const days = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+                reply = `*${days[askedDow]}*: ${seg}\n\nSi quieres, dime el *día y hora* que prefieres y verifico disponibilidad.`;
+            }
+        }
+        const texto = clampText(addEmojiStable(reply, chatId));
+        const saved = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
 
 
     // ——— Si es una PREGUNTA PURA de horarios/días, respondemos con la franja real
