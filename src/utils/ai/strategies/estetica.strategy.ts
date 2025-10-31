@@ -16,7 +16,23 @@ import {
 } from "./esteticaModules/domain/estetica.kb";
 
 /* ==== CONFIG ==== */
-const CONF = {
+type Conf = {
+    MEM_TTL_MIN: number;
+    GRAN_MIN: number;
+    MAX_HISTORY: number;
+    REPLY_MAX_LINES: number;
+    REPLY_MAX_CHARS: number;
+    TEMPERATURE: number;
+    MODEL: string;
+
+    // ← ahora requeridos
+    NAME_ACCEPT_STRICT: boolean;
+    NAME_LLM_ENABLED: boolean;
+    NAME_LLM_CONF_MIN: number;
+};
+
+
+const CONF: Conf = {
     MEM_TTL_MIN: 60,
     GRAN_MIN: 15,
     MAX_HISTORY: 20,
@@ -24,7 +40,13 @@ const CONF = {
     REPLY_MAX_CHARS: 900,
     TEMPERATURE: 0.3,
     MODEL: process.env.IA_TEXT_MODEL || "gpt-4o-mini",
+
+    // defaults para evitar undefined en tiempo de ejecución
+    NAME_ACCEPT_STRICT: true,   // acepta solo con gatillo (soy/me llamo/mi nombre es)
+    NAME_LLM_ENABLED: true,     // permite NER por LLM como sugerencia
+    NAME_LLM_CONF_MIN: 0.85,    // umbral de confianza para sugerir
 };
+
 
 const IMAGE_WAIT_MS = 1000;
 const IMAGE_CARRY_MS = 60_000;
@@ -55,6 +77,16 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
     recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now });
     return false;
 }
+
+function isYes(text: string) {
+    const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return /\b(si|sí|correcto|as[ií]\s*es|de acuerdo|ok|vale|exacto)\b/.test(t);
+}
+function isNo(text: string) {
+    const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    return /\b(no|negativo|no es|cambia|otro)\b/.test(t);
+}
+
 
 async function askedRecentlyForName(conversationId: number, withinMs = 90_000) {
     const prev = await prisma.message.findFirst({
@@ -156,8 +188,10 @@ type AgentState = {
         procedureId?: number;
         procedureName?: string;
         whenISO?: string;
-        whenText?: string; // fecha/hora “tal cual” que escribió el cliente (sin calcular)
-        // NOTA: no usamos timeHHMM ni timeNote para no “inferir” horas
+        whenText?: string; // textual tal cual
+        pendingConfirm?: {
+            name?: string; // ← sugerencia de nombre pendiente de “sí / no”
+        };
     };
     summary?: { text: string; expiresAt: string };
     expireAt?: string;
@@ -1091,6 +1125,8 @@ async function classifyTurnLLM(userText: string): Promise<{ label: "book" | "ask
     ].join("\n");
 
 
+
+
     const r = await openai.chat.completions.create({
         model: CONF.MODEL,
         temperature: 0,
@@ -1112,6 +1148,38 @@ async function classifyTurnLLM(userText: string): Promise<{ label: "book" | "ask
         }
     } catch { }
     return { label: "other", confidence: 0.5 };
+}
+
+async function extractEntitiesLLM(userText: string): Promise<{ name?: string; confidence?: number }> {
+    if (!CONF.NAME_LLM_ENABLED) return {};
+    const sys = [
+        "Eres un extractor de entidades para una clínica estética.",
+        "Devuelve SOLO un JSON minúsculo: {\"name\":\"\",\"confidence\":0.0}",
+        "Reglas:",
+        "- name: extrae el nombre completo del cliente SOLO si está presente en el texto.",
+        "- No inventes ni asumas. Si no hay nombre claro, deja \"name\" vacío.",
+        "- Penaliza fuertemente si hay días/horas/servicios pegados al lado del posible nombre.",
+        "- Prioriza patrones con gatillos ('soy', 'me llamo', 'mi nombre es').",
+    ].join("\n");
+
+    const r = await openai.chat.completions.create({
+        model: CONF.MODEL,
+        temperature: 0,
+        max_tokens: 60,
+        messages: [
+            { role: "system", content: sys },
+            { role: "user", content: String(userText || "").slice(0, 400) }
+        ]
+    }).catch(() => null);
+
+    try {
+        const raw = r?.choices?.[0]?.message?.content?.trim() || "";
+        const parsed = JSON.parse(raw);
+        const name = String(parsed?.name || "").trim();
+        const conf = Number(parsed?.confidence ?? 0);
+        if (!name) return {};
+        return { name, confidence: isFinite(conf) ? conf : 0.0 };
+    } catch { return {}; }
 }
 
 
@@ -1211,7 +1279,37 @@ export async function handleEsteticaStrategy({
     let state = await loadState(chatId);
     // 1º intenta con gatillos (soy / me llamo / mi nombre es)
     // 2º si no, usa el detector robusto de nombre "suelto" (validado)
-    let nameInText = extractName(userText) || looksLikeLooseName(userText);
+
+    let nameInText: string | null = null;
+    let nameSource: "trigger" | "loose" | "llm" | null = null;
+
+    // 1) Gatillos (alta precisión) → aceptar directo
+    const byTrigger = extractName(userText);
+    if (byTrigger) {
+        nameInText = byTrigger;
+        nameSource = "trigger";
+    } else {
+        // 2) Loose (solo si el mensaje parece ser SOLO el nombre) → requiere confirmación
+        const byLoose = looksLikeLooseName(userText);
+        if (byLoose && CONF.NAME_ACCEPT_STRICT !== true) {
+            nameInText = byLoose;
+            nameSource = "loose";
+        } else if (byLoose && CONF.NAME_ACCEPT_STRICT === true) {
+            // si estamos en modo estricto, lo tratamos como sugerencia (pendiente de confirmar)
+            nameInText = byLoose;
+            nameSource = "loose";
+        } else {
+            // 3) LLM NER (sugerencia) → requiere confirmación + umbral
+            const ent = await extractEntitiesLLM(userText);
+            if (ent?.name && (ent.confidence ?? 0) >= CONF.NAME_LLM_CONF_MIN) {
+                const cleaned = looksLikeLooseName(ent.name) || extractName(`mi nombre es ${ent.name}`);
+                if (cleaned) {
+                    nameInText = cleaned;
+                    nameSource = "llm";
+                }
+            }
+        }
+    }
 
 
 
@@ -1251,19 +1349,67 @@ export async function handleEsteticaStrategy({
         clsForWhen.label === "book" ||
         hasConcreteTimeAnchor(userText);
 
+    let pendingConfirm = prevDraft.pendingConfirm || undefined;
+
+    // si viene por gatillo, se fija directo.
+    // si viene por loose/llm → va a confirmación (a menos que ya teníamos name)
+    let nextName = prevDraft.name || (nameSource === "trigger" ? nameInText || undefined : undefined);
+    if (!prevDraft.name && nameInText && nameSource !== "trigger") {
+        pendingConfirm = { ...(pendingConfirm || {}), name: nameInText! };
+    }
+
     const newDraft = {
         ...prevDraft,
-        name: prevDraft.name || nameInText || undefined,
+        name: nextName,
+        pendingConfirm,
         procedureId: prevDraft.procedureId || (match.procedure?.id ?? undefined),
         procedureName: prevDraft.procedureName || (match.procedure?.name ?? undefined),
-        // whenISO: opcional—solo si detectas una fecha explícita tipo 12/11; aquí no forzamos
         whenISO: prevDraft.whenISO || undefined,
         whenText: prevDraft.whenText || (canCaptureWhen ? whenFreeCandidate : null) || undefined,
-        // textual SIEMPRE
     };
+
     const inferredIntent = await detectIntentSmart(userText, newDraft);
 
     await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
+    // ——— Confirmación de nombre pendiente (si aplica)
+    if (newDraft.pendingConfirm?.name && !newDraft.name) {
+        if (isYes(userText)) {
+            // Confirmado → fijamos nombre
+            newDraft.name = newDraft.pendingConfirm.name;
+            newDraft.pendingConfirm = undefined;
+            await patchState(chatId, { draft: newDraft });
+        } else if (isNo(userText)) {
+            // Rechazado → pedimos el nombre con gatillo
+            newDraft.pendingConfirm = undefined;
+            await patchState(chatId, { draft: newDraft });
+            const ask = "Gracias. ¿Cuál es tu *nombre completo*? (ej.: *Me llamo* Ana María Gómez)";
+            const saved = await sendBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: addEmojiStable(clampText(ask), chatId),
+                nuevoEstado: ConversationEstado.respondido,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        } else {
+            // Aún no hubo sí/no → preguntar explícitamente
+            const ask = `¿Te registro como *${newDraft.pendingConfirm.name}*?`;
+            const saved = await sendBotReply({
+                conversationId: chatId,
+                empresaId,
+                texto: addEmojiStable(clampText(ask), chatId),
+                nuevoEstado: ConversationEstado.respondido,
+                to: toPhone ?? conversacion.phone,
+                phoneNumberId,
+            });
+            if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+            await patchState(chatId, { draft: newDraft });
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+        }
+    }
+
 
     // 2) Handoff solo si tenemos las 3 piezas EN EL DRAFT (sin regex del texto)
     if (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft)) {
