@@ -2109,25 +2109,25 @@ function formatServicesPretty(kb: EsteticaKB, max = 8): string {
     return items.length ? items.join("\n") : "• ✨ (Aún no hay servicios configurados)";
 }
 
-// [ADD] Helper: texto para pedir piezas faltantes (proc/when/name)
+// [REEMPLAZO] — 1 sola pregunta por turno (prioridad: procedure → when → name)
 function buildAskPiecesText(kb: EsteticaKB, need: { proc: boolean; when: boolean; name: boolean }) {
-    const asks: string[] = [];
     if (need.proc) {
         const sample = (kb.procedures || [])
             .filter(p => p.enabled !== false)
             .slice(0, 3)
             .map(s => s.name)
             .join(", ");
-        asks.push(`¿Para qué *tratamiento* deseas la cita? (Ej.: ${sample || "Limpieza, Peeling, Toxina"})`);
+        return `¿Para qué *tratamiento* deseas la cita? (Ej.: ${sample || "Limpieza, Peeling, Toxina"})`;
     }
     if (need.when) {
-        asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “martes en la tarde” o “15/11 a las 3 pm”).`);
+        return `¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “martes en la tarde” o “15/11 a las 3 pm”).`;
     }
     if (need.name) {
-        asks.push(`¿Cuál es tu *nombre completo*?`);
+        return `¿Cuál es tu *nombre completo*? (Ej.: *Me llamo* Ana María Gómez)`;
     }
-    return asks.join(" ");
+    return "";
 }
+
 
 function paymentMethodsFromKB(kb: EsteticaKB): string[] {
     const list: string[] = [];
@@ -3229,13 +3229,18 @@ export async function handleEsteticaStrategy({
         texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
         // Si estamos (o parecemos estar) en flujo de agenda y faltan piezas, pídelas al final
+        // Política: si pidió agendar o ya hay slots parciales, pide SOLO 1 pieza faltante
         if (hasServiceOrWhen || inferredIntent === "schedule" || state.lastIntent === "schedule") {
             if (needProcedure || needWhen || needName) {
                 const tail = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
                 if (tail) texto = `${texto}\n\n${tail}`;
             }
             await patchState(chatId, { lastIntent: "schedule" });
+        } else {
+            // Invitación suave en respuestas informativas (sin forzar agenda)
+            texto = `${texto}\n\nSi deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.`;
         }
+
 
         texto = addEmojiStable(clampText(texto), chatId);
 
@@ -3283,12 +3288,19 @@ export async function handleEsteticaStrategy({
     }
 
     // ===== Respuesta libre (modo natural) usando el summary extendido
+    // ===== Respuesta libre (modo natural) usando el summary extendido
     let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
     const wasGreeted = (await loadState(chatId)).greeted; // ya tenemos 'state', pero aseguramos valor fresco
     texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
+    // Invitación suave SOLO si la intención fue informativa y no hay slots parciales
+    if (inferredIntent === "info" && !hasServiceOrWhen) {
+        texto = `${texto}\n\nSi deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.`;
+    }
+
     texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
     texto = addEmojiStable(texto, chatId);
+
 
     const saved = await sendBotReply({
         conversationId: chatId,
