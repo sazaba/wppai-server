@@ -832,25 +832,61 @@ function extractName(raw: string): string | null {
 }
 
 
-// (REEMPLAZA) — fallback “nombre suelto”
+
+// Palabras comunes que NO pueden aparecer en un "nombre suelto"
+const NON_NAME_WORDS_RX = new RegExp(
+    String.raw`\b(
+      hola|buenos|buenas|dias|días|tardes|noches|gracias|ok|vale|listo|perfecto|
+      quiero|quisiera|puedo|necesito|me|gustaria|gustaría|agendar|agenda|cita|reservar|disponible|disponibilidad|
+      precio|costo|vale|cuanto|cuánto|tratamiento|botox|toxina|relleno|peeling|hidra|limpieza|laser|l[aá]ser|mesoterapia|
+      dia|día|fecha|hora|tarde|mañana|manana|noche|hoy|mañana|manana|proximo|pr[oó]ximo|semana|cuando|cu[aá]ndo|que|qu[eé]
+    )\b`,
+    "i"
+);
+
+
+// (REEMPLAZA) — fallback “nombre suelto” con filtros fuertes
 function looksLikeLooseName(raw: string): string | null {
     if (!raw) return null;
+
+    // Si trae signos de pregunta/exclamación o comas, es muy probable que NO sea un nombre
+    if (/[?¿!¡,;:]/.test(raw)) return null;
+
+    // Si contiene palabras típicas de intención, fechas/horas o servicios → NO es nombre
+    if (NON_NAME_WORDS_RX.test(raw)) return null;
+
+    // Limpieza y cortes básicos
     let t = cutAtStops(stripJunk(raw));
     if (!t) return null;
 
-    if (CONTEXT_STOPS.test(t)) return null;
+    // Evita que el contexto “sospechoso” sobreviva
+    if (CONTEXT_STOPS.test(raw)) return null;
 
     const tokens = t.split(/\s+/).filter(Boolean);
-    if (tokens.length === 1 && NON_NAME_SINGLETONS.has(tokens[0].toLowerCase())) {
-        return null;
+
+    // Aceptamos 2–4 tokens como “nombre suelto”; 1 token solo si es largo (≥3)
+    if (tokens.length === 1) {
+        const one = tokens[0];
+        if (NON_NAME_SINGLETONS.has(one.toLowerCase())) return null;
+        if (one.length < 3) return null;
+    } else {
+        if (tokens.length < 2 || tokens.length > 4) return null;
     }
 
-    if (tokens.length < 1 || tokens.length > 6) return null;
+    // Todos los tokens deben ser “tipo nombre” o partículas, no verbos/comunes
+    for (const tok of tokens) {
+        const low = tok.toLowerCase();
+        if (NAME_PARTICLES.has(low)) continue;
+        // Si parece verbo/común (heurística): termina en -ar/-er/-ir o es muy genérica
+        if (/(ar|er|ir)$/.test(low)) return null;
+    }
 
     const pretty = normalizeNamePretty(t);
     if (!looksValidNameSequence(pretty)) return null;
+
     return pretty;
 }
+
 
 
 /** Extrae *solo* la preferencia temporal (día/fecha + hora) del texto del cliente */
