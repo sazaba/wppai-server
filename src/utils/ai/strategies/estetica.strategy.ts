@@ -55,6 +55,21 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
     recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: now });
     return false;
 }
+
+async function askedRecentlyForName(conversationId: number, withinMs = 90_000) {
+    const prev = await prisma.message.findFirst({
+        where: { conversationId, from: MessageFrom.bot },
+        orderBy: { timestamp: "desc" },
+        select: { contenido: true, timestamp: true },
+    });
+    if (!prev) return false;
+    const txt = (prev.contenido || "").toLowerCase();
+    const asked = txt.includes("¿cuál es tu *nombre completo*?".toLowerCase()) ||
+        txt.includes("cual es tu *nombre completo*?".toLowerCase());
+    const recent = Date.now() - new Date(prev.timestamp as any).getTime() <= withinMs;
+    return asked && recent;
+}
+
 function markActuallyReplied(conversationId: number, clientTs: Date) {
     recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: Date.now() });
 }
@@ -1194,7 +1209,10 @@ export async function handleEsteticaStrategy({
     // ====== Agendamiento flexible (colecta progresiva sin calcular hora) ======
     // 1) Actualiza draft con lo que venga en texto
     let state = await loadState(chatId);
-    let nameInText = extractName(userText);
+    // 1º intenta con gatillos (soy / me llamo / mi nombre es)
+    // 2º si no, usa el detector robusto de nombre "suelto" (validado)
+    let nameInText = extractName(userText) || looksLikeLooseName(userText);
+
 
 
     let match = resolveServiceName(kb, userText || "");
@@ -1338,10 +1356,17 @@ export async function handleEsteticaStrategy({
         };
     }
 
+
+
     // ===== Pedir piezas SOLO si hay intención de agenda o ya hay piezas
     const needProcedure = !newDraft.procedureId && !newDraft.procedureName;
     const needWhen = !hasSomeDateDraft(newDraft);
-    const needName = !newDraft.name;
+    let needName = !newDraft.name; // <— cambia a let
+
+    if (needName && await askedRecentlyForName(chatId)) {
+        // ya lo pedimos hace muy poco; evita repetir la misma pregunta
+        needName = false;
+    }
 
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
     const infoBreaker = shouldBypassScheduling(
