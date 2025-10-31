@@ -246,11 +246,14 @@ function isEducationalQuestion(text: string): boolean {
     return false;
 }
 
-function shouldBypassScheduling(t: string): boolean {
-    if (isSchedulingCue(t) || containsDateOrTimeHints(t)) return false; // señales claras → sí agenda
-    if (isShortQuestion(t) || isGeneralInfoQuestion(t) || isEducationalQuestion(t)) return true; // informativo → NO agenda
+
+function shouldBypassScheduling(t: string, hasPartialAgenda: boolean): boolean {
+    if (isSchedulingCue(t) || containsDateOrTimeHints(t)) return false;
+    if (hasPartialAgenda) return false;
+    if (isShortQuestion(t) || isGeneralInfoQuestion(t) || isEducationalQuestion(t)) return true;
     return false;
 }
+
 
 
 type Intent = "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
@@ -351,6 +354,25 @@ function formatServicesPretty(kb: EsteticaKB, max = 8): string {
 }
 
 
+// [ADD] Helper: texto para pedir piezas faltantes (proc/when/name)
+function buildAskPiecesText(kb: EsteticaKB, need: { proc: boolean; when: boolean; name: boolean }) {
+    const asks: string[] = [];
+    if (need.proc) {
+        const sample = (kb.procedures || [])
+            .filter(p => p.enabled !== false)
+            .slice(0, 3)
+            .map(s => s.name)
+            .join(", ");
+        asks.push(`¿Para qué *tratamiento* deseas la cita? (Ej.: ${sample || "Limpieza, Peeling, Toxina"})`);
+    }
+    if (need.when) {
+        asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “martes en la tarde” o “15/11 a las 3 pm”).`);
+    }
+    if (need.name) {
+        asks.push(`¿Cuál es tu *nombre completo*?`);
+    }
+    return asks.join(" ");
+}
 
 
 
@@ -1331,29 +1353,30 @@ export async function handleEsteticaStrategy({
     const needName = !newDraft.name;
 
     const hasServiceOrWhen = !!(newDraft.procedureId || newDraft.procedureName || newDraft.whenText || newDraft.whenISO);
-    const infoBreaker = shouldBypassScheduling(userText);
+    const infoBreaker = shouldBypassScheduling(
+        userText,
+        hasServiceOrWhen || inferredIntent === "schedule" || state.lastIntent === "schedule"
+    );
+
 
     const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
 
+    // === INFO BREAKER con seguimiento de agenda ===
+    if (infoBreaker) {
+        let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
+        const wasGreeted = (await loadState(chatId)).greeted;
+        texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
-    const shouldAskForAgendaPieces =
-        !infoBreaker && (inferredIntent === "schedule" || hasServiceOrWhen);
+        // Si estamos (o parecemos estar) en flujo de agenda y faltan piezas, pídelas al final
+        if (hasServiceOrWhen || inferredIntent === "schedule" || state.lastIntent === "schedule") {
+            if (needProcedure || needWhen || needName) {
+                const tail = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
+                if (tail) texto = `${texto}\n\n${tail}`;
+            }
+            await patchState(chatId, { lastIntent: "schedule" });
+        }
 
-
-    if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
-        const asks: string[] = [];
-        if (needProcedure) {
-            const sample = kb.procedures.slice(0, 3).map(s => s.name).join(", ");
-            asks.push(`¿Para qué *tratamiento* deseas la cita? (Ej.: ${sample})`);
-        }
-        if (needWhen) {
-            asks.push(`¿Qué *día y hora* prefieres? Escríbelo *tal cual* (ej.: “martes en la tarde” o “15/11 a las 3 pm”).`);
-        }
-        if (needName) {
-            asks.push(`¿Cuál es tu *nombre completo*?`);
-        }
-        let texto = clampText(asks.join(" "));
-        texto = addEmojiStable(texto, chatId);
+        texto = addEmojiStable(clampText(texto), chatId);
 
         const saved = await sendBotReply({
             conversationId: chatId,
@@ -1372,6 +1395,33 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
+    const shouldAskForAgendaPieces =
+        !infoBreaker && (inferredIntent === "schedule" || hasServiceOrWhen);
+
+
+    if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
+        let texto = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
+        texto = addEmojiStable(clampText(texto), chatId);
+
+        const saved = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
 
     // ===== Respuesta libre (modo natural) usando el summary extendido
     let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
