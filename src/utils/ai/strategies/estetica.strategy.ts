@@ -59,6 +59,30 @@ function markActuallyReplied(conversationId: number, clientTs: Date) {
     recentReplies.set(conversationId, { afterMs: clientTs.getTime(), repliedAtMs: Date.now() });
 }
 
+// Convierte "HH:MM" a minutos desde medianoche (ej.: "13:30" -> 810)
+function hmToMin(hm?: string | null): number | null {
+    if (!hm) return null;
+    const m = /^(\d{1,2}):(\d{2})$/.exec(hm.trim());
+    if (!m) return null;
+    const h = Number(m[1]), mi = Number(m[2]);
+    if (isNaN(h) || isNaN(mi)) return null;
+    return h * 60 + mi;
+}
+
+// Convierte minutos a etiqueta 12h (ej.: 780 -> "1pm")
+function minToLabel(min: number) {
+    const h24 = Math.floor(min / 60);
+    const m = min % 60;
+    const ampm = h24 >= 12 ? "pm" : "am";
+    const h12 = ((h24 % 12) || 12);
+    return m === 0 ? `${h12}${ampm}` : `${h12}:${m.toString().padStart(2, "0")}${ampm}`;
+}
+
+// Orden y etiqueta de días para day = 'mon'|'tue'|... según tu tabla
+const DAY_ORDER: Record<string, number> = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
+const DAY_LABEL: Record<string, string> = { mon: "L", tue: "M", wed: "X", thu: "J", fri: "V", sat: "S", sun: "D" };
+
+
 /** Detecta si el mensaje es nota de voz o audio */
 function isVoiceInbound(last: { isVoiceNote?: boolean | null; mediaType?: any; mimeType?: string | null; }) {
     if (last?.isVoiceNote) return true;
@@ -396,6 +420,52 @@ async function buildOrReuseSummary(args: {
         },
     });
 
+    // === Horario desde BD (tu esquema: day,isOpen,start1,end1,start2,end2) ===
+    const rawDays = await prisma.appointmentHour.findMany({
+        where: { empresaId },
+        select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
+    });
+
+    // Normaliza, ordena y arma tramos por día
+    type DayRow = { day: string; isOpen: number | boolean; start1?: string | null; end1?: string | null; start2?: string | null; end2?: string | null };
+    function formatDaysCompact(rows: DayRow[]) {
+        if (!rows?.length) return "";
+
+        // Ordena según L..D
+        const sorted = rows
+            .slice()
+            .sort((a, b) => (DAY_ORDER[a.day] || 99) - (DAY_ORDER[b.day] || 99));
+
+        const parts: string[] = [];
+
+        for (const r of sorted) {
+            const open = Number(r.isOpen) === 1 || r.isOpen === true;
+            if (!open) continue;
+
+            const spans: string[] = [];
+
+            const s1 = hmToMin(r.start1), e1 = hmToMin(r.end1);
+            if (s1 != null && e1 != null && e1 > s1) {
+                spans.push(`${minToLabel(s1)}–${minToLabel(e1)}`);
+            }
+
+            const s2 = hmToMin(r.start2), e2 = hmToMin(r.end2);
+            if (s2 != null && e2 != null && e2 > s2) {
+                spans.push(`${minToLabel(s2)}–${minToLabel(e2)}`);
+            }
+
+            if (spans.length) {
+                const label = DAY_LABEL[r.day] || r.day;
+                parts.push(`${label} ${spans.join(", ")}`);
+            }
+        }
+
+        return parts.join("; ");
+    }
+
+    let hoursLineFromDB = formatDaysCompact(rawDays as DayRow[]);
+
+
     // Pagos (opcional)
     const payments = paymentMethodsFromKB(kb);
 
@@ -412,15 +482,24 @@ async function buildOrReuseSummary(args: {
         .join(" | ");
 
     // Intento de extraer un horario "tal cual" desde KB/config, sin calcular
+    // Horario con prioridad BD → KB → kbFreeText (sin “calcular”, sólo formateo)
     let hoursLine: string | null = null;
-    const hoursFromKB = (kb as any).hoursSimple || (kb as any).hours || null;
-    if (hoursFromKB) hoursLine = String(hoursFromKB).trim();
 
-    // También permitimos que lo hayas escrito en kbFreeText como: "🕒 Horario: L–V 9–1; 2–6"
+    // 1) BD (formateado con DAY_LABEL + minToLabel)
+    if (hoursLineFromDB) hoursLine = hoursLineFromDB;
+
+    // 2) KB (simple o general), si BD no trajo nada
+    if (!hoursLine) {
+        const hoursFromKB = (kb as any).hoursSimple || (kb as any).hours || null;
+        if (hoursFromKB) hoursLine = String(hoursFromKB).trim();
+    }
+
+    // 3) kbFreeText (patrón "🕒 Horario: ...") como respaldo
     if (!hoursLine && apptCfg?.kbFreeText) {
         const m = String(apptCfg.kbFreeText).match(/🕒\s*Horario:\s*([^\n]+)/i);
         if (m) hoursLine = m[1].trim();
     }
+
 
     // FAQs (mismo parser que ya tenías)
     type FAQ = { q: string; a: string };
