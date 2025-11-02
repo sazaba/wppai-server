@@ -90,7 +90,6 @@ function isNo(text: string) {
 function norm(s: string) {
     return (s || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
 }
-
 async function askedRecentlyForName(conversationId: number, withinMs = 90_000) {
     const prev = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
@@ -98,12 +97,11 @@ async function askedRecentlyForName(conversationId: number, withinMs = 90_000) {
         select: { contenido: true, timestamp: true },
     });
     if (!prev) return false;
-
     const t = norm(prev.contenido || "");
     const asked =
-        /\bcual es tu nombre completo\b/.test(t) ||              // pedir nombre directo
-        /\bte registro como\b/.test(t);                          // confirmación de nombre
-
+        /\bcual es tu nombre completo\b/.test(t) ||
+        /\bme llamo\b.*\bnombre\b/.test(t) ||
+        /\bnombre completo\b/.test(t);
     const recent = Date.now() - new Date(prev.timestamp as any).getTime() <= withinMs;
     return asked && recent;
 }
@@ -425,6 +423,8 @@ function paymentMethodsFromKB(kb: EsteticaKB): string[] {
     for (const [label, v] of flags) if (v === true) list.push(label);
     return Array.from(new Set(list)).sort();
 }
+// variable reutilizable para evitar "Cannot redeclare block-scoped variable 'summary'"
+let summaryText: string = "";
 
 async function buildOrReuseSummary(args: {
     empresaId: number;
@@ -663,6 +663,29 @@ async function buildOrReuseSummary(args: {
     await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
     return compact;
 }
+
+/* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
+function overlayAgenda(summary: string, draft?: AgentState["draft"]): string {
+    const t = (draft?.procedureName || "").trim();
+    const n = (draft?.name || "").trim();
+    const w = (draft?.whenText || (draft?.whenISO ? new Date(draft.whenISO).toISOString() : "")).trim();
+
+    const agenda = [
+        "=== AGENDA_COLECTADA ===",
+        `tratamiento: ${t || "—"}`,
+        `nombre: ${n || "—"}`,
+        `preferencia: ${w || "—"}`,
+        "=== FIN_AGENDA ===",
+    ].join("\n");
+
+    // Quita bloque previo si existiera, luego inserta uno fresco al final
+    const cleaned = summary
+        .replace(/=== AGENDA_COLECTADA ===[\s\S]*?=== FIN_AGENDA ===/g, "")
+        .trim();
+
+    return `${cleaned}\n\n${agenda}`;
+}
+
 
 /* ====== NAME EXTRACTION (robusto) ====== */
 // Palabras y frases que NO son nombre aunque sean un solo token válido
@@ -1051,21 +1074,24 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         "No te presentes de nuevo después del primer turno (no digas 'soy el asistente...' ni repitas bienvenida).",
         "Evita saludos duplicados en turnos posteriores; ve directo a la respuesta.",
 
-        // === REGLAS DE HORARIOS ===
-        "NO muestres horarios a menos que el usuario lo pida explícitamente (palabras como: horario, horarios, días, abren, atienden, trabajan, ‘¿de qué hora a qué hora?’).",
-        "Si el usuario pregunta por servicios o precios, NO incluyas horarios en esa respuesta.",
-        "Al mostrar horarios, usa SOLO lo que esté en el RESUMEN (no inventes, no completes, no asumas).",
-        "Prefiere el bloque HORARIO_SIMPLE; si no existe, usa HORARIO. Si no hay ninguno, dilo de forma clara: 'Por ahora no tengo el horario en el sistema.'",
-        "Formato corto de ejemplo (NO hardcodees): 'L 9am–1pm, 2pm–6pm; M 9am–1pm, 2pm–6pm; …'. Puedes usar abreviaturas L, M, X, J, V, S, D si el RESUMEN lo permite; si el RESUMEN ya trae otro formato, respétalo.",
-        "Si preguntan por un día específico y ese día NO aparece en HORARIO_SIMPLE ni en HORARIO, responde claramente: 'Ese día no trabajamos en la clínica.'",
-        // === ALCANCE Y FUENTES ===
-        "Si el usuario pregunta por horarios o disponibilidad, prioriza avanzar con la agenda. Menciona valoración solo si el usuario la pide o si aún no está claro el tratamiento.",
-        "Evita forzar agenda en preguntas informativas; primero responde la info y luego invita sutilmente a dar tratamiento, día/hora y nombre.",
-        "Cuando las tres piezas estén completas, no prometas cupos; di que vas a validar disponibilidad y pasa la conversación a un asesor humano.",
-        "Si faltan datos operativos (pagos/promos/etc.), responde: 'esa información se confirma en la valoración o directamente en la clínica'.",
+        // === HORARIOS ===
+        "NO muestres horarios a menos que el usuario lo pida explícitamente (horario/horarios/días/abren/atienden/'¿de qué hora a qué hora?').",
+        "Si el usuario pregunta por servicios o precios, NO incluyas horarios.",
+        "Al mostrar horarios, usa SOLO lo que esté en el RESUMEN; no inventes ni asumas.",
+        "Si no hay horario en el RESUMEN, dilo de forma natural sin culpar al resumen (ej.: 'Por ahora no tengo el horario en el sistema.').",
+        "Si preguntan por un día que no aparece, responde claro (ej.: 'Ese día no trabajamos.').",
+
+        // === COLECTA PROGRESIVA VÍA AGENDA ===
+        "El RESUMEN incluye un bloque AGENDA_COLECTADA con 3 piezas: tratamiento, nombre, preferencia (día/hora).",
+        "Pide SOLO una pieza faltante por turno, en este orden: tratamiento → día/hora → nombre.",
+        "Si ya están las 3 piezas, NO prometas cupos ni confirmes; di que vas a validar disponibilidad y que un asesor continúa.",
+        "No digas 'en el resumen no se especifica' ni 'no veo en el resumen'; habla en primera persona y pregunta de forma natural.",
+        "Evita forzar agenda cuando el cliente hace preguntas informativas; primero responde su duda y luego invita suave a aportar la siguiente pieza si procede.",
+
         "Tu única fuente es el RESUMEN a continuación.",
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
+
 
     const messages: any[] = [{ role: "system", content: sys }];
     if (imageUrl) {
@@ -1264,8 +1290,7 @@ export async function handleEsteticaStrategy({
     // 1º intenta con gatillos (soy / me llamo / mi nombre es)
     // 2º si no, usa el detector robusto de nombre "suelto" (validado)
     let nameInText: string | null = null;
-    let nameSource: "trigger" | "loose" | "llm" | "loose_lastline" | null = null;
-
+    let nameSource: "trigger" | "loose" | "llm" | null = null;
 
     // Declarar nextName ANTES de usarlo
     const prevDraft = state.draft ?? {};
@@ -1299,26 +1324,6 @@ export async function handleEsteticaStrategy({
             }
         }
     }
-
-    // ===== B) Si el usuario envió varias líneas, toma la ÚLTIMA como posible nombre y acéptalo directo =====
-    // ==== DESDE AQUÍ (B) ====
-    // Si el usuario envió varias líneas, toma la ÚLTIMA como posible nombre y acéptalo directo
-    if (!nextName && !nameInText) {
-        const lines = (userText || "")
-            .split(/\r?\n/)
-            .map(s => s.trim())
-            .filter(Boolean);
-
-        if (lines.length >= 2) {
-            const lastLine = lines[lines.length - 1];
-            const lastAsName = looksLikeLooseName(lastLine);
-            if (lastAsName) {
-                nextName = lastAsName;
-                nameSource = "loose_lastline" as any;
-            }
-        }
-    }
-
 
     // Resolver procedimiento (se mantiene igual)
     let match = resolveServiceName(kb, userText || "");
@@ -1385,37 +1390,17 @@ export async function handleEsteticaStrategy({
     await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
 
     // ——— Confirmación de nombre pendiente (si aplica)
-    // ——— Confirmación de nombre pendiente (si aplica)
     if (newDraft.pendingConfirm?.name && !newDraft.name) {
-
-        {
-            const normalized = (s: string) =>
-                (s || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").trim();
-
-            const maybeNameNow = looksLikeLooseName(userText) || extractName(userText);
-            const suggested = newDraft.pendingConfirm?.name || "";
-
-            if (maybeNameNow && normalized(maybeNameNow) === normalized(suggested)) {
-                newDraft.name = suggested;
-                newDraft.pendingConfirm = undefined;
-                await patchState(chatId, { draft: newDraft });
-                // sigue el flujo sin volver a preguntar
-            }
-        }
-        // ==== HASTA AQUÍ (C) ====
-
-
         if (isYes(userText)) {
             // Confirmado → fijamos nombre
-            newDraft.name = newDraft.pendingConfirm?.name || "";
+            newDraft.name = newDraft.pendingConfirm.name;
             newDraft.pendingConfirm = undefined;
             await patchState(chatId, { draft: newDraft });
         } else if (isNo(userText)) {
             // Rechazado → pedimos el nombre con gatillo
             newDraft.pendingConfirm = undefined;
             await patchState(chatId, { draft: newDraft });
-            const ask =
-                "Gracias. ¿Cuál es tu *nombre completo*? (ej.: *Me llamo* Ana María Gómez)";
+            const ask = "Gracias. ¿Cuál es tu *nombre completo*? (ej.: *Me llamo* Ana María Gómez)";
             const saved = await sendBotReply({
                 conversationId: chatId,
                 empresaId,
@@ -1425,25 +1410,10 @@ export async function handleEsteticaStrategy({
                 phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-            return {
-                estado: ConversationEstado.respondido,
-                mensaje: saved.texto,
-                messageId: saved.messageId,
-                wamid: saved.wamid,
-                media: [],
-            };
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         } else {
             // Aún no hubo sí/no → preguntar explícitamente
-            // Aún no hubo sí/no → preguntar explícitamente (solo si hay sugerido)
-            const suggested = (newDraft.pendingConfirm?.name || "").trim();
-            let ask: string;
-
-            if (suggested) {
-                ask = `¿Te registro como *${suggested}*?`;
-            } else {
-                ask = "Gracias. ¿Cuál es tu *nombre completo*? (ej.: *Me llamo* Ana María Gómez)";
-            }
-
+            const ask = `¿Te registro como *${newDraft.pendingConfirm.name}*?`;
             const saved = await sendBotReply({
                 conversationId: chatId,
                 empresaId,
@@ -1454,16 +1424,74 @@ export async function handleEsteticaStrategy({
             });
             if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
             await patchState(chatId, { draft: newDraft });
-            return {
-                estado: ConversationEstado.respondido,
-                mensaje: saved.texto,
-                messageId: saved.messageId,
-                wamid: saved.wamid,
-                media: [],
-            };
+            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
     }
 
+    // 2) Handoff solo si tenemos las 3 piezas EN EL DRAFT (sin regex del texto)
+    if (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft)) {
+        const piezasBonitas = [
+            `💆 *Tratamiento:* ${newDraft.procedureName ?? "—"}`,
+            `👤 *Nombre:* ${newDraft.name}`,
+            newDraft.whenText
+                ? `🗓️ *Preferencia:* ${newDraft.whenText}`
+                : (newDraft.whenISO
+                    ? `🗓️ *Fecha:* ${new Date(newDraft.whenISO).toLocaleDateString("es-CO", {
+                        weekday: "long",
+                        day: "2-digit",
+                        month: "2-digit",
+                        year: "numeric",
+                    })}`
+                    : ""),
+        ].filter(Boolean).join("\n");
+
+        let cleaned = `Perfecto ✨, dame *unos minutos* mientras *verifico la disponibilidad* para ese horario y te confirmo por aquí.\n\n${piezasBonitas}`;
+
+        cleaned = sanitizeGreeting(cleaned, { allowFirstGreeting: false });
+        cleaned = cleaned.replace(/\bmi\s+nombre\s+es\s+[A-ZÁÉÍÓÚÑa-záéíóúñü\s]+/gi, "").trim();
+        cleaned = addEmojiStable(cleaned, chatId);
+
+        const saved = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: clampText(cleaned),
+            nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        await patchState(chatId, { handoffLocked: true });
+        return {
+            estado: ConversationEstado.requiere_agente,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
+    // 3) Si está fuera de alcance → redirige suave
+    if (isOutOfScope(userText)) {
+        const txt =
+            "Puedo ayudarte con información de nuestros servicios estéticos y agendar tu cita. ¿Qué procedimiento te interesa o para qué fecha te gustaría programar? 🙂";
+
+        const saved = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: txt,
+            nuevoEstado: ConversationEstado.respondido,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+        return {
+            estado: ConversationEstado.respondido,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
 
     // ——— Respuesta directa a “qué servicios”
     if (/\b(que\s+servicios|qué\s+servicios|servicios\s+ofreces?)\b/i.test(userText)) {
@@ -1512,11 +1540,13 @@ export async function handleEsteticaStrategy({
     );
 
 
-    const summary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
+    const baseSummary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
+    summaryText = overlayAgenda(baseSummary, newDraft);
 
     // === INFO BREAKER con seguimiento de agenda ===
     if (infoBreaker) {
-        let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
+        let texto = await runLLM({ summary: summaryText, userText, imageUrl }).catch(() => "");
+
         const wasGreeted = (await loadState(chatId)).greeted;
         texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
@@ -1528,28 +1558,34 @@ export async function handleEsteticaStrategy({
 
         if (wantBookSoft) {
             if (needProcedure || needWhen || needName) {
-                // ==== DESDE AQUÍ (Parche mensaje dinámico A) ====
-                const missing: string[] = [];
-                if (needProcedure) missing.push("qué *tratamiento* te interesa");
-                if (needWhen) missing.push("qué *día y hora* prefieres");
-                if (needName) missing.push("tu *nombre completo*");
-
-                let tail = "";
-                if (missing.length === 1) {
-                    tail = `Perfecto ✨, para continuar necesito saber ${missing[0]}.`;
-                } else if (missing.length === 2) {
-                    tail = `Perfecto ✨, para continuar necesito saber ${missing[0]} y ${missing[1]}.`;
-                } else {
-                    tail = `Claro 😊, para agendar necesito saber:\n• ${missing.join("\n• ")}\n¿Me ayudas con estos datos?`;
-                }
+                const tail = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
                 if (tail) texto = `${texto}\n\n${tail}`;
-                // ==== HASTA AQUÍ (Parche mensaje dinámico A) ====
             }
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
-            // (sigue igual)
+            async function appendOnceInvitationTail(
+                conversationId: number,
+                body: string,
+                tail: string
+            ) {
+                const prev = await prisma.message.findFirst({
+                    where: { conversationId, from: MessageFrom.bot },
+                    orderBy: { timestamp: "desc" },
+                    select: { contenido: true, timestamp: true }
+                });
+                const norm = normalizeForDedup;
+                if (prev && norm(prev.contenido || "").includes(norm(tail))) {
+                    return body; // ya lo dijimos
+                }
+                return `${body}\n\n${tail}`;
+            }
+            // ✅ por esta:
+            texto = await appendOnceInvitationTail(
+                chatId,
+                texto,
+                "Si luego quieres agendar, cuéntame *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*."
+            );
         }
-
 
 
         texto = addEmojiStable(clampText(texto), chatId);
@@ -1581,22 +1617,8 @@ export async function handleEsteticaStrategy({
 
 
     if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
-        // ==== DESDE AQUÍ (Parche mensaje dinámico B) ====
-        const missing: string[] = [];
-        if (needProcedure) missing.push("qué *tratamiento* te interesa");
-        if (needWhen) missing.push("qué *día y hora* prefieres");
-        if (needName) missing.push("tu *nombre completo*");
-
-        let ask: string;
-        if (missing.length === 1) {
-            ask = `Perfecto ✨, para continuar necesito saber ${missing[0]}.`;
-        } else if (missing.length === 2) {
-            ask = `Perfecto ✨, para continuar necesito saber ${missing[0]} y ${missing[1]}.`;
-        } else {
-            ask = `Claro 😊, para agendar necesito saber:\n• ${missing.join("\n• ")}\n¿Me ayudas con estos datos?`;
-        }
-
-        let texto = addEmojiStable(clampText(ask), chatId);
+        let texto = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
+        texto = addEmojiStable(clampText(texto), chatId);
 
         const saved = await sendBotReply({
             conversationId: chatId,
@@ -1616,16 +1638,17 @@ export async function handleEsteticaStrategy({
         };
     }
 
-    // ===== Respuesta libre (modo natural) usando el summary extendido
-    // ===== Respuesta libre (modo natural) usando el summary extendido
-    let texto = await runLLM({ summary, userText, imageUrl }).catch(() => "");
+    const baseSummary2 = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
+    summaryText = overlayAgenda(baseSummary2, newDraft);
+    let texto = await runLLM({ summary: summaryText, userText, imageUrl }).catch(() => "");
+
     const wasGreeted = (await loadState(chatId)).greeted; // ya tenemos 'state', pero aseguramos valor fresco
     texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
     // Invitación suave SOLO si la intención fue informativa y no hay slots parciales
-    // if (inferredIntent === "info" && !hasServiceOrWhen) {
-    //     texto = `${texto}\n\nSi deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.`;
-    // }
+    if (inferredIntent === "info" && !hasServiceOrWhen) {
+        texto = `${texto}\n\nSi deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.`;
+    }
 
     texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
     texto = addEmojiStable(texto, chatId);
