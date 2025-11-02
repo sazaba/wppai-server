@@ -711,6 +711,52 @@ async function buildOrReuseSummary(args: {
     if (S.kbBusinessOverview) lines.push(`📝 ${softTrim(S.kbBusinessOverview, 260)}`);
     if (S.kbFreeText) lines.push(`📝 ${softTrim(S.kbFreeText, 260)}`);
 
+    // === META solo para la IA (no visible al cliente) ===
+    // Colócalo antes de "🧠 Historial: ..."
+
+    // 1) Staff general (compacto)
+    if ((kb.staff ?? []).length) {
+        const staffMeta: string[] = [];
+        staffMeta.push("=== STAFF ===");
+        for (const s of kb.staff) {
+            // formatea rol en minúsculas legibles
+            const role = String(s.role || "").toLowerCase();
+            staffMeta.push(`- id=${s.id}; name=${s.name}; role=${role}; active=${s.active ? "1" : "0"}`);
+        }
+        staffMeta.push("=== FIN_STAFF ===");
+        lines.push(staffMeta.join("\n"));
+    }
+
+    // 2) Catálogo con duración y staff requerido por procedimiento
+    if ((kb.procedures ?? []).length) {
+        const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
+
+        const catMeta: string[] = [];
+        catMeta.push("=== CATALOGO_DETALLE ===");
+        for (const p of kb.procedures) {
+            if (p?.enabled === false) continue;
+
+            // duración: prioriza la del procedimiento; si no, usa defaultServiceDurationMin
+            const dur =
+                (p.durationMin != null ? p.durationMin : (kb.defaultServiceDurationMin ?? null));
+            const durTxt = dur != null ? `${dur}min` : "NA";
+
+            // staff requerido (si aplica)
+            const staffReq = (p.requiredStaffIds ?? [])
+                .map(id => staffById.get(id))
+                .filter(Boolean) as string[];
+            const staffTxt = staffReq.length ? staffReq.join(", ") : "libre";
+
+            // precio min como referencia para la IA (no para mostrar)
+            const priceTxt = p.priceMin != null ? `${Number(p.priceMin)}` : "NA";
+
+            catMeta.push(`- proc=${p.name}; dur=${durTxt}; staff=${staffTxt}; priceMinCOP=${priceTxt}`);
+        }
+        catMeta.push("=== FIN_CATALOGO ===");
+        lines.push(catMeta.join("\n"));
+    }
+
+
     lines.push(`🧠 Historial: ${history || "—"}`);
 
     let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n");
@@ -1030,16 +1076,32 @@ async function appendOnceInvitationTail(
     body: string,
     tail: string
 ) {
+    // 1) Si el propio cuerpo ya tiene CTA → no añadir
+    if (bodyHasCTA(body)) return body;
+
+    // 2) Evita repetir si el último bot ya lo mandó
     const prev = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
         orderBy: { timestamp: "desc" },
-        select: { contenido: true, timestamp: true }
+        select: { contenido: true }
     });
     const norm = normalizeForDedup;
     if (prev && norm(prev.contenido || "").includes(norm(tail))) {
-        return body; // ya enviado
+        return body;
     }
+
     return `${body}\n\n${tail}`;
+}
+
+
+// === CTA único y detector de CTA en el cuerpo ===
+const CTA_UNICO =
+    "¿Te gustaría agendar una cita? Si es así, cuéntame *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.";
+
+const CTA_RX = /\b(te\s+gustaria\s+agendar|si\s+(?:luego\s+)?quieres\s+agendar|si\s+deseas\s+agendar|agendar\s+una\s+cita|agendamos)\b/i;
+
+function bodyHasCTA(s: string) {
+    return CTA_RX.test(normalizeForDedup(s));
 }
 
 
@@ -1671,12 +1733,8 @@ export async function handleEsteticaStrategy({
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
 
-            // // ✅ por esta:
-            // texto = await appendOnceInvitationTail(
-            //     chatId,
-            //     texto,
-            //     "Si luego quieres agendar, cuéntame *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*."
-            // );
+            texto = await appendOnceInvitationTail(chatId, texto, CTA_UNICO);
+
         }
 
 
@@ -1740,12 +1798,9 @@ export async function handleEsteticaStrategy({
 
     // Invitación suave...
     if (inferredIntent === "info" && !hasServiceOrWhen) {
-        texto = await appendOnceInvitationTail(
-            chatId,
-            texto,
-            "Si deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*."
-        );
+        texto = await appendOnceInvitationTail(chatId, texto, CTA_UNICO);
     }
+
 
     texto = stripEmojis(texto);  // ← NUEVO (sanea emojis del LLM)
     texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
