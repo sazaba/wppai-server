@@ -90,6 +90,7 @@ function isNo(text: string) {
 function norm(s: string) {
     return (s || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
 }
+
 async function askedRecentlyForName(conversationId: number, withinMs = 90_000) {
     const prev = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
@@ -97,11 +98,12 @@ async function askedRecentlyForName(conversationId: number, withinMs = 90_000) {
         select: { contenido: true, timestamp: true },
     });
     if (!prev) return false;
+
     const t = norm(prev.contenido || "");
     const asked =
-        /\bcual es tu nombre completo\b/.test(t) ||
-        /\bme llamo\b.*\bnombre\b/.test(t) ||
-        /\bnombre completo\b/.test(t);
+        /\bcual es tu nombre completo\b/.test(t) ||              // pedir nombre directo
+        /\bte registro como\b/.test(t);                          // confirmación de nombre
+
     const recent = Date.now() - new Date(prev.timestamp as any).getTime() <= withinMs;
     return asked && recent;
 }
@@ -1262,7 +1264,8 @@ export async function handleEsteticaStrategy({
     // 1º intenta con gatillos (soy / me llamo / mi nombre es)
     // 2º si no, usa el detector robusto de nombre "suelto" (validado)
     let nameInText: string | null = null;
-    let nameSource: "trigger" | "loose" | "llm" | null = null;
+    let nameSource: "trigger" | "loose" | "llm" | "loose_lastline" | null = null;
+
 
     // Declarar nextName ANTES de usarlo
     const prevDraft = state.draft ?? {};
@@ -1298,6 +1301,8 @@ export async function handleEsteticaStrategy({
     }
 
     // ===== B) Si el usuario envió varias líneas, toma la ÚLTIMA como posible nombre y acéptalo directo =====
+    // ==== DESDE AQUÍ (B) ====
+    // Si el usuario envió varias líneas, toma la ÚLTIMA como posible nombre y acéptalo directo
     if (!nextName && !nameInText) {
         const lines = (userText || "")
             .split(/\r?\n/)
@@ -1307,7 +1312,6 @@ export async function handleEsteticaStrategy({
         if (lines.length >= 2) {
             const lastLine = lines[lines.length - 1];
             const lastAsName = looksLikeLooseName(lastLine);
-            // Si la última línea parece nombre válido, lo fijamos de una vez (sin pendingConfirm)
             if (lastAsName) {
                 nextName = lastAsName;
                 nameSource = "loose_lastline" as any;
@@ -1383,14 +1387,10 @@ export async function handleEsteticaStrategy({
     // ——— Confirmación de nombre pendiente (si aplica)
     // ——— Confirmación de nombre pendiente (si aplica)
     if (newDraft.pendingConfirm?.name && !newDraft.name) {
-        // ===== C) Auto-confirmar si el mensaje actual ES exactamente el nombre sugerido =====
+
         {
             const normalized = (s: string) =>
-                (s || "")
-                    .toLowerCase()
-                    .normalize("NFD")
-                    .replace(/\p{Diacritic}/gu, "")
-                    .trim();
+                (s || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").trim();
 
             const maybeNameNow = looksLikeLooseName(userText) || extractName(userText);
             const suggested = newDraft.pendingConfirm?.name || "";
@@ -1399,9 +1399,11 @@ export async function handleEsteticaStrategy({
                 newDraft.name = suggested;
                 newDraft.pendingConfirm = undefined;
                 await patchState(chatId, { draft: newDraft });
-                // seguimos el flujo normal sin volver a preguntar
+                // sigue el flujo sin volver a preguntar
             }
         }
+        // ==== HASTA AQUÍ (C) ====
+
 
         if (isYes(userText)) {
             // Confirmado → fijamos nombre
@@ -1432,8 +1434,16 @@ export async function handleEsteticaStrategy({
             };
         } else {
             // Aún no hubo sí/no → preguntar explícitamente
-            const suggested = newDraft.pendingConfirm?.name || "";
-            const ask = `¿Te registro como *${suggested}*?`;
+            // Aún no hubo sí/no → preguntar explícitamente (solo si hay sugerido)
+            const suggested = (newDraft.pendingConfirm?.name || "").trim();
+            let ask: string;
+
+            if (suggested) {
+                ask = `¿Te registro como *${suggested}*?`;
+            } else {
+                ask = "Gracias. ¿Cuál es tu *nombre completo*? (ej.: *Me llamo* Ana María Gómez)";
+            }
+
             const saved = await sendBotReply({
                 conversationId: chatId,
                 empresaId,
@@ -1518,34 +1528,28 @@ export async function handleEsteticaStrategy({
 
         if (wantBookSoft) {
             if (needProcedure || needWhen || needName) {
-                const tail = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
+                // ==== DESDE AQUÍ (Parche mensaje dinámico A) ====
+                const missing: string[] = [];
+                if (needProcedure) missing.push("qué *tratamiento* te interesa");
+                if (needWhen) missing.push("qué *día y hora* prefieres");
+                if (needName) missing.push("tu *nombre completo*");
+
+                let tail = "";
+                if (missing.length === 1) {
+                    tail = `Perfecto ✨, para continuar necesito saber ${missing[0]}.`;
+                } else if (missing.length === 2) {
+                    tail = `Perfecto ✨, para continuar necesito saber ${missing[0]} y ${missing[1]}.`;
+                } else {
+                    tail = `Claro 😊, para agendar necesito saber:\n• ${missing.join("\n• ")}\n¿Me ayudas con estos datos?`;
+                }
                 if (tail) texto = `${texto}\n\n${tail}`;
+                // ==== HASTA AQUÍ (Parche mensaje dinámico A) ====
             }
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
-            // async function appendOnceInvitationTail(
-            //     conversationId: number,
-            //     body: string,
-            //     tail: string
-            // ) {
-            //     const prev = await prisma.message.findFirst({
-            //         where: { conversationId, from: MessageFrom.bot },
-            //         orderBy: { timestamp: "desc" },
-            //         select: { contenido: true, timestamp: true }
-            //     });
-            //     const norm = normalizeForDedup;
-            //     if (prev && norm(prev.contenido || "").includes(norm(tail))) {
-            //         return body; // ya lo dijimos
-            //     }
-            //     return `${body}\n\n${tail}`;
-            // }
-            // // ✅ por esta:
-            // texto = await appendOnceInvitationTail(
-            //     chatId,
-            //     texto,
-            //     "Si luego quieres agendar, cuéntame *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*."
-            // );
+            // (sigue igual)
         }
+
 
 
         texto = addEmojiStable(clampText(texto), chatId);
@@ -1577,8 +1581,22 @@ export async function handleEsteticaStrategy({
 
 
     if (shouldAskForAgendaPieces && (needProcedure || needWhen || needName)) {
-        let texto = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
-        texto = addEmojiStable(clampText(texto), chatId);
+        // ==== DESDE AQUÍ (Parche mensaje dinámico B) ====
+        const missing: string[] = [];
+        if (needProcedure) missing.push("qué *tratamiento* te interesa");
+        if (needWhen) missing.push("qué *día y hora* prefieres");
+        if (needName) missing.push("tu *nombre completo*");
+
+        let ask: string;
+        if (missing.length === 1) {
+            ask = `Perfecto ✨, para continuar necesito saber ${missing[0]}.`;
+        } else if (missing.length === 2) {
+            ask = `Perfecto ✨, para continuar necesito saber ${missing[0]} y ${missing[1]}.`;
+        } else {
+            ask = `Claro 😊, para agendar necesito saber:\n• ${missing.join("\n• ")}\n¿Me ayudas con estos datos?`;
+        }
+
+        let texto = addEmojiStable(clampText(ask), chatId);
 
         const saved = await sendBotReply({
             conversationId: chatId,
