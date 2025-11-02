@@ -1671,12 +1671,12 @@ export async function handleEsteticaStrategy({
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
 
-            // ✅ por esta:
-            texto = await appendOnceInvitationTail(
-                chatId,
-                texto,
-                "Si luego quieres agendar, cuéntame *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*."
-            );
+            // // ✅ por esta:
+            // texto = await appendOnceInvitationTail(
+            //     chatId,
+            //     texto,
+            //     "Si luego quieres agendar, cuéntame *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*."
+            // );
         }
 
 
