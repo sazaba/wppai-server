@@ -135,6 +135,46 @@ function minToLabel(min: number) {
     return m === 0 ? `${h12}${ampm}` : `${h12}:${m.toString().padStart(2, "0")}${ampm}`;
 }
 
+function normalizeWhenPreview(raw?: string | null): string | undefined {
+    if (!raw) return undefined;
+    const t = raw.trim();
+
+    // Día (Lun..Dom) compacto
+    const d = t.toLowerCase()
+        .replace(/lunes/i, "Lun")
+        .replace(/martes/i, "Mar")
+        .replace(/mi[eé]rcoles|miercoles/i, "Mié")
+        .replace(/jueves/i, "Jue")
+        .replace(/viernes/i, "Vie")
+        .replace(/s[áa]bado|sabado/i, "Sáb")
+        .replace(/domingo/i, "Dom");
+
+    // Parte del día simple
+    let part = "";
+    if (/\b(mañana|manana)\b/i.test(d)) part = "AM";
+    else if (/\b(tarde)\b/i.test(d)) part = "PM";
+    else if (/\b(noche)\b/i.test(d)) part = "NOCHE";
+
+    // Hora aproximada: “~16:00” si hay número
+    const hm = d.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+    let hhmm = "";
+    if (hm) {
+        let h = parseInt(hm[1], 10);
+        const m = hm[2] ? parseInt(hm[2], 10) : 0;
+        const ampm = (hm[3] || "").toLowerCase();
+        if (ampm === "pm" && h < 12) h += 12;
+        if (ampm === "am" && h === 12) h = 0;
+        hhmm = `~${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+        if (!part) part = (h >= 12 && h < 19) ? "PM" : (h >= 19 ? "NOCHE" : "AM");
+    }
+
+    // Día corto si lo hay
+    const dayShort = (d.match(/\b(Lun|Mar|Mié|Jue|Vie|Sáb|Dom)\b/i)?.[0]) || "";
+
+    return [dayShort, part && `(${part})`, hhmm].filter(Boolean).join(" ").trim();
+}
+
+
 // Orden y etiqueta de días para day = 'mon'|'tue'|... según tu tabla
 const DAY_ORDER: Record<string, number> = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
 const DAY_LABEL: Record<string, string> = { mon: "L", tue: "M", wed: "X", thu: "J", fri: "V", sat: "S", sun: "D" };
@@ -198,6 +238,7 @@ type AgentState = {
         procedureName?: string;
         whenISO?: string;
         whenText?: string; // textual tal cual
+        whenPreview?: string;
         pendingConfirm?: {
             name?: string; // ← sugerencia de nombre pendiente de “sí / no”
         };
@@ -1351,13 +1392,23 @@ export async function handleEsteticaStrategy({
 
     } else {
 
-        // 2) Loose (solo si el mensaje parece ser SOLO el nombre) → requiere confirmación
+        // 2) Loose (si el mensaje es SOLO el nombre) → podemos aceptar directo aun en modo estricto
         const byLoose = looksLikeLooseName(userText);
-        if (byLoose && CONF.NAME_ACCEPT_STRICT !== true) {
+
+        // Heurística: “solo nombre”, sin signos ni palabras de contexto
+        const onlyNameNoContext =
+            !!byLoose &&
+            !/[?¿!¡,;:]/.test(userText) &&
+            !NON_NAME_WORDS_RX.test(userText) &&
+            !CONTEXT_STOPS.test(userText);
+
+        if (byLoose && onlyNameNoContext) {
+            // ✅ Aceptación silenciosa, incluso con NAME_ACCEPT_STRICT = true
             nameInText = byLoose;
             nameSource = "loose";
-        } else if (byLoose && CONF.NAME_ACCEPT_STRICT === true) {
-            // si estamos en modo estricto, lo tratamos como sugerencia (pendiente de confirmar)
+            nextName = byLoose; // ← fijamos directo, NO pedimos confirmación
+        } else if (byLoose && CONF.NAME_ACCEPT_STRICT !== true) {
+            // modo laxo: sugerencia directa (también se podría fijar)
             nameInText = byLoose;
             nameSource = "loose";
         } else {
@@ -1371,6 +1422,7 @@ export async function handleEsteticaStrategy({
                 }
             }
         }
+
     }
 
     // Resolver procedimiento (se mantiene igual)
@@ -1415,9 +1467,13 @@ export async function handleEsteticaStrategy({
         pendingConfirm = { ...(pendingConfirm || {}), name: nameInText! };
     }
 
+    const whenTextNext = (canCaptureWhen && whenFreeCandidate)
+        ? whenFreeCandidate
+        : prevDraft.whenText || undefined;
+
     const newDraft = {
         ...prevDraft,
-        name: nextName, // ← ya contiene el valor correcto si hubo gatillo
+        name: nextName,
         pendingConfirm,
         procedureId: (match.procedure?.id && match.procedure?.id !== prevDraft.procedureId)
             ? match.procedure.id
@@ -1427,10 +1483,10 @@ export async function handleEsteticaStrategy({
             : prevDraft.procedureName,
 
         whenISO: prevDraft.whenISO || undefined,
-        whenText: (canCaptureWhen && whenFreeCandidate)
-            ? whenFreeCandidate
-            : prevDraft.whenText || undefined,
+        whenText: whenTextNext,
+        whenPreview: whenTextNext ? normalizeWhenPreview(whenTextNext) : prevDraft.whenPreview, // ← NUEVO
     };
+
 
 
     const inferredIntent = await detectIntentSmart(userText, newDraft);
@@ -1496,10 +1552,11 @@ export async function handleEsteticaStrategy({
         const slaText = getSlaConfirmText(kb);
         let cleaned = `Perfecto ✨, dame *${slaText}* mientras *verifico la disponibilidad* para ese horario y te confirmo por aquí.\n\n${piezasBonitas}`;
 
-
         cleaned = sanitizeGreeting(cleaned, { allowFirstGreeting: false });
         cleaned = cleaned.replace(/\bmi\s+nombre\s+es\s+[A-ZÁÉÍÓÚÑa-záéíóúñü\s]+/gi, "").trim();
+        cleaned = stripEmojis(cleaned);                   // ← NUEVO
         cleaned = addEmojiStable(cleaned, chatId);
+
 
         const saved = await sendBotReply({
             conversationId: chatId,
@@ -1678,10 +1735,10 @@ export async function handleEsteticaStrategy({
     summaryText = overlayAgenda(baseSummary2, newDraft);
     let texto = await runLLM({ summary: summaryText, userText, imageUrl }).catch(() => "");
 
-    const wasGreeted = (await loadState(chatId)).greeted; // ya tenemos 'state', pero aseguramos valor fresco
+    const wasGreeted = (await loadState(chatId)).greeted;
     texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
-    // Invitación suave SOLO si la intención fue informativa y no hay slots parciales
+    // Invitación suave...
     if (inferredIntent === "info" && !hasServiceOrWhen) {
         texto = await appendOnceInvitationTail(
             chatId,
@@ -1690,9 +1747,10 @@ export async function handleEsteticaStrategy({
         );
     }
 
-
+    texto = stripEmojis(texto);  // ← NUEVO (sanea emojis del LLM)
     texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
     texto = addEmojiStable(texto, chatId);
+
 
 
     const saved = await sendBotReply({
