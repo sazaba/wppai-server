@@ -80,12 +80,17 @@ function shouldSkipDoubleReply(conversationId: number, clientTs: Date, windowMs 
 
 function isYes(text: string) {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    return /\b(si|sí|correcto|as[ií]\s*es|de acuerdo|ok|vale|exacto)\b/.test(t);
+    // incluye yes/yep/affirmative + emojis 👍👌
+    return /\b(si|sí|correcto|as[ií]\s*es|de acuerdo|ok|vale|exacto|yes|yep|affirmative)\b/.test(t)
+        || /[👍👌]/.test(text || "");
 }
 function isNo(text: string) {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    return /\b(no|negativo|no es|cambia|otro)\b/.test(t);
+    // incluye no/nope/negative + emoji 👎
+    return /\b(no|negativo|no es|cambia|otro|nope|negative)\b/.test(t)
+        || /[👎]/.test(text || "");
 }
+
 
 function norm(s: string) {
     return (s || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
@@ -423,6 +428,16 @@ function paymentMethodsFromKB(kb: EsteticaKB): string[] {
     for (const [label, v] of flags) if (v === true) list.push(label);
     return Array.from(new Set(list)).sort();
 }
+
+function getSlaConfirmText(kb: EsteticaKB) {
+    // Busca en KB o deja default
+    const raw = (kb as any)?.slaConfirmText || (kb as any)?.appointmentSlaText || "";
+    const t = String(raw || "").trim();
+    return t || "unos minutos"; // ejemplo configurable: "5–15 min"
+}
+
+
+
 // variable reutilizable para evitar "Cannot redeclare block-scoped variable 'summary'"
 let summaryText: string = "";
 
@@ -935,6 +950,12 @@ function sanitizeGreeting(text: string, opts?: { allowFirstGreeting?: boolean })
     return s || text;
 }
 
+// Quita emojis/variantes del texto del LLM para evitar duplicados antes de addEmojiStable
+function stripEmojis(s: string) {
+    // rangos amplios + VS16
+    return (s || "").replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\uFE0F]/gu, "");
+}
+
 /* ===== FORMATO / RESPUESTA ===== */
 function clampText(t: string, lines = CONF.REPLY_MAX_LINES, chars = CONF.REPLY_MAX_CHARS) {
     let txt = (t || "").trim();
@@ -944,6 +965,12 @@ function clampText(t: string, lines = CONF.REPLY_MAX_LINES, chars = CONF.REPLY_M
     if (txt.length > chars) txt = txt.slice(0, chars - 3) + "…";
     return txt;
 }
+
+// Para respuestas informativas: 4 líneas máx (sin tocar el global)
+function clampInfoText(t: string) {
+    return clampText(t, Math.min(CONF.REPLY_MAX_LINES, 4), CONF.REPLY_MAX_CHARS);
+}
+
 
 /** Normaliza texto para deduplicación (insensible a mayúsculas, tildes y espacios) */
 function normalizeForDedup(s: string) {
@@ -955,6 +982,25 @@ function normalizeForDedup(s: string) {
         .replace(/[^\p{L}\p{N}\s]/gu, "")   // quita signos/emoji para comparar
         .trim();
 }
+
+// Agrega un tail si no fue dicho recientemente por el bot
+async function appendOnceInvitationTail(
+    conversationId: number,
+    body: string,
+    tail: string
+) {
+    const prev = await prisma.message.findFirst({
+        where: { conversationId, from: MessageFrom.bot },
+        orderBy: { timestamp: "desc" },
+        select: { contenido: true, timestamp: true }
+    });
+    const norm = normalizeForDedup;
+    if (prev && norm(prev.contenido || "").includes(norm(tail))) {
+        return body; // ya enviado
+    }
+    return `${body}\n\n${tail}`;
+}
+
 
 /** Un solo emoji “premium” por conversación (estable) */
 function addEmojiStable(text: string, conversationId: number) {
@@ -1301,8 +1347,10 @@ export async function handleEsteticaStrategy({
     if (byTrigger) {
         nameInText = byTrigger;
         nameSource = "trigger";
-        nextName = byTrigger; // ← ya existe la variable, no da error
+        nextName = byTrigger; // fijamos directo y NO pedimos confirmación
+
     } else {
+
         // 2) Loose (solo si el mensaje parece ser SOLO el nombre) → requiere confirmación
         const byLoose = looksLikeLooseName(userText);
         if (byLoose && CONF.NAME_ACCEPT_STRICT !== true) {
@@ -1445,7 +1493,9 @@ export async function handleEsteticaStrategy({
                     : ""),
         ].filter(Boolean).join("\n");
 
-        let cleaned = `Perfecto ✨, dame *unos minutos* mientras *verifico la disponibilidad* para ese horario y te confirmo por aquí.\n\n${piezasBonitas}`;
+        const slaText = getSlaConfirmText(kb);
+        let cleaned = `Perfecto ✨, dame *${slaText}* mientras *verifico la disponibilidad* para ese horario y te confirmo por aquí.\n\n${piezasBonitas}`;
+
 
         cleaned = sanitizeGreeting(cleaned, { allowFirstGreeting: false });
         cleaned = cleaned.replace(/\bmi\s+nombre\s+es\s+[A-ZÁÉÍÓÚÑa-záéíóúñü\s]+/gi, "").trim();
@@ -1563,22 +1613,7 @@ export async function handleEsteticaStrategy({
             }
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
-            async function appendOnceInvitationTail(
-                conversationId: number,
-                body: string,
-                tail: string
-            ) {
-                const prev = await prisma.message.findFirst({
-                    where: { conversationId, from: MessageFrom.bot },
-                    orderBy: { timestamp: "desc" },
-                    select: { contenido: true, timestamp: true }
-                });
-                const norm = normalizeForDedup;
-                if (prev && norm(prev.contenido || "").includes(norm(tail))) {
-                    return body; // ya lo dijimos
-                }
-                return `${body}\n\n${tail}`;
-            }
+
             // ✅ por esta:
             texto = await appendOnceInvitationTail(
                 chatId,
@@ -1588,7 +1623,8 @@ export async function handleEsteticaStrategy({
         }
 
 
-        texto = addEmojiStable(clampText(texto), chatId);
+        texto = stripEmojis(clampInfoText(texto));
+        texto = addEmojiStable(texto, chatId);
 
         const saved = await sendBotReply({
             conversationId: chatId,
@@ -1647,8 +1683,13 @@ export async function handleEsteticaStrategy({
 
     // Invitación suave SOLO si la intención fue informativa y no hay slots parciales
     if (inferredIntent === "info" && !hasServiceOrWhen) {
-        texto = `${texto}\n\nSi deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*.`;
+        texto = await appendOnceInvitationTail(
+            chatId,
+            texto,
+            "Si deseas agendar, dime *tratamiento*, *día y hora* (tal cual) y tu *nombre completo*."
+        );
     }
+
 
     texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
     texto = addEmojiStable(texto, chatId);
