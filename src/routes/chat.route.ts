@@ -15,6 +15,7 @@ const {
     reabrirConversacion,     // 🆕
     responderManual,
     crearConversacion,
+    eliminarConversacion,
     iniciarChat,
 } = ChatCtrl
 
@@ -34,6 +35,7 @@ router.post('/chats/:id/responder-manual', checkTrialLimits, responderManual)
 
 // 📌 Crear conversación (no cuenta)
 router.post('/chats', crearConversacion)
+router.delete('/chats/:id', eliminarConversacion)
 
 // 📌 Iniciar fuera de 24h con plantilla (si lo usas)
 if (iniciarChat) {

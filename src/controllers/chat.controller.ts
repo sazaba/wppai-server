@@ -421,3 +421,56 @@ export const crearConversacion = async (req: Request, res: Response) => {
         return res.status(500).json({ error: 'Error al crear la conversación' })
     }
 }
+// ——————————————————————————————
+// DELETE eliminar conversación (y dependencias seguras)
+// ——————————————————————————————
+export const eliminarConversacion = async (req: Request, res: Response) => {
+    const { id } = req.params
+    const convId = Number(id)
+    const empresaId = (req as any).user?.empresaId
+
+    if (!convId || !empresaId) {
+        return res.status(400).json({ error: 'Solicitud inválida' })
+    }
+
+    try {
+        const conv = await prisma.conversation.findUnique({ where: { id: convId } })
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para eliminar esta conversación' })
+        }
+
+        await prisma.$transaction(async (tx) => {
+            // 1) Borrar pedidos ligados (cascada limpia OrderItem y PaymentReceipt)
+            await tx.order.deleteMany({
+                where: { conversationId: convId, empresaId },
+            })
+
+            // 2) Borrar mensajes de la conversación
+            await tx.message.deleteMany({
+                where: { conversationId: convId, empresaId },
+            })
+
+            // 3) Desasociar citas (conservar histórico)
+            await tx.appointment.updateMany({
+                where: { conversationId: convId, empresaId },
+                data: { conversationId: null },
+            })
+
+            // 4) Limpiar estado conversacional (por si no cascada)
+            await tx.conversationState.deleteMany({
+                where: { conversationId: convId },
+            })
+
+            // 5) Borrar conversación
+            await tx.conversation.delete({ where: { id: convId } })
+        })
+
+        const io = getIO(req)
+        io?.emit?.('chat_eliminado', { id: convId })
+
+        return res.json({ success: true })
+    } catch (err: any) {
+        console.error('❌ Error eliminando conversación:', err?.message || err)
+        return res.status(500).json({ error: 'No se pudo eliminar la conversación' })
+    }
+}
