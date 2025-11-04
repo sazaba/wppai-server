@@ -42,8 +42,20 @@ if (iniciarChat) {
     router.post('/chats/iniciar', iniciarChat)
 }
 
+
 // 📌 Estados
-router.put('/chats/:id/estado', updateConversationEstado)
+router.put(
+    '/chats/:id/estado',
+    (req, _res, next) => {
+        console.log('[ROUTE hit] PUT /api/chats/:id/estado body =', req.body)
+        next()
+    },
+    updateConversationEstado
+)
+
+router.put('/chats/:id/cerrar', cerrarConversacion)
+router.put('/chats/:id/reabrir', reabrirConversacion) // 🆕
+
 router.put('/chats/:id/cerrar', cerrarConversacion)
 router.put('/chats/:id/reabrir', reabrirConversacion) // 🆕
 

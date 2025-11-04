@@ -124,7 +124,8 @@ app.use(
 
 
 app.use(express.urlencoded({ extended: true }))
-app.use(express.json({ type: 'application/json', limit: '5mb' }))
+app.use(express.json({ type: ['application/json', 'application/*+json'], limit: '5mb' }))
+
 
 // 🏥 Healthchecks
 app.get('/healthz', (_req, res) => res.status(200).send('ok'))
