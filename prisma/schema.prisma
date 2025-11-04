@@ -33,8 +33,9 @@ enum ConversationEstado {
   respondido
   en_proceso
   requiere_agente
-  venta_en_proceso // NUEVO
-  venta_realizada // NUEVO
+  venta_en_proceso
+  venta_realizada
+  agendado
   cerrado
 }
 
