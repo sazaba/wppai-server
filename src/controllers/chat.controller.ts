@@ -304,28 +304,51 @@ export const responderConIA = async (req: Request, res: Response) => {
 // ——————————————————————————————
 // Cambiar estado conversación
 // ——————————————————————————————
+// ——————————————————————————————
+// Cambiar estado conversación (versión robusta)
+// ——————————————————————————————
 export const updateConversationEstado = async (req: Request, res: Response) => {
     const { id } = req.params
-    const { estado } = req.body as { estado: ConversationEstado }
     const empresaId = (req as any).user?.empresaId
 
-    if (!estado || !Object.values(ConversationEstado).includes(estado)) {
-        return res.status(400).json({ error: 'Estado inválido' })
+    // 1) Normalizar 'estado' desde body de forma robusta
+    const rawEstado = (req.body?.estado ?? '').toString()
+    const normalized = rawEstado
+        .normalize('NFKC')
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '_')      // "En proceso" => "en_proceso"
+        .replace(/-/g, '_')        // "en-proceso" => "en_proceso"
+
+    // 2) Armar set de válidos desde el enum de Prisma
+    const allowed = new Set<string>(Object.values(ConversationEstado)) // p.ej ['pendiente','en_proceso','respondido','requiere_agente','agendado','cerrado',...]
+
+    // 3) Validar y abortar si no está soportado
+    if (!normalized || !allowed.has(normalized)) {
+        // Log para depurar qué está llegando realmente
+        console.warn('[updateConversationEstado] Estado inválido recibido:', {
+            body_estado: rawEstado,
+            normalized,
+            allowed: Array.from(allowed),
+        })
+        return res.status(400).json({ error: 'Estado inválido', estado_recibido: rawEstado })
     }
 
     try {
+        // 4) Verificar autorización sobre la conversación
         const conv = await prisma.conversation.findUnique({ where: { id: Number(id) } })
         if (!conv || conv.empresaId !== empresaId) {
             return res.status(403).json({ error: 'No autorizado para modificar esta conversación' })
         }
 
+        // 5) Actualizar usando el valor normalizado (cast seguro para Prisma)
         const updated = await prisma.conversation.update({
             where: { id: conv.id },
-            data: { estado },
+            data: { estado: normalized as ConversationEstado },
         })
 
-        // 🆕 Emitimos socket para sincronizar el frontend
-        const io = getIO(req)
+        // 6) Emitir socket
+        const io = req.app.get('io')
         io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
 
         return res.json({ success: true, estado: updated.estado })
@@ -334,6 +357,7 @@ export const updateConversationEstado = async (req: Request, res: Response) => {
         return res.status(500).json({ error: 'Error actualizando estado de la conversación' })
     }
 }
+
 
 // ——————————————————————————————
 // Cerrar conversación
