@@ -1,4 +1,3 @@
-// src/controllers/chat.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { ConversationEstado, MessageFrom } from '@prisma/client'
@@ -81,7 +80,6 @@ export const getMessagesByConversation = async (req: Request, res: Response) => 
             orderBy: { timestamp: 'asc' },
             skip,
             take: limit,
-            // Nota: no cambiamos tu select; asumimos que message incluye mediaId/mediaUrl si existen
         })
 
         // 🆕: firmar mediaUrl cuando solo tenemos mediaId (necesario para <img>/<video>)
@@ -99,8 +97,6 @@ export const getMessagesByConversation = async (req: Request, res: Response) => 
 
 // ——————————————————————————————
 // POST enviar mensaje manual del agente
-// Evita duplicado/rol 'bot': NO pases conversationId al service.
-// Persiste tú como AGENTE.
 // ——————————————————————————————
 export const responderManual = async (req: Request, res: Response) => {
     const { id } = req.params
@@ -117,7 +113,7 @@ export const responderManual = async (req: Request, res: Response) => {
             return res.status(403).json({ error: 'No autorizado para responder esta conversación' })
         }
 
-        // 1) Enviar a WhatsApp (NO pasar conversationId para evitar persistencia automática como 'bot')
+        // 1) Enviar a WhatsApp
         await sendOutboundMessage({
             empresaId: conv.empresaId,
             to: conv.phone,
@@ -136,18 +132,19 @@ export const responderManual = async (req: Request, res: Response) => {
             },
         })
 
-        // 3) Actualizar estado (ajusta a tu gusto)
-        await prisma.conversation.update({
+        // 3) Actualizar estado
+        const updated = await prisma.conversation.update({
             where: { id: conv.id },
             data: { estado: ConversationEstado.respondido },
         })
 
-        // 4) Emitir socket en el formato que tu frontend espera
+        // 4) Emitir sockets
         const io = getIO(req)
         io?.emit?.('nuevo_mensaje', {
             conversationId: conv.id,
             message,
         })
+        io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
 
         res.status(200).json({ success: true, message })
     } catch (err: any) {
@@ -157,8 +154,7 @@ export const responderManual = async (req: Request, res: Response) => {
 }
 
 // ——————————————————————————————
-// POST responder (si quieres mantener esta variante genérica)
-// Igual que arriba: NO pasar conversationId al service.
+// POST responder (variante genérica)
 // ——————————————————————————————
 export const postMessageToConversation = async (req: Request, res: Response) => {
     const empresaId = (req as any).user?.empresaId
@@ -192,7 +188,7 @@ export const postMessageToConversation = async (req: Request, res: Response) => 
             },
         })
 
-        await prisma.conversation.update({
+        const updated = await prisma.conversation.update({
             where: { id: conv.id },
             data: { estado: ConversationEstado.respondido },
         })
@@ -202,6 +198,7 @@ export const postMessageToConversation = async (req: Request, res: Response) => 
             conversationId: conv.id,
             message,
         })
+        io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
 
         res.status(201).json({ message })
     } catch (error: any) {
@@ -212,7 +209,6 @@ export const postMessageToConversation = async (req: Request, res: Response) => 
 
 // ——————————————————————————————
 // POST iniciar chat con plantilla (fuera de 24h)
-// Usa sendTemplate (tu service ya lo expone).
 // ——————————————————————————————
 export const iniciarChat = async (req: Request, res: Response) => {
     try {
@@ -328,6 +324,10 @@ export const updateConversationEstado = async (req: Request, res: Response) => {
             data: { estado },
         })
 
+        // 🆕 Emitimos socket para sincronizar el frontend
+        const io = getIO(req)
+        io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
+
         return res.json({ success: true, estado: updated.estado })
     } catch (err) {
         console.error('❌ Error actualizando estado:', err)
@@ -360,6 +360,34 @@ export const cerrarConversacion = async (req: Request, res: Response) => {
     } catch (err) {
         console.error('Error al cerrar conversación:', err)
         res.status(500).json({ error: 'No se pudo cerrar la conversación' })
+    }
+}
+
+// ——————————————————————————————
+// 🆕 Reabrir conversación → estado RESPONDIDO
+// ——————————————————————————————
+export const reabrirConversacion = async (req: Request, res: Response) => {
+    const { id } = req.params
+    const empresaId = (req as any).user?.empresaId
+
+    try {
+        const conv = await prisma.conversation.findUnique({ where: { id: Number(id) } })
+        if (!conv || conv.empresaId !== empresaId) {
+            return res.status(403).json({ error: 'No autorizado para reabrir esta conversación' })
+        }
+
+        const updated = await prisma.conversation.update({
+            where: { id: conv.id },
+            data: { estado: ConversationEstado.respondido },
+        })
+
+        const io = getIO(req)
+        io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
+
+        return res.status(200).json({ success: true })
+    } catch (err) {
+        console.error('Error al reabrir conversación:', err)
+        return res.status(500).json({ error: 'No se pudo reabrir la conversación' })
     }
 }
 

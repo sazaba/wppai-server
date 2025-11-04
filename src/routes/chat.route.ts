@@ -1,4 +1,3 @@
-// src/routes/chat.route.ts
 import { Router } from 'express'
 import { verificarJWT } from '../middleware/auth.middleware'
 import { checkTrialLimits } from '../middleware/trialLimit.middleware'
@@ -13,9 +12,10 @@ const {
     responderConIA,
     updateConversationEstado,
     cerrarConversacion,
+    reabrirConversacion,     // 🆕
     responderManual,
-    crearConversacion,   // <- debe existir/exportarse en el controller
-    iniciarChat,         // <- opcional, si lo usas
+    crearConversacion,
+    iniciarChat,
 } = ChatCtrl
 
 const router = Router()
@@ -43,5 +43,6 @@ if (iniciarChat) {
 // 📌 Estados
 router.put('/chats/:id/estado', updateConversationEstado)
 router.put('/chats/:id/cerrar', cerrarConversacion)
+router.put('/chats/:id/reabrir', reabrirConversacion) // 🆕
 
 export default router
