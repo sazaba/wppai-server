@@ -17,6 +17,20 @@ import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsa
 const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000) // 3 min
 const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)  // 2 min
 
+// ===== Helper TRIAL: estado de prueba 7 días (o plan PRO) =====
+async function getTrialStatus(empresaId: number) {
+    const emp = await prisma.empresa.findUnique({
+        where: { id: empresaId },
+        select: { plan: true, createdAt: true, trialEnd: true },
+    })
+    if (!emp) return { active: false, endsAt: null as Date | null }
+
+    const isPaid = (emp.plan || '').toLowerCase() === 'pro'
+    const endsAt = emp.trialEnd ?? new Date(emp.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000)
+    const active = isPaid || (Date.now() <= endsAt.getTime())
+    return { active, endsAt }
+}
+
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
     const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -268,6 +282,27 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         // ----- Evitar falso escalado con audio sin transcripción
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
+        // === BLOQUEAR RESPUESTA DE IA si la prueba expiró ===
+        const { active: trialActive, endsAt } = await getTrialStatus(empresaId)
+        if (!trialActive) {
+            // Responder 200 para que Meta no reintente el webhook
+            if (!responded) {
+                res.status(200).json({ success: true, trial: 'expired' })
+                responded = true
+            }
+
+            // Avisar al frontend con tu banner (reutiliza wa_policy_error)
+            const ioBlock = req.app.get('io') as any
+            ioBlock?.emit?.('wa_policy_error', {
+                conversationId: conversation.id,
+                code: 'trial_expired',
+                message: `La prueba gratuita terminó el ${endsAt?.toLocaleDateString('es-CO')}. Para seguir respondiendo, activa tu plan.`,
+            })
+
+            // No llamar IA ni enviar nada saliente
+            return
+        }
+
         // 3) IA → RESPUESTA (auto envía y persiste)
         // 👇 Si es imagen SIN caption, NO invocamos IA (esperamos el texto siguiente)
         if (skipIAForThisWebhook) {
@@ -414,7 +449,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     }
 
                     if (creado) {
-                        io?.emit?.('nuevo_mensaje', {
+                        const io2 = req.app.get('io') as any
+                        io2?.emit?.('nuevo_mensaje', {
                             conversationId: conversation.id,
                             message: {
                                 id: creado.id,
@@ -453,7 +489,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         })
 
                         for (const m of medias) {
-                            io?.emit?.('nuevo_mensaje', {
+                            const io3 = req.app.get('io') as any
+                            io3?.emit?.('nuevo_mensaje', {
                                 conversationId: conversation.id,
                                 message: {
                                     id: m.id,
