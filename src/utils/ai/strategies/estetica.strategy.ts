@@ -1367,6 +1367,16 @@ export async function handleEsteticaStrategy({
         return { estado: "pendiente", mensaje: "" };
     }
 
+    // 🚫 MUTEO por post-agenda: no activar IA si ya está agendado / en consulta post-agenda
+    if (
+        conversacion.estado === ConversationEstado.agendado ||
+        conversacion.estado === ConversationEstado.agendado_consulta
+    ) {
+        await patchState(chatId, { handoffLocked: true });
+        return { estado: "pendiente", mensaje: "" };
+    }
+
+
     const last = await prisma.message.findFirst({
         where: { conversationId: chatId, from: MessageFrom.client },
         orderBy: { timestamp: "desc" },

@@ -130,6 +130,25 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             console.log('[CONV] reabierta', { id: conversation.id })
         }
 
+        // 🔒 Regla post-agenda: si entra mensaje del cliente y la conversación estaba agendada,
+        // pasa automáticamente a "agendado_consulta" y saltamos la IA.
+        let isPostAgendaMessage = false
+        if (conversation.estado === ConversationEstado.agendado) {
+            await prisma.conversation.update({
+                where: { id: conversation.id },
+                data: { estado: ConversationEstado.agendado_consulta },
+            })
+            conversation.estado = ConversationEstado.agendado_consulta
+            isPostAgendaMessage = true
+
+            // Notificar al frontend del cambio de estado
+            const io = req.app.get('io') as any
+            io?.emit?.('estado_actualizado', {
+                conversationId: conversation.id,
+                estado: conversation.estado,
+            })
+        }
+
         // ----- Contenido base (texto/botones)
         let contenido: string =
             msg.text?.body ||
@@ -231,6 +250,14 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             // if (!captionForDb) skipIAForThisWebhook = true
         }
 
+        // 👇 Si el chat está en post-agenda, no invocamos IA (además del caso imagen sin caption)
+        if (conversation.estado === ConversationEstado.agendado_consulta) {
+            skipIAForThisWebhook = true
+        }
+        if (isPostAgendaMessage) {
+            skipIAForThisWebhook = true
+        }
+
         // Guardar ENTRANTE (ahora también persistimos mediaUrl si existe)
         const inboundData: any = {
             conversationId: conversation.id,
@@ -304,14 +331,14 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         }
 
         // 3) IA → RESPUESTA (auto envía y persiste)
-        // 👇 Si es imagen SIN caption, NO invocamos IA (esperamos el texto siguiente)
+        // 👇 Salidas tempranas por skipIAForThisWebhook
         if (skipIAForThisWebhook) {
             if (!responded) {
-                res.status(200).json({ success: true, skipped: 'image_without_caption' })
+                res.status(200).json({ success: true, skipped: 'post_agenda' })
                 responded = true
             }
             if (process.env.DEBUG_AI === '1') {
-                console.log('[IA] Skip: imagen sin caption; esperamos texto para responder.')
+                console.log('[IA] Skip: post-agenda (agendado/agendado_consulta) o imagen sin caption. Mensaje entregado sin respuesta automática.')
             }
             return
         }

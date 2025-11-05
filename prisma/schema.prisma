@@ -36,6 +36,7 @@ enum ConversationEstado {
   venta_en_proceso
   venta_realizada
   agendado
+  agendado_consulta
   cerrado
 }
 
