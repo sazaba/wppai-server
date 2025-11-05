@@ -132,19 +132,32 @@ export const responderManual = async (req: Request, res: Response) => {
             },
         })
 
-        // 3) Actualizar estado
-        const updated = await prisma.conversation.update({
-            where: { id: conv.id },
-            data: { estado: ConversationEstado.respondido },
-        })
+        // // 3) Actualizar estado
+        // const updated = await prisma.conversation.update({
+        //     where: { id: conv.id },
+        //     data: { estado: ConversationEstado.respondido },
+        // })
 
-        // 4) Emitir sockets
+        // // 4) Emitir sockets
+        // const io = getIO(req)
+        // io?.emit?.('nuevo_mensaje', {
+        //     conversationId: conv.id,
+        //     message,
+        // })
+        // io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
+
+        // 3) NO cambiar estado: se mantiene tal cual esté
+
+        // 4) Emitir sockets (solo nuevo mensaje; el estado no cambió)
         const io = getIO(req)
         io?.emit?.('nuevo_mensaje', {
             conversationId: conv.id,
             message,
         })
-        io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
+        // Si quieres, puedes omitir este emit porque no hay cambio de estado:
+        // io?.emit?.('chat_actualizado', { id: conv.id, estado: conv.estado })
+
+
 
         res.status(200).json({ success: true, message })
     } catch (err: any) {
@@ -188,17 +201,28 @@ export const postMessageToConversation = async (req: Request, res: Response) => 
             },
         })
 
-        const updated = await prisma.conversation.update({
-            where: { id: conv.id },
-            data: { estado: ConversationEstado.respondido },
-        })
+        // const updated = await prisma.conversation.update({
+        //     where: { id: conv.id },
+        //     data: { estado: ConversationEstado.respondido },
+        // })
+
+        // const io = getIO(req)
+        // io?.emit?.('nuevo_mensaje', {
+        //     conversationId: conv.id,
+        //     message,
+        // })
+        // io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
+
+        // NO cambiar estado
 
         const io = getIO(req)
         io?.emit?.('nuevo_mensaje', {
             conversationId: conv.id,
             message,
         })
-        io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
+        // Opcional: omitir chat_actualizado si no hubo cambio real
+        // io?.emit?.('chat_actualizado', { id: conv.id, estado: conv.estado })
+
 
         res.status(201).json({ message })
     } catch (error: any) {
