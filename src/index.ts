@@ -143,6 +143,7 @@ app.use('/api/auth', authRoutes)
 app.use('/api/webhook', webhookRoutes)
 app.use('/api/whatsapp', whatsappRoutes)
 app.use('/api', registerRoutes)
+app.use('/api', dashboardRoutes)
 
 // 🔐 Rutas protegidas
 app.use('/api/products', productRoutes)
@@ -153,7 +154,7 @@ app.use('/api/templates', messageTemplateRoutes)
 app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
-app.use('/api', dashboardRoutes)
+
 
 // 🗓️ Agenda (NUEVO)
 app.use('/api', esteticaConfigRoutes);
