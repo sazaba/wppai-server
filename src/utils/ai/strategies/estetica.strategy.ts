@@ -1361,17 +1361,29 @@ export async function handleEsteticaStrategy({
     });
     if (!conversacion) return null;
 
+
     // Guard si ya está bloqueado por handoff
     const statePre = await loadState(chatId);
     if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
         return { estado: "pendiente", mensaje: "" };
     }
 
-    // 🚫 MUTEO por post-agenda: no activar IA si ya está agendado / en consulta post-agenda
-    if (
-        conversacion.estado === ConversationEstado.agendado ||
-        conversacion.estado === ConversationEstado.agendado_consulta
-    ) {
+    /**
+     * POST-AGENDA:
+     * - Si la conversación llega en 'agendado' (recién creada la cita), en el primer inbound
+     *   la marcamos como 'agendado_consulta' y silenciamos IA.
+     * - Si ya está en 'agendado_consulta', solo silenciamos IA.
+     */
+    if (conversacion.estado === ConversationEstado.agendado) {
+        await prisma.conversation.update({
+            where: { id: chatId },
+            data: { estado: ConversationEstado.agendado_consulta },
+        });
+        await patchState(chatId, { handoffLocked: true });
+        return { estado: "pendiente", mensaje: "" };
+    }
+
+    if (conversacion.estado === ConversationEstado.agendado_consulta) {
         await patchState(chatId, { handoffLocked: true });
         return { estado: "pendiente", mensaje: "" };
     }
