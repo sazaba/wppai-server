@@ -51,17 +51,20 @@ export const registrar = async (req: Request, res: Response) => {
 
     try {
         const hashed = await bcrypt.hash(password, 10)
+
+        // ▲ TRIAL de 7 días (parametrizable por env TRIAL_DAYS)
         const ahora = new Date()
-        const finPrueba = new Date(ahora.getTime() + 30 * 24 * 60 * 60 * 1000)
+        const trialDays = Number(process.env.TRIAL_DAYS ?? 7)
+        const finPrueba = new Date(ahora.getTime() + trialDays * 24 * 60 * 60 * 1000)
 
         const empresa = await prisma.empresa.create({
             data: {
                 nombre: nombreEmpresa,
                 estado: 'activo',
-                plan: 'gratis',
-                trialStart: ahora,
-                trialEnd: finPrueba,
-                conversationsUsed: 0,
+                plan: 'gratis',        // ▲ plan gratuito por defecto
+                trialStart: ahora,     // ▲ inicio del trial
+                trialEnd: finPrueba,   // ▲ fin del trial (7 días por defecto)
+                conversationsUsed: 0,  // ▲ contador en 0
                 usuarios: {
                     create: { email, password: hashed, rol: 'admin' },
                 },
