@@ -286,6 +286,19 @@ async function patchState(conversationId: number, patch: Partial<AgentState>) {
 /* ===== INTENT DETECTOR (no forzar agenda) ===== */
 
 /* ==== INFO / SCHEDULE GUARDS (del componente viejo) ==== */
+
+/* ==== CANCEL / RESCHEDULE FAST DETECTORS ==== */
+const RX_CANCEL = /\b(cancel(ar|a|aci[oó]n)|anular|dar de baja|remover|eliminar\s+la\s+cita|cancelen\s+la\s+cita)\b/i;
+const RX_REAGENDAR = /\b(reagend(ar|a|aci[oó]n)|reprogram(ar|a|aci[oó]n)|cambiar\s+la\s+cita|mover\s+la\s+cita|aplazar\s+la\s+cita|posponer\s+la\s+cita|otra\s+hora|otro\s+d[ií]a)\b/i;
+
+function wantsCancelOrReschedule(t: string): "cancel" | "reschedule" | null {
+    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    if (RX_CANCEL.test(s)) return "cancel";
+    if (RX_REAGENDAR.test(s)) return "reschedule";
+    return null;
+}
+
+
 function isSchedulingCue(t: string): boolean {
     const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
     return (
@@ -1363,10 +1376,72 @@ export async function handleEsteticaStrategy({
 
 
     // Guard si ya está bloqueado por handoff
+    // Guard si ya está bloqueado por handoff
     const statePre = await loadState(chatId);
-    if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
+    const isReqAgente = (conversacion.estado as unknown as string) === 'requiere_agente';
+    if (isReqAgente || !!statePre.handoffLocked) {
         return { estado: "pendiente", mensaje: "" };
     }
+
+
+    /* ===== FAST ESCALATION: cancel / reschedule ===== */
+    try {
+        // Trae el último mensaje del cliente (solo lo necesario para el detector)
+        const lastLite = await prisma.message.findFirst({
+            where: { conversationId: chatId, from: MessageFrom.client },
+            orderBy: { timestamp: "desc" },
+            select: { id: true, contenido: true, timestamp: true },
+        });
+
+        // Dedup suave para evitar doble reacción si llega el mismo mensaje duplicado
+        if (lastLite?.id && seenInboundRecently(lastLite.id)) {
+            return null;
+        }
+        if (lastLite?.timestamp && shouldSkipDoubleReply(chatId, lastLite.timestamp)) {
+            return null;
+        }
+
+        const userTextFast = (mensajeArg || "").trim() || (lastLite?.contenido || "").trim();
+        const esc = wantsCancelOrReschedule(userTextFast);
+
+        if (esc) {
+            // Si ya está en requiere_agente/handoff, no hacemos nada
+            const locked =
+                (conversacion.estado as unknown as string) === 'requiere_agente' ||
+                !!statePre.handoffLocked;
+
+            if (!locked) {
+                // Actualiza intención en el state (útil para backoffice)
+                await patchState(chatId, { lastIntent: esc === "cancel" ? "cancel" : "reschedule", handoffLocked: true });
+
+                // Mensaje breve y neutral para no romper el tono del flujo ya probado
+                const txt =
+                    esc === "cancel"
+                        ? "Te ayudo con la *cancelación* de tu cita: en un momento te escribe un asesor para gestionarla. 🙂"
+                        : "Te ayudo con el *cambio de fecha/hora* de tu cita: en un momento te escribe un asesor para gestionarlo. 🙂";
+
+                const saved = await sendBotReply({
+                    conversationId: chatId,
+                    empresaId,
+                    texto: addEmojiStable(clampText(txt), chatId),
+                    nuevoEstado: ConversationEstado.requiere_agente,
+                    to: toPhone ?? conversacion.phone,
+                    phoneNumberId,
+                });
+
+                if (lastLite?.timestamp) markActuallyReplied(chatId, lastLite.timestamp);
+
+                return {
+                    estado: ConversationEstado.requiere_agente,
+                    mensaje: saved.texto,
+                    messageId: saved.messageId,
+                    wamid: saved.wamid,
+                    media: [],
+                };
+            }
+        }
+    } catch { /* no-op en fast lane; continuar flujo normal */ }
+
 
     /**
      * POST-AGENDA:
