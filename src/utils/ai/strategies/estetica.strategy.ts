@@ -1362,11 +1362,17 @@ export async function handleEsteticaStrategy({
     if (!conversacion) return null;
 
 
-    // Guard si ya está bloqueado por handoff
+    // // Guard si ya está bloqueado por handoff
+    // const statePre = await loadState(chatId);
+    // if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
+    //     return { estado: "pendiente", mensaje: "" };
+    // }
+    // Guard: si ya está bloqueado por handoff, no interviene la IA
     const statePre = await loadState(chatId);
-    if (conversacion.estado === ConversationEstado.requiere_agente || statePre.handoffLocked) {
+    if (statePre.handoffLocked) {
         return { estado: "pendiente", mensaje: "" };
     }
+
 
     /**
      * POST-AGENDA:
@@ -1576,6 +1582,45 @@ export async function handleEsteticaStrategy({
     const inferredIntent = await detectIntentSmart(userText, newDraft);
 
     await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
+
+    // Fast-lane: si el cliente quiere cancelar o reagendar, pasa directo a humano
+    if (inferredIntent === "cancel" || inferredIntent === "reschedule") {
+        const piezas: string[] = [];
+        if (newDraft.procedureName) piezas.push(`💆 *Tratamiento:* ${newDraft.procedureName}`);
+        if (newDraft.whenText) piezas.push(`🗓️ *Preferencia:* ${newDraft.whenText}`);
+        if (newDraft.name) piezas.push(`👤 *Nombre:* ${newDraft.name}`);
+
+        let aviso = inferredIntent === "cancel"
+            ? "Entiendo que deseas *cancelar* tu cita."
+            : "Entiendo que deseas *reagendar* tu cita.";
+
+        const cola = piezas.length
+            ? `\n\n${piezas.join("\n")}\n\nTe comunico con un asesor para ayudarte de inmediato.`
+            : `\n\nTe comunico con un asesor para ayudarte de inmediato.`;
+
+        const textoHandoff = addEmojiStable(clampText(`${aviso}${cola}`), chatId);
+
+        const saved = await sendBotReply({
+            conversationId: chatId,
+            empresaId,
+            texto: textoHandoff,
+            nuevoEstado: ConversationEstado.requiere_agente,
+            to: toPhone ?? conversacion.phone,
+            phoneNumberId,
+        });
+
+        await patchState(chatId, { handoffLocked: true }); // ← clave: desde ahora el guard (Parche A) silencia la IA
+        if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+
+        return {
+            estado: ConversationEstado.requiere_agente,
+            mensaje: saved.texto,
+            messageId: saved.messageId,
+            wamid: saved.wamid,
+            media: [],
+        };
+    }
+
 
     // ——— Confirmación de nombre pendiente (si aplica)
     if (newDraft.pendingConfirm?.name && !newDraft.name) {
