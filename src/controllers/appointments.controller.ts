@@ -346,10 +346,10 @@ export async function createAppointment(req: Request, res: Response) {
         // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
         const violates = violatesNoticeAndWindow(
             {
-                minNoticeH: cfg.minNoticeH,
-                maxAdvanceD: cfg.maxAdvanceD,
-                allowSameDay: cfg.allowSameDay,
-                bookingWindowDays: cfg.bookingWindowDays,
+                minNoticeH: 0,
+                maxAdvanceD: null,
+                allowSameDay: true,
+                bookingWindowDays: null,
             },
             start
         );
@@ -452,10 +452,10 @@ export async function updateAppointment(req: Request, res: Response) {
             // Ventanas (minNotice/maxAdvance/same-day/bookingWindowDays)
             const violates = violatesNoticeAndWindow(
                 {
-                    minNoticeH: cfg.minNoticeH,
-                    maxAdvanceD: cfg.maxAdvanceD,
-                    allowSameDay: cfg.allowSameDay,
-                    bookingWindowDays: cfg.bookingWindowDays,
+                    minNoticeH: 0,
+                    maxAdvanceD: null,
+                    allowSameDay: true,
+                    bookingWindowDays: null,
                 },
                 start
             );
