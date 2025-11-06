@@ -368,17 +368,17 @@ export async function createAppointment(req: Request, res: Response) {
         });
         if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
 
-        // 3) Solapamiento con BUFFER
-        const overlap = await hasOverlapWithBuffer({
-            empresaId,
-            startAt: start,
-            endAt: end,
-            bufferMin: cfg.bufferMin,
-        });
-        if (overlap)
-            return res
-                .status(409)
-                .json({ error: "Existe otra cita en ese intervalo (buffer aplicado)." });
+        // // 3) Solapamiento con BUFFER
+        // const overlap = await hasOverlapWithBuffer({
+        //     empresaId,
+        //     startAt: start,
+        //     endAt: end,
+        //     bufferMin: cfg.bufferMin,
+        // });
+        // if (overlap)
+        //     return res
+        //         .status(409)
+        //         .json({ error: "Existe otra cita en ese intervalo (buffer aplicado)." });
 
         // 4) Crear cita
         const appt = await prisma.appointment.create({
@@ -475,15 +475,15 @@ export async function updateAppointment(req: Request, res: Response) {
             if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
 
             // Solapamiento con BUFFER (ignorando la propia cita)
-            const overlap = await hasOverlapWithBuffer({
-                empresaId,
-                startAt: start,
-                endAt: end,
-                bufferMin: cfg.bufferMin,
-                ignoreId: id,
-            });
-            if (overlap)
-                return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
+            // const overlap = await hasOverlapWithBuffer({
+            //     empresaId,
+            //     startAt: start,
+            //     endAt: end,
+            //     bufferMin: cfg.bufferMin,
+            //     ignoreId: id,
+            // });
+            // if (overlap)
+            //     return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
         }
 
         const appt = await prisma.appointment.update({
