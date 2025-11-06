@@ -283,7 +283,22 @@ async function patchState(conversationId: number, patch: Partial<AgentState>) {
     await saveState(conversationId, { ...prev, ...patch });
 }
 
-/* ===== INTENT DETECTOR (no forzar agenda) ===== */
+function isRescheduleIntent(text: string): boolean {
+    const s = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+
+    // match directos
+    // reemplaza las 2 primeras líneas del isRescheduleIntent:
+    if (/\bre[-\s]*agend(ar|a|o|e|emos|ame|amos)?\b/.test(s)) return true; // re-agendar / re agendar
+    if (/\bre[-\s]*program(ar|a|o|e|emos)?\b/.test(s)) return true;         // re-programar / re programar
+    // reprogramar, reprograma…
+
+    // verbos generales pero con contexto de cita/fecha/hora
+    if (/\b(cambiar|mover|modificar|aplazar|adelantar|correr)\b/.test(s) &&
+        /\b(cita|turno|hora|fecha)\b/.test(s)) return true;
+
+    return false;
+}
+
 
 /* ==== INFO / SCHEDULE GUARDS (del componente viejo) ==== */
 function isSchedulingCue(t: string): boolean {
@@ -355,6 +370,8 @@ type Intent = "info" | "price" | "schedule" | "reschedule" | "cancel" | "other";
 function detectIntent(text: string, draft: AgentState["draft"]): Intent {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
 
+    if (isRescheduleIntent(t)) return "reschedule";
+
     // explícitos
     const scheduleHints = [
         "agendar", "agendo", "agendemos", "agenda", "cita", "programar", "reservar", "reserva",
@@ -378,6 +395,8 @@ function detectIntent(text: string, draft: AgentState["draft"]): Intent {
 
 async function detectIntentSmart(text: string, draft: AgentState["draft"]): Promise<Intent> {
     const t = (text || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+
+    if (isRescheduleIntent(t)) return "reschedule";
 
     if (/\b(precio|precios|costo|vale|cuanto|desde)\b/.test(t)) return "price";
     if (/\b(reprogram|cambiar|mover)\b/.test(t)) return "reschedule";
