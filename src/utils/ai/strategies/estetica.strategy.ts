@@ -3348,27 +3348,6 @@ export async function handleEsteticaStrategy({
     });
     if (!conversacion) return null;
 
-    // ===== HANDOFF POR MENSAJE MANUAL DEL AGENTE =====
-    // Si el último mensaje de la conversación es del agente, forzamos handoff.
-    {
-        const lastAny = await prisma.message.findFirst({
-            where: { conversationId: chatId },
-            orderBy: { timestamp: "desc" },
-            select: { id: true, from: true, timestamp: true },
-        });
-
-        if (lastAny?.from === MessageFrom.agent) {
-            // Bloquea IA y marca requiere_agente
-            await prisma.conversation.update({
-                where: { id: chatId },
-                data: { estado: ConversationEstado.requiere_agente },
-            });
-            await patchState(chatId, { handoffLocked: true });
-
-            // No respondemos nada: queda “pendiente” para que el humano continúe
-            return { estado: ConversationEstado.requiere_agente, mensaje: "" };
-        }
-    }
 
 
 
@@ -3485,6 +3464,33 @@ export async function handleEsteticaStrategy({
     // ====== Agendamiento flexible (colecta progresiva sin calcular hora) ======
     // ====== Agendamiento flexible (colecta progresiva sin calcular hora) ======
     let state = await loadState(chatId);
+    // ===== HANDOFF POR MENSAJE MANUAL DEL AGENTE =====
+    // Si el último mensaje de la conversación es del agente, forzamos handoff.
+    // ===== HANDOFF POR MENSAJE MANUAL DEL AGENTE =====
+    // Solo aplica si la conversación NO está cerrada ni respondida.
+    // En 'cerrado' o 'respondido' queremos permitir que la IA vuelva a hablar.
+    {
+        const lastAny = await prisma.message.findFirst({
+            where: { conversationId: chatId },
+            orderBy: { timestamp: "desc" },
+            select: { id: true, from: true, timestamp: true },
+        });
+
+        const estadoActual = conversacion.estado;
+
+        if (
+            lastAny?.from === MessageFrom.agent &&
+            estadoActual !== ConversationEstado.cerrado &&
+            estadoActual !== ConversationEstado.respondido
+        ) {
+            await prisma.conversation.update({
+                where: { id: chatId },
+                data: { estado: ConversationEstado.requiere_agente },
+            });
+            await patchState(chatId, { handoffLocked: true });
+            return { estado: ConversationEstado.requiere_agente, mensaje: "" };
+        }
+    }
 
     // 1º intenta con gatillos (soy / me llamo / mi nombre es)
     // 2º si no, usa el detector robusto de nombre "suelto" (validado)
