@@ -134,3 +134,60 @@ export const getChatInputStaff = async (req: Request, res: Response) => {
         return res.status(500).json({ error: "Error obteniendo staff" });
     }
 };
+/**
+ * GET /api/chat-input/services
+ * Devuelve servicios/procedimientos activos para el ChatInput,
+ * con su duración sugerida (defaultDuration).
+ */
+export const getChatInputServices = async (req: Request, res: Response) => {
+    const empresaId = (req as any).user?.empresaId;
+    if (!empresaId) {
+        return res.status(400).json({ error: "empresaId requerido" });
+    }
+
+    try {
+        // Fuente principal: EsteticaProcedure (si existe en tu schema)
+        const procs = await prisma.esteticaProcedure.findMany({
+            where: { empresaId, enabled: true },
+            orderBy: { name: "asc" },
+            select: { id: true, name: true, durationMin: true },
+        });
+
+        if (procs.length > 0) {
+            const data = procs.map((p) => ({
+                id: p.id,
+                name: p.name,
+                defaultDuration: p.durationMin ?? null,
+            }));
+            return res.json({ ok: true, data });
+        }
+
+        // Fallback: si no hay registros, intentar leer desde BusinessConfigAppt.services (JSON)
+        const cfg = await prisma.businessConfigAppt.findUnique({
+            where: { empresaId },
+            select: { services: true },
+        });
+
+        const listFromCfg =
+            (Array.isArray(cfg?.services) ? cfg?.services : []) as Array<any>;
+
+        const data = listFromCfg
+            .map((s, i) => ({
+                id: Number(s?.id) || i + 1,
+                name: String(s?.name || s?.titulo || "").trim(),
+                defaultDuration:
+                    typeof s?.defaultDuration === "number"
+                        ? s.defaultDuration
+                        : typeof s?.durationMin === "number"
+                            ? s.durationMin
+                            : null,
+            }))
+            .filter((x) => x.name);
+
+        return res.json({ ok: true, data });
+    } catch (err) {
+        console.error("[getChatInputServices] error:", err);
+        return res.status(500).json({ error: "Error obteniendo servicios" });
+    }
+};
+
