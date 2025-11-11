@@ -24,6 +24,7 @@ import appointmentHoursRoutes from './routes/appointmentHours.routes'
 import esteticaConfigRoutes from "./routes/estetica.config.routes";
 
 import dashboardRoutes from './routes/dashboard.routes'
+import chatInputRoutes from './routes/chatInput.routes'
 
 
 // 📦 Cargar variables de entorno
@@ -144,6 +145,7 @@ app.use('/api/webhook', webhookRoutes)
 app.use('/api/whatsapp', whatsappRoutes)
 app.use('/api', registerRoutes)
 app.use('/api', dashboardRoutes)
+app.use('/api', chatInputRoutes)
 
 // 🔐 Rutas protegidas
 app.use('/api/products', productRoutes)
