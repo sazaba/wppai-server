@@ -12,6 +12,6 @@ const router = Router();
 router.get("/chat-input/state/:conversationId", verificarJWT, getChatInputState);
 router.get("/chat-input/meta/:conversationId", verificarJWT, getChatInputMeta);
 router.get("/chat-input/staff", verificarJWT, getChatInputStaff);
-router.get("/api/chat-input/services", verificarJWT, getChatInputServices);
+router.get("/chat-input/services", verificarJWT, getChatInputServices);
 
 export default router;
