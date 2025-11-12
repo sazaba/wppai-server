@@ -768,7 +768,7 @@ async function buildOrReuseSummary(args: {
         lines.push(staffMeta.join("\n"));
     }
 
-    // 2) Catálogo con duración y staff requerido por procedimiento
+    // 2) Catálogo con duración, staff y depósito por procedimiento (para la IA)
     if ((kb.procedures ?? []).length) {
         const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
 
@@ -777,25 +777,24 @@ async function buildOrReuseSummary(args: {
         for (const p of kb.procedures) {
             if (p?.enabled === false) continue;
 
-            // duración: prioriza la del procedimiento; si no, usa defaultServiceDurationMin
-            const dur =
-                (p.durationMin != null ? p.durationMin : (kb.defaultServiceDurationMin ?? null));
+            const dur = (p.durationMin != null ? p.durationMin : (kb.defaultServiceDurationMin ?? null));
             const durTxt = dur != null ? `${dur}min` : "NA";
 
-            // staff requerido (si aplica)
-            const staffReq = (p.requiredStaffIds ?? [])
-                .map(id => staffById.get(id))
-                .filter(Boolean) as string[];
+            const staffReq = (p.requiredStaffIds ?? []).map(id => staffById.get(id)).filter(Boolean) as string[];
             const staffTxt = staffReq.length ? staffReq.join(", ") : "libre";
 
-            // precio min como referencia para la IA (no para mostrar)
             const priceTxt = p.priceMin != null ? `${Number(p.priceMin)}` : "NA";
 
-            catMeta.push(`- proc=${p.name}; dur=${durTxt}; staff=${staffTxt}; priceMinCOP=${priceTxt}`);
+            // 🔹 Depósito por procedimiento
+            const depReq = p.depositRequired ? 1 : 0;
+            const depAmt = p.depositAmount != null ? `${Number(p.depositAmount)}` : "NA";
+
+            catMeta.push(`- proc=${p.name}; dur=${durTxt}; staff=${staffTxt}; priceMinCOP=${priceTxt}; depositRequired=${depReq}; depositAmountCOP=${depAmt}`);
         }
         catMeta.push("=== FIN_CATALOGO ===");
         lines.push(catMeta.join("\n"));
     }
+
 
 
     lines.push(`🧠 Historial: ${history || "—"}`);
