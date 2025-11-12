@@ -654,3 +654,50 @@ export async function deleteStaff(req: Request, res: Response) {
     return res.json({ ok: true })
 }
 
+// ========= Eliminar EsteticaProcedure =========
+
+export async function deleteProcedure(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+    }
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+        return res.status(400).json({ ok: false, error: "id inválido" });
+    }
+
+    // Verifica que el procedimiento pertenezca a la empresa
+    const exists = await prisma.esteticaProcedure.findFirst({
+        where: { id, empresaId },
+        select: { id: true, name: true },
+    });
+
+    if (!exists) {
+        return res.status(404).json({ ok: false, error: "Procedimiento no encontrado" });
+    }
+
+    try {
+        await prisma.esteticaProcedure.delete({ where: { id } });
+        return res.json({ ok: true });
+    } catch (err: any) {
+        // Manejo elegante de constraints/relaciones (por ejemplo, si hay citas ligadas)
+        // Prisma: P2003 → foreign key constraint failed
+        const code = err?.code || err?.meta?.code;
+        if (code === "P2003") {
+            return res.status(409).json({
+                ok: false,
+                error:
+                    "No se puede eliminar porque el servicio está relacionado con otros registros (por ejemplo, citas).",
+            });
+        }
+        console.error("❌ deleteProcedure error:", err);
+        const msg =
+            err?.message ||
+            err?.meta?.cause ||
+            "Error eliminando el procedimiento";
+        return res.status(500).json({ ok: false, error: msg });
+    }
+}

@@ -14,6 +14,7 @@ import {
     upsertException,
     purgeAllEsteticaData,
     deleteStaff,
+    deleteProcedure,
 } from '../controllers/estetica.config.controller'
 
 const router = Router()
@@ -39,13 +40,13 @@ router.post('/estetica/config', upsertApptConfig)
 router.get('/estetica/procedures', listProcedures)
 // POST /api/estetica/procedure
 router.post('/estetica/procedure', upsertProcedure)
+router.delete('/estetica/procedure/:id', deleteProcedure)
 
 /** ========= Staff ========= */
 // GET /api/estetica/staff
 router.get('/estetica/staff', listStaff)
 // POST /api/estetica/staff
 router.post('/estetica/staff', upsertStaff)
-
 router.delete('/estetica/staff/:id', deleteStaff)
 
 /** ========= Exceptions ========= */
