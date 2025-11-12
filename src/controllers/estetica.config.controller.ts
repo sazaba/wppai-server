@@ -701,3 +701,29 @@ export async function deleteProcedure(req: Request, res: Response) {
         return res.status(500).json({ ok: false, error: msg });
     }
 }
+
+export async function deleteException(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId)
+    const id = Number(req.params.id)
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" })
+    }
+    if (!Number.isFinite(id)) {
+        return res.status(400).json({ ok: false, error: "id inválido" })
+    }
+
+    try {
+        const del = await prisma.appointmentException.deleteMany({
+            where: { id, empresaId },
+        })
+        if (del.count === 0) {
+            return res.status(404).json({ ok: false, error: "Excepción no encontrada" })
+        }
+        return res.json({ ok: true, deleted: del.count })
+    } catch (err: any) {
+        const msg = err?.message || "Error eliminando excepción"
+        return res.status(500).json({ ok: false, error: msg })
+    }
+}

@@ -15,6 +15,7 @@ import {
     purgeAllEsteticaData,
     deleteStaff,
     deleteProcedure,
+    deleteException,
 } from '../controllers/estetica.config.controller'
 
 const router = Router()
@@ -54,6 +55,7 @@ router.delete('/estetica/staff/:id', deleteStaff)
 router.get('/estetica/exceptions', listExceptions)
 // POST /api/estetica/exception
 router.post('/estetica/exception', upsertException)
+router.delete('/estetica/exception/:id', deleteException)
 
 router.delete("/estetica/purge", purgeAllEsteticaData);
 
