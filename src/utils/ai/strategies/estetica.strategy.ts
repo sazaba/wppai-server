@@ -711,6 +711,7 @@ async function buildOrReuseSummary(args: {
     if (payments.length) lines.push(`${icon("pay")} Pagos: ${payments.join(" • ")}`);
 
     // === SERVICIOS con staff asignado (legible) ===
+    // === SERVICIOS con staff asignado + depósito por procedimiento (legible) ===
     if ((kb.procedures ?? []).length) {
         const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
 
@@ -719,17 +720,24 @@ async function buildOrReuseSummary(args: {
 
         for (const p of kb.procedures) {
             if (p.enabled === false) continue;
+
             const durTxt = p.durationMin ? `${p.durationMin}min` : "N/A";
             const priceTxt = p.priceMin ? `desde ${formatCOP(p.priceMin)}` : "";
-            const staffReq = (p.requiredStaffIds ?? [])
-                .map(id => staffById.get(id))
-                .filter(Boolean) as string[];
+            const staffReq = (p.requiredStaffIds ?? []).map(id => staffById.get(id)).filter(Boolean) as string[];
             const staffTxt = staffReq.length ? staffReq.join(", ") : "— sin asignar —";
-            svcLines.push(`• ${p.name} (${durTxt}, ${priceTxt}) → 👩‍⚕️ ${staffTxt}`);
+
+            // Depósito por procedimiento
+            const depFlag = p.depositRequired ? "sí" : "no";
+            const depTxt = p.depositRequired
+                ? (p.depositAmount != null ? ` · Depósito: ${formatCOP(Number(p.depositAmount))}` : " · Depósito: sí")
+                : "";
+
+            svcLines.push(`• ${p.name} (${durTxt}${priceTxt ? `, ${priceTxt}` : ""}) → 👩‍⚕️ ${staffTxt}${depTxt}`);
         }
 
         lines.push(svcLines.join("\n"));
     }
+
 
 
     if (hoursLine) lines.push(`${icon("hrs")} Horario: ${hoursLine}`);
