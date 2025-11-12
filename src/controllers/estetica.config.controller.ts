@@ -636,3 +636,21 @@ export async function purgeAllEsteticaData(req: Request, res: Response) {
 
     return res.json({ ok: true, deleted: result });
 }
+
+// en controllers/estetica.config.controller.ts
+export async function deleteStaff(req: Request, res: Response) {
+    const empresaId = getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId)
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: "empresaId requerido" })
+    }
+    const id = Number(req.params.id)
+    if (!Number.isFinite(id)) return res.status(400).json({ ok: false, error: 'id inválido' })
+
+    // seguridad básica: eliminar solo si pertenece a la empresa
+    const exists = await prisma.staff.findFirst({ where: { id, empresaId }, select: { id: true } })
+    if (!exists) return res.status(404).json({ ok: false, error: 'No encontrado' })
+
+    await prisma.staff.delete({ where: { id } })
+    return res.json({ ok: true })
+}
+
