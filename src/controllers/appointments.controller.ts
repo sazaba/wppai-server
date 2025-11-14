@@ -912,3 +912,33 @@ export async function deleteAppointment(req: Request, res: Response) {
         return res.status(500).json({ error: "No se pudo eliminar la cita" });
     }
 }
+// DELETE /api/appointments/reminders/:id
+export async function deleteReminderRule(req: Request, res: Response) {
+    try {
+        const empresaId = getEmpresaId(req);
+        const id = Number(req.params.id);
+
+        if (!Number.isInteger(id)) {
+            return res.status(400).json({ error: "ID inválido" });
+        }
+
+        const existing = await prisma.reminderRule.findFirst({
+            where: { id, empresaId },
+        });
+
+        if (!existing) {
+            return res.status(404).json({ error: "Regla de recordatorio no encontrada" });
+        }
+
+        await prisma.reminderRule.delete({
+            where: { id: existing.id },
+        });
+
+        return res.json({ ok: true, mensaje: "Regla de recordatorio eliminada correctamente" });
+    } catch (err: any) {
+        console.error("[deleteReminderRule] ❌", err);
+        return res
+            .status(500)
+            .json({ error: "Error al eliminar la regla de recordatorio" });
+    }
+}
