@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { verificarJWT } from "../middleware/auth.middleware";
+import { verifyCronToken } from "../middleware/cron.middleware";
 import {
     listAppointments,
     createAppointment,
@@ -13,6 +14,7 @@ import {
     triggerReminderTick,
     deleteAppointment,
     dispatchAppointmentReminders,
+
 } from "../controllers/appointments.controller";
 
 const router = Router();
@@ -36,5 +38,11 @@ router.get("/reminders", listReminderRules);
 router.post("/reminders", upsertReminderRule);
 router.post("/reminders/tick", triggerReminderTick);
 router.post("/reminders/dispatch", dispatchAppointmentReminders);
+
+
+
+router.post("/internal/reminders/tick", verifyCronToken, triggerReminderTick);
+router.post("/internal/reminders/dispatch", verifyCronToken, dispatchAppointmentReminders);
+
 
 export default router;

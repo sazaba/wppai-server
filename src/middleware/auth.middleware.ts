@@ -3,6 +3,7 @@ import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
 
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecreto'
+const CRON_INTERNAL_TOKEN = process.env.CRON_INTERNAL_TOKEN || null
 
 export interface JwtPayload {
     id: number
@@ -19,19 +20,17 @@ declare global {
     }
 }
 
-// Rutas que no requieren autenticación
 const OPEN_PATHS = [
     '/api/auth/register',
     '/api/auth/login',
-    '/api/auth/whatsapp',    // inicio OAuth
-    '/api/auth/callback',    // callback OAuth
+    '/api/auth/whatsapp',
+    '/api/auth/callback',
     '/api/auth/exchange-code',
     '/api/auth/wabas'
 ]
 
-// Rutas donde permitimos token en query ?t=... (para <img>, <video>, etc.)
 const QUERY_TOKEN_PATHS = [
-    '/api/whatsapp/media' // GET /api/whatsapp/media/:mediaId?t=JWT
+    '/api/whatsapp/media'
 ]
 
 function stripQuery(originalUrl: string) {
@@ -43,27 +42,38 @@ function matchPrefix(url: string, prefixes: string[]) {
     return prefixes.some(p => clean.startsWith(p))
 }
 
-// src/middleware/auth.middleware.ts
 export const verificarJWT = (req: Request, res: Response, next: NextFunction) => {
-    // Preflight CORS
+
     if (req.method === 'OPTIONS') return res.sendStatus(204)
 
-    // ⛔ BYPASS total para el stream de media (el controlador valida t o usa DB)
     const cleanPath = stripQuery(req.originalUrl)
     if (req.method === 'GET' && /^\/api\/whatsapp\/media\//.test(cleanPath)) {
         return next()
     }
 
-    // Permitir rutas públicas
     if (matchPrefix(req.originalUrl, OPEN_PATHS)) {
         return next()
     }
 
-    // 1) Authorization: Bearer ...
+    // 🔥🔥🔥 >>>> NUEVO: BYPASS PARA CRON <<<< 🔥🔥🔥
     const authHeader = req.headers.authorization
-    if (authHeader && /^Bearer\s+/i.test(authHeader)) {
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace('Bearer ', '')
+
+        // Si coincide con el token interno, no se valida JWT
+        if (CRON_INTERNAL_TOKEN && token === CRON_INTERNAL_TOKEN) {
+            // Puedes asignar empresa fija, o leer de la agenda
+            req.user = {
+                id: 0,
+                email: 'cron@system',
+                rol: 'admin',
+                empresaId: 1 // OJO: puedes cambiarlo si manejas multiempresa
+            }
+            return next()
+        }
+
+        // ---- Validación JWT normal ----
         try {
-            const token = authHeader.replace(/^Bearer\s+/i, '')
             const decoded = jwt.verify(token, JWT_SECRET) as JwtPayload
             if (!decoded?.empresaId || !decoded?.id) {
                 return res.status(401).json({ error: 'Token inválido (payload incompleto)' })
@@ -78,7 +88,6 @@ export const verificarJWT = (req: Request, res: Response, next: NextFunction) =>
         }
     }
 
-    // 2) Token por query SOLO en rutas habilitadas (no aplica a /media, ya hicimos bypass)
     if (matchPrefix(req.originalUrl, QUERY_TOKEN_PATHS)) {
         const tokenQ = typeof req.query.t === 'string' ? req.query.t : null
         if (!tokenQ) return res.status(401).json({ error: 'Token no proporcionado' })
