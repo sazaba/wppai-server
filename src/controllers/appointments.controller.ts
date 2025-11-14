@@ -934,7 +934,10 @@ export async function deleteReminderRule(req: Request, res: Response) {
             where: { id: existing.id },
         });
 
-        return res.json({ ok: true, mensaje: "Regla de recordatorio eliminada correctamente" });
+        return res.json({
+            ok: true,
+            mensaje: "Regla de recordatorio eliminada correctamente",
+        });
     } catch (err: any) {
         console.error("[deleteReminderRule] ❌", err);
         return res
@@ -942,3 +945,4 @@ export async function deleteReminderRule(req: Request, res: Response) {
             .json({ error: "Error al eliminar la regla de recordatorio" });
     }
 }
+
