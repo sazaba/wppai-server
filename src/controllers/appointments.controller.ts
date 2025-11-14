@@ -4,6 +4,7 @@ import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
 import { addMinutes } from "date-fns";
 import { sendTemplateByName } from "../services/whatsapp.service";
+import { MessageFrom } from "@prisma/client";
 
 
 /* ===================== Helpers ===================== */
@@ -832,6 +833,8 @@ export async function dispatchAppointmentReminders(req: Request, res: Response) 
         },
     });
 
+    const io = req.app.get("io") as any;
+
     let sent = 0;
     let failed = 0;
 
@@ -853,15 +856,80 @@ export async function dispatchAppointmentReminders(req: Request, res: Response) 
         const rule = log.reminderRule;
 
         try {
-            // 👇 aquí usas la plantilla aprobada en Meta
-            await sendTemplateByName({
+            // 1) Enviar la plantilla aprobada en Meta
+            const result = await sendTemplateByName({
                 empresaId: appt.empresaId,
                 to: appt.customerPhone,
-                name: rule.templateName,     // ej. "recordatorio_cita_12_es"
-                lang: rule.templateLang,     // ej. "es" o "en_US"
-                variables: [],               // tu plantilla NO usa {{1}}, {{2}}, ...
+                name: rule.templateName, // ej. "recordatorio_cita_12"
+                lang: rule.templateLang, // ej. "es" o "en_US"
+                variables: [],           // tu plantilla NO usa {{1}}, {{2}}, ...
             });
 
+            // 2) Buscar / crear conversación para ese teléfono
+            let conversation = null as any;
+
+            if (appt.conversationId) {
+                conversation = await prisma.conversation.findUnique({
+                    where: { id: appt.conversationId },
+                });
+            }
+
+            if (!conversation) {
+                conversation = await prisma.conversation.findFirst({
+                    where: {
+                        empresaId: appt.empresaId,
+                        phone: appt.customerPhone,
+                    },
+                });
+            }
+
+            if (!conversation) {
+                // si nunca ha escrito, creamos la conversación igual
+                conversation = await prisma.conversation.create({
+                    data: {
+                        empresaId: appt.empresaId,
+                        phone: appt.customerPhone,
+                        estado: "agendado_consulta" as any, // o "respondido"/"en_proceso" según tu flujo
+                    },
+                });
+            }
+
+            // 3) Texto que verás en el chat (puedes ajustarlo a tu gusto)
+            const fechaLocal = appt.startAt.toLocaleString("es-CO", {
+                timeZone: appt.timezone || "America/Bogota",
+            });
+
+            const reminderText =
+                `Hola 👋, te recordamos tu cita programada para ${fechaLocal}. ` +
+                `Si necesitas reprogramar o cancelar, respóndenos por este medio.`;
+
+            // 4) Guardar mensaje del BOT en la tabla message
+            const msgDb = await prisma.message.create({
+                data: {
+                    conversationId: conversation.id,
+                    empresaId: appt.empresaId,
+                    from: MessageFrom.bot,
+                    contenido: reminderText,
+                    timestamp: new Date(),
+                    // si sendTemplateByName retorna wamid, puedes mapearlo aquí:
+                    // externalId: result?.wamid ?? null,
+                },
+            });
+
+            // 5) Emitir al frontend para que aparezca en el chat
+            io?.emit?.("nuevo_mensaje", {
+                conversationId: conversation.id,
+                message: {
+                    id: msgDb.id,
+                    externalId: msgDb.externalId ?? null,
+                    from: "bot",
+                    contenido: msgDb.contenido,
+                    timestamp: msgDb.timestamp.toISOString(),
+                },
+                estado: conversation.estado,
+            });
+
+            // 6) Marcar el log como enviado
             await prisma.appointmentReminderLog.update({
                 where: { id: log.id },
                 data: {
@@ -870,9 +938,13 @@ export async function dispatchAppointmentReminders(req: Request, res: Response) 
                     error: null,
                 },
             });
+
             sent++;
         } catch (e: any) {
-            console.error("[dispatchAppointmentReminders] ERROR sendTemplateByName:", e?.response?.data || e);
+            console.error(
+                "[dispatchAppointmentReminders] ERROR sendTemplateByName:",
+                e?.response?.data || e
+            );
 
             await prisma.appointmentReminderLog.update({
                 where: { id: log.id },
