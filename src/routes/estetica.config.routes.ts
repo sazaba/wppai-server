@@ -31,7 +31,7 @@ router.get('/estetica/config', getApptConfig)
 // POST /api/estetica/config
 router.post('/estetica/config', upsertApptConfig)
 
-/** ========= Reminders (ReminderRule + flag appointmentReminders) ========= */
+/** ========= Reminders (ReminderRule + flag appointmentReminders) =====13 nov==== */
 // GET /api/estetica/reminders-config
 router.get("/estetica/reminders-config", getRemindersConfig);
 // POST /api/estetica/reminders-config

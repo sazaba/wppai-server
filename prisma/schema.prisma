@@ -486,9 +486,12 @@ model Appointment {
   procedureId       Int?
   EsteticaProcedure EsteticaProcedure? @relation(name: "ProcedureToAppointments", fields: [procedureId], references: [id])
 
-  // ✅ NUEVO: staff asignado (opcional)
+  // ✅ staff asignado (opcional)
   staffId Int?
   staff   Staff? @relation(fields: [staffId], references: [id])
+
+  // ✅ NUEVO: si esta cita debe tener recordatorio 24h antes
+  sendReminder24h Boolean @default(false)
 
   empresa      Empresa       @relation(fields: [empresaId], references: [id])
   conversation Conversation? @relation(fields: [conversationId], references: [id])
@@ -508,7 +511,7 @@ model Appointment {
   @@index([empresaId, status, startAt, customerPhone])
   @@index([deletedAt])
   @@index([empresaId, deletedAt, startAt])
-  @@index([empresaId, staffId]) // ✅ útil para consultas por recurso
+  @@index([empresaId, staffId]) // útil para consultas por recurso
   @@map("appointment")
 }
 

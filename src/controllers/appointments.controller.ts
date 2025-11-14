@@ -306,8 +306,11 @@ export async function createAppointment(req: Request, res: Response) {
             startAt,
             endAt,
             timezone,
-            procedureId, // opcional
+            procedureId,       // opcional
             serviceDurationMin, // opcional (cache)
+
+            // ✅ NUEVO: viene desde el ChatInput
+            sendReminder24h,
         } = req.body;
 
         if (!customerName || !customerPhone || !serviceName || !startAt || !endAt) {
@@ -359,7 +362,7 @@ export async function createAppointment(req: Request, res: Response) {
                 .json({ error: "El horario solicitado no cumple con las reglas de reserva." });
         }
 
-        // 2b) NUEVO: límite de citas por día
+        // 2b) límite de citas por día
         const cap = await ensureDailyCap({
             empresaId,
             when: start,
@@ -367,18 +370,6 @@ export async function createAppointment(req: Request, res: Response) {
             cap: cfg.maxDailyAppointments,
         });
         if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
-
-        // // 3) Solapamiento con BUFFER
-        // const overlap = await hasOverlapWithBuffer({
-        //     empresaId,
-        //     startAt: start,
-        //     endAt: end,
-        //     bufferMin: cfg.bufferMin,
-        // });
-        // if (overlap)
-        //     return res
-        //         .status(409)
-        //         .json({ error: "Existe otra cita en ese intervalo (buffer aplicado)." });
 
         // 4) Crear cita
         const appt = await prisma.appointment.create({
@@ -394,12 +385,16 @@ export async function createAppointment(req: Request, res: Response) {
                 startAt: start,
                 endAt: end,
                 timezone: timezone || cfg.timezone || "America/Bogota",
+
                 // nuevos opcionales
                 procedureId: procedureId ? Number(procedureId) : null,
                 customerDisplayName: customerName ?? null,
                 serviceDurationMin:
                     serviceDurationMin ?? cfg.defaultServiceDurationMin ?? null,
                 locationNameCache: cfg.locationName ?? null,
+
+                // ✅ NUEVO: flag por cita
+                sendReminder24h: !!sendReminder24h,
             },
         });
 
@@ -410,6 +405,8 @@ export async function createAppointment(req: Request, res: Response) {
     }
 }
 
+
+/* ===================== Update ===================== */
 /* ===================== Update ===================== */
 // PUT /api/appointments/:id
 export async function updateAppointment(req: Request, res: Response) {
@@ -436,7 +433,7 @@ export async function updateAppointment(req: Request, res: Response) {
         const cfg = await loadApptRuntimeConfig(empresaId);
 
         if (changedWindow) {
-            // Horario de atención (en TZ) + excepción
+            // 1) Horario de atención (en TZ de negocio) + excepción
             const wh = await ensureWithinBusinessHours({
                 empresaId,
                 start,
@@ -449,7 +446,7 @@ export async function updateAppointment(req: Request, res: Response) {
             if (dayExcept)
                 return res.status(409).json({ error: "Día bloqueado por excepción." });
 
-            // Ventanas (minNotice/maxAdvance/same-day/bookingWindowDays)
+            // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
             const violates = violatesNoticeAndWindow(
                 {
                     minNoticeH: 0,
@@ -459,12 +456,13 @@ export async function updateAppointment(req: Request, res: Response) {
                 },
                 start
             );
-            if (violates)
+            if (violates) {
                 return res
                     .status(409)
                     .json({ error: "El horario solicitado no cumple con las reglas de reserva." });
+            }
 
-            // Límite de citas por día (ignorando la propia)
+            // 3) Límite de citas por día (ignorando la propia)
             const cap = await ensureDailyCap({
                 empresaId,
                 when: start,
@@ -474,16 +472,16 @@ export async function updateAppointment(req: Request, res: Response) {
             });
             if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
 
-            // Solapamiento con BUFFER (ignorando la propia cita)
+            // 4) (opcional) Solapamiento con BUFFER (ignorando la propia cita)
             // const overlap = await hasOverlapWithBuffer({
-            //     empresaId,
-            //     startAt: start,
-            //     endAt: end,
-            //     bufferMin: cfg.bufferMin,
-            //     ignoreId: id,
+            //   empresaId,
+            //   startAt: start,
+            //   endAt: end,
+            //   bufferMin: cfg.bufferMin,
+            //   ignoreId: id,
             // });
             // if (overlap)
-            //     return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
+            //   return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
         }
 
         const appt = await prisma.appointment.update({
@@ -499,7 +497,6 @@ export async function updateAppointment(req: Request, res: Response) {
                 startAt: start,
                 endAt: end,
                 timezone: patch.timezone ?? existing.timezone,
-                // opcionales nuevos
                 procedureId:
                     patch.procedureId !== undefined
                         ? patch.procedureId
@@ -512,6 +509,12 @@ export async function updateAppointment(req: Request, res: Response) {
                     patch.serviceDurationMin ?? existing.serviceDurationMin,
                 locationNameCache:
                     patch.locationNameCache ?? existing.locationNameCache,
+
+                // ✅ NUEVO: si lo mandan en el patch, lo actualizamos
+                sendReminder24h:
+                    patch.sendReminder24h !== undefined
+                        ? !!patch.sendReminder24h
+                        : existing.sendReminder24h,
             },
         });
 
@@ -521,6 +524,8 @@ export async function updateAppointment(req: Request, res: Response) {
         res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
     }
 }
+
+
 
 /* ===================== CONFIG (GET + POST) ===================== */
 
@@ -773,25 +778,30 @@ export async function upsertReminderRule(req: Request, res: Response) {
 }
 
 // POST /api/appointments/reminders/tick?window=5
-// Solo para pruebas: selecciona "debidos" y marca queued
+
 export async function triggerReminderTick(req: Request, res: Response) {
     const windowMinutes = Number(req.query.window || 5);
 
     const rows = await prisma.$queryRawUnsafe<any[]>(
         `
-    SELECT a.id as appointmentId, rr.id as ruleId
-    FROM appointment a
-    JOIN reminder_rule rr ON rr.empresaId = a.empresaId AND rr.active = 1
-    LEFT JOIN appointment_reminder_log l
-      ON l.appointmentId = a.id AND l.reminderRuleId = rr.id
-    WHERE a.status IN ('confirmed')
-      AND l.id IS NULL
-      AND TIMESTAMPDIFF(MINUTE, NOW(), a.startAt) BETWEEN (rr.offsetHours*60) AND (rr.offsetHours*60 + ?)
-  `,
+      SELECT a.id as appointmentId, rr.id as ruleId
+      FROM appointment a
+      JOIN reminder_rule rr
+        ON rr.empresaId = a.empresaId
+       AND rr.active = 1
+      LEFT JOIN appointment_reminder_log l
+        ON l.appointmentId = a.id
+       AND l.reminderRuleId = rr.id
+      WHERE a.status IN ('confirmed')
+        AND a.sendReminder24h = 1                 -- ✅ solo citas que pidieron recordatorio
+        AND rr.offsetHours = 24                   -- ✅ solo la regla de 24h
+        AND l.id IS NULL
+        AND TIMESTAMPDIFF(MINUTE, NOW(), a.startAt)
+            BETWEEN (rr.offsetHours*60) AND (rr.offsetHours*60 + ?)
+    `,
         windowMinutes
     );
 
-    // Simulación: marcamos en cola (queued)
     for (const r of rows) {
         await prisma.appointmentReminderLog.create({
             data: {
@@ -804,6 +814,7 @@ export async function triggerReminderTick(req: Request, res: Response) {
 
     res.json({ ok: true, count: rows.length, sample: rows.slice(0, 10) });
 }
+
 
 // DELETE /api/appointments/:id
 export async function deleteAppointment(req: Request, res: Response) {

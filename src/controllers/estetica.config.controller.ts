@@ -728,8 +728,7 @@ export async function deleteException(req: Request, res: Response) {
     }
 }
 
-// ========= Recordatorios (ReminderRule + flag appointmentReminders) =========
-
+// ========= Recordatorios (ReminderRule + flag appointmentReminders) ======13 nov===
 
 
 export async function getRemindersConfig(req: Request, res: Response) {
