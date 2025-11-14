@@ -796,7 +796,7 @@ export async function triggerReminderTick(req: Request, res: Response) {
        AND l.reminderRuleId = rr.id
       WHERE a.status IN ('pending')
         AND a.sendReminder24h = 1                 -- ✅ solo citas que pidieron recordatorio
-        AND rr.offsetHours = 24                   -- ✅ solo la regla de 24h
+       
         AND l.id IS NULL
         AND TIMESTAMPDIFF(MINUTE, NOW(), a.startAt)
             BETWEEN (rr.offsetHours*60) AND (rr.offsetHours*60 + ?)
