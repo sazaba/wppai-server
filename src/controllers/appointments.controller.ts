@@ -3,6 +3,8 @@ import prisma from "../lib/prisma";
 import { getEmpresaId } from "./_getEmpresaId";
 import { z } from "zod";
 import { addMinutes } from "date-fns";
+import { sendTemplateByName } from "../services/whatsapp.service";
+
 
 /* ===================== Helpers ===================== */
 
@@ -813,6 +815,82 @@ export async function triggerReminderTick(req: Request, res: Response) {
     }
 
     res.json({ ok: true, count: rows.length, sample: rows.slice(0, 10) });
+}
+
+// POST /api/appointments/reminders/dispatch
+// Toma los logs en cola y envía la plantilla por WhatsApp
+export async function dispatchAppointmentReminders(req: Request, res: Response) {
+    const limit = Number(req.query.limit || 50); // por si quieres controlar el lote
+
+    const logs = await prisma.appointmentReminderLog.findMany({
+        where: { status: "queued" },
+        take: limit,
+        orderBy: { id: "asc" },
+        include: {
+            appointment: true,
+            reminderRule: true,
+        },
+    });
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const log of logs) {
+        if (!log.appointment || !log.reminderRule) {
+            // si falta info, marcamos como fallido
+            await prisma.appointmentReminderLog.update({
+                where: { id: log.id },
+                data: {
+                    status: "failed",
+                    error: "Falta appointment o reminderRule relacionado",
+                },
+            });
+            failed++;
+            continue;
+        }
+
+        const appt = log.appointment;
+        const rule = log.reminderRule;
+
+        try {
+            // 👇 aquí usas la plantilla aprobada en Meta
+            await sendTemplateByName({
+                empresaId: appt.empresaId,
+                to: appt.customerPhone,
+                name: rule.templateName,     // ej. "recordatorio_cita_12_es"
+                lang: rule.templateLang,     // ej. "es" o "en_US"
+                variables: [],               // tu plantilla NO usa {{1}}, {{2}}, ...
+            });
+
+            await prisma.appointmentReminderLog.update({
+                where: { id: log.id },
+                data: {
+                    status: "sent",
+                    sentAt: new Date(),
+                    error: null,
+                },
+            });
+            sent++;
+        } catch (e: any) {
+            console.error("[dispatchAppointmentReminders] ERROR sendTemplateByName:", e?.response?.data || e);
+
+            await prisma.appointmentReminderLog.update({
+                where: { id: log.id },
+                data: {
+                    status: "failed",
+                    error: JSON.stringify(e?.response?.data || String(e)).slice(0, 2000),
+                },
+            });
+            failed++;
+        }
+    }
+
+    return res.json({
+        ok: true,
+        processed: logs.length,
+        sent,
+        failed,
+    });
 }
 
 

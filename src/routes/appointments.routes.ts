@@ -12,6 +12,7 @@ import {
     upsertReminderRule,
     triggerReminderTick,
     deleteAppointment,
+    dispatchAppointmentReminders,
 } from "../controllers/appointments.controller";
 
 const router = Router();
@@ -34,5 +35,6 @@ router.delete("/:id", deleteAppointment);
 router.get("/reminders", listReminderRules);
 router.post("/reminders", upsertReminderRule);
 router.post("/reminders/tick", triggerReminderTick);
+router.post("/reminders/dispatch", dispatchAppointmentReminders);
 
 export default router;
