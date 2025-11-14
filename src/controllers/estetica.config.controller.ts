@@ -727,3 +727,178 @@ export async function deleteException(req: Request, res: Response) {
         return res.status(500).json({ ok: false, error: msg })
     }
 }
+
+// ========= Recordatorios (ReminderRule + flag appointmentReminders) =========
+
+
+
+export async function getRemindersConfig(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId)
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: 'empresaId requerido' })
+    }
+
+    const config = await prisma.businessConfigAppt.findUnique({
+        where: { empresaId },
+        include: {
+            ReminderRule: {
+                where: { active: true },
+                orderBy: { offsetHours: 'asc' },
+                include: {
+                    // 👇 ya tienes la relación en el modelo
+                    messageTemplate: true,
+                },
+            },
+        },
+    })
+
+    if (!config) {
+        return res
+            .status(404)
+            .json({ ok: false, error: 'Config de agenda no encontrada' })
+    }
+
+    // Por ahora usamos la PRIMERA regla activa (ej. 24h antes)
+    const rule = (config.ReminderRule && config.ReminderRule[0]) || null
+
+    return res.json({
+        ok: true,
+        appointmentReminders: config.appointmentReminders,
+        rule: rule
+            ? {
+                id: rule.id,
+                offsetHours: rule.offsetHours,
+                messageTemplateId: rule.messageTemplateId,
+                templateName: rule.templateName,
+                templateLang: rule.templateLang,
+                template: rule.messageTemplate
+                    ? {
+                        id: rule.messageTemplate.id,
+                        nombre: rule.messageTemplate.nombre,
+                        idioma: rule.messageTemplate.idioma,
+                        estado: rule.messageTemplate.estado,
+                        categoria: rule.messageTemplate.categoria,
+                    }
+                    : null,
+            }
+            : null,
+    })
+}
+
+export async function upsertRemindersConfig(req: Request, res: Response) {
+    const empresaId =
+        getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId)
+
+    if (!empresaId || Number.isNaN(empresaId)) {
+        return res.status(400).json({ ok: false, error: 'empresaId requerido' })
+    }
+
+    const { appointmentReminders, templateId, offsetHours } = req.body as {
+        appointmentReminders?: boolean
+        templateId?: number
+        offsetHours?: number
+    }
+
+    const cfg = await prisma.businessConfigAppt.findUnique({ where: { empresaId } })
+    if (!cfg) {
+        return res.status(400).json({
+            ok: false,
+            error:
+                'Primero debes guardar la configuración general de agenda (BusinessConfigAppt).',
+        })
+    }
+
+    const targetOffset = Number.isFinite(Number(offsetHours))
+        ? Number(offsetHours)
+        : 24
+
+    // 1) Actualizamos el flag global en BusinessConfigAppt
+    await prisma.businessConfigAppt.update({
+        where: { empresaId },
+        data: { appointmentReminders: !!appointmentReminders },
+    })
+
+    // ⛔ Si se desactivan recordatorios: desactivar todas las reglas de esa config
+    if (!appointmentReminders) {
+        await prisma.reminderRule.updateMany({
+            where: { empresaId, configApptId: cfg.id },
+            data: { active: false },
+        })
+        return res.json({ ok: true, appointmentReminders: false })
+    }
+
+    // 2) Si se van a activar, necesitamos una plantilla válida
+    if (!templateId) {
+        return res.status(400).json({
+            ok: false,
+            error: 'templateId es obligatorio cuando appointmentReminders = true',
+        })
+    }
+
+    // Validar plantilla de la empresa
+    const tmpl = await prisma.messageTemplate.findFirst({
+        where: { id: Number(templateId), empresaId },
+    })
+
+    if (!tmpl) {
+        return res
+            .status(400)
+            .json({ ok: false, error: 'Plantilla no encontrada para esta empresa' })
+    }
+
+    // 3) Buscar regla existente para ese offset (empresa + config + offset)
+    const existing = await prisma.reminderRule.findFirst({
+        where: {
+            empresaId,
+            configApptId: cfg.id,
+            offsetHours: targetOffset,
+        },
+    })
+
+    if (existing) {
+        // UPDATE tipado
+        const updateData: Prisma.ReminderRuleUncheckedUpdateInput = {
+            active: true,
+            offsetHours: targetOffset,
+            messageTemplateId: tmpl.id,
+            templateName: tmpl.nombre,
+            templateLang: tmpl.idioma ?? 'es',
+            // no tocamos templateParams aquí (se mantiene lo que hubiera)
+        }
+
+        const rule = await prisma.reminderRule.update({
+            where: { id: existing.id },
+            data: updateData,
+        })
+
+        return res.json({
+            ok: true,
+            appointmentReminders: true,
+            rule,
+        })
+    }
+
+    // CREATE tipado
+    const createData: Prisma.ReminderRuleUncheckedCreateInput = {
+        empresaId,
+        configApptId: cfg.id,
+        active: true,
+        offsetHours: targetOffset,
+        messageTemplateId: tmpl.id,
+        templateName: tmpl.nombre,
+        templateLang: tmpl.idioma ?? 'es',
+        templateParams: Prisma.JsonNull, // ✅ JSON nulo válido
+    }
+
+    const rule = await prisma.reminderRule.create({
+        data: createData,
+    })
+
+    return res.json({
+        ok: true,
+        appointmentReminders: true,
+        rule,
+    })
+}

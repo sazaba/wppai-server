@@ -16,6 +16,8 @@ import {
     deleteStaff,
     deleteProcedure,
     deleteException,
+    getRemindersConfig,
+    upsertRemindersConfig,
 } from '../controllers/estetica.config.controller'
 
 const router = Router()
@@ -29,12 +31,12 @@ router.get('/estetica/config', getApptConfig)
 // POST /api/estetica/config
 router.post('/estetica/config', upsertApptConfig)
 
-/** ========= AppointmentHour ========= */
-/* ¡Ya tienes /api/appointment-hours funcionando! No dupliquemos paths aquí.
-   Si algún día quisieras traerlos a este router, serían:
-   router.get('/estetica/hours', listHours)
-   router.post('/estetica/hours', upsertHours)
-*/
+/** ========= Reminders (ReminderRule + flag appointmentReminders) ========= */
+// GET /api/estetica/reminders-config
+router.get("/estetica/reminders-config", getRemindersConfig);
+// POST /api/estetica/reminders-config
+router.post("/estetica/reminders-config", upsertRemindersConfig);
+
 
 /** ========= EsteticaProcedure ========= */
 // GET /api/estetica/procedures
