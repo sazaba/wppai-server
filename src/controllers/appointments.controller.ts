@@ -794,7 +794,7 @@ export async function triggerReminderTick(req: Request, res: Response) {
       LEFT JOIN appointment_reminder_log l
         ON l.appointmentId = a.id
        AND l.reminderRuleId = rr.id
-      WHERE a.status IN ('confirmed')
+      WHERE a.status IN ('pending')
         AND a.sendReminder24h = 1                 -- ✅ solo citas que pidieron recordatorio
         AND rr.offsetHours = 24                   -- ✅ solo la regla de 24h
         AND l.id IS NULL
