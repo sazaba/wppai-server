@@ -782,40 +782,83 @@ export async function upsertReminderRule(req: Request, res: Response) {
 
 // POST /api/appointments/reminders/tick?window=5
 
+// POST /api/appointments/reminders/tick?window=30
 export async function triggerReminderTick(req: Request, res: Response) {
-    const windowMinutes = Number(req.query.window || 5);
+    try {
+        // Este window solo se usa como FALLO DE ORIGEN (primer run sin meta)
+        const windowMinutes = Number(req.query.window || 30);
 
-    const rows = await prisma.$queryRawUnsafe<any[]>(
-        `
-      SELECT a.id as appointmentId, rr.id as ruleId
-      FROM appointment a
-      JOIN reminder_rule rr
-        ON rr.empresaId = a.empresaId
-       AND rr.active = 1
-      LEFT JOIN appointment_reminder_log l
-        ON l.appointmentId = a.id
-       AND l.reminderRuleId = rr.id
-      WHERE a.status IN ('pending')
-        AND a.sendReminder24h = 1                 -- ✅ solo citas que pidieron recordatorio
-       
-        AND l.id IS NULL
-        AND TIMESTAMPDIFF(MINUTE, NOW(), a.startAt)
-            BETWEEN (rr.offsetHours*60) AND (rr.offsetHours*60 + ?)
-    `,
-        windowMinutes
-    );
+        const now = new Date();
 
-    for (const r of rows) {
-        await prisma.appointmentReminderLog.create({
-            data: {
-                appointmentId: r.appointmentId,
-                reminderRuleId: r.ruleId,
-                status: "queued",
-            },
+        // 1) Leer último tick desde cron_meta
+        const [meta] = await prisma.$queryRawUnsafe<any[]>(
+            `SELECT last_run FROM cron_meta WHERE key_name = 'reminders_tick' LIMIT 1`
+        );
+
+        // Si nunca ha corrido, miramos hacia atrás windowMinutes
+        const fallbackLast = new Date(now.getTime() - windowMinutes * 60_000);
+        const lastRun: Date = meta?.last_run ? new Date(meta.last_run) : fallbackLast;
+
+        // 2) Buscar citas cuya HORA DE RECORDATORIO cayó entre lastRun y now
+        //    reminderAt = startAt - offsetHours horas
+        const rows = await prisma.$queryRawUnsafe<any[]>(
+            `
+            SELECT 
+                a.id  AS appointmentId,
+                rr.id AS ruleId
+            FROM appointment a
+            JOIN reminder_rule rr
+              ON rr.empresaId = a.empresaId
+             AND rr.active = 1
+            LEFT JOIN appointment_reminder_log l
+              ON l.appointmentId   = a.id
+             AND l.reminderRuleId  = rr.id
+            WHERE a.status IN ('pending')
+              AND a.sendReminder24h = 1          -- solo citas que pidieron recordatorio
+              AND l.id IS NULL                   -- sin log previo (idempotencia)
+              AND a.startAt > NOW()              -- solo citas futuras
+              -- 👇 HORA DE RECORDATORIO entre lastRun y now
+              AND (a.startAt - INTERVAL rr.offsetHours HOUR)
+                    BETWEEN ? AND ?
+        `,
+            lastRun,
+            now
+        );
+
+        // 3) Crear logs en cola
+        for (const r of rows) {
+            await prisma.appointmentReminderLog.create({
+                data: {
+                    appointmentId: r.appointmentId,
+                    reminderRuleId: r.ruleId,
+                    status: "queued",
+                },
+            });
+        }
+
+        // 4) Actualizar last_run para el próximo tick
+        await prisma.$executeRawUnsafe(
+            `
+            INSERT INTO cron_meta (key_name, last_run)
+            VALUES ('reminders_tick', ?)
+            ON DUPLICATE KEY UPDATE last_run = VALUES(last_run)
+        `,
+            now
+        );
+
+        return res.json({
+            ok: true,
+            count: rows.length,
+            lastRun,
+            now,
+            sample: rows.slice(0, 10),
         });
+    } catch (err: any) {
+        console.error("[triggerReminderTick] ❌", err);
+        return res
+            .status(500)
+            .json({ ok: false, error: err?.message || "Error interno en tick" });
     }
-
-    res.json({ ok: true, count: rows.length, sample: rows.slice(0, 10) });
 }
 
 // POST /api/appointments/reminders/dispatch

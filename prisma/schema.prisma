@@ -765,19 +765,9 @@ model ConversationState {
   @@map("conversation_state")
 }
 
-// model AppointmentHold {
-//   id             Int      @id @default(autoincrement())
-//   empresaId      Int      @map("empresa_id")
-//   startAt        DateTime @map("start_at")
-//   endAt          DateTime @map("end_at")
-//   staffId        Int?     @map("staff_id") // <-- OPCIÓN A: nullable (hold global permitido)
-//   conversationId Int      @map("conversation_id")
-//   expiresAt      DateTime @map("expires_at")
-//   createdAt      DateTime @default(now()) @map("created_at")
+model CronMeta {
+  keyName String   @id @map("key_name")
+  lastRun DateTime @map("last_run")
 
-//   // Unicidad por slot+staff (NOTA: en Postgres, múltiples NULL son permitidos)
-//   @@unique([empresaId, startAt, endAt, staffId], map: "appointment_hold_unique_slot_staff")
-//   // Purga rápida por expiración
-//   @@index([empresaId, expiresAt], map: "appointment_hold_empresa_expires_idx")
-//   @@map("appointment_hold")
-// }
+  @@map("cron_meta")
+}
