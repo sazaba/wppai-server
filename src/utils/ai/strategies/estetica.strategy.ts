@@ -1,6 +1,7 @@
 // utils/ai/strategies/estetica.strategy.ts
 import axios from "axios";
 import prisma from "../../../lib/prisma";
+import type { Weekday } from "@prisma/client";
 import {
     ConversationEstado,
     MediaType,
@@ -177,6 +178,63 @@ function normalizeWhenPreview(raw?: string | null): string | undefined {
 // Orden y etiqueta de días para day = 'mon'|'tue'|... según tu tabla
 const DAY_ORDER: Record<string, number> = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
 const DAY_LABEL: Record<string, string> = { mon: "L", tue: "M", wed: "X", thu: "J", fri: "V", sat: "S", sun: "D" };
+
+
+// Mapeo nombre de día → clave usada en appointmentHour (mon..sun)
+const DAY_NAME_TO_KEY: Record<string, string> = {
+    lunes: "mon",
+    martes: "tue",
+    miercoles: "wed",
+    miércoles: "wed",
+    jueves: "thu",
+    viernes: "fri",
+    sabado: "sat",
+    sábado: "sat",
+    domingo: "sun",
+};
+
+// Detecta el día (mon..sun) a partir de un texto tipo "sábado en la tarde"
+function detectDayKeyFromText(text?: string | null): string | null {
+    if (!text) return null;
+    const s = text.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+    for (const [name, key] of Object.entries(DAY_NAME_TO_KEY)) {
+        if (s.includes(name)) return key;
+    }
+    return null;
+}
+
+// Consulta en BD si ese día tiene agenda abierta (al menos un tramo horario)
+async function isDayOpenInAgenda(empresaId: number, dayKey: string): Promise<boolean> {
+    const row = await prisma.appointmentHour.findFirst({
+        where: { empresaId, day: dayKey as Weekday },
+        select: { isOpen: true, start1: true, end1: true, start2: true, end2: true },
+    });
+
+    if (!row) return false;
+
+    const open = Number(row.isOpen) === 1 || row.isOpen === true;
+    const hasSpan =
+        (row.start1 && row.end1 && row.start1.trim() && row.end1.trim()) ||
+        (row.start2 && row.end2 && row.start2.trim() && row.end2.trim());
+
+    return open && !!hasSpan;
+}
+
+// Versión "bonita" del nombre del día para responder al cliente
+function prettyDayFromKey(dayKey: string): string {
+    switch (dayKey) {
+        case "mon": return "lunes";
+        case "tue": return "martes";
+        case "wed": return "miércoles";
+        case "thu": return "jueves";
+        case "fri": return "viernes";
+        case "sat": return "sábado";
+        case "sun": return "domingo";
+        default: return dayKey;
+    }
+}
+
+
 
 /** Detecta si el mensaje es nota de voz o audio */
 function isVoiceInbound(last: { isVoiceNote?: boolean | null; mediaType?: any; mimeType?: string | null; }) {
@@ -1745,6 +1803,44 @@ export async function handleEsteticaStrategy({
             return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
         }
     }
+
+    // ==== VALIDAR QUE EL DÍA SOLICITADO EXISTA EN EL HORARIO ====
+    if (newDraft.whenText) {
+        const dayKey = detectDayKeyFromText(newDraft.whenText);
+        if (dayKey) {
+            const isOpen = await isDayOpenInAgenda(empresaId, dayKey);
+
+            // Si el día no está abierto en appointmentHour → avisar al cliente y NO hacer handoff
+            if (!isOpen) {
+                const diaBonito = prettyDayFromKey(dayKey);
+
+                let texto = `Para *${diaBonito}* no tengo agenda disponible en el sistema (ese día no atendemos). ¿Te sirve otro día dentro de nuestro horario?`;
+                texto = addEmojiStable(clampText(texto), chatId);
+
+                const saved = await sendBotReply({
+                    conversationId: chatId,
+                    empresaId,
+                    texto,
+                    nuevoEstado: ConversationEstado.respondido,
+                    to: toPhone ?? conversacion.phone,
+                    phoneNumberId,
+                });
+
+                if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
+
+                // No bloqueamos la IA ni cambiamos a "requiere_agente":
+                // dejamos que el cliente proponga otro día.
+                return {
+                    estado: ConversationEstado.respondido,
+                    mensaje: saved.texto,
+                    messageId: saved.messageId,
+                    wamid: saved.wamid,
+                    media: [],
+                };
+            }
+        }
+    }
+
 
     // 2) Handoff solo si tenemos las 3 piezas EN EL DRAFT (sin regex del texto)
     if (newDraft.name && newDraft.procedureName && hasSomeDateDraft(newDraft)) {
