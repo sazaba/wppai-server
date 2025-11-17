@@ -132,34 +132,25 @@ export const responderManual = async (req: Request, res: Response) => {
             },
         })
 
-        // // 3) Actualizar estado
-        // const updated = await prisma.conversation.update({
-        //     where: { id: conv.id },
-        //     data: { estado: ConversationEstado.respondido },
-        // })
+        // 3) Al responder manualmente → forzamos handoff a humano
+        const updated = await prisma.conversation.update({
+            where: { id: conv.id },
+            data: { estado: ConversationEstado.requiere_agente },
+        })
 
-        // // 4) Emitir sockets
-        // const io = getIO(req)
-        // io?.emit?.('nuevo_mensaje', {
-        //     conversationId: conv.id,
-        //     message,
-        // })
-        // io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
-
-        // 3) NO cambiar estado: se mantiene tal cual esté
-
-        // 4) Emitir sockets (solo nuevo mensaje; el estado no cambió)
+        // 4) Emitir sockets: nuevo mensaje + cambio de estado
         const io = getIO(req)
         io?.emit?.('nuevo_mensaje', {
             conversationId: conv.id,
             message,
         })
-        // Si quieres, puedes omitir este emit porque no hay cambio de estado:
-        // io?.emit?.('chat_actualizado', { id: conv.id, estado: conv.estado })
-
-
+        io?.emit?.('chat_actualizado', {
+            id: updated.id,
+            estado: updated.estado,
+        })
 
         res.status(200).json({ success: true, message })
+
     } catch (err: any) {
         console.error('Error al guardar respuesta manual:', err?.response?.data || err.message)
         res.status(500).json({ error: 'Error al guardar el mensaje' })
@@ -201,30 +192,25 @@ export const postMessageToConversation = async (req: Request, res: Response) => 
             },
         })
 
-        // const updated = await prisma.conversation.update({
-        //     where: { id: conv.id },
-        //     data: { estado: ConversationEstado.respondido },
-        // })
+        // 3) Al enviar mensaje desde este endpoint → marcar requiere_agente
+        const updated = await prisma.conversation.update({
+            where: { id: conv.id },
+            data: { estado: ConversationEstado.requiere_agente },
+        })
 
-        // const io = getIO(req)
-        // io?.emit?.('nuevo_mensaje', {
-        //     conversationId: conv.id,
-        //     message,
-        // })
-        // io?.emit?.('chat_actualizado', { id: updated.id, estado: updated.estado })
-
-        // NO cambiar estado
-
+        // 4) Emitir sockets
         const io = getIO(req)
         io?.emit?.('nuevo_mensaje', {
             conversationId: conv.id,
             message,
         })
-        // Opcional: omitir chat_actualizado si no hubo cambio real
-        // io?.emit?.('chat_actualizado', { id: conv.id, estado: conv.estado })
-
+        io?.emit?.('chat_actualizado', {
+            id: updated.id,
+            estado: updated.estado,
+        })
 
         res.status(201).json({ message })
+
     } catch (error: any) {
         console.error(error?.response?.data || error)
         res.status(500).json({ error: 'Error al enviar o guardar el mensaje' })

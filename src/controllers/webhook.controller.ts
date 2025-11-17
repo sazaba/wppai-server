@@ -250,13 +250,14 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             // if (!captionForDb) skipIAForThisWebhook = true
         }
 
-        // 👇 Si el chat está en post-agenda, no invocamos IA (además del caso imagen sin caption)
-        if (conversation.estado === ConversationEstado.agendado_consulta) {
+        // 👇 Si el chat está en post-agenda O en requiere_agente, no invocamos IA
+        if (
+            conversation.estado === ConversationEstado.agendado_consulta ||
+            conversation.estado === ConversationEstado.requiere_agente
+        ) {
             skipIAForThisWebhook = true
         }
-        if (isPostAgendaMessage) {
-            skipIAForThisWebhook = true
-        }
+
 
         // Guardar ENTRANTE (ahora también persistimos mediaUrl si existe)
         const inboundData: any = {
