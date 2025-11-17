@@ -367,34 +367,32 @@ function isRescheduleIntent(text: string): boolean {
 type AppointmentConfirmKind = "none" | "confirm" | "cancel" | "reschedule";
 
 // Regla rápida por palabras clave
-function detectAppointmentConfirmationRule(text: string): AppointmentConfirmKind {
-    const s = norm(text || "");
+// Regla rápida por palabras clave para confirmar / cancelar / reagendar
+function detectAppointmentConfirmationRule(
+    text: string
+): "confirm" | "cancel" | "reschedule" | "none" {
+    const s = norm(text || "")
 
-    // Primero reagendar (usa mismo detector robusto)
-    if (isRescheduleIntent(text)) return "reschedule";
+    if (isRescheduleIntent(text)) return "reschedule"
 
-    // Cancelar / no asistir
     if (
         /\b(cancelar|cancela|cancelo|anular|anulo|anulada|anulado)\b/.test(s) ||
         /\b(no\s+voy\s+a\s+poder|no\s+puedo\s+ir|no\s+me\s+es\s+posible|no\s+asistir[eé]|no\s+voy)\b/.test(s)
     ) {
-        return "cancel";
+        return "cancel"
     }
 
-    // Confirmar asistencia
     if (
         /\b(confirmo|confirmar|confirmada|confirmado)\b/.test(s) ||
         /\b(si\s+voy|sí\s+voy|si\s+asisto|sí\s+asisto)\b/.test(s) ||
-        /\b(all[aá]\s+estar[eé]|all[aá]\s+nos\s+vemos|nos\s+vemos\s+all[aá]\b/.test(s) ||
-        /\b(perfecto\s+nos\s+vemos|listo\s+nos\s+vemos)\b/.test(s)
+        /\b(all[aá]\s+estar[eé]|all[aá]\s+nos\s+vemos|nos\s+vemos\s+all[aá])\b/.test(s)
     ) {
-        return "confirm";
+        return "confirm"
     }
 
-    return "none";
+    return "none"
 }
 
-// LLM para casos “largos / compuestos”
 async function classifyAppointmentConfirmationLLM(
     userText: string
 ): Promise<{ status: AppointmentConfirmKind; confidence: number }> {
