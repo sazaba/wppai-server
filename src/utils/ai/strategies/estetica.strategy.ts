@@ -1633,8 +1633,6 @@ export async function handleEsteticaStrategy({
 
     }
 
-
-
     /**
   * POST-AGENDA / CONFIRMACIÓN:
   * - Cuando la conversación está ligada a una cita ya agendada,
