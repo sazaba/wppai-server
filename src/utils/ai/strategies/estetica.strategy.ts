@@ -1617,11 +1617,20 @@ export async function handleEsteticaStrategy({
         const locked = stateNow.handoffLocked;
 
         // En 'requiere_agente' o con lock activo => silenciar IA
-        if (estadoStr === "requiere_agente" || locked) {
+        // En 'requiere_agente' o con lock activo => silenciar IA,
+        // PERO dejemos pasar los estados agendado/agendado_consulta
+        // para poder registrar confirmaciones/cancelaciones del cliente.
+        if (
+            estadoStr === "requiere_agente" ||
+            (locked &&
+                estadoStr !== "agendado" &&
+                estadoStr !== "agendado_consulta")
+        ) {
             // Asegura lock explícito si aún no estaba marcado
             if (!locked) await patchState(chatId, { handoffLocked: true });
             return { estado: "pendiente", mensaje: "" };
         }
+
     }
 
 
