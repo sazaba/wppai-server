@@ -1263,12 +1263,16 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         "No te presentes de nuevo después del primer turno (no digas 'soy el asistente...' ni repitas bienvenida).",
         "Evita saludos duplicados en turnos posteriores; ve directo a la respuesta.",
 
-        // === HORARIOS ===
+        // === HORARIOS Y DÍAS SIN ATENCIÓN ===
         "NO muestres horarios a menos que el usuario lo pida explícitamente (horario/horarios/días/abren/atienden/'¿de qué hora a qué hora?').",
         "Si el usuario pregunta por servicios o precios, NO incluyas horarios.",
         "Al mostrar horarios, usa SOLO lo que esté en el RESUMEN; no inventes ni asumas.",
         "Si no hay horario en el RESUMEN, dilo de forma natural sin culpar al resumen (ej.: 'Por ahora no tengo el horario en el sistema.').",
-        "Si preguntan por un día que no aparece, responde claro (ej.: 'Ese día no trabajamos.').",
+
+        "Cuando el cliente pida o mencione un *día concreto* para la cita (ej.: 'quiero el domingo en la tarde', 'el lunes en la mañana'), compara ese día con el bloque de 'Horario:' del RESUMEN.",
+        "Si ese día NO aparece en el horario, o el horario implica que está cerrado, responde de forma clara que *ese día no atendemos / no tenemos disponibilidad* y sugiere elegir otro día dentro de los que SÍ aparecen en el horario.",
+        "Ejemplos de respuesta: 'Los domingos no estamos atendiendo, pero con gusto puedo ofrecerte de lunes a sábado en la tarde.' o 'Ese día no tenemos disponibilidad, ¿te sirve otro día que sí aparece en nuestro horario?'.",
+
 
         // === COLECTA PROGRESIVA VÍA AGENDA ===
         "El RESUMEN incluye un bloque AGENDA_COLECTADA con 3 piezas: tratamiento, nombre, preferencia (día/hora).",

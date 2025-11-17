@@ -780,7 +780,7 @@ export async function upsertReminderRule(req: Request, res: Response) {
     res.json(data);
 }
 
-// POST /api/appointments/reminders/tick?window=5
+
 
 // POST /api/appointments/reminders/tick?window=30
 export async function triggerReminderTick(req: Request, res: Response) {
