@@ -1622,12 +1622,12 @@ export async function handleEsteticaStrategy({
         // para poder registrar confirmaciones/cancelaciones del cliente.
         if (
             estadoStr === "requiere_agente" ||
-            (locked &&
-                estadoStr !== "agendado" &&
-                estadoStr !== "agendado_consulta")
+            (locked && estadoStr !== "agendado" && estadoStr !== "agendado_consulta")
         ) {
-            // Asegura lock explícito si aún no estaba marcado
-            if (!locked) await patchState(chatId, { handoffLocked: true });
+            // Asegura lock explícito si entramos por requiere_agente
+            if (!locked && estadoStr === "requiere_agente") {
+                await patchState(chatId, { handoffLocked: true });
+            }
             return { estado: "pendiente", mensaje: "" };
         }
 
