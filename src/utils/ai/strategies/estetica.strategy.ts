@@ -1168,6 +1168,18 @@ function normalizeForDedup(s: string) {
         .trim();
 }
 
+function llmAlreadyAskedForWhen(s: string) {
+    const t = norm(s);
+    return (
+        /\bque dia y hora\b/.test(t) ||
+        /\bque dia prefieres\b/.test(t) ||
+        /\bpara cuando te gustaria\b/.test(t) ||
+        /\bcuando te gustaria\b/.test(t) ||
+        /\bpara que dia\b/.test(t)
+    );
+}
+
+
 // Agrega un tail si no fue dicho recientemente por el bot
 async function appendOnceInvitationTail(
     conversationId: number,
@@ -1321,6 +1333,12 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         "No te presentes de nuevo después del primer turno (no digas 'soy el asistente...' ni repitas bienvenida).",
         "Evita saludos duplicados en turnos posteriores; ve directo a la respuesta.",
 
+        // === PROHIBIR PREGUNTAS DE AGENDA AL LLM ===
+        "No pidas datos para agendar la cita. NO preguntes por día, hora, fecha, nombre, teléfono ni disponibilidad.",
+        "Si el usuario dice que quiere una cita o está interesado en agendar, solo responde con información del tratamiento y confirma que puedes ayudarle, pero deja que otro módulo pregunte por tratamiento, día/hora y nombre.",
+        "En particular, evita frases como: '¿qué día y hora prefieres?', '¿para cuándo te gustaría la cita?', '¿para qué día?', '¿a nombre de quién?', 'dime tu nombre' o similares.",
+
+
         // === HORARIOS Y DÍAS SIN ATENCIÓN ===
         "NO muestres horarios a menos que el usuario lo pida explícitamente (horario/horarios/días/abren/atienden/'¿de qué hora a qué hora?').",
         "Si el usuario pregunta por servicios o precios, NO incluyas horarios.",
@@ -1341,8 +1359,6 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         "Si ya están las 3 piezas (tratamiento, día/hora y nombre), NO prometas cupos ni confirmes; di que vas a validar disponibilidad y que un asesor continúa.",
         "No digas 'en el resumen no se especifica' ni 'no veo en el resumen'; habla en primera persona y pregunta de forma natural.",
         "Evita forzar agenda cuando el cliente hace preguntas informativas; primero responde su duda y luego invita suave a aportar la siguiente pieza si procede.",
-
-
         "Tu única fuente es el RESUMEN a continuación.",
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
     ].join("\n");
@@ -1978,16 +1994,16 @@ export async function handleEsteticaStrategy({
         const wantBookSoft = hasBookingIntent(userText) || clsSoft.label === "book" || hasConcreteTimeAnchor(userText);
 
         if (wantBookSoft) {
-            if (needProcedure || needWhen || needName) {
+            // Solo añadimos nuestra pregunta si el LLM NO está preguntando ya por día/hora
+            if (!llmAlreadyAskedForWhen(texto) && (needProcedure || needWhen || needName)) {
                 const tail = buildAskPiecesText(kb, { proc: needProcedure, when: needWhen, name: needName });
                 if (tail) texto = `${texto}\n\n${tail}`;
             }
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
-
             texto = await appendOnceInvitationTail(chatId, texto, CTA_UNICO);
-
         }
+
 
 
         texto = stripEmojis(clampInfoText(texto));
