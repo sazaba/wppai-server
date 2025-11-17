@@ -1332,12 +1332,16 @@ async function runLLM({ summary, userText, imageUrl }: any) {
         "Ejemplos de respuesta: 'Los domingos no estamos atendiendo, pero con gusto puedo ofrecerte de lunes a sábado en la tarde.' o 'Ese día no tenemos disponibilidad, ¿te sirve otro día que sí aparece en nuestro horario?'.",
 
 
+
         // === COLECTA PROGRESIVA VÍA AGENDA ===
         "El RESUMEN incluye un bloque AGENDA_COLECTADA con 3 piezas: tratamiento, nombre, preferencia (día/hora).",
         "Pide SOLO una pieza faltante por turno, en este orden: tratamiento → día/hora → nombre.",
-        "Si ya están las 3 piezas, NO prometas cupos ni confirmes; di que vas a validar disponibilidad y que un asesor continúa.",
+        "Cuando el cliente ya mencionó un día, una hora o una preferencia (por ejemplo: 'lunes en la tarde', 'mañana', 'en la noche'), NO vuelvas a hacer preguntas generales como '¿qué día y hora prefieres?'; usa esa preferencia directa o responde si ese día está disponible.",
+        "Cuando acabas de informar que un día no está disponible (por ejemplo: 'sábado no atendemos'), NO repitas el bloque inicial de bienvenida ni vuelvas a preguntar lo mismo; solo sugiere que elija otro día dentro del horario disponible.",
+        "Si ya están las 3 piezas (tratamiento, día/hora y nombre), NO prometas cupos ni confirmes; di que vas a validar disponibilidad y que un asesor continúa.",
         "No digas 'en el resumen no se especifica' ni 'no veo en el resumen'; habla en primera persona y pregunta de forma natural.",
         "Evita forzar agenda cuando el cliente hace preguntas informativas; primero responde su duda y luego invita suave a aportar la siguiente pieza si procede.",
+
 
         "Tu única fuente es el RESUMEN a continuación.",
         "\n=== RESUMEN ===\n" + summary + "\n=== FIN ===",
