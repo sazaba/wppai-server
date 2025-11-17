@@ -299,11 +299,18 @@ type AgentState = {
         pendingConfirm?: {
             name?: string; // ← sugerencia de nombre pendiente de “sí / no”
         };
+
+        // 🔽 NUEVO: tracking de confirmación de la cita
+        statusConfirm?: "pending" | "confirmed" | "cancelled" | "reschedule";
+        confirmSource?: "client" | "agent" | "system";
+        confirmText?: string;
+        confirmAt?: string; // ISO string
     };
     summary?: { text: string; expiresAt: string };
     expireAt?: string;
     handoffLocked?: boolean;
 };
+
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
@@ -355,6 +362,93 @@ function isRescheduleIntent(text: string): boolean {
 
     return false;
 }
+
+// === CONFIRMACIÓN DE CITA (post-agenda) ===
+type AppointmentConfirmKind = "none" | "confirm" | "cancel" | "reschedule";
+
+// Regla rápida por palabras clave
+function detectAppointmentConfirmationRule(text: string): AppointmentConfirmKind {
+    const s = norm(text || "");
+
+    // Primero reagendar (usa mismo detector robusto)
+    if (isRescheduleIntent(text)) return "reschedule";
+
+    // Cancelar / no asistir
+    if (
+        /\b(cancelar|cancela|cancelo|anular|anulo|anulada|anulado)\b/.test(s) ||
+        /\b(no\s+voy\s+a\s+poder|no\s+puedo\s+ir|no\s+me\s+es\s+posible|no\s+asistir[eé]|no\s+voy)\b/.test(s)
+    ) {
+        return "cancel";
+    }
+
+    // Confirmar asistencia
+    if (
+        /\b(confirmo|confirmar|confirmada|confirmado)\b/.test(s) ||
+        /\b(si\s+voy|sí\s+voy|si\s+asisto|sí\s+asisto)\b/.test(s) ||
+        /\b(all[aá]\s+estar[eé]|all[aá]\s+nos\s+vemos|nos\s+vemos\s+all[aá]\b/.test(s) ||
+        /\b(perfecto\s+nos\s+vemos|listo\s+nos\s+vemos)\b/.test(s)
+    ) {
+        return "confirm";
+    }
+
+    return "none";
+}
+
+// LLM para casos “largos / compuestos”
+async function classifyAppointmentConfirmationLLM(
+    userText: string
+): Promise<{ status: AppointmentConfirmKind; confidence: number }> {
+    const sys = [
+        "Eres un clasificador de respuestas a mensajes de confirmación de citas de una clínica estética.",
+        "Debes responder SOLO un JSON, por ejemplo: {\"status\":\"confirm\",\"confidence\":0.9}",
+        "Estados posibles:",
+        "- \"confirm\": el cliente confirma que SÍ asistirá a la cita.",
+        "- \"cancel\": el cliente indica que NO asistirá o que desea cancelar definitivamente.",
+        "- \"reschedule\": el cliente pide CAMBIAR de día/hora o reagendar.",
+        "- \"none\": el mensaje no habla claramente de confirmar/cancelar/reagendar (por ejemplo, solo agradece o hace preguntas).",
+        "Si el mensaje mezcla cancelar y reagendar, prioriza \"reschedule\" si está claro que quiere otra fecha.",
+        "Nunca agregues texto fuera del JSON."
+    ].join("\n");
+
+    const r = await openai.chat.completions.create({
+        model: CONF.MODEL,
+        temperature: 0,
+        max_tokens: 40,
+        messages: [
+            { role: "system", content: sys },
+            { role: "user", content: String(userText || "").slice(0, 500) },
+        ],
+    }).catch(() => null);
+
+    try {
+        const raw = r?.choices?.[0]?.message?.content?.trim() || "";
+        const parsed = JSON.parse(raw);
+        const status = parsed?.status as AppointmentConfirmKind | undefined;
+        const confidence = Number(parsed?.confidence ?? 0.7);
+
+        if (status === "confirm" || status === "cancel" || status === "reschedule" || status === "none") {
+            return {
+                status,
+                confidence: Number.isFinite(confidence) ? confidence : 0.7,
+            };
+        }
+    } catch { /* noop */ }
+
+    return { status: "none", confidence: 0.0 };
+}
+
+// Orquestador: primero reglas, luego LLM “premium”
+async function detectAppointmentConfirmation(text: string): Promise<AppointmentConfirmKind> {
+    const rule = detectAppointmentConfirmationRule(text);
+    if (rule !== "none") return rule;
+
+    const llm = await classifyAppointmentConfirmationLLM(text);
+    if (llm.confidence >= 0.7) return llm.status;
+
+    return "none";
+}
+
+
 
 
 /* ==== INFO / SCHEDULE GUARDS (del componente viejo) ==== */
@@ -865,18 +959,33 @@ async function buildOrReuseSummary(args: {
 }
 
 /* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
+/* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
 function overlayAgenda(summary: string, draft?: AgentState["draft"]): string {
     const t = (draft?.procedureName || "").trim();
     const n = (draft?.name || "").trim();
     const w = (draft?.whenText || (draft?.whenISO ? new Date(draft.whenISO).toISOString() : "")).trim();
 
-    const agenda = [
+    // 🔽 NUEVO: info de confirmación
+    const statusConfirm = draft?.statusConfirm;
+    const confirmAt = draft?.confirmAt;
+    const confirmText = draft?.confirmText;
+
+    const agendaLines: string[] = [
         "=== AGENDA_COLECTADA ===",
         `tratamiento: ${t || "—"}`,
         `nombre: ${n || "—"}`,
         `preferencia: ${w || "—"}`,
-        "=== FIN_AGENDA ===",
-    ].join("\n");
+    ];
+
+    if (statusConfirm) {
+        agendaLines.push(`estado_confirmacion: ${statusConfirm}`);
+        if (confirmAt) agendaLines.push(`confirmacion_ultima_vez: ${confirmAt}`);
+        if (confirmText) agendaLines.push(`confirmacion_texto: ${softTrim(confirmText, 160)}`);
+    }
+
+    agendaLines.push("=== FIN_AGENDA ===");
+
+    const agenda = agendaLines.join("\n");
 
     // Quita bloque previo si existiera, luego inserta uno fresco al final
     const cleaned = summary
@@ -885,6 +994,7 @@ function overlayAgenda(summary: string, draft?: AgentState["draft"]): string {
 
     return `${cleaned}\n\n${agenda}`;
 }
+
 
 
 /* ====== NAME EXTRACTION (robusto) ====== */
@@ -1519,22 +1629,50 @@ export async function handleEsteticaStrategy({
 
 
     /**
-     * POST-AGENDA:
-     * - Si la conversación llega en 'agendado' (recién creada la cita), en el primer inbound
-     *   la marcamos como 'agendado_consulta' y silenciamos IA.
-     * - Si ya está en 'agendado_consulta', solo silenciamos IA.
-     */
-    if (conversacion.estado === ConversationEstado.agendado) {
-        await prisma.conversation.update({
-            where: { id: chatId },
-            data: { estado: ConversationEstado.agendado_consulta },
-        });
-        await patchState(chatId, { handoffLocked: true });
-        return { estado: "pendiente", mensaje: "" };
-    }
+  * POST-AGENDA / CONFIRMACIÓN:
+  * - Cuando la conversación está ligada a una cita ya agendada,
+  *   solo usamos el mensaje del cliente para marcar si confirmó / canceló / pidió reagendar.
+  * - NO cambiamos el estado de la conversación (se queda en 'agendado') y
+  *   la IA no responde nada; esto es solo tracking.
+  */
+    if (
+        conversacion.estado === ConversationEstado.agendado ||
+        conversacion.estado === ConversationEstado.agendado_consulta
+    ) {
+        const textForConfirm = (mensajeArg || "").trim();
 
-    if (conversacion.estado === ConversationEstado.agendado_consulta) {
+        if (textForConfirm) {
+            const kind = await detectAppointmentConfirmation(textForConfirm);
+
+            if (kind !== "none") {
+                const prev = await loadState(chatId);
+                const prevDraft = prev.draft ?? {};
+                const nowIso = new Date().toISOString();
+
+                const statusMapped =
+                    kind === "confirm"
+                        ? "confirmed"
+                        : kind === "cancel"
+                            ? "cancelled"
+                            : kind === "reschedule"
+                                ? "reschedule"
+                                : prevDraft.statusConfirm;
+
+                const newDraft = {
+                    ...prevDraft,
+                    statusConfirm: statusMapped,
+                    confirmSource: "client" as const,
+                    confirmText: textForConfirm,
+                    confirmAt: nowIso,
+                };
+
+                await patchState(chatId, { draft: newDraft });
+            }
+        }
+
+        // Silenciamos la IA para este chat post-agenda (solo registro de estado)
         await patchState(chatId, { handoffLocked: true });
+
         return { estado: "pendiente", mensaje: "" };
     }
 
