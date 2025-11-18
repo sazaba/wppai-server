@@ -411,15 +411,17 @@ export async function createAppointment(req: Request, res: Response) {
             return res.status(409).json({ error: "Día bloqueado por excepción." });
 
         // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
+        // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
         const violates = violatesNoticeAndWindow(
             {
-                minNoticeH: 0,
-                maxAdvanceD: null,
-                allowSameDay: true,
-                bookingWindowDays: null,
+                minNoticeH: cfg.minNoticeH,
+                maxAdvanceD: cfg.maxAdvanceD,
+                allowSameDay: cfg.allowSameDay,
+                bookingWindowDays: cfg.bookingWindowDays,
             },
             start
         );
+
         if (violates) {
             return res
                 .status(409)
@@ -511,15 +513,17 @@ export async function updateAppointment(req: Request, res: Response) {
                 return res.status(409).json({ error: "Día bloqueado por excepción." });
 
             // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
+            // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
             const violates = violatesNoticeAndWindow(
                 {
-                    minNoticeH: 0,
-                    maxAdvanceD: null,
-                    allowSameDay: true,
-                    bookingWindowDays: null,
+                    minNoticeH: cfg.minNoticeH,
+                    maxAdvanceD: cfg.maxAdvanceD,
+                    allowSameDay: cfg.allowSameDay,
+                    bookingWindowDays: cfg.bookingWindowDays,
                 },
                 start
             );
+
             if (violates) {
                 return res
                     .status(409)
