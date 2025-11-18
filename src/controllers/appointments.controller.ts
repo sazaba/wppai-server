@@ -290,7 +290,8 @@ export async function listAppointments(req: Request, res: Response) {
     const AND: any[] = [{ empresaId }];
     if (from && to) AND.push({ startAt: { gte: from }, endAt: { lte: to } });
 
-    const data = await prisma.appointment.findMany({
+    // 1) Traemos las citas como antes
+    const appts = await prisma.appointment.findMany({
         where: { AND },
         orderBy: { startAt: "asc" },
         select: {
@@ -308,13 +309,50 @@ export async function listAppointments(req: Request, res: Response) {
             timezone: true,
             createdAt: true,
             updatedAt: true,
-            statusConfirm: true,
-            confirmAt: true,
+
         },
     });
 
-    res.json(data);
+    // 2) Obtenemos todos los conversationId asociados
+    const convIds = appts
+        .map((a) => a.conversationId)
+        .filter((id): id is number => typeof id === "number");
+
+    let stateByConvId: Record<number, any> = {};
+
+    if (convIds.length > 0) {
+        const states = await prisma.conversationState.findMany({
+            where: { conversationId: { in: convIds } },
+            select: {
+                conversationId: true,
+                data: true, // aquí viene el JSON con { draft, summary, ... }
+            },
+        });
+
+        for (const s of states) {
+            stateByConvId[s.conversationId] = s.data;
+        }
+    }
+
+    // 3) Enriquecemos cada cita con el estado de confirmación del conversation_state
+    const enriched = appts.map((a) => {
+        const state = a.conversationId
+            ? stateByConvId[a.conversationId] ?? null
+            : null;
+        // Enviar TODO el summary tal cual lo generas en estetica.strategy
+        const summary = state?.summary ?? null;
+
+        return {
+            ...a,
+            summary, // ⬅️ ESTE es el campo que consumirá el frontend
+        };
+
+
+    });
+
+    res.json(enriched);
 }
+
 
 /* ===================== Create ===================== */
 // POST /api/appointments
@@ -536,13 +574,16 @@ export async function updateAppointment(req: Request, res: Response) {
                 locationNameCache:
                     patch.locationNameCache ?? existing.locationNameCache,
 
-                // ✅ NUEVO: si lo mandan en el patch, lo actualizamos
+
+
+                // ✅ NUEVO: flag por cita
                 sendReminder24h:
                     patch.sendReminder24h !== undefined
                         ? !!patch.sendReminder24h
                         : existing.sendReminder24h,
             },
         });
+
 
         res.json(appt);
     } catch (err: any) {
