@@ -278,7 +278,7 @@ export const iniciarChat = async (req: Request, res: Response) => {
 }
 
 // ——————————————————————————————
-// IA (sin cambios de tipos)
+// IA (con debug de estado conversacional)
 // ——————————————————————————————
 export const responderConIA = async (req: Request, res: Response) => {
     const { chatId, mensaje, intentosFallidos = 0 } = req.body as {
@@ -294,8 +294,43 @@ export const responderConIA = async (req: Request, res: Response) => {
             return res.status(403).json({ error: 'No autorizado para responder esta conversación' })
         }
 
+        // 🟡 DEBUG 1: antes de llamar a la IA
+        console.log('[IA DEBUG] -> handleIAReply IN', {
+            chatId,
+            empresaId,
+            mensaje,
+            intentosFallidos,
+            estadoConversacion: conv.estado,
+        })
+
         const result = await handleIAReply(chatId, mensaje)
         if (!result) return res.status(400).json({ error: 'No se pudo generar respuesta con IA' })
+
+        // 🟡 DEBUG 2: después de la IA (qué decidió)
+        console.log('[IA DEBUG] <- handleIAReply OUT', {
+            chatId,
+            resultEstado: result.estado,
+            resultMensaje: result.mensaje,
+        })
+
+        // 🟡 DEBUG 3: leer cómo quedó el conversation_state después de handleIAReply
+        const state = await prisma.conversationState.findFirst({
+            where: { conversationId: chatId },
+        })
+
+        // El estado real está dentro de `data` (JsonValue)
+        const data = state?.data as any
+
+        console.log('[IA DEBUG] conversation_state AFTER', {
+            chatId,
+            stateId: state?.id,
+            raw: state,                    // por si queremos ver todo el registro
+            draft: data?.draft,            // aquí debería aparecer statusConfirm, confirmText, etc.
+            summary: data?.summary,
+            handoffLocked: data?.handoffLocked,
+            expireAt: data?.expireAt ?? data?.expiresAt, // según como lo guardes
+        })
+
 
         if (result.estado === ConversationEstado.requiere_agente) {
             return res.json({
@@ -310,6 +345,7 @@ export const responderConIA = async (req: Request, res: Response) => {
         return res.status(500).json({ error: 'Error al procesar respuesta de IA' })
     }
 }
+
 
 // ——————————————————————————————
 // Cambiar estado conversación

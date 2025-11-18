@@ -1634,12 +1634,20 @@ export async function handleEsteticaStrategy({
     }
 
     /**
-  * POST-AGENDA / CONFIRMACIÓN:
-  * - Cuando la conversación está ligada a una cita ya agendada,
-  *   solo usamos el mensaje del cliente para marcar si confirmó / canceló / pidió reagendar.
-  * - NO cambiamos el estado de la conversación (se queda en 'agendado') y
-  *   la IA no responde nada; esto es solo tracking.
-  */
+     * POST-AGENDA / CONFIRMACIÓN
+     * - Cuando la conversación está ligada a una cita ya agendada,
+     *   solo usamos el mensaje del cliente para marcar si confirmó / canceló / pidió reagendar.
+     * - NO cambiamos el estado de la conversación.
+     * - La IA NO responde nada (solo tracking).
+     */
+
+    // 📌 LOG #1 — Confirmar que realmente entramos al bloque
+    console.log('[DEBUG POST-AGENDA ENTRY]', {
+        chatId,
+        estado: conversacion.estado,
+        mensajeArg,
+    });
+
     if (
         conversacion.estado === ConversationEstado.agendado ||
         conversacion.estado === ConversationEstado.agendado_consulta
@@ -1671,7 +1679,8 @@ export async function handleEsteticaStrategy({
                     confirmAt: nowIso,
                 };
 
-                console.log('[POST-AGENDA CONFIRM]', {
+                // 📌 LOG #2 — Confirmar que detectamos confirm/cancel/reschedule
+                console.log('[POST-AGENDA CONFIRM DETECTED]', {
                     chatId,
                     estado: conversacion.estado,
                     textForConfirm,
@@ -1690,10 +1699,9 @@ export async function handleEsteticaStrategy({
                     },
                 });
             }
-
         }
 
-        // Silenciamos la IA para este chat post-agenda (solo registro de estado)
+        // Silenciamos la IA para este chat post-agenda (solo registro)
         await patchState(chatId, { handoffLocked: true });
 
         return { estado: "pendiente", mensaje: "" };
