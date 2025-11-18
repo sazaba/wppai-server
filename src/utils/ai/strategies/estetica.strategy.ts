@@ -1866,14 +1866,21 @@ export async function handleEsteticaStrategy({
     let pendingConfirm = prevDraft.pendingConfirm || undefined;
 
     // si viene por gatillo, se fija directo.
-    // si viene por loose/llm → va a confirmación (a menos que ya teníamos name)
-    if (!prevDraft.name && nameInText && nameSource !== "trigger") {
+    // si viene por loose/llm → va a confirmación SOLO si no hemos fijado name en este turno
+    // es decir, nextName sigue igual que prevDraft.name
+    if (
+        !prevDraft.name &&
+        nameInText &&
+        nameSource !== "trigger" &&
+        nextName === prevDraft.name
+    ) {
         pendingConfirm = { ...(pendingConfirm || {}), name: nameInText! };
     }
 
     const whenTextNext = (canCaptureWhen && whenFreeCandidate)
         ? whenFreeCandidate
         : prevDraft.whenText || undefined;
+
 
     const newDraft = {
         ...prevDraft,
@@ -1937,16 +1944,21 @@ export async function handleEsteticaStrategy({
 
 
     // ——— Confirmación de nombre pendiente (si aplica)
-    if (newDraft.pendingConfirm?.name && !newDraft.name) {
+    // ——— Confirmación de nombre pendiente (si aplica)
+    if (newDraft.pendingConfirm?.name) {
         if (isYes(userText)) {
-            // Confirmado → fijamos nombre
-            newDraft.name = newDraft.pendingConfirm.name;
+            // Confirmado → si aún no estaba puesto el name, lo fijamos
+            if (!newDraft.name) {
+                newDraft.name = newDraft.pendingConfirm.name;
+            }
             newDraft.pendingConfirm = undefined;
             await patchState(chatId, { draft: newDraft });
+            // No respondemos nada especial; seguimos flujo normal
         } else if (isNo(userText)) {
-            // Rechazado → pedimos el nombre con gatillo
+            // Rechazado → limpiamos sugerencia y pedimos nombre con gatillo
             newDraft.pendingConfirm = undefined;
             await patchState(chatId, { draft: newDraft });
+
             const ask = "Gracias. ¿Cuál es tu *nombre completo*? (ej.: *Me llamo* Ana María Gómez)";
             const saved = await sendBotReply({
                 conversationId: chatId,
@@ -1957,7 +1969,13 @@ export async function handleEsteticaStrategy({
                 phoneNumberId,
             });
             if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
-            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            return {
+                estado: ConversationEstado.respondido,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         } else {
             // Aún no hubo sí/no → preguntar explícitamente
             const ask = `¿Te registro como *${newDraft.pendingConfirm.name}*?`;
@@ -1971,9 +1989,16 @@ export async function handleEsteticaStrategy({
             });
             if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
             await patchState(chatId, { draft: newDraft });
-            return { estado: ConversationEstado.respondido, mensaje: saved.texto, messageId: saved.messageId, wamid: saved.wamid, media: [] };
+            return {
+                estado: ConversationEstado.respondido,
+                mensaje: saved.texto,
+                messageId: saved.messageId,
+                wamid: saved.wamid,
+                media: [],
+            };
         }
     }
+
 
     // ==== VALIDAR QUE EL DÍA SOLICITADO EXISTA EN EL HORARIO ====
     if (newDraft.whenText) {
