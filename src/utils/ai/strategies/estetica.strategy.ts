@@ -1671,13 +1671,17 @@ export async function handleEsteticaStrategy({
                     confirmAt: nowIso,
                 };
 
-                // 1) Tomamos el summary actual (si existe)
-                const baseSummary = prev.summary?.text || "";
+                console.log('[POST-AGENDA CONFIRM]', {
+                    chatId,
+                    estado: conversacion.estado,
+                    textForConfirm,
+                    kind,
+                    newDraft,
+                });
 
-                // 2) Inyectamos el overlay con la info de confirmación
+                const baseSummary = prev.summary?.text || "";
                 const newSummaryText = overlayAgenda(baseSummary, newDraft);
 
-                // 3) Guardamos draft + summary actualizado en conversation_state
                 await patchState(chatId, {
                     draft: newDraft,
                     summary: {
@@ -1685,8 +1689,8 @@ export async function handleEsteticaStrategy({
                         expiresAt: nowPlusMin(CONF.MEM_TTL_MIN),
                     },
                 });
-
             }
+
         }
 
         // Silenciamos la IA para este chat post-agenda (solo registro de estado)
