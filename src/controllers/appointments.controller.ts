@@ -164,6 +164,27 @@ async function loadApptRuntimeConfig(empresaId: number) {
     };
 }
 
+
+/* ===================== Summary / ConversationState helpers ===================== */
+
+/**
+ * Lee el JSON de estado/resumen de la conversación
+ * desde la tabla conversation_state (modelo ConversationState).
+ */
+async function getConversationStateData(conversationId: number | null | undefined) {
+    if (!conversationId) return null;
+
+    const state = await prisma.conversationState.findUnique({
+        where: { conversationId },
+        select: { data: true },
+    });
+
+    // `data` es un campo Json en Prisma → lo devolvemos tal cual
+    return state?.data ?? null;
+}
+
+
+
 /* ===================== Reglas de ventana / excepciones / overlap ===================== */
 
 function violatesNoticeAndWindow(
@@ -937,6 +958,11 @@ export async function dispatchAppointmentReminders(req: Request, res: Response) 
                 });
             }
 
+            // 🧠 Leer ConversationState (summary JSON) asociado a la conversación
+            const conversationState = await getConversationStateData(conversation.id);
+
+
+
             // 3) Texto que verás en el chat (puedes ajustarlo a tu gusto)
             const fechaLocal = appt.startAt.toLocaleString("es-CO", {
                 timeZone: appt.timezone || "America/Bogota",
@@ -970,7 +996,9 @@ export async function dispatchAppointmentReminders(req: Request, res: Response) 
                     timestamp: msgDb.timestamp.toISOString(),
                 },
                 estado: conversation.estado,
+                conversationState, // ⬅️ aquí mandas el JSON de ConversationState
             });
+
 
             // 6) Marcar el log como enviado
             await prisma.appointmentReminderLog.update({
