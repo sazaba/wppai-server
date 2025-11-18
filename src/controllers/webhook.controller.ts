@@ -250,13 +250,12 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             // if (!captionForDb) skipIAForThisWebhook = true
         }
 
-        // 👇 Si el chat está en post-agenda O en requiere_agente, no invocamos IA
-        if (
-            conversation.estado === ConversationEstado.agendado_consulta ||
-            conversation.estado === ConversationEstado.requiere_agente
-        ) {
+        // 👇 Solo bloqueamos IA si el chat está en requiere_agente.
+        // En agendado / agendado_consulta SÍ dejamos pasar a la IA para registrar confirmaciones/cambios.
+        if (conversation.estado === ConversationEstado.requiere_agente) {
             skipIAForThisWebhook = true
         }
+
 
 
         // Guardar ENTRANTE (ahora también persistimos mediaUrl si existe)
@@ -450,6 +449,16 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 let botMessageId = result?.messageId ?? undefined
                 let botContenido = (result?.mensaje || '').trim()
 
+                // 🧵 Modo post-agenda: aunque la IA genere texto, NO lo enviamos al cliente.
+                // Solo usamos la IA para actualizar conversation_state (summary, draft, etc.).
+                if (
+                    conversation.estado === ConversationEstado.agendado ||
+                    conversation.estado === ConversationEstado.agendado_consulta
+                ) {
+                    botContenido = ''
+                }
+
+
                 if (botContenido && !botMessageId) {
                     const creadoFallback = await prisma.message.create({
                         data: {
@@ -491,6 +500,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         })
                     }
                 }
+
 
                 // 5) Si el handler envió imágenes de productos, emítelas también
                 if (result?.media?.length) {
