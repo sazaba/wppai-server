@@ -308,6 +308,8 @@ export async function listAppointments(req: Request, res: Response) {
             timezone: true,
             createdAt: true,
             updatedAt: true,
+            statusConfirm: true,
+            confirmAt: true,
         },
     });
 

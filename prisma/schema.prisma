@@ -130,6 +130,13 @@ enum StaffRole {
   medico
 }
 
+enum AppointmentConfirmStatus {
+  pending
+  confirmed
+  rescheduled
+  cancelled
+}
+
 /**
  * ========== Modelos base ==========
  */
@@ -465,11 +472,13 @@ model PaymentReceipt {
 }
 
 model Appointment {
-  id             Int               @id @default(autoincrement())
+  id             Int                      @id @default(autoincrement())
   empresaId      Int
   conversationId Int?
-  source         AppointmentSource @default(client)
-  status         AppointmentStatus @default(pending)
+  source         AppointmentSource        @default(client)
+  status         AppointmentStatus        @default(pending)
+  statusConfirm  AppointmentConfirmStatus @default(pending)
+  confirmAt      DateTime?
 
   customerName        String
   customerPhone       String
