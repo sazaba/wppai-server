@@ -1671,7 +1671,21 @@ export async function handleEsteticaStrategy({
                     confirmAt: nowIso,
                 };
 
-                await patchState(chatId, { draft: newDraft });
+                // 1) Tomamos el summary actual (si existe)
+                const baseSummary = prev.summary?.text || "";
+
+                // 2) Inyectamos el overlay con la info de confirmación
+                const newSummaryText = overlayAgenda(baseSummary, newDraft);
+
+                // 3) Guardamos draft + summary actualizado en conversation_state
+                await patchState(chatId, {
+                    draft: newDraft,
+                    summary: {
+                        text: newSummaryText,
+                        expiresAt: nowPlusMin(CONF.MEM_TTL_MIN),
+                    },
+                });
+
             }
         }
 
