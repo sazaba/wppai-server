@@ -6,6 +6,7 @@ import {
     ConversationEstado,
     MediaType,
     MessageFrom,
+    AppointmentStatus,
 } from "@prisma/client";
 import { openai } from "../../../lib/openai";
 import * as Wam from "../../../services/whatsapp.service";
@@ -294,22 +295,28 @@ type AgentState = {
         procedureId?: number;
         procedureName?: string;
         whenISO?: string;
-        whenText?: string; // textual tal cual
+        whenText?: string;
         whenPreview?: string;
         pendingConfirm?: {
-            name?: string; // ← sugerencia de nombre pendiente de “sí / no”
+            name?: string;
         };
 
-        // 🔽 NUEVO: tracking de confirmación de la cita
+        // tracking de confirmación de la cita
         statusConfirm?: "pending" | "confirmed" | "cancelled" | "reschedule";
         confirmSource?: "client" | "agent" | "system";
         confirmText?: string;
         confirmAt?: string; // ISO string
     };
-    summary?: { text: string; expiresAt: string };
+    summary?: {
+        text: string;
+        expiresAt: string;
+        statusConfirm?: "pending" | "confirmed" | "cancelled" | "reschedule";
+        confirmAt?: string;
+    };
     expireAt?: string;
     handoffLocked?: boolean;
 };
+
 
 function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
@@ -952,9 +959,16 @@ async function buildOrReuseSummary(args: {
     let compact = lines.join("\n").replace(/\n{3,}/g, "\n\n");
     compact = softTrim(compact, 2400);
 
-    await patchState(conversationId, { summary: { text: compact, expiresAt: nowPlusMin(CONF.MEM_TTL_MIN) } });
+    await patchState(conversationId, {
+        summary: {
+            ...(cached.summary || {}),
+            text: compact,
+            expiresAt: nowPlusMin(CONF.MEM_TTL_MIN),
+        },
+    });
     return compact;
 }
+
 
 /* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
 /* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
@@ -1680,7 +1694,7 @@ export async function handleEsteticaStrategy({
                 };
 
                 // 📌 LOG #2 — Confirmar que detectamos confirm/cancel/reschedule
-                console.log('[POST-AGENDA CONFIRM DETECTED]', {
+                console.log("[POST-AGENDA CONFIRM DETECTED]", {
                     chatId,
                     estado: conversacion.estado,
                     textForConfirm,
@@ -1691,15 +1705,57 @@ export async function handleEsteticaStrategy({
                 const baseSummary = prev.summary?.text || "";
                 const newSummaryText = overlayAgenda(baseSummary, newDraft);
 
+                // 🔹 2.1 Actualizar estado de la cita en la tabla appointment
+                try {
+                    const appt = await prisma.appointment.findFirst({
+                        where: { conversationId: chatId },
+                        orderBy: { startAt: "desc" },
+                        select: { id: true, status: true },
+                    });
+
+                    if (appt && statusMapped) {
+                        let newStatus: AppointmentStatus | undefined;
+
+                        if (statusMapped === "confirmed") {
+                            newStatus = AppointmentStatus.confirmed;
+                        } else if (statusMapped === "cancelled") {
+                            newStatus = AppointmentStatus.cancelled;
+                        } else if (statusMapped === "reschedule") {
+                            // aquí decides tu flujo de negocio:
+                            // opción A: marcar como "rescheduled"
+                            newStatus = AppointmentStatus.rescheduled;
+
+                            // opción B (alternativa): volverla a pending
+                            // newStatus = AppointmentStatus.pending;
+                        }
+
+                        if (newStatus && newStatus !== appt.status) {
+                            await prisma.appointment.update({
+                                where: { id: appt.id },
+                                data: { status: newStatus }, // 👈 ahora es tipo AppointmentStatus
+                            });
+                        }
+                    }
+
+
+                } catch (err) {
+                    console.error("[POST-AGENDA APPT UPDATE ERROR]", err);
+                }
+
+                // 🔹 2.2 Guardar también la confirmación en summary (estructurada)
                 await patchState(chatId, {
                     draft: newDraft,
                     summary: {
+                        ...(prev.summary || {}),
                         text: newSummaryText,
                         expiresAt: nowPlusMin(CONF.MEM_TTL_MIN),
+                        statusConfirm: newDraft.statusConfirm,
+                        confirmAt: newDraft.confirmAt,
                     },
                 });
             }
         }
+
 
         // Silenciamos la IA para este chat post-agenda (solo registro)
         await patchState(chatId, { handoffLocked: true });
