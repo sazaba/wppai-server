@@ -133,8 +133,8 @@ enum StaffRole {
 enum AppointmentConfirmStatus {
   pending
   confirmed
-  rescheduled
   cancelled
+  reschedule
 }
 
 /**
