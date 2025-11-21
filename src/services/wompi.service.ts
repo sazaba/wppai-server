@@ -61,6 +61,8 @@ export async function createPaymentSource(cardData: {
  * - incluye acceptance_token
  * - incluye signature (HMAC-SHA256 con INTEGRITY_KEY)
  */
+// src/services/wompi.service.ts
+
 export async function chargeWithToken({
     token,
     amountInCents,
@@ -76,18 +78,31 @@ export async function chargeWithToken({
 }) {
     const acceptance_token = await getAcceptanceToken();
 
-    // 🔐 Cadena para la firma: reference + amount_in_cents + currency
-    const signaturePayload = `${reference}${amountInCents}${currency}`;
+    // Aseguramos que sea entero
+    const amount = Math.trunc(amountInCents);
+
+    // 🔐 IMPORTANTE: probamos este orden para la firma:
+    // amount_in_cents + currency + reference
+    const signaturePayload = `${amount}${currency}${reference}`;
 
     const signature = crypto
         .createHmac("sha256", WOMPI_INTEGRITY_KEY)
         .update(signaturePayload)
         .digest("hex");
 
+    // 👀 Debug temporal (puedes quitarlo luego)
+    console.log("WOMPI charge debug =>", {
+        amount,
+        currency,
+        reference,
+        signaturePayload,
+        signature,
+    });
+
     const response = await axios.post(
         `${WOMPI_BASE_URL}/transactions`,
         {
-            amount_in_cents: amountInCents,
+            amount_in_cents: amount,
             currency,
             customer_email: customerEmail,
             reference,
@@ -97,7 +112,7 @@ export async function chargeWithToken({
                 token,
                 installments: 1,
             },
-            signature, // 👈 ahora sí enviamos la firma
+            signature, // 👈 ahora enviamos la firma con este payload
         },
         {
             headers: {
