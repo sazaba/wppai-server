@@ -269,6 +269,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
 
         const wompiData = wompiResp.data; // 👈 wompiResp YA es response.data
 
+
         const isApproved = wompiData.status === "APPROVED";
 
         const paymentRecord = await prisma.subscriptionPayment.create({
