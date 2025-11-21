@@ -223,10 +223,6 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
    4) Cobrar suscripción
 ======================================================= */
 
-// src/controllers/billing.controller.ts
-
-// dentro de src/controllers/billing.controller.ts
-
 export const chargeSubscription = async (req: Request, res: Response) => {
     try {
         const empresaId = getEmpresaId(req);
@@ -257,18 +253,20 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        // OJO aquí:
+        // Monto en centavos (price viene en unidades monetarias)
         const amountInCents = Math.round(Number(subscription.plan.price) * 100);
+
+        const reference = `sub_${subscription.id}_${Date.now()}`;
 
         const wompiResp = await Wompi.chargeWithToken({
             token: pm.wompiToken,
             amountInCents,
             customerEmail: "cliente@example.com",
-            reference: `sub_${subscription.id}_${Date.now()}`,
+            reference,
         });
 
-        const wompiData = wompiResp.data; // 👈 wompiResp YA es response.data
-
+        // wompiResp viene de service como response.data
+        const wompiData = wompiResp?.data ?? wompiResp;
 
         const isApproved = wompiData.status === "APPROVED";
 
@@ -306,7 +304,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         return res.json({
             ok: isApproved,
             payment: paymentRecord,
-            wompi: wompiResp,
+            wompi: wompiData,
         });
     } catch (error: any) {
         console.error(
@@ -318,8 +316,6 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             .json({ ok: false, error: "Error cobrando suscripción" });
     }
 };
-
-
 
 /* =======================================================
    5) Dashboard de Billing (estado general)
