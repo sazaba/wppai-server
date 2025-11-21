@@ -257,16 +257,16 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        const amountInCents = Number(subscription.plan.price); // SIN * 100
+        // OJO aquí:
+        const amountInCents = Math.round(Number(subscription.plan.price) * 100);
 
-
-        // 👉 YA NO PASAMOS acceptanceToken, lo resuelve internamente wompi.service
         const wompiResp = await Wompi.chargeWithToken({
             token: pm.wompiToken,
             amountInCents,
             customerEmail: "cliente@example.com", // luego lo cambiamos por el real
             reference: `sub_${subscription.id}_${Date.now()}`,
         });
+
 
         const wompiData = wompiResp.data;
         const isApproved = wompiData.status === "APPROVED";

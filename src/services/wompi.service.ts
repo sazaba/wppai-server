@@ -1,12 +1,10 @@
 // src/services/wompi.service.ts
 import axios from "axios";
-import crypto from "crypto";
 
 const WOMPI_PUBLIC_KEY = process.env.WOMPI_PUBLIC_KEY!;
 const WOMPI_PRIVATE_KEY = process.env.WOMPI_PRIVATE_KEY!;
 const WOMPI_BASE_URL =
     process.env.WOMPI_BASE_URL || "https://sandbox.wompi.co/v1";
-const WOMPI_INTEGRITY_KEY = process.env.WOMPI_INTEGRITY_KEY!;
 
 // Cache en memoria del acceptance_token
 let acceptanceTokenCache: string | null = null;
@@ -61,8 +59,7 @@ export async function createPaymentSource(cardData: {
 
 /**
  * Cobra una transacción usando el token de tarjeta
- * - incluye acceptance_token
- * - incluye signature (HMAC-SHA256 con INTEGRITY_KEY)
+ * (pagos tokenizados → SIN signature, solo acceptance_token)
  */
 export async function chargeWithToken({
     token,
@@ -79,26 +76,15 @@ export async function chargeWithToken({
 }) {
     const acceptance_token = await getAcceptanceToken();
 
-    // ✅ Aseguramos que sea entero y lo usamos tal cual (SIN multiplicar por 100 aquí)
+    // Aseguramos que sea entero en centavos
     const amount = Math.trunc(amountInCents);
 
-    // 🔐 Formato de firma según Wompi:
-    // reference + amount_in_cents + currency  (SIN separadores)
-    const signaturePayload = `${reference}${amount}${currency}`;
-
-    const signature = crypto
-        .createHmac("sha256", WOMPI_INTEGRITY_KEY)
-        .update(signaturePayload)
-        .digest("hex");
-
-    // 👀 Debug (puedes quitarlo luego)
     console.log("WOMPI charge debug =>", {
         amount,
         currency,
         reference,
         acceptance_token,
-        signaturePayload,
-        signature,
+        info: "TOKENIZED CARD PAYMENT · SIN signature",
     });
 
     const response = await axios.post(
@@ -114,7 +100,7 @@ export async function chargeWithToken({
                 token,
                 installments: 1,
             },
-            signature,
+            // ⛔️ SIN signature
         },
         {
             headers: {
