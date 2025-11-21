@@ -40,11 +40,21 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             paymentMethod: payment,
         });
     } catch (error: any) {
-        console.error(
-            "Error creando método de pago:",
-            error?.response?.data || error.message || error
-        );
-        return res.status(500).json({ ok: false, error: "Error creando método de pago" });
+        console.error("🔥 ERROR en createPaymentMethod() ------------------");
+        console.error("Mensaje:", error.message);
+
+        if (error.response) {
+            console.error("Status Wompi:", error.response.status);
+            console.error("Data Wompi:", error.response.data);
+        } else {
+            console.error("Error sin response:", error);
+        }
+
+        return res.status(500).json({
+            ok: false,
+            error: "WOMPI_ERROR",
+            details: error.response?.data || error.message,
+        });
     }
 };
 
