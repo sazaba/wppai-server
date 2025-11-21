@@ -1,70 +1,47 @@
 // src/services/wompi.service.ts
 import axios from "axios";
-
-function safe(v?: string | null) {
-    if (!v) return "undefined";
-    if (v.length < 8) return v;
-    return v.slice(0, 4) + "..." + v.slice(-4);
-}
-
-console.log("🔧 [WOMPI CONFIG]");
-console.log("  WOMPI_PUBLIC_KEY:", safe(process.env.WOMPI_PUBLIC_KEY));
-console.log("  WOMPI_PRIVATE_KEY:", safe(process.env.WOMPI_PRIVATE_KEY));
-console.log("  WOMPI_BASE_URL:", process.env.WOMPI_BASE_URL);
-console.log("  WOMPI_INTEGRITY_KEY:", safe(process.env.WOMPI_INTEGRITY_KEY));
+import crypto from "crypto";
 
 const WOMPI_PUBLIC_KEY = process.env.WOMPI_PUBLIC_KEY!;
 const WOMPI_PRIVATE_KEY = process.env.WOMPI_PRIVATE_KEY!;
 const WOMPI_BASE_URL =
     process.env.WOMPI_BASE_URL || "https://sandbox.wompi.co/v1";
+const WOMPI_INTEGRITY_KEY = process.env.WOMPI_INTEGRITY_KEY!;
 
-// Cache del acceptance token
+// Cache en memoria del acceptance_token
 let acceptanceTokenCache: string | null = null;
 
-/* ======================================================
-   🔹 GET acceptance_token
-====================================================== */
+/* =======================================================
+   Helper: obtener acceptance_token del comercio
+======================================================= */
 export async function getAcceptanceToken(): Promise<string> {
-    console.log("⚡ [WOMPI] Solicitando acceptance_token...");
+    if (acceptanceTokenCache) return acceptanceTokenCache;
 
-    if (acceptanceTokenCache) {
-        console.log("⚡ [WOMPI] acceptance_token cacheado:", safe(acceptanceTokenCache));
-        return acceptanceTokenCache;
+    console.log("💡 [WOMPI] getAcceptanceToken() …");
+    console.log("   BASE_URL:", WOMPI_BASE_URL);
+    console.log("   PUBLIC_KEY:", WOMPI_PUBLIC_KEY?.slice(0, 12) + "...");
+
+    const res = await axios.get(`${WOMPI_BASE_URL}/merchants/${WOMPI_PUBLIC_KEY}`);
+
+    const hasPresigned = !!res.data?.data?.presigned_acceptance;
+    const token = res.data?.data?.presigned_acceptance?.acceptance_token;
+
+    console.log("   → status:", res.status, "hasPresigned:", hasPresigned);
+
+    if (!token) {
+        console.error("   ❌ No se encontró presigned_acceptance en /merchants");
+        throw new Error("No se pudo obtener el acceptance_token de Wompi");
     }
 
-    try {
-        const url = `${WOMPI_BASE_URL}/merchants/${WOMPI_PUBLIC_KEY}`;
-        console.log("🌐 GET", url);
+    acceptanceTokenCache = token;
+    console.log("   ✅ acceptance_token cacheado (longitud):", token.length);
 
-        const res = await axios.get(url);
-
-        console.log("📥 Respuesta /merchants:", {
-            status: res.status,
-            hasPresigned: !!res.data?.data?.presigned_acceptance,
-        });
-
-        const token = res.data?.data?.presigned_acceptance?.acceptance_token;
-
-        if (!token) {
-            console.error("❌ No se encontró acceptance_token en /merchants");
-            console.error(JSON.stringify(res.data, null, 2));
-            throw new Error("No se pudo obtener acceptance_token");
-        }
-
-        acceptanceTokenCache = token;
-
-        console.log("✅ acceptance_token obtenido:", safe(token));
-        return token;
-    } catch (err: any) {
-        console.error("🔥 ERROR obteniendo acceptance_token");
-        console.error(err.response?.data || err.message);
-        throw err;
-    }
+    return token;
 }
 
-/* ======================================================
-   🔹 CREATE TOKEN DE TARJETA
-====================================================== */
+/* =======================================================
+   Crear token de tarjeta (tok_test_…)
+======================================================= */
 export async function createPaymentSource(cardData: {
     number: string;
     cvc: string;
@@ -72,40 +49,40 @@ export async function createPaymentSource(cardData: {
     exp_year: string;
     card_holder: string;
 }) {
-    console.log("💳 [WOMPI] Creando token de tarjeta...");
+    console.log("💳 [WOMPI] Creando token de tarjeta…");
+    console.log("   BASE_URL:", WOMPI_BASE_URL);
 
-    const url = `${WOMPI_BASE_URL}/tokens/cards`;
-    console.log("→ POST", url);
+    const response = await axios.post(
+        `${WOMPI_BASE_URL}/tokens/cards`,
+        {
+            number: cardData.number,
+            cvc: cardData.cvc,
+            exp_month: cardData.exp_month,
+            exp_year: cardData.exp_year,
+            card_holder: cardData.card_holder,
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${WOMPI_PUBLIC_KEY}`,
+            },
+        }
+    );
 
-    try {
-        const response = await axios.post(
-            url,
-            { ...cardData },
-            {
-                headers: {
-                    Authorization: `Bearer ${WOMPI_PUBLIC_KEY}`,
-                },
-            }
-        );
+    const data = response.data?.data;
+    console.log("   ✅ Token creado:", {
+        id: data?.id,
+        brand: data?.brand,
+        last_four: data?.last_four,
+    });
 
-        console.log("💳 Token creado:", {
-            id: response.data?.data?.id,
-            brand: response.data?.data?.brand,
-            last_four: response.data?.data?.last_four,
-        });
-
-        return response.data.data;
-    } catch (err: any) {
-        console.error("🔥 ERROR creando token de tarjeta");
-        console.error("Status:", err.response?.status);
-        console.error("Data:", err.response?.data);
-        throw err;
-    }
+    return data; // token Wompi
 }
 
-/* ======================================================
-   🔹 COBRAR CON TOKEN
-====================================================== */
+/* =======================================================
+   Cobrar usando token de tarjeta
+   - Usa acceptance_token
+   - Usa signature (HMAC-SHA256 con INTEGRITY_KEY)
+======================================================= */
 export async function chargeWithToken({
     token,
     amountInCents,
@@ -119,52 +96,66 @@ export async function chargeWithToken({
     customerEmail: string;
     reference: string;
 }) {
-    console.log("💸 [WOMPI] Iniciando cobro con token...");
-    console.log("👉 token:", token);
-    console.log("👉 amount:", amountInCents);
-    console.log("👉 reference:", reference);
-
+    // 1) acceptance_token
     const acceptance_token = await getAcceptanceToken();
 
-    const url = `${WOMPI_BASE_URL}/transactions`;
-    console.log("→ POST", url);
+    // 2) monto en centavos entero
+    const amount = Math.trunc(amountInCents);
 
-    const payload = {
-        amount_in_cents: Math.trunc(amountInCents),
-        currency,
-        customer_email: customerEmail,
-        reference,
-        acceptance_token,
-        payment_method: {
-            type: "CARD",
-            token,
-            installments: 1,
-        },
-    };
+    // 3) payload de firma según Wompi:
+    //    reference + amount_in_cents + currency  (sin separadores)
+    const signaturePayload = `${reference}${amount}${currency}`;
 
-    console.log("📦 Payload enviado a Wompi:", {
-        ...payload,
-        acceptance_token: safe(payload.acceptance_token),
-    });
+    const signature = crypto
+        .createHmac("sha256", WOMPI_INTEGRITY_KEY)
+        .update(signaturePayload)
+        .digest("hex");
+
+    console.log("💸 [WOMPI] Iniciando cobro con token…");
+    console.log("   token:", token);
+    console.log("   amount_in_cents:", amount);
+    console.log("   currency:", currency);
+    console.log("   reference:", reference);
+    console.log("   acceptance_token.len:", acceptance_token.length);
+    console.log("   integrity_key.prefix:", WOMPI_INTEGRITY_KEY.slice(0, 12) + "…");
+    console.log("   signaturePayload:", signaturePayload);
+    console.log("   signature:", signature);
 
     try {
-        const response = await axios.post(url, payload, {
-            headers: {
-                Authorization: `Bearer ${WOMPI_PRIVATE_KEY}`,
+        const response = await axios.post(
+            `${WOMPI_BASE_URL}/transactions`,
+            {
+                amount_in_cents: amount,
+                currency,
+                customer_email: customerEmail,
+                reference,
+                acceptance_token,
+                payment_method: {
+                    type: "CARD",
+                    token,
+                    installments: 1,
+                },
+                signature,
             },
-        });
+            {
+                headers: {
+                    Authorization: `Bearer ${WOMPI_PRIVATE_KEY}`,
+                },
+            }
+        );
 
-        console.log("📥 Respuesta de Wompi:", {
+        console.log("   ✅ [WOMPI] Transaction OK:", {
             status: response.status,
-            transactionId: response.data?.data?.id,
-            statusWompi: response.data?.data?.status,
+            id: response.data?.data?.id,
+            statusTxn: response.data?.data?.status,
         });
 
+        // OJO: aquí devolvemos directamente response.data
         return response.data;
     } catch (err: any) {
-        console.error("🔥 ERROR en cobro Wompi");
-        console.error("Status:", err.response?.status);
-        console.error("Data:", err.response?.data);
+        console.error("   ❌ [WOMPI] Error en /transactions");
+        console.error("   Status:", err.response?.status);
+        console.error("   Data:", err.response?.data || err.message);
         throw err;
     }
 }

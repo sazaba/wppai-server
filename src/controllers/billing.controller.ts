@@ -263,12 +263,12 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const wompiResp = await Wompi.chargeWithToken({
             token: pm.wompiToken,
             amountInCents,
-            customerEmail: "cliente@example.com", // luego lo cambiamos por el real
+            customerEmail: "cliente@example.com",
             reference: `sub_${subscription.id}_${Date.now()}`,
         });
 
+        const wompiData = wompiResp.data; // 👈 wompiResp YA es response.data
 
-        const wompiData = wompiResp.data;
         const isApproved = wompiData.status === "APPROVED";
 
         const paymentRecord = await prisma.subscriptionPayment.create({
