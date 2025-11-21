@@ -23,11 +23,13 @@ async function getPlanOrThrow(code: "basic" | "pro") {
 
 // Crea o reutiliza la suscripción para el plan indicado
 // - Si hay suscripción existente, actualiza planId (upgrade / downgrade)
-// - Si no hay, la crea con un periodo inicial (lo afinamos al cobrar)
-async function createOrUpdateSubscriptionForPlan(empresaId: number, planCode: "basic" | "pro") {
+// - Si no hay, la crea con un periodo inicial (luego lo ajusta el cobro)
+async function createOrUpdateSubscriptionForPlan(
+    empresaId: number,
+    planCode: "basic" | "pro"
+) {
     const plan = await getPlanOrThrow(planCode);
 
-    // Tomamos la última suscripción creada para esta empresa
     let subscription = await prisma.subscription.findFirst({
         where: { empresaId },
         orderBy: { createdAt: "desc" },
@@ -35,8 +37,8 @@ async function createOrUpdateSubscriptionForPlan(empresaId: number, planCode: "b
     });
 
     if (subscription) {
-        // Upgrade / downgrade si el plan es distinto
         if (subscription.planId !== plan.id) {
+            // upgrade / downgrade
             subscription = await prisma.subscription.update({
                 where: { id: subscription.id },
                 data: {
@@ -48,7 +50,7 @@ async function createOrUpdateSubscriptionForPlan(empresaId: number, planCode: "b
                 include: { plan: true },
             });
         } else {
-            // Mantenemos el mismo plan, nos aseguramos de que esté "active"
+            // mismo plan, asegurar active
             subscription = await prisma.subscription.update({
                 where: { id: subscription.id },
                 data: {
@@ -59,7 +61,6 @@ async function createOrUpdateSubscriptionForPlan(empresaId: number, planCode: "b
             });
         }
     } else {
-        // No existía suscripción, la creamos
         const now = new Date();
         const nextMonth = new Date(now);
         nextMonth.setMonth(now.getMonth() + 1);
@@ -79,8 +80,10 @@ async function createOrUpdateSubscriptionForPlan(empresaId: number, planCode: "b
 }
 
 // Actualiza el plan de la empresa SOLO cuando hay pago aprobado
-async function syncEmpresaPlanWithSubscription(empresaId: number, planCode: "basic" | "pro") {
-    // Asumimos que en Empresa.plan existen valores: 'gratis' | 'basic' | 'pro'
+async function syncEmpresaPlanWithSubscription(
+    empresaId: number,
+    planCode: "basic" | "pro"
+) {
     await prisma.empresa.update({
         where: { id: empresaId },
         data: {
@@ -91,19 +94,13 @@ async function syncEmpresaPlanWithSubscription(empresaId: number, planCode: "bas
 }
 
 /* =======================================================
-   1) Crear método de pago (tarjeta → token Wompi)
+   1) Crear / cambiar método de pago (tarjeta → token Wompi)
 ======================================================= */
 
 export const createPaymentMethod = async (req: Request, res: Response) => {
     try {
         const empresaId = getEmpresaId(req);
-        const {
-            number,
-            cvc,
-            exp_month,
-            exp_year,
-            card_holder,
-        } = req.body;
+        const { number, cvc, exp_month, exp_year, card_holder } = req.body;
 
         // 1. Crear token en Wompi (tarjeta → tok_test_xxx)
         const tokenData = await Wompi.createPaymentSource({
@@ -114,7 +111,13 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             card_holder,
         });
 
-        // 2. Guardar método de pago en nuestra BD
+        // 2. Marcar métodos anteriores como no default (solo 1 default)
+        await prisma.paymentMethod.updateMany({
+            where: { empresaId },
+            data: { isDefault: false },
+        });
+
+        // 3. Guardar nuevo método de pago como default
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
@@ -151,8 +154,46 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   2) Crear / actualizar suscripción para PLAN BASIC
-   (solo prepara la suscripción; NO cambia el plan de la empresa)
+   2) Eliminar método de pago por defecto
+======================================================= */
+
+export const deletePaymentMethod = async (req: Request, res: Response) => {
+    try {
+        const empresaId = getEmpresaId(req);
+
+        const pm = await prisma.paymentMethod.findFirst({
+            where: { empresaId, isDefault: true },
+        });
+
+        if (!pm) {
+            return res
+                .status(404)
+                .json({ ok: false, error: "No hay método de pago para eliminar" });
+        }
+
+        // Romper referencia en pagos históricos
+        await prisma.subscriptionPayment.updateMany({
+            where: { paymentMethodId: pm.id },
+            data: { paymentMethodId: null },
+        });
+
+        await prisma.paymentMethod.delete({
+            where: { id: pm.id },
+        });
+
+        return res.json({ ok: true });
+    } catch (error: any) {
+        console.error("Error eliminando método de pago:", error);
+        return res.status(500).json({
+            ok: false,
+            error: error.message || "Error eliminando método de pago",
+        });
+    }
+};
+
+/* =======================================================
+   3) Crear / actualizar suscripción BASIC
+   (solo prepara la suscripción; el cambio de plan se hace al pagar)
 ======================================================= */
 
 export const createSubscriptionBasic = async (req: Request, res: Response) => {
@@ -179,13 +220,7 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   3) Cobrar suscripción (usa método de pago por defecto)
-   - Cobra el monto del plan actual de la suscripción
-   - Registra SubscriptionPayment
-   - SOLO si Wompi responde APPROVED:
-       • Marca el pago como "paid" + paidAt
-       • Actualiza currentPeriodStart/End de la suscripción
-       • Cambia empresa.plan → basic/pro y estado → activo
+   4) Cobrar suscripción
 ======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
@@ -197,7 +232,6 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             include: {
                 paymentMethods: { where: { isDefault: true }, take: 1 },
                 subscriptions: {
-                    // usamos la última suscripción "activa"
                     where: { status: "active" },
                     take: 1,
                     orderBy: { createdAt: "desc" },
@@ -225,7 +259,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const wompiResp = await Wompi.chargeWithToken({
             token: pm.wompiToken,
             amountInCents,
-            customerEmail: "cliente@example.com", // luego lo cambiamos por el real
+            customerEmail: "cliente@example.com", // luego lo cambiamos por dato real
             reference: `sub_${subscription.id}_${Date.now()}`,
         });
 
@@ -246,7 +280,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             },
         });
 
-        // 3. Si está aprobado → actualizamos periodo y plan de la empresa
+        // 3. Si aprobado → actualizar periodo + plan empresa
         if (isApproved) {
             const now = new Date();
             const nextMonth = new Date(now);
@@ -261,7 +295,6 @@ export const chargeSubscription = async (req: Request, res: Response) => {
                 },
             });
 
-            // Plan de la empresa: gratis → basic/pro, upgrade, downgrade
             const newPlanCode = subscription.plan.code as "basic" | "pro";
             await syncEmpresaPlanWithSubscription(empresaId, newPlanCode);
         }
@@ -272,7 +305,10 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             wompi: wompiResp,
         });
     } catch (error: any) {
-        console.error("Error cobrando suscripción:", error?.response?.data || error.message || error);
+        console.error(
+            "Error cobrando suscripción:",
+            error?.response?.data || error.message || error
+        );
         return res
             .status(500)
             .json({ ok: false, error: "Error cobrando suscripción" });
@@ -280,11 +316,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   4) Dashboard de Billing (estado general)
-   - Método de pago por defecto
-   - Suscripción activa
-   - Últimos pagos
-   - Plan actual de la empresa y siguiente fecha de cobro
+   5) Dashboard de Billing (estado general)
 ======================================================= */
 
 export const getBillingStatus = async (req: Request, res: Response) => {
@@ -315,7 +347,6 @@ export const getBillingStatus = async (req: Request, res: Response) => {
             paymentMethod: empresa?.paymentMethods[0] || null,
             subscription,
             payments: empresa?.subscriptionPayments || [],
-            // Extra para el dashboard:
             empresaPlan: empresa?.plan || "gratis",
             empresaEstado: empresa?.estado || null,
             nextBillingDate: subscription?.currentPeriodEnd || null,
