@@ -22,8 +22,6 @@ async function getPlanOrThrow(code: "basic" | "pro") {
 }
 
 // Crea o reutiliza la suscripción para el plan indicado
-// - Si hay suscripción existente, actualiza planId (upgrade / downgrade)
-// - Si no hay, la crea con un periodo inicial (luego lo ajusta el cobro)
 async function createOrUpdateSubscriptionForPlan(
     empresaId: number,
     planCode: "basic" | "pro"
@@ -94,45 +92,83 @@ async function syncEmpresaPlanWithSubscription(
 }
 
 /* =======================================================
-   1) Crear / cambiar método de pago (tarjeta → token Wompi)
+   1) Crear / cambiar método de pago (3DS → Payment Source)
 ======================================================= */
 
 export const createPaymentMethod = async (req: Request, res: Response) => {
     try {
         const empresaId = getEmpresaId(req);
-        const { number, cvc, exp_month, exp_year, card_holder } = req.body;
 
-        // 1. Crear token en Wompi (tarjeta → tok_test_xxx)
-        const tokenData = await Wompi.createPaymentSource({
+        const {
             number,
             cvc,
             exp_month,
             exp_year,
             card_holder,
+            email,
+            deviceFingerprint,
+        } = req.body;
+
+        if (!deviceFingerprint) {
+            return res.status(400).json({
+                ok: false,
+                error: "DEVICE_FINGERPRINT_REQUIRED",
+            });
+        }
+
+        // 1. Crear payment source en Wompi (3DS)
+        const source = await Wompi.createPaymentSource3DS({
+            number,
+            cvc,
+            exp_month,
+            exp_year,
+            card_holder,
+            deviceFingerprint,
+            customerEmail: email,
         });
 
-        // 2. Marcar métodos anteriores como no default (solo 1 default)
+        // 2. Marcar métodos anteriores como no default
         await prisma.paymentMethod.updateMany({
             where: { empresaId },
             data: { isDefault: false },
         });
 
-        // 3. Guardar nuevo método de pago como default
+        // 3. Datos auxiliares
+        const lastFour =
+            typeof number === "string" && number.length >= 4
+                ? number.slice(-4)
+                : null;
+
+        const brand =
+            (source as any)?.token?.brand ||
+            (source as any)?.payment_method?.extra?.brand ||
+            null;
+
+        // 4. Guardar método de pago apuntando al payment_source
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
-                wompiToken: tokenData.id,
-                brand: tokenData.brand,
-                lastFour: tokenData.last_four,
+                wompiSourceId: source.id,
+                wompiToken: null, // ya no usamos token directo
+                brand,
+                lastFour,
                 expMonth: exp_month,
                 expYear: exp_year,
                 isDefault: true,
+                cardHolder: card_holder,
+                email: email || null,
+                status: source.status ?? null,
             },
         });
 
         return res.json({
             ok: true,
             paymentMethod: payment,
+            wompiSource: {
+                id: source.id,
+                status: source.status,
+                redirect_url: source.redirect_url,
+            },
         });
     } catch (error: any) {
         console.error("🔥 ERROR en createPaymentMethod() ------------------");
@@ -193,7 +229,6 @@ export const deletePaymentMethod = async (req: Request, res: Response) => {
 
 /* =======================================================
    3) Crear / actualizar suscripción BASIC
-   (solo prepara la suscripción; el cambio de plan se hace al pagar)
 ======================================================= */
 
 export const createSubscriptionBasic = async (req: Request, res: Response) => {
@@ -220,7 +255,7 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   4) Cobrar suscripción
+   4) Cobrar suscripción (usa CARD_PAYMENT_SOURCE)
 ======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
@@ -253,21 +288,33 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
+        if (!pm.wompiSourceId) {
+            return res.status(400).json({
+                ok: false,
+                error: "Método de pago sin payment_source_id (wompiSourceId)",
+            });
+        }
+
+        // 🔹 Buscar email en la tabla usuario (primer usuario de esa empresa)
+        const usuarioBilling = await prisma.usuario.findFirst({
+            where: { empresaId },
+        });
+
+        const customerEmail =
+            pm.email || usuarioBilling?.email || "cliente@example.com";
+
         // Monto en centavos (price viene en unidades monetarias)
         const amountInCents = Math.round(Number(subscription.plan.price) * 100);
-
         const reference = `sub_${subscription.id}_${Date.now()}`;
 
-        const wompiResp = await Wompi.chargeWithToken({
-            token: pm.wompiToken,
+        const wompiResp = await Wompi.chargeWithPaymentSource({
+            paymentSourceId: pm.wompiSourceId,
             amountInCents,
-            customerEmail: "cliente@example.com",
+            customerEmail,
             reference,
         });
 
-        // wompiResp viene de service como response.data
         const wompiData = wompiResp?.data ?? wompiResp;
-
         const isApproved = wompiData.status === "APPROVED";
 
         const paymentRecord = await prisma.subscriptionPayment.create({
@@ -355,6 +402,49 @@ export const getBillingStatus = async (req: Request, res: Response) => {
         });
     } catch (err: any) {
         console.error("Error cargando estado de billing:", err);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+};
+
+/* =======================================================
+   6) Webhook de Wompi (payment_source.updated, etc.)
+======================================================= */
+
+export const handleWompiWebhook = async (req: Request, res: Response) => {
+    try {
+        const body = req.body as any;
+        const event = body?.event;
+        const data = body?.data;
+
+        console.log("📩 [WOMPI WEBHOOK] Evento recibido:", event);
+
+        if (!event || !data) {
+            return res.status(400).json({ ok: false, error: "Payload inválido" });
+        }
+
+        // 🔹 Cuando el medio de pago queda listo para usarse
+        if (event === "payment_source.updated") {
+            const sourceId = data.id;
+            const status = data.status;
+
+            console.log("🔄 payment_source.updated:", { sourceId, status });
+
+            await prisma.paymentMethod.updateMany({
+                where: { wompiSourceId: sourceId },
+                data: {
+                    status,
+                    // si quieres: marcarlo default al quedar AVAILABLE
+                    isDefault: status === "AVAILABLE" ? true : undefined,
+                },
+            });
+        }
+
+        // Aquí podrías manejar también transaction.updated, etc.
+        // if (event === "transaction.updated") { ... }
+
+        return res.json({ ok: true });
+    } catch (err: any) {
+        console.error("❌ Error procesando webhook de Wompi:", err);
         return res.status(500).json({ ok: false, error: err.message });
     }
 };

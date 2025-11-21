@@ -7,21 +7,31 @@ import {
     createSubscriptionBasic,
     chargeSubscription,
     getBillingStatus,
+    handleWompiWebhook,   // 👈 NUEVO: webhook dentro del mismo controller
 } from "../controllers/billing.controller";
 
 const router = Router();
 
-// Todas las rutas requieren JWT
+/* ======================================================
+   🔔 Webhook de Wompi — PÚBLICO (sin JWT)
+   Wompi llama aquí cuando cambia el estado del payment_source
+====================================================== */
+router.post("/webhook/wompi", handleWompiWebhook);
+
+/* ======================================================
+   🔐 Rutas privadas — requieren JWT
+   (se monta después del webhook)
+====================================================== */
 router.use(verificarJWT);
 
-// Dashboard
+/* Dashboard de Billing */
 router.get("/status", getBillingStatus);
 
-// Métodos de pago
+/* Métodos de pago */
 router.post("/payment-method", createPaymentMethod);
 router.delete("/payment-method", deletePaymentMethod);
 
-// Suscripciones
+/* Suscripciones */
 router.post("/subscription/basic", createSubscriptionBasic);
 router.post("/subscription/charge", chargeSubscription);
 
