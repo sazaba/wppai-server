@@ -78,12 +78,13 @@ export async function chargeWithToken({
 }) {
     const acceptance_token = await getAcceptanceToken();
 
+
     // Aseguramos que sea entero
     const amount = Math.trunc(amountInCents);
 
-    // 🔐 IMPORTANTE: probamos este orden para la firma:
-    // amount_in_cents + currency + reference
-    const signaturePayload = `${amount}${currency}${reference}`;
+    // 🔐 Formato esperado por Wompi:
+    // "REFERENCE~AMOUNT_IN_CENTS~CURRENCY"
+    const signaturePayload = `${reference}~${amount}~${currency}`;
 
     const signature = crypto
         .createHmac("sha256", WOMPI_INTEGRITY_KEY)
@@ -98,6 +99,7 @@ export async function chargeWithToken({
         signaturePayload,
         signature,
     });
+
 
     const response = await axios.post(
         `${WOMPI_BASE_URL}/transactions`,
