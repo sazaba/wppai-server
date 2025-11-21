@@ -223,6 +223,8 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
    4) Cobrar suscripción
 ======================================================= */
 
+// src/controllers/billing.controller.ts
+
 export const chargeSubscription = async (req: Request, res: Response) => {
     try {
         const empresaId = getEmpresaId(req);
@@ -255,18 +257,17 @@ export const chargeSubscription = async (req: Request, res: Response) => {
 
         const amountInCents = Number(subscription.plan.price) * 100;
 
-        // 1. Cobro en Wompi
+        // 👇 AHORA chargeWithToken ya mete el acceptance_token por dentro
         const wompiResp = await Wompi.chargeWithToken({
             token: pm.wompiToken,
             amountInCents,
-            customerEmail: "cliente@example.com", // luego lo cambiamos por dato real
+            customerEmail: "cliente@example.com", // luego lo cambiamos por el real
             reference: `sub_${subscription.id}_${Date.now()}`,
         });
 
         const wompiData = wompiResp.data;
         const isApproved = wompiData.status === "APPROVED";
 
-        // 2. Registrar pago
         const paymentRecord = await prisma.subscriptionPayment.create({
             data: {
                 empresaId,
@@ -280,7 +281,6 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             },
         });
 
-        // 3. Si aprobado → actualizar periodo + plan empresa
         if (isApproved) {
             const now = new Date();
             const nextMonth = new Date(now);
@@ -314,6 +314,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             .json({ ok: false, error: "Error cobrando suscripción" });
     }
 };
+
 
 /* =======================================================
    5) Dashboard de Billing (estado general)
