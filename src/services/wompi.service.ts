@@ -4,7 +4,8 @@ import crypto from "crypto";
 
 const WOMPI_PUBLIC_KEY = process.env.WOMPI_PUBLIC_KEY!;
 const WOMPI_PRIVATE_KEY = process.env.WOMPI_PRIVATE_KEY!;
-const WOMPI_BASE_URL = process.env.WOMPI_BASE_URL || "https://sandbox.wompi.co/v1";
+const WOMPI_BASE_URL =
+    process.env.WOMPI_BASE_URL || "https://sandbox.wompi.co/v1";
 const WOMPI_INTEGRITY_KEY = process.env.WOMPI_INTEGRITY_KEY!;
 
 // Cache en memoria del acceptance_token
@@ -16,7 +17,9 @@ let acceptanceTokenCache: string | null = null;
 export async function getAcceptanceToken(): Promise<string> {
     if (acceptanceTokenCache) return acceptanceTokenCache;
 
-    const res = await axios.get(`${WOMPI_BASE_URL}/merchants/${WOMPI_PUBLIC_KEY}`);
+    const res = await axios.get(
+        `${WOMPI_BASE_URL}/merchants/${WOMPI_PUBLIC_KEY}`
+    );
 
     const token = res.data?.data?.presigned_acceptance?.acceptance_token;
     if (!token) {
@@ -61,8 +64,6 @@ export async function createPaymentSource(cardData: {
  * - incluye acceptance_token
  * - incluye signature (HMAC-SHA256 con INTEGRITY_KEY)
  */
-// src/services/wompi.service.ts
-
 export async function chargeWithToken({
     token,
     amountInCents,
@@ -78,14 +79,26 @@ export async function chargeWithToken({
 }) {
     const acceptance_token = await getAcceptanceToken();
 
+    // ✅ Aseguramos que sea entero y lo usamos tal cual (SIN multiplicar por 100 aquí)
     const amount = Math.trunc(amountInCents);
 
+    // 🔐 Formato de firma según Wompi:
+    // reference + amount_in_cents + currency  (SIN separadores)
+    const signaturePayload = `${reference}${amount}${currency}`;
+
+    const signature = crypto
+        .createHmac("sha256", WOMPI_INTEGRITY_KEY)
+        .update(signaturePayload)
+        .digest("hex");
+
+    // 👀 Debug (puedes quitarlo luego)
     console.log("WOMPI charge debug =>", {
         amount,
         currency,
         reference,
         acceptance_token,
-        info: "SIN SIGNATURE — TOKENIZED PAYMENTS NO LA USAN"
+        signaturePayload,
+        signature,
     });
 
     const response = await axios.post(
@@ -101,7 +114,7 @@ export async function chargeWithToken({
                 token,
                 installments: 1,
             },
-            // ❌ SIN signature
+            signature,
         },
         {
             headers: {
@@ -112,4 +125,3 @@ export async function chargeWithToken({
 
     return response.data;
 }
-

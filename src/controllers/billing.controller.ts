@@ -257,7 +257,8 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        const amountInCents = Number(subscription.plan.price) * 100;
+        const amountInCents = Number(subscription.plan.price); // SIN * 100
+
 
         // 👉 YA NO PASAMOS acceptanceToken, lo resuelve internamente wompi.service
         const wompiResp = await Wompi.chargeWithToken({
