@@ -3,53 +3,30 @@ import axios from "axios";
 
 const WOMPI_PUBLIC_KEY = process.env.WOMPI_PUBLIC_KEY!;
 const WOMPI_PRIVATE_KEY = process.env.WOMPI_PRIVATE_KEY!;
+const WOMPI_BASE_URL = process.env.WOMPI_BASE_URL || "https://sandbox.wompi.co/v1";
 
-// 👇 Unificamos para sandbox y producción
-// En .env local y en Render:
-//   WOMPI_BASE_URL=https://sandbox.wompi.co/v1
-// En producción:
-//   WOMPI_BASE_URL=https://production.wompi.co/v1
-const WOMPI_BASE_URL = process.env.WOMPI_BASE_URL ?? "https://sandbox.wompi.co/v1";
-
-/* =======================================================
-   Cache de acceptance_token
-======================================================= */
-
-let acceptanceCache: { token: string; fetchedAt: number } | null = null;
-// Puedes cambiar el TTL, 12 horas es bastante seguro
-const ACCEPTANCE_TTL_MS = 1000 * 60 * 60 * 12;
+// Cache en memoria del acceptance_token para no pedirlo en cada request
+let acceptanceTokenCache: string | null = null;
 
 /**
- * Obtiene el acceptance_token desde Wompi y lo cachea en memoria.
- * Funciona igual en sandbox y producción, usando WOMPI_BASE_URL + PUBLIC_KEY.
+ * Obtiene (y cachea) el acceptance_token de Wompi para tu comercio.
+ * Funciona igual en sandbox y en producción, solo cambia WOMPI_BASE_URL y las llaves.
  */
-async function getAcceptanceToken(): Promise<string> {
-    const now = Date.now();
+export async function getAcceptanceToken(): Promise<string> {
+    if (acceptanceTokenCache) return acceptanceTokenCache;
 
-    if (
-        acceptanceCache &&
-        now - acceptanceCache.fetchedAt < ACCEPTANCE_TTL_MS
-    ) {
-        return acceptanceCache.token;
-    }
+    const res = await axios.get(
+        `${WOMPI_BASE_URL}/merchants/${WOMPI_PUBLIC_KEY}`
+    );
 
-    const url = `${WOMPI_BASE_URL.replace(/\/v1$/, "")}/v1/merchants/${WOMPI_PUBLIC_KEY}`;
-
-    const res = await axios.get(url);
-    const token =
-        res.data?.data?.presigned_acceptance?.acceptance_token as string | undefined;
-
+    const token = res.data?.data?.presigned_acceptance?.acceptance_token;
     if (!token) {
-        throw new Error("No se pudo obtener acceptance_token desde Wompi");
+        throw new Error("No se pudo obtener el acceptance_token de Wompi");
     }
 
-    acceptanceCache = { token, fetchedAt: now };
+    acceptanceTokenCache = token;
     return token;
 }
-
-/* =======================================================
-   Crear token de tarjeta (payment source)
-======================================================= */
 
 export async function createPaymentSource(cardData: {
     number: string;
@@ -74,12 +51,8 @@ export async function createPaymentSource(cardData: {
         }
     );
 
-    return response.data.data; // retorna token
+    return response.data.data; // token Wompi
 }
-
-/* =======================================================
-   Cobrar usando token de tarjeta
-======================================================= */
 
 export async function chargeWithToken({
     token,
@@ -94,7 +67,6 @@ export async function chargeWithToken({
     customerEmail: string;
     reference: string;
 }) {
-    // 👇 obtenemos automáticamente el acceptance_token correcto
     const acceptance_token = await getAcceptanceToken();
 
     const response = await axios.post(
@@ -103,13 +75,13 @@ export async function chargeWithToken({
             amount_in_cents: amountInCents,
             currency,
             customer_email: customerEmail,
-            acceptance_token, // 👈 obligatorio para Wompi
+            reference,
             payment_method: {
                 type: "CARD",
                 token,
                 installments: 1,
             },
-            reference,
+            acceptance_token, // 👈 ahora siempre lo mandamos desde aquí
         },
         {
             headers: {

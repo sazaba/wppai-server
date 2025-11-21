@@ -225,6 +225,8 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
 
 // src/controllers/billing.controller.ts
 
+// dentro de src/controllers/billing.controller.ts
+
 export const chargeSubscription = async (req: Request, res: Response) => {
     try {
         const empresaId = getEmpresaId(req);
@@ -257,7 +259,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
 
         const amountInCents = Number(subscription.plan.price) * 100;
 
-        // 👇 AHORA chargeWithToken ya mete el acceptance_token por dentro
+        // 👉 YA NO PASAMOS acceptanceToken, lo resuelve internamente wompi.service
         const wompiResp = await Wompi.chargeWithToken({
             token: pm.wompiToken,
             amountInCents,
@@ -314,6 +316,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             .json({ ok: false, error: "Error cobrando suscripción" });
     }
 };
+
 
 
 /* =======================================================
