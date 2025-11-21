@@ -78,30 +78,15 @@ export async function chargeWithToken({
 }) {
     const acceptance_token = await getAcceptanceToken();
 
-
-    // Aseguramos que sea entero (sin decimales)
     const amount = Math.trunc(amountInCents);
 
-    // 🔐 Formato de firma según Wompi:
-    // reference + amount_in_cents + currency (SIN separadores)
-    const signaturePayload = `${reference}${amount}${currency}`;
-
-    const signature = crypto
-        .createHmac("sha256", WOMPI_INTEGRITY_KEY)
-        .update(signaturePayload)
-        .digest("hex");
-
-    // Debug temporal
     console.log("WOMPI charge debug =>", {
         amount,
         currency,
         reference,
-        signaturePayload,
-        signature,
+        acceptance_token,
+        info: "SIN SIGNATURE — TOKENIZED PAYMENTS NO LA USAN"
     });
-
-
-
 
     const response = await axios.post(
         `${WOMPI_BASE_URL}/transactions`,
@@ -116,7 +101,7 @@ export async function chargeWithToken({
                 token,
                 installments: 1,
             },
-            signature, // 👈 ahora enviamos la firma con este payload
+            // ❌ SIN signature
         },
         {
             headers: {
@@ -127,3 +112,4 @@ export async function chargeWithToken({
 
     return response.data;
 }
+
