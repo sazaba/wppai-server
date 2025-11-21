@@ -79,19 +79,19 @@ export async function chargeWithToken({
     const acceptance_token = await getAcceptanceToken();
 
 
-    // Aseguramos que sea entero
+    // Aseguramos que sea entero (sin decimales)
     const amount = Math.trunc(amountInCents);
 
-    // 🔐 Formato esperado por Wompi:
-    // "REFERENCE~AMOUNT_IN_CENTS~CURRENCY"
-    const signaturePayload = `${reference}~${amount}~${currency}`;
+    // 🔐 Formato de firma según Wompi:
+    // reference + amount_in_cents + currency (SIN separadores)
+    const signaturePayload = `${reference}${amount}${currency}`;
 
     const signature = crypto
         .createHmac("sha256", WOMPI_INTEGRITY_KEY)
         .update(signaturePayload)
         .digest("hex");
 
-    // 👀 Debug temporal (puedes quitarlo luego)
+    // Debug temporal
     console.log("WOMPI charge debug =>", {
         amount,
         currency,
@@ -99,6 +99,8 @@ export async function chargeWithToken({
         signaturePayload,
         signature,
     });
+
+
 
 
     const response = await axios.post(
