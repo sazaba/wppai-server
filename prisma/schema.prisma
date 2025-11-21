@@ -53,7 +53,8 @@ enum Rol {
 }
 
 enum Plan {
-  gratis
+  gratis // modo actual (usado junto a trialStart / trialEnd)
+  basic // plan de pago mensual base
   pro
 }
 
@@ -61,6 +62,26 @@ enum Estado {
   inactivo
   activo
   suspendido
+}
+
+enum SubscriptionStatus {
+  active // suscripción activa y al día
+  past_due // tiene pagos pendientes / fallidos
+  canceled // cancelada
+}
+
+enum BillingInterval {
+  monthly
+}
+
+enum PaymentStatus {
+  pending
+  paid
+  failed
+}
+
+enum PaymentMethodType {
+  card
 }
 
 enum MediaType {
@@ -164,6 +185,10 @@ model Empresa {
   messageTemplates MessageTemplate[]
 
   orders Order[] // pedidos asociados
+
+  subscriptions        Subscription[]
+  paymentMethods       PaymentMethod[]
+  subscriptionPayments SubscriptionPayment[]
 
   createdAt            DateTime               @default(now())
   updatedAt            DateTime               @updatedAt
@@ -770,4 +795,95 @@ model CronMeta {
   lastRun DateTime @map("last_run")
 
   @@map("cron_meta")
+}
+
+//payments////
+
+model SubscriptionPlan {
+  id       Int             @id @default(autoincrement())
+  name     String // Nombre visible: "Plan Básico", "Plan Pro"
+  code     String          @unique // identificador interno: "basic", "pro"
+  price    Decimal         @db.Decimal(10, 2) // valor mensual en tu moneda
+  interval BillingInterval @default(monthly)
+  isActive Boolean         @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions Subscription[]
+
+  @@map("subscription_plan")
+}
+
+model Subscription {
+  id        Int                @id @default(autoincrement())
+  empresaId Int
+  planId    Int
+  status    SubscriptionStatus @default(active)
+
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+
+  cancelAtPeriodEnd Boolean   @default(false)
+  canceledAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa Empresa          @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  plan    SubscriptionPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  paymentMethods       PaymentMethod[]
+  subscriptionPayments SubscriptionPayment[]
+
+  @@index([empresaId, status])
+  @@map("subscription")
+}
+
+model PaymentMethod {
+  id             Int               @id @default(autoincrement())
+  empresaId      Int
+  subscriptionId Int?
+  type           PaymentMethodType @default(card)
+
+  wompiToken String  @db.VarChar(191) // token de Wompi
+  brand      String? @db.VarChar(32) // VISA, MC, etc
+  lastFour   String? @db.VarChar(4)
+  expMonth   String? @db.VarChar(2)
+  expYear    String? @db.VarChar(4)
+  isDefault  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  subscriptionPayments SubscriptionPayment[]
+
+  @@index([empresaId, isDefault])
+  @@map("payment_method")
+}
+
+model SubscriptionPayment {
+  id              Int  @id @default(autoincrement())
+  empresaId       Int
+  subscriptionId  Int
+  paymentMethodId Int?
+
+  wompiTransactionId String?       @db.VarChar(191)
+  amount             Decimal       @db.Decimal(10, 2)
+  status             PaymentStatus @default(pending)
+  paidAt             DateTime?
+  errorMessage       String?       @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa       Empresa        @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  subscription  Subscription   @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  paymentMethod PaymentMethod? @relation(fields: [paymentMethodId], references: [id])
+
+  @@index([empresaId, status, createdAt])
+  @@map("subscription_payment")
 }

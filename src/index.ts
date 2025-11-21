@@ -26,6 +26,8 @@ import esteticaConfigRoutes from "./routes/estetica.config.routes";
 import dashboardRoutes from './routes/dashboard.routes'
 import chatInputRoutes from './routes/chatInput.routes'
 
+import billingRoutes from "./routes/billing.routes";
+
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -156,6 +158,7 @@ app.use('/api/templates', messageTemplateRoutes)
 app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
+app.use("/api/billing", billingRoutes);
 
 
 // 🗓️ Agenda (NUEVO)
