@@ -253,6 +253,34 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
+   3.b) Crear / actualizar suscripción PRO
+======================================================= */
+
+export const createSubscriptionPro = async (req: Request, res: Response) => {
+    try {
+        const empresaId = getEmpresaId(req);
+
+        const { subscription, plan } = await createOrUpdateSubscriptionForPlan(
+            empresaId,
+            "pro"
+        );
+
+        return res.json({
+            ok: true,
+            subscription,
+            plan,
+        });
+    } catch (error: any) {
+        console.error("Error creando suscripción PRO:", error);
+        return res.status(500).json({
+            ok: false,
+            error: error.message || "Error creando suscripción PRO",
+        });
+    }
+};
+
+
+/* =======================================================
    4) Cobrar suscripción (usa CARD + token, con PENDING manejado)
 ======================================================= */
 

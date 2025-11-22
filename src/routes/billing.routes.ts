@@ -7,7 +7,8 @@ import {
     createSubscriptionBasic,
     chargeSubscription,
     getBillingStatus,
-    handleWompiWebhook,   // 👈 NUEVO: webhook dentro del mismo controller
+    handleWompiWebhook,
+    createSubscriptionPro,   // 👈 NUEVO: webhook dentro del mismo controller
 } from "../controllers/billing.controller";
 
 const router = Router();
@@ -33,6 +34,8 @@ router.delete("/payment-method", deletePaymentMethod);
 
 /* Suscripciones */
 router.post("/subscription/basic", createSubscriptionBasic);
+router.post("/subscription/pro", createSubscriptionPro);
+
 router.post("/subscription/charge", chargeSubscription);
 
 export default router;
