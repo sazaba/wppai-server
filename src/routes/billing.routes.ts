@@ -13,11 +13,7 @@ import {
 
 const router = Router();
 
-/* ======================================================
-   🔔 Webhook de Wompi — PÚBLICO (sin JWT)
-   Wompi llama aquí cuando cambia el estado del payment_source
-====================================================== */
-router.post("/webhook/wompi", handleWompiWebhook);
+
 
 /* ======================================================
    🔐 Rutas privadas — requieren JWT
