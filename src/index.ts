@@ -148,6 +148,7 @@ app.use('/api/whatsapp', whatsappRoutes)
 app.use('/api', registerRoutes)
 app.use('/api', dashboardRoutes)
 app.use('/api', chatInputRoutes)
+app.use("/api/wompi", wompiRouter);
 
 // 🔐 Rutas protegidas
 app.use('/api/products', productRoutes)
@@ -159,7 +160,7 @@ app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
 app.use("/api/billing", billingRoutes);
-app.use("/api/wompi", wompiRouter);
+
 
 
 // 🗓️ Agenda (NUEVO)
