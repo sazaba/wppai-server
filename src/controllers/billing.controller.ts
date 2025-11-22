@@ -116,8 +116,8 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             });
         }
 
-        // 1. Crear payment source en Wompi (3DS)
-        const source = await Wompi.createPaymentSource3DS({
+        // 1. Crear payment source + cardToken en Wompi (3DS)
+        const { source, cardToken } = await Wompi.createPaymentSource3DS({
             number,
             cvc,
             exp_month,
@@ -133,23 +133,21 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             data: { isDefault: false },
         });
 
-        // 3. Datos auxiliares
+        // 3. Datos auxiliares usando el token real de Wompi
         const lastFour =
-            typeof number === "string" && number.length >= 4
+            cardToken?.last_four ??
+            (typeof number === "string" && number.length >= 4
                 ? number.slice(-4)
-                : null;
+                : null);
 
-        const brand =
-            (source as any)?.token?.brand ||
-            (source as any)?.payment_method?.extra?.brand ||
-            null;
+        const brand = cardToken?.brand ?? null;
 
         // 4. Guardar método de pago apuntando al payment_source
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
-                wompiSourceId: source.id,
-                wompiToken: null, // ya no usamos token directo
+                wompiSourceId: String(source.id), // 🔥 convertir a string (corrección clave)
+                wompiToken: null,                 // ya no usamos token directo
                 brand,
                 lastFour,
                 expMonth: exp_month,
@@ -170,6 +168,7 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
                 redirect_url: source.redirect_url,
             },
         });
+
     } catch (error: any) {
         console.error("🔥 ERROR en createPaymentMethod() ------------------");
         console.error("Mensaje:", error.message);
