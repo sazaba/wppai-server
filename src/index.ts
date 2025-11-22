@@ -27,7 +27,7 @@ import dashboardRoutes from './routes/dashboard.routes'
 import chatInputRoutes from './routes/chatInput.routes'
 
 import billingRoutes from "./routes/billing.routes";
-
+import wompiRouter from "./routes/wompi.route";
 
 // 📦 Cargar variables de entorno
 dotenv.config()
@@ -159,6 +159,7 @@ app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
 app.use("/api/billing", billingRoutes);
+app.use("/api/wompi", wompiRouter);
 
 
 // 🗓️ Agenda (NUEVO)

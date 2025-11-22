@@ -445,7 +445,7 @@ export const handleWompiWebhook = async (req: Request, res: Response) => {
             return res.status(400).json({ ok: false, error: "Payload inválido" });
         }
 
-        // 🔹 Cuando el medio de pago queda listo para usarse
+        /* 1) payment_source.updated → actualizar método de pago */
         if (event === "payment_source.updated") {
             const sourceId = data.id;
             const status = data.status;
@@ -453,19 +453,72 @@ export const handleWompiWebhook = async (req: Request, res: Response) => {
             console.log("🔄 payment_source.updated:", { sourceId, status });
 
             await prisma.paymentMethod.updateMany({
-                where: { wompiSourceId: sourceId },
+                where: { wompiSourceId: String(sourceId) },
                 data: {
                     status,
-                    // si quieres: marcarlo default al quedar AVAILABLE
+                    // opcional: marcar default al quedar AVAILABLE
                     isDefault: status === "AVAILABLE" ? true : undefined,
                 },
             });
+
+            return res.json({ ok: true });
         }
 
-        // Aquí podrías manejar también transaction.updated, etc.
-        // if (event === "transaction.updated") { ... }
+        /* 2) transaction.updated → actualizar pago y plan */
+        if (event === "transaction.updated") {
+            const txId: string = data.id;
+            const txStatus: string = data.status;
+            console.log("🔄 transaction.updated:", { txId, txStatus });
 
-        return res.json({ ok: true });
+            const payment = await prisma.subscriptionPayment.findFirst({
+                where: { wompiTransactionId: txId },
+                include: { subscription: { include: { plan: true } } },
+            });
+
+            if (!payment) {
+                console.warn("⚠️ No se encontró subscriptionPayment para tx:", txId);
+                return res.json({ ok: true, ignored: "no_payment" });
+            }
+
+            const isApproved = txStatus === "APPROVED";
+
+            // Actualizar registro de pago
+            await prisma.subscriptionPayment.update({
+                where: { id: payment.id },
+                data: {
+                    status: isApproved ? "paid" : "pending",
+                    paidAt: isApproved ? new Date() : null,
+                    errorMessage: isApproved ? null : JSON.stringify(data),
+                },
+            });
+
+            // Si se aprobó, actualizar suscripción + plan de empresa
+            if (isApproved && payment.subscriptionId && payment.subscription?.plan) {
+                const now = new Date();
+                const nextMonth = new Date(now);
+                nextMonth.setMonth(now.getMonth() + 1);
+
+                await prisma.subscription.update({
+                    where: { id: payment.subscriptionId },
+                    data: {
+                        currentPeriodStart: now,
+                        currentPeriodEnd: nextMonth,
+                        status: "active",
+                    },
+                });
+
+                await syncEmpresaPlanWithSubscription(
+                    payment.empresaId,
+                    payment.subscription.plan.code as "basic" | "pro"
+                );
+            }
+
+            return res.json({ ok: true });
+        }
+
+        // Otros eventos de Wompi que por ahora no manejas
+        console.log("ℹ️ Evento Wompi no manejado:", event);
+        return res.json({ ok: true, ignored: true });
     } catch (err: any) {
         console.error("❌ Error procesando webhook de Wompi:", err);
         return res.status(500).json({ ok: false, error: err.message });
