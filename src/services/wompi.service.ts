@@ -310,13 +310,16 @@ export async function chargeWithPaymentSource({
         acceptance_token,
         accept_personal_auth,
         payment_method: {
-            type: "CARD_PAYMENT_SOURCE",
+            // 👇 Ajuste clave: usar "CARD" y soportar payment_source_id
+            type: "CARD",
             payment_source_id: paymentSourceId,
+            installments: 1, // 👈 igual que en chargeWithToken
         },
         signature,
     };
 
     console.log("   → POST", `${WOMPI_BASE_URL}/transactions`);
+    console.log("   → Body:", JSON.stringify(body, null, 2));
 
     try {
         const response = await axios.post(`${WOMPI_BASE_URL}/transactions`, body, {
@@ -334,7 +337,10 @@ export async function chargeWithPaymentSource({
     } catch (err: any) {
         console.error("   ❌ ERROR en cobro Wompi (Payment Source)");
         console.error("   Status:", err.response?.status);
-        console.error("   Data:", err.response?.data || err.message);
+        console.error(
+            "   Data:",
+            err.response?.data ? JSON.stringify(err.response.data, null, 2) : err.message
+        );
         throw err;
     }
 }
