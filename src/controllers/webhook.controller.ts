@@ -17,19 +17,61 @@ import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsa
 const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000) // 3 min
 const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)  // 2 min
 
-// ===== Helper TRIAL: estado de prueba 7 días (o plan PRO) =====
+/* ===== Helper fechas + estado de acceso (TRIAL + SUSCRIPCIÓN) ===== */
+
+const SUBS_GRACE_DAYS = 2
+
+function addDays(date: Date, days: number): Date {
+    const d = new Date(date)
+    d.setDate(d.getDate() + days)
+    return d
+}
+
+// Solo prueba gratuita (7 días). Ya NO usamos plan PRO aquí.
 async function getTrialStatus(empresaId: number) {
     const emp = await prisma.empresa.findUnique({
         where: { id: empresaId },
-        select: { plan: true, createdAt: true, trialEnd: true },
+        select: { createdAt: true, trialEnd: true },
     })
     if (!emp) return { active: false, endsAt: null as Date | null }
 
-    const isPaid = (emp.plan || '').toLowerCase() === 'pro'
-    const endsAt = emp.trialEnd ?? new Date(emp.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000)
-    const active = isPaid || (Date.now() <= endsAt.getTime())
+    const endsAt =
+        emp.trialEnd ??
+        new Date(emp.createdAt.getTime() + 7 * 24 * 60 * 60 * 1000)
+
+    const active = Date.now() <= endsAt.getTime()
     return { active, endsAt }
 }
+
+// Estado de suscripción usando currentPeriodEnd + 2 días de gracia
+async function getSubscriptionAccessStatus(empresaId: number) {
+    const sub = await prisma.subscription.findFirst({
+        where: { empresaId, status: 'active' },
+        orderBy: { createdAt: 'desc' },
+    })
+
+    if (!sub) {
+        return {
+            active: false,
+            inGrace: false,
+            endsAt: null as Date | null,
+        }
+    }
+
+    const now = new Date()
+    const end = sub.currentPeriodEnd
+    const graceLimit = addDays(end, SUBS_GRACE_DAYS)
+
+    const active = now <= graceLimit
+    const inGrace = now > end && now <= graceLimit
+
+    return {
+        active,
+        inGrace,
+        endsAt: end,
+    }
+}
+
 
 // GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
@@ -309,26 +351,53 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         // ----- Evitar falso escalado con audio sin transcripción
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
-        // === BLOQUEAR RESPUESTA DE IA si la prueba expiró ===
-        const { active: trialActive, endsAt } = await getTrialStatus(empresaId)
-        if (!trialActive) {
-            // Responder 200 para que Meta no reintente el webhook
+        // === BLOQUEAR RESPUESTA DE IA si NO hay trial activo NI suscripción activa (con gracia) ===
+        const { active: trialActive, endsAt: trialEndsAt } = await getTrialStatus(empresaId)
+        const {
+            active: subsActive,
+            inGrace,
+            endsAt: subsEndsAt,
+        } = await getSubscriptionAccessStatus(empresaId)
+
+        // 🔒 Regla:
+        // - Si hay trial activo → dejamos pasar IA.
+        // - Si hay suscripción activa o en gracia → dejamos pasar IA.
+        // - Si NO hay trial y NO hay suscripción (ni gracia) → bloqueamos IA.
+        if (!trialActive && !subsActive) {
             if (!responded) {
-                res.status(200).json({ success: true, trial: 'expired' })
+                res.status(200).json({ success: true, access: 'blocked' })
                 responded = true
             }
 
-            // Avisar al frontend con tu banner (reutiliza wa_policy_error)
             const ioBlock = req.app.get('io') as any
+
+            // Priorizar mensaje de suscripción si existe
+            const ends = subsEndsAt || trialEndsAt
+            const fechaStr = ends
+                ? ends.toLocaleDateString('es-CO')
+                : null
+
+            let code = 'subscription_expired'
+            let message =
+                'Tu acceso a la IA está inactivo. Por favor renueva o activa un plan.'
+
+            if (subsEndsAt) {
+                message = `Tu membresía terminó el ${fechaStr}. Para seguir respondiendo automáticamente, renueva tu plan.`
+            } else if (trialEndsAt) {
+                code = 'trial_expired'
+                message = `La prueba gratuita terminó el ${fechaStr}. Para seguir respondiendo automáticamente, activa tu plan.`
+            }
+
             ioBlock?.emit?.('wa_policy_error', {
                 conversationId: conversation.id,
-                code: 'trial_expired',
-                message: `La prueba gratuita terminó el ${endsAt?.toLocaleDateString('es-CO')}. Para seguir respondiendo, activa tu plan.`,
+                code,
+                message,
             })
 
             // No llamar IA ni enviar nada saliente
             return
         }
+
 
         // 3) IA → RESPUESTA (auto envía y persiste)
         // 👇 Salidas tempranas por skipIAForThisWebhook

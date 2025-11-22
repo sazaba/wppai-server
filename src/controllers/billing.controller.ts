@@ -4,6 +4,42 @@ import prisma from "../lib/prisma";
 import * as Wompi from "../services/wompi.service";
 import { getEmpresaId } from "./_getEmpresaId";
 
+
+/* =======================================================
+   Config periodo de gracia + helpers de fecha
+======================================================= */
+
+const GRACE_DAYS = 2;
+
+function addDays(date: Date, days: number): Date {
+    const d = new Date(date);
+    d.setDate(d.getDate() + days);
+    return d;
+}
+
+function addMonths(date: Date, months: number): Date {
+    const d = new Date(date);
+    d.setMonth(d.getMonth() + months);
+    return d;
+}
+
+/**
+ * Calcula el siguiente periodo de suscripción aplicando:
+ * - Si pagan ANTES de que termine el periodo + gracia → se ancla en currentPeriodEnd.
+ * - Si pagan DESPUÉS de la gracia → se ancla en hoy (now).
+ */
+function calculateRenewalPeriod(currentEnd: Date, now: Date) {
+    const graceLimit = addDays(currentEnd, GRACE_DAYS);
+    const baseStart = now <= graceLimit ? currentEnd : now;
+
+    const newStart = addDays(baseStart, 1);
+    const newEnd = addMonths(newStart, 1);
+
+    return { newStart, newEnd };
+}
+
+
+
 /* =======================================================
    Helpers internos
 ======================================================= */
@@ -376,14 +412,15 @@ export const chargeSubscription = async (req: Request, res: Response) => {
 
         if (isApproved) {
             const now = new Date();
-            const nextMonth = new Date(now);
-            nextMonth.setMonth(now.getMonth() + 1);
+            const currentEnd = subscription.currentPeriodEnd;
+
+            const { newStart, newEnd } = calculateRenewalPeriod(currentEnd, now);
 
             await prisma.subscription.update({
                 where: { id: subscription.id },
                 data: {
-                    currentPeriodStart: now,
-                    currentPeriodEnd: nextMonth,
+                    currentPeriodStart: newStart,
+                    currentPeriodEnd: newEnd,
                     status: "active",
                 },
             });
@@ -391,6 +428,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             const newPlanCode = subscription.plan.code as "basic" | "pro";
             await syncEmpresaPlanWithSubscription(empresaId, newPlanCode);
         }
+
 
         // 👇 Respuesta al frontend distinguiendo estados
         if (isApproved) {
@@ -456,6 +494,26 @@ export const getBillingStatus = async (req: Request, res: Response) => {
 
         const subscription = empresa?.subscriptions[0] || null;
 
+        // Meta de estado de suscripción: días restantes y periodo de gracia
+        let daysLeft: number | null = null;
+        let isInGrace = false;
+        let isActiveForUse = false;
+
+        if (subscription) {
+            const now = new Date();
+            const end = subscription.currentPeriodEnd;
+            const diffMs = end.getTime() - now.getTime();
+
+            daysLeft = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+
+            const graceLimit = addDays(end, GRACE_DAYS);
+
+            isInGrace = daysLeft < 0 && now <= graceLimit;
+            // Se considera activa para uso mientras no pase el límite de gracia
+            isActiveForUse = now <= graceLimit;
+        }
+
+
         return res.json({
             ok: true,
             paymentMethod: empresa?.paymentMethods[0] || null,
@@ -464,7 +522,14 @@ export const getBillingStatus = async (req: Request, res: Response) => {
             empresaPlan: empresa?.plan || "gratis",
             empresaEstado: empresa?.estado || null,
             nextBillingDate: subscription?.currentPeriodEnd || null,
+            meta: {
+                daysLeft,
+                isInGrace,
+                isActiveForUse,
+                graceDays: GRACE_DAYS,
+            },
         });
+
     } catch (err: any) {
         console.error("Error cargando estado de billing:", err);
         return res.status(500).json({ ok: false, error: err.message });
@@ -555,26 +620,37 @@ export const handleWompiWebhook = async (req: Request, res: Response) => {
                 },
             });
 
-            // Si se aprobó, actualizar suscripción + plan de empresa
+            // Si se aprobó, actualizar suscripción + plan de empresa (con periodo de gracia)
             if (isApproved && payment.subscriptionId && payment.subscription?.plan) {
                 const now = new Date();
-                const nextMonth = new Date(now);
-                nextMonth.setMonth(now.getMonth() + 1);
 
-                await prisma.subscription.update({
+                // Traer la suscripción actual para leer bien el currentPeriodEnd
+                const subscription = await prisma.subscription.findUnique({
                     where: { id: payment.subscriptionId },
-                    data: {
-                        currentPeriodStart: now,
-                        currentPeriodEnd: nextMonth,
-                        status: "active",
-                    },
                 });
 
-                await syncEmpresaPlanWithSubscription(
-                    payment.empresaId,
-                    payment.subscription.plan.code as "basic" | "pro"
-                );
+                if (subscription) {
+                    const { newStart, newEnd } = calculateRenewalPeriod(
+                        subscription.currentPeriodEnd,
+                        now
+                    );
+
+                    await prisma.subscription.update({
+                        where: { id: payment.subscriptionId },
+                        data: {
+                            currentPeriodStart: newStart,
+                            currentPeriodEnd: newEnd,
+                            status: "active",
+                        },
+                    });
+
+                    await syncEmpresaPlanWithSubscription(
+                        payment.empresaId,
+                        payment.subscription.plan.code as "basic" | "pro"
+                    );
+                }
             }
+
 
             return res.json({ ok: true });
         }

@@ -2259,8 +2259,15 @@ export async function handleEsteticaStrategy({
             }
             await patchState(chatId, { lastIntent: "schedule" });
         } else {
-            texto = await appendOnceInvitationTail(chatId, texto, CTA_UNICO);
+            // ❌ NO metas CTA si solo está preguntando información
+            // deja la respuesta educativa limpia
+            // (si quieres, solo invita cuando ya haya mostrado interés en cita)
+            // ejemplo opcional:
+            // if (hasBookingIntent(userText)) {
+            //   texto = await appendOnceInvitationTail(chatId, texto, CTA_UNICO);
+            // }
         }
+
 
 
 
