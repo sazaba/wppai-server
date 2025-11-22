@@ -2326,18 +2326,30 @@ export async function handleEsteticaStrategy({
     summaryText = overlayAgenda(baseSummary2, newDraft);
     let texto = await runLLM({ summary: summaryText, userText, imageUrl }).catch(() => "");
 
+    // Respetar saludo solo en el primer turno
     const wasGreeted = (await loadState(chatId)).greeted;
     texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
-    // Invitación suave...
+    // 🔹 Fallback amigable si el modelo devolvió vacío
+    if (!texto) {
+        const clinicName = kb.businessName || "la clínica";
+        texto = `¡Hola! Soy el asistente virtual de *${clinicName}*. ` +
+            "Cuéntame, ¿en qué te puedo ayudar hoy?";
+    }
+
+    // Invitación suave SOLO cuando sea info y aún no entra en agenda
     if (inferredIntent === "info" && !hasServiceOrWhen) {
         texto = await appendOnceInvitationTail(chatId, texto, CTA_UNICO);
     }
 
+    // Opcional: si quieres conservar solo 1 emoji estable, pero permitir
+    // que el modelo use alguno propio, NO llames stripEmojis aquí.
+    // Si prefieres limpiar, deja la línea siguiente comentada o elimínala:
+    // texto = stripEmojis(texto);
 
-    texto = stripEmojis(texto);  // ← NUEVO (sanea emojis del LLM)
-    texto = clampText(texto || "¡Hola! ¿Prefieres info de tratamientos o ver opciones para agendar?");
+    texto = clampText(texto);
     texto = addEmojiStable(texto, chatId);
+
 
 
 
