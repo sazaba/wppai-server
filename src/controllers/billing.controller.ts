@@ -142,12 +142,12 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
 
         const brand = cardToken?.brand ?? null;
 
-        // 4. Guardar método de pago apuntando al payment_source y token
+        // 4. Guardar método de pago apuntando al payment_source (id real que usaremos para cobrar)
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
-                wompiSourceId: String(source.id),  // se mantiene por referencia
-                wompiToken: cardToken?.id || null, // ← token para cobros
+                wompiSourceId: String(source.id),     // ← ESTE es el que usaremos para cobrar
+                wompiToken: cardToken?.id || null,    // lo dejamos guardado por referencia
                 brand,
                 lastFour,
                 expMonth: exp_month,
@@ -253,7 +253,7 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   4) Cobrar suscripción (usa CARD + token)
+   4) Cobrar suscripción (ahora usa Payment Source: CARD + payment_source_id)
 ======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
@@ -286,10 +286,10 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        if (!pm.wompiToken) {
+        if (!pm.wompiSourceId) {
             return res.status(400).json({
                 ok: false,
-                error: "Método de pago sin token de Wompi (wompiToken)",
+                error: "Método de pago sin wompiSourceId (payment_source_id)",
             });
         }
 
@@ -305,17 +305,21 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const amountInCents = Math.round(Number(subscription.plan.price) * 100);
         const reference = `sub_${subscription.id}_${Date.now()}`;
 
-        // 💳 Cobro usando el token, no el payment_source_id
-        const wompiResp = await Wompi.chargeWithToken({
-            token: pm.wompiToken,
+        // 💳 Cobro usando payment_source_id (flujo correcto para suscripciones)
+        const wompiResp = await Wompi.chargeWithPaymentSource({
+            paymentSourceId: pm.wompiSourceId,
             amountInCents,
             customerEmail,
             reference,
         });
 
         const wompiData = wompiResp?.data ?? wompiResp;
-        const isApproved = wompiData.status === "APPROVED";
+        const txStatus = wompiData.status as string;
 
+        const isApproved = txStatus === "APPROVED";
+        const isPending = txStatus === "PENDING";
+
+        // Guardamos el pago (si no es APPROVED queda pending)
         const paymentRecord = await prisma.subscriptionPayment.create({
             data: {
                 empresaId,
@@ -329,6 +333,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             },
         });
 
+        // Si está aprobado, renovamos periodo y actualizamos plan de empresa
         if (isApproved) {
             const now = new Date();
             const nextMonth = new Date(now);
@@ -347,8 +352,29 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             await syncEmpresaPlanWithSubscription(empresaId, newPlanCode);
         }
 
+        // 👇 Manejo de respuesta: PENDING ya no es "error"
+        if (isApproved) {
+            return res.json({
+                ok: true,
+                message: "Pago aprobado",
+                payment: paymentRecord,
+                wompi: wompiData,
+            });
+        }
+
+        if (isPending) {
+            return res.json({
+                ok: true,
+                message: "Pago en proceso de aprobación",
+                payment: paymentRecord,
+                wompi: wompiData,
+            });
+        }
+
+        // Otros estados (DECLINED, ERROR, VOIDED, etc.)
         return res.json({
-            ok: isApproved,
+            ok: false,
+            message: "Pago no aprobado",
             payment: paymentRecord,
             wompi: wompiData,
         });
