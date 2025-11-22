@@ -120,6 +120,12 @@ export async function createPaymentSource(cardData: {
    3) NUEVO: Crear Payment Source (3DS)
 ============================================================ */
 
+/* ============================================================
+   3) NUEVO: Crear Payment Source (3DS) CORREGIDO
+   - Primero crea el token de tarjeta (tok_...)
+   - Luego crea el payment_source usando ese token (string)
+============================================================ */
+
 export async function createPaymentSource3DS(data: {
     number: string;
     cvc: string;
@@ -132,17 +138,29 @@ export async function createPaymentSource3DS(data: {
     console.log("💳 [WOMPI] Creando payment source (3DS)...");
     console.log("   → POST /payment_sources");
 
+    // 1) Obtener acceptance_token
     const acceptance_token = await getAcceptanceToken();
+
+    // 2) Crear token de tarjeta (tok_...) usando la función legacy
+    //    OJO: createPaymentSource aquí realmente crea el *card token*
+    const cardToken = await createPaymentSource({
+        number: data.number,
+        cvc: data.cvc,
+        exp_month: data.exp_month,
+        exp_year: data.exp_year,
+        card_holder: data.card_holder,
+    });
+
+    console.log("   ✅ Card token creado para 3DS:", {
+        id: cardToken?.id,
+        brand: cardToken?.brand,
+        last_four: cardToken?.last_four,
+    });
 
     const body = {
         type: "CARD",
-        token: {
-            number: data.number,
-            exp_month: data.exp_month,
-            exp_year: data.exp_year,
-            cvc: data.cvc,
-            card_holder: data.card_holder,
-        },
+        // 👇 AQUÍ VA EL STRING, NO EL OBJETO
+        token: cardToken.id,
         acceptance_token,
         device_fingerprint: data.deviceFingerprint,
         customer_email: data.customerEmail,
@@ -156,7 +174,7 @@ export async function createPaymentSource3DS(data: {
         });
 
         const source = res.data?.data;
-        console.log("   ✅ Payment source creado:", {
+        console.log("   ✅ Payment source creado (3DS):", {
             id: source?.id,
             status: source?.status,
             redirect_url: source?.redirect_url,
@@ -164,12 +182,13 @@ export async function createPaymentSource3DS(data: {
 
         return source; // incluye id, status, redirect_url, etc.
     } catch (err: any) {
-        console.error("   ❌ Error creando payment source en Wompi");
+        console.error("   ❌ Error creando payment source en Wompi (3DS)");
         console.error("   Status:", err.response?.status);
         console.error("   Data:", err.response?.data || err.message);
         throw err;
     }
 }
+
 
 /* ============================================================
    4) LEGACY: Cobro con token (CARD)
