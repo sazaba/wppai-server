@@ -92,8 +92,6 @@ async function syncEmpresaPlanWithSubscription(
 }
 
 /* =======================================================
-   1) Crear / cambiar método de pago (3DS → Payment Source)
-/* =======================================================
    1) Crear / cambiar método de pago (TOKEN ÚNICO)
    - Crea token de tarjeta en Wompi (tok_...)
    - Guarda el token y datos de la tarjeta en paymentMethod
@@ -198,8 +196,6 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
     }
 };
 
-
-
 /* =======================================================
    2) Eliminar método de pago por defecto
 ======================================================= */
@@ -292,13 +288,8 @@ export const createSubscriptionPro = async (req: Request, res: Response) => {
     }
 };
 
-
-
 /* =======================================================
-   4) Cobrar suscripción (usa Payment Source si existe)
-======================================================= */
-/* =======================================================
-   4) Cobrar suscripción (usa CARD + token, con PENDING manejado)
+   4) Cobrar suscripción (CARD + token, PENDING manejado)
 ======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
@@ -438,7 +429,6 @@ export const chargeSubscription = async (req: Request, res: Response) => {
     }
 };
 
-
 /* =======================================================
    5) Dashboard de Billing (estado general)
 ======================================================= */
@@ -482,7 +472,7 @@ export const getBillingStatus = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   6) Webhook de Wompi (payment_source.updated, etc.)
+   6) Webhook de Wompi (payment_source.updated, transaction.updated)
 ======================================================= */
 
 export const handleWompiWebhook = async (req: Request, res: Response) => {
@@ -518,9 +508,30 @@ export const handleWompiWebhook = async (req: Request, res: Response) => {
 
         /* 2) transaction.updated → actualizar pago y plan */
         if (event === "transaction.updated") {
-            const txId: string = data.id;
-            const txStatus: string = data.status;
+            console.log(
+                "🔄 transaction.updated RAW:",
+                JSON.stringify(data, null, 2)
+            );
+
+            const txId =
+                data?.id ||
+                data?.transaction?.id ||
+                data?.payload?.transaction?.id;
+
+            const txStatus =
+                data?.status ||
+                data?.transaction?.status ||
+                data?.payload?.transaction?.status;
+
             console.log("🔄 transaction.updated:", { txId, txStatus });
+
+            if (!txId || !txStatus) {
+                console.error(
+                    "⚠️ Webhook recibido sin campos id/status válidos:",
+                    data
+                );
+                return res.json({ ok: false, ignored: "invalid_payload" });
+            }
 
             const payment = await prisma.subscriptionPayment.findFirst({
                 where: { wompiTransactionId: txId },
