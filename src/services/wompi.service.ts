@@ -117,9 +117,6 @@ export async function createPaymentSource(cardData: {
 }
 
 /* ============================================================
-   3) NUEVO: Crear Payment Source (3DS)
-============================================================ */
-/* ============================================================
    3) NUEVO: Crear Payment Source (3DS) CORREGIDO
    - Crea el token de tarjeta (tok_...)
    - Crea el payment_source usando ese token
@@ -162,7 +159,7 @@ export async function createPaymentSource3DS(data: {
 
     const body = {
         type: "CARD",
-        token: cardToken.id,              // 👈 solo el id del token
+        token: cardToken.id, // 👈 solo el id del token
         acceptance_token,
         device_fingerprint: data.deviceFingerprint,
         customer_email: data.customerEmail,
@@ -184,7 +181,7 @@ export async function createPaymentSource3DS(data: {
             redirect_url: source?.redirect_url,
         });
 
-        // 👇 Ahora sí devolvemos ambas cosas, como espera el controller
+        // 👇 Devolvemos ambas cosas para que el controller pueda guardar info de la tarjeta
         return { source, cardToken };
     } catch (err: any) {
         console.error("   ❌ Error creando payment source en Wompi (3DS)");
@@ -194,10 +191,9 @@ export async function createPaymentSource3DS(data: {
     }
 }
 
-
-
 /* ============================================================
    4) LEGACY: Cobro con token (CARD)
+   (útil mientras sigas usando el tok_ directamente)
 ============================================================ */
 
 export async function chargeWithToken({
@@ -270,6 +266,7 @@ export async function chargeWithToken({
 
 /* ============================================================
    5) NUEVO: Cobro con Payment Source (CARD_PAYMENT_SOURCE)
+   (para suscripciones reales con payment_source_id guardado)
 ============================================================ */
 
 export async function chargeWithPaymentSource({
@@ -310,10 +307,10 @@ export async function chargeWithPaymentSource({
         acceptance_token,
         accept_personal_auth,
         payment_method: {
-            // 👇 Ajuste clave: usar "CARD" y soportar payment_source_id
+            // 👇 Usamos CARD con payment_source_id según docs
             type: "CARD",
             payment_source_id: paymentSourceId,
-            installments: 1, // 👈 igual que en chargeWithToken
+            installments: 1,
         },
         signature,
     };
