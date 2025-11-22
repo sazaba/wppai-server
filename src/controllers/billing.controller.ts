@@ -142,12 +142,12 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
 
         const brand = cardToken?.brand ?? null;
 
-        // 4. Guardar método de pago apuntando al payment_source (id real que usaremos para cobrar)
+        // 4. Guardar método de pago apuntando al payment_source y token
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
-                wompiSourceId: String(source.id),     // ← ESTE es el que usaremos para cobrar
-                wompiToken: cardToken?.id || null,    // lo dejamos guardado por referencia
+                wompiSourceId: String(source.id),  // referencia al payment_source (por si luego lo usas)
+                wompiToken: cardToken?.id || null, // ← token para cobros (lo importante ahora)
                 brand,
                 lastFour,
                 expMonth: exp_month,
@@ -253,7 +253,7 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   4) Cobrar suscripción (ahora usa Payment Source: CARD + payment_source_id)
+   4) Cobrar suscripción (usa CARD + token, con PENDING manejado)
 ======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
@@ -286,10 +286,10 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        if (!pm.wompiSourceId) {
+        if (!pm.wompiToken) {
             return res.status(400).json({
                 ok: false,
-                error: "Método de pago sin wompiSourceId (payment_source_id)",
+                error: "Método de pago sin token de Wompi (wompiToken)",
             });
         }
 
@@ -305,9 +305,9 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const amountInCents = Math.round(Number(subscription.plan.price) * 100);
         const reference = `sub_${subscription.id}_${Date.now()}`;
 
-        // 💳 Cobro usando payment_source_id (flujo correcto para suscripciones)
-        const wompiResp = await Wompi.chargeWithPaymentSource({
-            paymentSourceId: pm.wompiSourceId,
+        // 💳 Cobro usando el token (flujo que ya sabíamos que funcionaba)
+        const wompiResp = await Wompi.chargeWithToken({
+            token: pm.wompiToken,
             amountInCents,
             customerEmail,
             reference,
@@ -319,7 +319,6 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const isApproved = txStatus === "APPROVED";
         const isPending = txStatus === "PENDING";
 
-        // Guardamos el pago (si no es APPROVED queda pending)
         const paymentRecord = await prisma.subscriptionPayment.create({
             data: {
                 empresaId,
@@ -333,7 +332,6 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             },
         });
 
-        // Si está aprobado, renovamos periodo y actualizamos plan de empresa
         if (isApproved) {
             const now = new Date();
             const nextMonth = new Date(now);
@@ -352,7 +350,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             await syncEmpresaPlanWithSubscription(empresaId, newPlanCode);
         }
 
-        // 👇 Manejo de respuesta: PENDING ya no es "error"
+        // 👇 Respuesta al frontend distinguiendo estados
         if (isApproved) {
             return res.json({
                 ok: true,
