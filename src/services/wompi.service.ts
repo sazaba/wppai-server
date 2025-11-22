@@ -169,7 +169,8 @@ export async function createPaymentSource3DS(data: {
     try {
         const res = await axios.post(`${WOMPI_BASE_URL}/payment_sources`, body, {
             headers: {
-                Authorization: `Bearer ${WOMPI_PUBLIC_KEY}`,
+                // 👇 AQUÍ DEBE IR LA PRIVATE, IGUAL QUE EN /transactions
+                Authorization: `Bearer ${WOMPI_PRIVATE_KEY}`,
             },
         });
 
@@ -187,6 +188,7 @@ export async function createPaymentSource3DS(data: {
         console.error("   Data:", err.response?.data || err.message);
         throw err;
     }
+
 }
 
 
