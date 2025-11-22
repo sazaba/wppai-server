@@ -119,11 +119,12 @@ export async function createPaymentSource(cardData: {
 /* ============================================================
    3) NUEVO: Crear Payment Source (3DS)
 ============================================================ */
-
 /* ============================================================
    3) NUEVO: Crear Payment Source (3DS) CORREGIDO
-   - Primero crea el token de tarjeta (tok_...)
-   - Luego crea el payment_source usando ese token (string)
+   - Crea el token de tarjeta (tok_...)
+   - Crea el payment_source usando ese token
+   - Devuelve { source, cardToken } para que el controller
+     pueda guardar brand y last_four reales
 ============================================================ */
 
 export async function createPaymentSource3DS(data: {
@@ -142,7 +143,9 @@ export async function createPaymentSource3DS(data: {
     const acceptance_token = await getAcceptanceToken();
 
     // 2) Crear token de tarjeta (tok_...) usando la función legacy
-    //    OJO: createPaymentSource aquí realmente crea el *card token*
+    console.log("💳 [WOMPI] Creando token de tarjeta (LEGACY)...");
+    console.log("   → POST /tokens/cards");
+
     const cardToken = await createPaymentSource({
         number: data.number,
         cvc: data.cvc,
@@ -159,8 +162,7 @@ export async function createPaymentSource3DS(data: {
 
     const body = {
         type: "CARD",
-        // 👇 AQUÍ VA EL STRING, NO EL OBJETO
-        token: cardToken.id,
+        token: cardToken.id,              // 👈 solo el id del token
         acceptance_token,
         device_fingerprint: data.deviceFingerprint,
         customer_email: data.customerEmail,
@@ -169,27 +171,29 @@ export async function createPaymentSource3DS(data: {
     try {
         const res = await axios.post(`${WOMPI_BASE_URL}/payment_sources`, body, {
             headers: {
-                // 👇 AQUÍ DEBE IR LA PRIVATE, IGUAL QUE EN /transactions
+                // 👇 IMPORTANTE: usar la PRIVATE KEY
                 Authorization: `Bearer ${WOMPI_PRIVATE_KEY}`,
             },
         });
 
         const source = res.data?.data;
+
         console.log("   ✅ Payment source creado (3DS):", {
             id: source?.id,
             status: source?.status,
             redirect_url: source?.redirect_url,
         });
 
-        return source; // incluye id, status, redirect_url, etc.
+        // 👇 Ahora sí devolvemos ambas cosas, como espera el controller
+        return { source, cardToken };
     } catch (err: any) {
         console.error("   ❌ Error creando payment source en Wompi (3DS)");
         console.error("   Status:", err.response?.status);
         console.error("   Data:", err.response?.data || err.message);
         throw err;
     }
-
 }
+
 
 
 /* ============================================================
