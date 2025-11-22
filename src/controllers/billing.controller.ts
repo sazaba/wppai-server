@@ -142,12 +142,12 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
 
         const brand = cardToken?.brand ?? null;
 
-        // 4. Guardar método de pago apuntando al payment_source
+        // 4. Guardar método de pago apuntando al payment_source y token
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
-                wompiSourceId: String(source.id), // 🔥 convertir a string (corrección clave)
-                wompiToken: null,                 // ya no usamos token directo
+                wompiSourceId: String(source.id),  // se mantiene por referencia
+                wompiToken: cardToken?.id || null, // ← token para cobros
                 brand,
                 lastFour,
                 expMonth: exp_month,
@@ -168,7 +168,6 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
                 redirect_url: source.redirect_url,
             },
         });
-
     } catch (error: any) {
         console.error("🔥 ERROR en createPaymentMethod() ------------------");
         console.error("Mensaje:", error.message);
@@ -254,7 +253,7 @@ export const createSubscriptionBasic = async (req: Request, res: Response) => {
 };
 
 /* =======================================================
-   4) Cobrar suscripción (usa CARD_PAYMENT_SOURCE)
+   4) Cobrar suscripción (usa CARD + token)
 ======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
@@ -287,10 +286,10 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        if (!pm.wompiSourceId) {
+        if (!pm.wompiToken) {
             return res.status(400).json({
                 ok: false,
-                error: "Método de pago sin payment_source_id (wompiSourceId)",
+                error: "Método de pago sin token de Wompi (wompiToken)",
             });
         }
 
@@ -306,8 +305,9 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const amountInCents = Math.round(Number(subscription.plan.price) * 100);
         const reference = `sub_${subscription.id}_${Date.now()}`;
 
-        const wompiResp = await Wompi.chargeWithPaymentSource({
-            paymentSourceId: pm.wompiSourceId,
+        // 💳 Cobro usando el token, no el payment_source_id
+        const wompiResp = await Wompi.chargeWithToken({
+            token: pm.wompiToken,
             amountInCents,
             customerEmail,
             reference,
