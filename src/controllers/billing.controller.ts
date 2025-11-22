@@ -93,6 +93,10 @@ async function syncEmpresaPlanWithSubscription(
 
 /* =======================================================
    1) Crear / cambiar método de pago (3DS → Payment Source)
+/* =======================================================
+   1) Crear / cambiar método de pago (TOKEN ÚNICO)
+   - Crea token de tarjeta en Wompi (tok_...)
+   - Guarda el token y datos de la tarjeta en paymentMethod
 ======================================================= */
 
 export const createPaymentMethod = async (req: Request, res: Response) => {
@@ -106,9 +110,10 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             exp_year,
             card_holder,
             email,
-            deviceFingerprint,
+            deviceFingerprint, // sigue llegando desde el front
         } = req.body;
 
+        // Mantengo la validación para no romper el frontend actual
         if (!deviceFingerprint) {
             return res.status(400).json({
                 ok: false,
@@ -116,15 +121,20 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             });
         }
 
-        // 1. Crear payment source + cardToken en Wompi (3DS)
-        const { source, cardToken } = await Wompi.createPaymentSource3DS({
+        if (!number || !cvc || !exp_month || !exp_year || !card_holder) {
+            return res.status(400).json({
+                ok: false,
+                error: "CARD_DATA_INCOMPLETE",
+            });
+        }
+
+        // 1. Crear token de tarjeta en Wompi (tok_...)
+        const cardToken = await Wompi.createPaymentSource({
             number,
             cvc,
             exp_month,
             exp_year,
             card_holder,
-            deviceFingerprint,
-            customerEmail: email,
         });
 
         // 2. Marcar métodos anteriores como no default
@@ -133,7 +143,7 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             data: { isDefault: false },
         });
 
-        // 3. Datos auxiliares usando el token real de Wompi
+        // 3. Datos auxiliares
         const lastFour =
             cardToken?.last_four ??
             (typeof number === "string" && number.length >= 4
@@ -142,12 +152,12 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
 
         const brand = cardToken?.brand ?? null;
 
-        // 4. Guardar método de pago apuntando al payment_source y token
+        // 4. Guardar método de pago con el token de Wompi
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
-                wompiSourceId: String(source.id),  // referencia al payment_source (por si luego lo usas)
-                wompiToken: cardToken?.id || null, // ← token para cobros (lo importante ahora)
+                wompiSourceId: null,               // ya no usamos payment_source
+                wompiToken: cardToken?.id || null, // ← token para cobros
                 brand,
                 lastFour,
                 expMonth: exp_month,
@@ -155,17 +165,18 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
                 isDefault: true,
                 cardHolder: card_holder,
                 email: email || null,
-                status: source.status ?? null,
+                status: "AVAILABLE",               // estado local
             },
         });
 
         return res.json({
             ok: true,
             paymentMethod: payment,
+            // Para no romper el frontend que esperaba wompiSource
             wompiSource: {
-                id: source.id,
-                status: source.status,
-                redirect_url: source.redirect_url,
+                id: null,
+                status: "AVAILABLE",
+                redirect_url: null,
             },
         });
     } catch (error: any) {
@@ -186,6 +197,8 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
         });
     }
 };
+
+
 
 /* =======================================================
    2) Eliminar método de pago por defecto
@@ -280,11 +293,12 @@ export const createSubscriptionPro = async (req: Request, res: Response) => {
 };
 
 
-/* =======================================================
-   4) Cobrar suscripción (usa CARD + token, con PENDING manejado)
-======================================================= */
+
 /* =======================================================
    4) Cobrar suscripción (usa Payment Source si existe)
+======================================================= */
+/* =======================================================
+   4) Cobrar suscripción (usa CARD + token, con PENDING manejado)
 ======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
@@ -317,11 +331,10 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        if (!pm.wompiSourceId && !pm.wompiToken) {
+        if (!pm.wompiToken) {
             return res.status(400).json({
                 ok: false,
-                error:
-                    "Método de pago sin identificador válido de Wompi (ni payment_source_id ni token)",
+                error: "Método de pago sin token de Wompi (wompiToken)",
             });
         }
 
@@ -337,34 +350,20 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const amountInCents = Math.round(Number(subscription.plan.price) * 100);
         const reference = `sub_${subscription.id}_${Date.now()}`;
 
-        // 💳 Cobro usando Payment Source SI existe; si no, usando token (compat)
-        let wompiResp: any;
+        console.log(
+            "💳 [BILLING] Cobro de suscripción usando token de tarjeta:",
+            pm.wompiToken
+        );
 
-        if (pm.wompiSourceId) {
-            console.log(
-                "💳 [BILLING] Cobro de suscripción usando payment_source_id:",
-                pm.wompiSourceId
-            );
-            wompiResp = await Wompi.chargeWithPaymentSource({
-                paymentSourceId: pm.wompiSourceId,
-                amountInCents,
-                customerEmail,
-                reference,
-            });
-        } else {
-            console.log(
-                "💳 [BILLING] Cobro de suscripción usando token (modo legacy):",
-                pm.wompiToken
-            );
+        // 💳 Cobro usando el token
+        const wompiResp = await Wompi.chargeWithToken({
+            token: pm.wompiToken,
+            amountInCents,
+            customerEmail,
+            reference,
+        });
 
-            wompiResp = await Wompi.chargeWithToken({
-                token: pm.wompiToken!,
-                amountInCents,
-                customerEmail,
-                reference,
-            });
-        }
-
+        // `chargeWithToken` devuelve `response.data`, pero por seguridad
         const wompiData = wompiResp?.data ?? wompiResp;
         const txStatus = wompiData.status as string;
 
