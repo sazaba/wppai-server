@@ -283,6 +283,9 @@ export const createSubscriptionPro = async (req: Request, res: Response) => {
 /* =======================================================
    4) Cobrar suscripción (usa CARD + token, con PENDING manejado)
 ======================================================= */
+/* =======================================================
+   4) Cobrar suscripción (usa Payment Source si existe)
+======================================================= */
 
 export const chargeSubscription = async (req: Request, res: Response) => {
     try {
@@ -314,10 +317,11 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const subscription = empresa.subscriptions[0];
         const pm = empresa.paymentMethods[0];
 
-        if (!pm.wompiToken) {
+        if (!pm.wompiSourceId && !pm.wompiToken) {
             return res.status(400).json({
                 ok: false,
-                error: "Método de pago sin token de Wompi (wompiToken)",
+                error:
+                    "Método de pago sin identificador válido de Wompi (ni payment_source_id ni token)",
             });
         }
 
@@ -333,13 +337,33 @@ export const chargeSubscription = async (req: Request, res: Response) => {
         const amountInCents = Math.round(Number(subscription.plan.price) * 100);
         const reference = `sub_${subscription.id}_${Date.now()}`;
 
-        // 💳 Cobro usando el token (flujo que ya sabíamos que funcionaba)
-        const wompiResp = await Wompi.chargeWithToken({
-            token: pm.wompiToken,
-            amountInCents,
-            customerEmail,
-            reference,
-        });
+        // 💳 Cobro usando Payment Source SI existe; si no, usando token (compat)
+        let wompiResp: any;
+
+        if (pm.wompiSourceId) {
+            console.log(
+                "💳 [BILLING] Cobro de suscripción usando payment_source_id:",
+                pm.wompiSourceId
+            );
+            wompiResp = await Wompi.chargeWithPaymentSource({
+                paymentSourceId: pm.wompiSourceId,
+                amountInCents,
+                customerEmail,
+                reference,
+            });
+        } else {
+            console.log(
+                "💳 [BILLING] Cobro de suscripción usando token (modo legacy):",
+                pm.wompiToken
+            );
+
+            wompiResp = await Wompi.chargeWithToken({
+                token: pm.wompiToken!,
+                amountInCents,
+                customerEmail,
+                reference,
+            });
+        }
 
         const wompiData = wompiResp?.data ?? wompiResp;
         const txStatus = wompiData.status as string;
@@ -414,6 +438,7 @@ export const chargeSubscription = async (req: Request, res: Response) => {
             .json({ ok: false, error: "Error cobrando suscripción" });
     }
 };
+
 
 /* =======================================================
    5) Dashboard de Billing (estado general)

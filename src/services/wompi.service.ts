@@ -9,8 +9,7 @@ const WOMPI_BASE_URL =
 const WOMPI_INTEGRITY_KEY = process.env.WOMPI_INTEGRITY_KEY!;
 
 /* ============================================================
-   Cache en memoria de tokens de aceptación (para /payment_sources
-   y ahora también para /transactions)
+   Cache en memoria de tokens de aceptación
 ============================================================ */
 
 type AcceptanceTokens = {
@@ -77,7 +76,8 @@ export async function getAcceptanceToken(): Promise<string> {
 }
 
 /* ============================================================
-   2) Crear token de tarjeta (tok_xxx) – LEGACY pero útil
+   2) Crear token de tarjeta (tok_xxx) – LEGACY
+   ⚠️ IMPORTANTE: el token es de UN SOLO USO (payment_source O transacción)
 ============================================================ */
 
 export async function createPaymentSource(cardData: {
@@ -125,9 +125,6 @@ export async function createPaymentSource(cardData: {
 
 /* ============================================================
    3) Crear Payment Source (3DS)
-   - Crea el token de tarjeta (tok_...)
-   - Crea el payment_source usando ese token
-   - Devuelve { source, cardToken } para guardar brand y last_four
 ============================================================ */
 
 export async function createPaymentSource3DS(data: {
@@ -165,7 +162,7 @@ export async function createPaymentSource3DS(data: {
 
     const body = {
         type: "CARD",
-        token: cardToken.id, // 👈 solo el id del token
+        token: cardToken.id, // 👈 solo el id del token (SE CONSUME AQUÍ)
         acceptance_token,
         device_fingerprint: data.deviceFingerprint,
         customer_email: data.customerEmail,
@@ -202,7 +199,8 @@ export async function createPaymentSource3DS(data: {
 }
 
 /* ============================================================
-   4) Cobro con token (CARD) – AHORA INCLUYE acceptance_token
+   4) Cobro con token (CARD)
+   ⚠️ ÚSALO SOLO SI NO CREASTE payment_source ANTES.
 ============================================================ */
 
 export async function chargeWithToken({
@@ -251,7 +249,6 @@ export async function chargeWithToken({
             installments: 1,
         },
         signature,
-        // 👇 ESTE CAMPO ES EL QUE FALTABA Y PRODUCÍA EL 422
         acceptance_token,
     };
 
@@ -289,8 +286,8 @@ export async function chargeWithToken({
 }
 
 /* ============================================================
-   5) Cobro con Payment Source (CARD_PAYMENT_SOURCE)
-   ⚠️ De momento NO lo estás usando. Déjalo como experimental.
+   5) Cobro con Payment Source (RECURRENTE / SUSCRIPCIONES)
+   ✅ ESTE ES EL QUE USAREMOS PARA chargeSubscription
 ============================================================ */
 
 export async function chargeWithPaymentSource({
@@ -306,9 +303,6 @@ export async function chargeWithPaymentSource({
     customerEmail: string;
     reference: string;
 }) {
-    // OJO: este flujo todavía no está probado con la API real de Wompi.
-    // Por ahora tu suscripción usa chargeWithToken(), que ya funciona.
-
     const amount = Math.trunc(amountInCents);
     const signaturePlain = `${reference}${amount}${currency}${WOMPI_INTEGRITY_KEY}`;
     const signature = crypto
@@ -316,13 +310,22 @@ export async function chargeWithPaymentSource({
         .update(signaturePlain)
         .digest("hex");
 
-    console.log("💸 [WOMPI] Iniciando cobro con Payment Source (EXPERIMENTAL)...");
+    // 🔹 También usamos acceptance_token aquí
+    const acceptance_token = await getAcceptanceToken();
+
+    console.log(
+        "💸 [WOMPI] Iniciando cobro con Payment Source (RECURRENTE)..."
+    );
     console.log("   → payment_source_id:", paymentSourceId);
     console.log("   → amount_in_cents:", amount);
     console.log("   → currency:", currency);
     console.log("   → reference:", reference);
     console.log("   → signaturePlain:", signaturePlain);
     console.log("   → signature (sha256):", signature);
+    console.log(
+        "   → acceptance_token (len):",
+        acceptance_token ? acceptance_token.length : 0
+    );
 
     const body = {
         amount_in_cents: amount,
@@ -331,12 +334,11 @@ export async function chargeWithPaymentSource({
         reference,
         payment_method: {
             type: "CARD",
-            // ⚠️ Esta parte depende 100% de cómo Wompi maneje payment_sources.
-            // Lo dejamos como placeholder.
             payment_source_id: paymentSourceId,
             installments: 1,
         },
         signature,
+        acceptance_token,
     };
 
     console.log("   → POST", `${WOMPI_BASE_URL}/transactions`);
