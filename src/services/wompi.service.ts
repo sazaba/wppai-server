@@ -9,7 +9,8 @@ const WOMPI_BASE_URL =
 const WOMPI_INTEGRITY_KEY = process.env.WOMPI_INTEGRITY_KEY!;
 
 /* ============================================================
-   Cache en memoria de tokens de aceptación (para /payment_sources)
+   Cache en memoria de tokens de aceptación (para /payment_sources
+   y ahora también para /transactions)
 ============================================================ */
 
 type AcceptanceTokens = {
@@ -21,7 +22,6 @@ let acceptanceTokensCache: AcceptanceTokens | null = null;
 
 /* ============================================================
    1) Obtener (y cachear) tokens de aceptación del comercio
-   ⚠️ Se usan SOLO para crear payment_sources, NO para cobrar
 ============================================================ */
 
 export async function getAcceptanceTokens(): Promise<AcceptanceTokens> {
@@ -128,7 +128,6 @@ export async function createPaymentSource(cardData: {
    - Crea el token de tarjeta (tok_...)
    - Crea el payment_source usando ese token
    - Devuelve { source, cardToken } para guardar brand y last_four
-   ⚠️ Aquí SÍ usamos acceptance_token
 ============================================================ */
 
 export async function createPaymentSource3DS(data: {
@@ -203,8 +202,7 @@ export async function createPaymentSource3DS(data: {
 }
 
 /* ============================================================
-   4) Cobro con token (CARD) – CORREGIDO
-   ⚠️ NO usa acceptance_token (para evitar "ya fue usado")
+   4) Cobro con token (CARD) – AHORA INCLUYE acceptance_token
 ============================================================ */
 
 export async function chargeWithToken({
@@ -227,6 +225,9 @@ export async function chargeWithToken({
         .update(signaturePlain)
         .digest("hex");
 
+    // 🔹 Obtener acceptance_token para la transacción
+    const acceptance_token = await getAcceptanceToken();
+
     console.log("💸 [WOMPI] Iniciando cobro con token...");
     console.log("   → token:", token);
     console.log("   → amount_in_cents:", amount);
@@ -234,6 +235,10 @@ export async function chargeWithToken({
     console.log("   → reference:", reference);
     console.log("   → signaturePlain:", signaturePlain);
     console.log("   → signature (sha256):", signature);
+    console.log(
+        "   → acceptance_token (len):",
+        acceptance_token ? acceptance_token.length : 0
+    );
 
     const body = {
         amount_in_cents: amount,
@@ -246,6 +251,8 @@ export async function chargeWithToken({
             installments: 1,
         },
         signature,
+        // 👇 ESTE CAMPO ES EL QUE FALTABA Y PRODUCÍA EL 422
+        acceptance_token,
     };
 
     console.log("   → POST", `${WOMPI_BASE_URL}/transactions`);
@@ -273,7 +280,9 @@ export async function chargeWithToken({
         console.error("   Status:", err.response?.status);
         console.error(
             "   Data:",
-            err.response?.data ? JSON.stringify(err.response.data, null, 2) : err.message
+            err.response?.data
+                ? JSON.stringify(err.response.data, null, 2)
+                : err.message
         );
         throw err;
     }
@@ -355,7 +364,9 @@ export async function chargeWithPaymentSource({
         console.error("   Status:", err.response?.status);
         console.error(
             "   Data:",
-            err.response?.data ? JSON.stringify(err.response.data, null, 2) : err.message
+            err.response?.data
+                ? JSON.stringify(err.response.data, null, 2)
+                : err.message
         );
         throw err;
     }
