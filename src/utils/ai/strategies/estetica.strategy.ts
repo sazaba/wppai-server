@@ -2252,18 +2252,31 @@ export async function handleEsteticaStrategy({
     summaryText = overlayAgenda(baseSummary, newDraft);
 
     if (infoBreaker) {
-        let texto = await runLLM({ summary: summaryText, userText, imageUrl }).catch(() => "");
+        // En la llamada dentro de handleEsteticaStrategy:
+        let texto = await runLLM({ summary: summaryText, userText, imageUrl })
+            .catch((e) => {
+                console.error("❌ ERROR CRÍTICO EN RUNLLM:", e); // Agrega esto para ver el log
+                return "";
+            });
 
         const wasGreeted = (await loadState(chatId)).greeted;
         texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
 
         // 🔁 FALLBACK: si el LLM no devolvió nada, responde algo útil
+        // 🔁 FALLBACK MODIFICADO
         if (!texto || !texto.trim()) {
-            const procName = newDraft.procedureName || match.procedure?.name;
-            if (procName) {
-                texto = `Claro, te cuento en qué consiste *${procName}* de forma sencilla.\n\nEs un tratamiento médico-estético que se aplica en puntos específicos para relajar los músculos responsables de las líneas de expresión. No cambia tus facciones, solo suaviza arrugas dinámicas como las de la frente o el entrecejo.\n\nSi quieres, también puedo ayudarte a resolver más dudas sobre el procedimiento.`;
+            // Si falló el LLM, no asumamos que sigue hablando del procedimiento anterior
+            // a menos que la intención actual sea explícitamente sobre ese procedimiento.
+
+            // Solo usamos la respuesta prefabricada si match.procedure (del turno ACTUAL) encontró algo.
+            // NO usamos newDraft.procedureName porque ese puede ser viejo.
+            const currentProcMatch = match.procedure?.name;
+
+            if (currentProcMatch) {
+                texto = `Claro, te cuento en qué consiste *${currentProcMatch}* de forma sencilla.\n\nEs un tratamiento médico-estético que se aplica en puntos específicos... (etc)`;
             } else {
-                texto = `Claro, con gusto te explico nuestros tratamientos y cómo funcionan. Cuéntame sobre qué procedimiento quieres más detalles.`;
+                // Respuesta genérica de seguridad
+                texto = `Disculpa, tuve un pequeño lapso de conexión. 🧠\n\n¿Podrías repetirme tu última duda? Estoy aquí para ayudarte con información de la clínica o agendar tu cita.`;
             }
         }
 
