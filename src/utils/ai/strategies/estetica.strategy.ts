@@ -495,10 +495,16 @@ function isGeneralInfoQuestion(t: string): boolean {
     );
 }
 /** Verbos/expresiones de intención de reservar (no hardcode de negocio; solo intención lingüística) */
+/** Verbos/expresiones de intención de reservar (no hardcode de negocio; /** Verbos/expresiones de intención de reservar (solo intención lingüística) */
 function hasBookingIntent(t: string): boolean {
-    const s = (t || "").toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-    return /\b(agendar?|agendo|agendemos|programar?|reserv(ar|a|ame)|reserva|quiero ir|puedo ir|agendalo|agendame|agenda(?:me)?)\b/.test(s);
+    const s = (t || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/\p{Diacritic}/gu, "");
+
+    return /\b(agendar?|agendo|agendemos|programar?|reservar?|reserva|reservame|cita|citas|turno|consulta|quiero\s+una\s+cita|quisiera\s+una\s+cita|sacar\s+una\s+cita|quiero\s+ir|puedo\s+ir|agendalo|agendame|agendamelo|agenda(?:me)?)\b/.test(s);
 }
+
 
 /** Ancla temporal explícita (fecha/slot concreto) */
 function hasConcreteTimeAnchor(t: string): boolean {
@@ -2237,7 +2243,8 @@ export async function handleEsteticaStrategy({
         (inferredIntent === "schedule") ||
         state.lastIntent === "schedule" ||
         hasConcreteTimeAnchor(userText) ||
-        hasBookingIntent(userText)
+        hasBookingIntent(userText) ||
+        clsForWhen.label === "book" // ⬅️ NUEVO: protege frases de agenda sin hora
     );
 
 
