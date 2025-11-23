@@ -2244,12 +2244,21 @@ export async function handleEsteticaStrategy({
     const baseSummary = await buildOrReuseSummary({ empresaId, conversationId: chatId, kb });
     summaryText = overlayAgenda(baseSummary, newDraft);
 
-    // === INFO BREAKER con seguimiento de agenda ===
     if (infoBreaker) {
         let texto = await runLLM({ summary: summaryText, userText, imageUrl }).catch(() => "");
 
         const wasGreeted = (await loadState(chatId)).greeted;
         texto = sanitizeGreeting(texto, { allowFirstGreeting: !wasGreeted });
+
+        // 🔁 FALLBACK: si el LLM no devolvió nada, responde algo útil
+        if (!texto || !texto.trim()) {
+            const procName = newDraft.procedureName || match.procedure?.name;
+            if (procName) {
+                texto = `Claro, te cuento en qué consiste *${procName}* de forma sencilla.\n\nEs un tratamiento médico-estético que se aplica en puntos específicos para relajar los músculos responsables de las líneas de expresión. No cambia tus facciones, solo suaviza arrugas dinámicas como las de la frente o el entrecejo.\n\nSi quieres, también puedo ayudarte a resolver más dudas sobre el procedimiento.`;
+            } else {
+                texto = `Claro, con gusto te explico nuestros tratamientos y cómo funcionan. Cuéntame sobre qué procedimiento quieres más detalles.`;
+            }
+        }
 
         // Si estamos (o parecemos estar) en flujo de agenda y faltan piezas, pídelas al final
         // Política: si pidió agendar o ya hay slots parciales, pide SOLO 1 pieza faltante
@@ -2267,15 +2276,7 @@ export async function handleEsteticaStrategy({
         } else {
             // ❌ NO metas CTA si solo está preguntando información
             // deja la respuesta educativa limpia
-            // (si quieres, solo invita cuando ya haya mostrado interés en cita)
-            // ejemplo opcional:
-            // if (hasBookingIntent(userText)) {
-            //   texto = await appendOnceInvitationTail(chatId, texto, CTA_UNICO);
-            // }
         }
-
-
-
 
         texto = stripEmojis(clampInfoText(texto));
         texto = addEmojiStable(texto, chatId);
@@ -2297,6 +2298,7 @@ export async function handleEsteticaStrategy({
             media: [],
         };
     }
+
 
     const wantBookSoft =
         hasBookingIntent(userText) ||
