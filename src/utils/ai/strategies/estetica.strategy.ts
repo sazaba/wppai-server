@@ -1648,15 +1648,15 @@ export async function handleEsteticaStrategy({
     }
 
     /**
-     * POST-AGENDA / CONFIRMACIÓN
-     * - Cuando la conversación está ligada a una cita ya agendada,
-     *   solo usamos el mensaje del cliente para marcar si confirmó / canceló / pidió reagendar.
-     * - NO cambiamos el estado de la conversación.
-     * - La IA NO responde nada (solo tracking).
-     */
+   /**
+   * POST-AGENDA / CONFIRMACIÓN
+   * - Si el mensaje es claramente de confirmar / cancelar / reagendar,
+   *   solo registramos el cambio en la cita (sin responder nada).
+   * - Si NO es confirm/cancel/reagendar (ej. “¿qué es el botox?”),
+   *   dejamos que el flujo normal de la IA continúe (LEE RESUMEN, responde info, etc.).
+   */
 
-    // 📌 LOG #1 — Confirmar que realmente entramos al bloque
-    console.log('[DEBUG POST-AGENDA ENTRY]', {
+    console.log("[DEBUG POST-AGENDA ENTRY]", {
         chatId,
         estado: conversacion.estado,
         mensajeArg,
@@ -1668,10 +1668,14 @@ export async function handleEsteticaStrategy({
     ) {
         const textForConfirm = (mensajeArg || "").trim();
 
+        let handledConfirm = false;
+
         if (textForConfirm) {
             const kind = await detectAppointmentConfirmation(textForConfirm);
 
             if (kind !== "none") {
+                handledConfirm = true;
+
                 const prev = await loadState(chatId);
                 const prevDraft = prev.draft ?? {};
                 const nowIso = new Date().toISOString();
@@ -1693,7 +1697,6 @@ export async function handleEsteticaStrategy({
                     confirmAt: nowIso,
                 };
 
-                // 📌 LOG #2 — Confirmar que detectamos confirm/cancel/reschedule
                 console.log("[POST-AGENDA CONFIRM DETECTED]", {
                     chatId,
                     estado: conversacion.estado,
@@ -1705,7 +1708,6 @@ export async function handleEsteticaStrategy({
                 const baseSummary = prev.summary?.text || "";
                 const newSummaryText = overlayAgenda(baseSummary, newDraft);
 
-                // 🔹 2.1 Actualizar estado de la cita en la tabla appointment
                 try {
                     const appt = await prisma.appointment.findFirst({
                         where: { conversationId: chatId },
@@ -1721,28 +1723,21 @@ export async function handleEsteticaStrategy({
                         } else if (statusMapped === "cancelled") {
                             newStatus = AppointmentStatus.cancelled;
                         } else if (statusMapped === "reschedule") {
-                            // aquí decides tu flujo de negocio:
-                            // opción A: marcar como "rescheduled"
                             newStatus = AppointmentStatus.rescheduled;
-
-                            // opción B (alternativa): volverla a pending
-                            // newStatus = AppointmentStatus.pending;
+                            // o AppointmentStatus.pending si prefieres
                         }
 
                         if (newStatus && newStatus !== appt.status) {
                             await prisma.appointment.update({
                                 where: { id: appt.id },
-                                data: { status: newStatus }, // 👈 ahora es tipo AppointmentStatus
+                                data: { status: newStatus },
                             });
                         }
                     }
-
-
                 } catch (err) {
                     console.error("[POST-AGENDA APPT UPDATE ERROR]", err);
                 }
 
-                // 🔹 2.2 Guardar también la confirmación en summary (estructurada)
                 await patchState(chatId, {
                     draft: newDraft,
                     summary: {
@@ -1756,12 +1751,17 @@ export async function handleEsteticaStrategy({
             }
         }
 
+        // ✅ Solo silenciamos la IA cuando SÍ hubo confirm/cancel/reagendar
+        if (handledConfirm) {
+            await patchState(chatId, { handoffLocked: true });
+            return { estado: "pendiente", mensaje: "" };
+        }
 
-        // Silenciamos la IA para este chat post-agenda (solo registro)
-        await patchState(chatId, { handoffLocked: true });
-
-        return { estado: "pendiente", mensaje: "" };
+        // ❗ Si handledConfirm es false, seguimos el flujo normal:
+        // no hacemos return aquí, la función continúa y el bot
+        // puede responder dudas de información usando el resumen.
     }
+
 
 
     const last = await prisma.message.findFirst({
@@ -1984,7 +1984,13 @@ export async function handleEsteticaStrategy({
 
     const inferredIntent = await detectIntentSmart(userText, newDraft);
 
-    await patchState(chatId, { draft: newDraft, lastIntent: inferredIntent });
+    await patchState(chatId, {
+        draft: newDraft,
+        lastIntent: inferredIntent,
+        lastServiceId: newDraft.procedureId ?? null,
+        lastServiceName: newDraft.procedureName ?? null,
+    });
+
 
     // Fast-lane: si el cliente quiere cancelar o reagendar, pasa directo a humano
     if (inferredIntent === "cancel" || inferredIntent === "reschedule") {
