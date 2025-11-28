@@ -565,6 +565,7 @@ export async function chargeWithPaymentSource({
         customer_email: customerEmail,
         reference,
         payment_source_id: Number(paymentSourceId), // ID en la raíz y numérico
+        installments: 1,
         signature,
         acceptance_token,
     };
