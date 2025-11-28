@@ -778,20 +778,20 @@
 
 
 
-
 import { Request, Response } from "express";
 import prisma from "../lib/prisma";
 import * as Wompi from "../services/wompi.service";
 import { getEmpresaId } from "./_getEmpresaId";
 import { SubscriptionPlan } from "@prisma/client";
 
+// Asegúrate de que estos precios coincidan con lo que esperas cobrar
 const CREDIT_PACKAGES: Record<number, number> = {
-    300: 1500,
-    600: 1500,
+    300: 50000,
+    600: 90000,
 };
 
 /* =======================================================
-   📅 HELPERS DE FECHA
+   HELPERS
 ======================================================= */
 function addDays(date: Date, days: number): Date {
     const d = new Date(date);
@@ -811,9 +811,6 @@ function calculateRenewalPeriod(currentEnd: Date, now: Date, graceDays: number) 
     return { newStart, newEnd };
 }
 
-/* =======================================================
-   ⚙️ HELPERS INTERNOS DE BASE DE DATOS
-======================================================= */
 async function getPlanOrThrow(code: "basic" | "pro") {
     const plan = await prisma.subscriptionPlan.findUnique({ where: { code } });
     if (!plan) throw new Error(`No existe plan ${code}`);
@@ -865,8 +862,7 @@ async function syncEmpresaPlanAndLimits(empresaId: number, plan: SubscriptionPla
 }
 
 /* =======================================================
-   1) Crear método de pago (USANDO FUENTE PERMANENTE)
-   ✅ CORREGIDO: tokenizeCard + createPaymentSourceVault
+   1) Crear método de pago (Con Fuente Permanente)
 ======================================================= */
 export const createPaymentMethod = async (req: Request, res: Response) => {
     try {
@@ -876,20 +872,20 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
         if (!deviceFingerprint) return res.status(400).json({ ok: false, error: "DEVICE_FINGERPRINT_REQUIRED" });
         if (!number || !cvc || !email) return res.status(400).json({ ok: false, error: "DATA_INCOMPLETE" });
 
-        // 1. Tokenizar (Obtener tok_ de un solo uso)
+        // 1. Tokenizar (Token temporal)
         const tokenData = await Wompi.tokenizeCard({
             number, cvc, exp_month, exp_year, card_holder
         });
-        const oneTimeToken = tokenData.id;
 
-        // 2. Crear Fuente de Pago Permanente (Usando el token)
+        // 2. Crear Fuente de Pago Permanente (Vault)
+        // ✅ CORREGIDO: Usamos createPaymentSourceVault que definimos en el servicio
         const sourceData = await Wompi.createPaymentSourceVault({
-            token: oneTimeToken,
+            token: tokenData.id,
             customerEmail: email,
             deviceFingerprint
         });
 
-        // El ID de la fuente (ej. "2532") es el que guardaremos y reusaremos
+        // Guardamos este ID que es reutilizable (ej: "12345")
         const permanentId = String(sourceData.id);
 
         // 3. Limpiar anteriores
@@ -898,12 +894,12 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
             data: { isDefault: false },
         });
 
-        // 4. Guardar Fuente
+        // 4. Guardar
         const payment = await prisma.paymentMethod.create({
             data: {
                 empresaId,
                 wompiSourceId: permanentId,
-                wompiToken: permanentId, // ✨ Guardamos el ID Permanente
+                wompiToken: permanentId, // ID Permanente aquí
                 brand: tokenData.brand,
                 lastFour: tokenData.last_four,
                 expMonth: exp_month,
@@ -1052,7 +1048,7 @@ export const purchaseConversationCredits = async (req: Request, res: Response) =
 
         // 💳 COBRO con ID Permanente
         const wompiResp = await Wompi.chargeWithPaymentSource({
-            paymentSourceId: pm.wompiToken,
+            paymentSourceId: pm.wompiToken!,
             amountInCents,
             customerEmail,
             reference,
@@ -1088,11 +1084,12 @@ export const purchaseConversationCredits = async (req: Request, res: Response) =
     }
 };
 
-// ... (getBillingStatus y handleWompiWebhook se mantienen igual, solo cópialos del archivo anterior) ...
 /* =======================================================
    6) Dashboard y Webhook
 ======================================================= */
 export const getBillingStatus = async (req: Request, res: Response) => {
+    // ... Tu función getBillingStatus (la versión que ya tenías con trial) ...
+    // Se mantiene igual, aquí la resumo para no repetir tanto código
     try {
         const empresaId = getEmpresaId(req);
         const empresa = await prisma.empresa.findUnique({
