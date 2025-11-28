@@ -788,8 +788,8 @@ import { getEmpresaId } from "./_getEmpresaId";
 import { SubscriptionPlan } from "@prisma/client";
 
 const CREDIT_PACKAGES: Record<number, number> = {
-    300: 50000,
-    600: 90000,
+    300: 1500,
+    600: 1600,
 };
 
 /* =======================================================
