@@ -1243,7 +1243,6 @@ export const getBillingStatus = async (req: Request, res: Response) => {
                     orderBy: { createdAt: "desc" },
                     take: 10,
                 },
-                // ✨ NUEVO: Historial de compra de paquetes
                 conversationPurchases: {
                     orderBy: { createdAt: "desc" },
                     take: 5
@@ -1253,24 +1252,37 @@ export const getBillingStatus = async (req: Request, res: Response) => {
 
         const subscription = empresa?.subscriptions[0] || null;
 
+        // Variables de estado
         let daysLeft: number | null = null;
         let isInGrace = false;
         let isActiveForUse = false;
-        // Obtenemos los días de gracia del plan o un default de seguridad
+        let isTrial = false; // ✨ Bandera para saber si es modo prueba
         const graceDaysPlan = subscription?.plan?.gracePeriodDays ?? 2;
 
+        const now = new Date();
+
         if (subscription) {
-            const now = new Date();
+            // === CASO 1: TIENE SUSCRIPCIÓN ===
             const end = subscription.currentPeriodEnd;
             const diffMs = end.getTime() - now.getTime();
-
             daysLeft = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
 
-            // ✨ ACTUALIZADO: Usamos variable dinámica
             const graceLimit = addDays(end, graceDaysPlan);
-
             isInGrace = daysLeft < 0 && now <= graceLimit;
             isActiveForUse = now <= graceLimit;
+        } else {
+            // === CASO 2: MODO TRIAL (GRATIS) ===
+            // Si no hay suscripción, miramos el trialEnd de la empresa
+            if (empresa?.trialEnd) {
+                isTrial = true;
+                const end = empresa.trialEnd;
+                const diffMs = end.getTime() - now.getTime();
+                daysLeft = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+
+                // En trial no hay "periodo de gracia" de pago, simplemente se acaba.
+                // Se considera activo si aún quedan días (o es el mismo día 0).
+                isActiveForUse = daysLeft >= 0;
+            }
         }
 
         return res.json({
@@ -1278,23 +1290,24 @@ export const getBillingStatus = async (req: Request, res: Response) => {
             paymentMethod: empresa?.paymentMethods[0] || null,
             subscription,
             payments: empresa?.subscriptionPayments || [],
-            conversationPurchases: empresa?.conversationPurchases || [], // Enviamos al front
+            conversationPurchases: empresa?.conversationPurchases || [],
 
             empresaPlan: empresa?.plan || "gratis",
             empresaEstado: empresa?.estado || null,
 
-            // ✨ NUEVO: Info de consumo para el dashboard
             usage: {
                 used: empresa?.conversationsUsed || 0,
                 limit: empresa?.monthlyConversationLimit || 0,
             },
 
-            nextBillingDate: subscription?.currentPeriodEnd || null,
+            nextBillingDate: subscription?.currentPeriodEnd || empresa?.trialEnd || null,
+
             meta: {
                 daysLeft,
                 isInGrace,
                 isActiveForUse,
-                graceDays: graceDaysPlan, // Para mostrar en UI
+                graceDays: graceDaysPlan,
+                isTrial, // ✨ Enviamos esto al front para cambiar el texto del banner
             },
         });
 
@@ -1303,7 +1316,6 @@ export const getBillingStatus = async (req: Request, res: Response) => {
         return res.status(500).json({ ok: false, error: err.message });
     }
 };
-
 /* =======================================================
    7) Webhook de Wompi (Inteligente)
 ======================================================= */
