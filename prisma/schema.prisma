@@ -173,9 +173,13 @@ model Empresa {
   plan   Plan   @default(gratis)
   estado Estado @default(inactivo)
 
-  trialStart        DateTime?
-  trialEnd          DateTime?
-  conversationsUsed Int       @default(0)
+  trialStart DateTime?
+  trialEnd   DateTime?
+
+  // ✨ NUEVO: Gestión de Créditos
+  conversationsUsed        Int      @default(0)
+  monthlyConversationLimit Int      @default(300) // Límite total (Base + Compras)
+  conversationsCycleStart  DateTime @default(now()) // Fecha de corte para reinicio
 
   usuarios Usuario[]
 
@@ -184,11 +188,14 @@ model Empresa {
   cuentaWhatsapp   WhatsappAccount?
   messageTemplates MessageTemplate[]
 
-  orders Order[] // pedidos asociados
+  orders Order[]
 
   subscriptions        Subscription[]
   paymentMethods       PaymentMethod[]
   subscriptionPayments SubscriptionPayment[]
+
+  // ✨ NUEVO: Relación con paquetes comprados
+  conversationPurchases ConversationPurchase[]
 
   createdAt            DateTime               @default(now())
   updatedAt            DateTime               @updatedAt
@@ -199,8 +206,8 @@ model Empresa {
   BusinessConfigAppt   BusinessConfigAppt?
   EsteticaProcedure    EsteticaProcedure[]
   ReminderRule         ReminderRule[]
-  Staff                Staff[] // NUEVO
-  AppointmentException AppointmentException[] // NUEVO
+  Staff                Staff[]
+  AppointmentException AppointmentException[]
 
   @@map("empresa")
 }
@@ -801,11 +808,15 @@ model CronMeta {
 
 model SubscriptionPlan {
   id       Int             @id @default(autoincrement())
-  name     String // Nombre visible: "Plan Básico", "Plan Pro"
-  code     String          @unique // identificador interno: "basic", "pro"
-  price    Decimal         @db.Decimal(10, 2) // valor mensual en tu moneda
+  name     String
+  code     String          @unique
+  price    Decimal         @db.Decimal(10, 2)
   interval BillingInterval @default(monthly)
   isActive Boolean         @default(true)
+
+  // ✨ NUEVO: Configuración de límites y periodo de gracia
+  gracePeriodDays Int @default(2) // Días extra antes de cortar servicio
+  monthlyCredits  Int @default(300) // Cantidad base de conversaciones del plan
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -897,4 +908,28 @@ model SubscriptionPayment {
 
   @@index([empresaId, status, createdAt])
   @@map("subscription_payment")
+}
+
+model ConversationPurchase {
+  id        Int @id @default(autoincrement())
+  empresaId Int
+
+  creditsAmount Int // Ej: 300, 600
+  pricePaid     Decimal @db.Decimal(10, 2)
+
+  wompiTransactionId String?       @db.VarChar(191)
+  status             PaymentStatus @default(pending)
+  errorMessage       String?       @db.Text
+
+  // Control de aplicación de créditos
+  isApplied Boolean   @default(false)
+  appliedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId, status])
+  @@map("conversation_purchase")
 }

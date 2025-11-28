@@ -5,19 +5,27 @@ import {
     createPaymentMethod,
     deletePaymentMethod,
     createSubscriptionBasic,
+    createSubscriptionPro,
     chargeSubscription,
     getBillingStatus,
     handleWompiWebhook,
-    createSubscriptionPro,   // 👈 NUEVO: webhook dentro del mismo controller
+    purchaseConversationCredits,
 } from "../controllers/billing.controller";
 
 const router = Router();
 
+/* ======================================================
+   🌍 Rutas PÚBLICAS (Sin JWT)
+   IMPORTANTE: El webhook de Wompi debe ir aquí, antes
+   del middleware de autenticación, porque Wompi no
+   envía tu token de usuario.
+====================================================== */
+router.post("/webhook", handleWompiWebhook);
 
 
 /* ======================================================
-   🔐 Rutas privadas — requieren JWT
-   (se monta después del webhook)
+   🔐 Rutas PRIVADAS — requieren JWT
+   Todo lo que esté debajo de esta línea requiere login
 ====================================================== */
 router.use(verificarJWT);
 
@@ -28,10 +36,13 @@ router.get("/status", getBillingStatus);
 router.post("/payment-method", createPaymentMethod);
 router.delete("/payment-method", deletePaymentMethod);
 
-/* Suscripciones */
+/* Suscripciones (Activar Plan) */
 router.post("/subscription/basic", createSubscriptionBasic);
 router.post("/subscription/pro", createSubscriptionPro);
 
+/* Cobro manual de suscripción (Reintentos) */
 router.post("/subscription/charge", chargeSubscription);
+
+router.post("/purchase-credits", purchaseConversationCredits);
 
 export default router;

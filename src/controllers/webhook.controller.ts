@@ -15,7 +15,7 @@ import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsa
 
 /** ===== Retraso humano simulado ===== */
 const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000) // 3 min
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)  // 2 min
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)   // 2 min
 
 /* ===== Helper fechas + estado de acceso (TRIAL + SUSCRIPCIÓN) ===== */
 
@@ -142,6 +142,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         }
 
         // Empresa / cuenta
+        // ⚠️ CAMBIO CRÍTICO: Agregamos include: { empresa: true } para leer los límites
         const cuenta = await prisma.whatsappAccount.findUnique({
             where: { phoneNumberId },
             include: { empresa: true },
@@ -151,9 +152,51 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             return res.status(200).json({ ignored: true })
         }
         const empresaId = cuenta.empresaId
+        const empresaData = cuenta.empresa // Datos completos de la empresa (incluyendo límites)
 
         // Conversación
         let conversation = await prisma.conversation.findFirst({ where: { phone: fromWa, empresaId } })
+
+        // =================================================================================
+        // 🛑 NUEVO: LÓGICA DE LÍMITE DE CONVERSACIONES (300 Mensuales)
+        // =================================================================================
+
+        // 1. Detectar si esto cuenta como "Nueva Conversación"
+        const isNewSession = !conversation || conversation.estado === ConversationEstado.cerrado
+
+        // 2. Revisar si ya topó el límite
+        const isLimitReached = empresaData.conversationsUsed >= empresaData.monthlyConversationLimit
+
+        // 3. BLOQUEAR si es nueva sesión Y no hay cupo
+        if (isNewSession && isLimitReached) {
+            console.warn(`🚫 [BILLING] Límite alcanzado (${empresaData.conversationsUsed}/${empresaData.monthlyConversationLimit}). Bloqueando.`)
+
+            // Avisar al frontend (Dashboard)
+            const io = req.app.get('io') as any
+            io?.emit?.('wa_policy_error', {
+                conversationId: conversation?.id || 0,
+                phone: fromWa,
+                code: 'limit_reached',
+                message: 'Has alcanzado el límite mensual de conversaciones. Compra más créditos.',
+            })
+
+            // Detener ejecución aquí (no guarda mensaje, no responde IA)
+            return res.status(200).json({ ignored: true, reason: 'monthly_limit_reached' })
+        }
+
+        // 4. Si hay cupo y es nueva sesión, INCREMENTAR contador
+        if (isNewSession) {
+            await prisma.empresa.update({
+                where: { id: empresaId },
+                data: { conversationsUsed: { increment: 1 } }
+            })
+            console.log(`📊 [BILLING] Nueva conversación iniciada. Uso: ${empresaData.conversationsUsed + 1}`)
+        }
+        // =================================================================================
+        // FIN LÓGICA DE LÍMITES
+        // =================================================================================
+
+
         if (!conversation) {
             conversation = await prisma.conversation.create({
                 data: { phone: fromWa, estado: ConversationEstado.pendiente, empresaId },
@@ -352,6 +395,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
         // === BLOQUEAR RESPUESTA DE IA si NO hay trial activo NI suscripción activa (con gracia) ===
+        // 🔒 Este es el "Candado de Tiempo"
         const { active: trialActive, endsAt: trialEndsAt } = await getTrialStatus(empresaId)
         const {
             active: subsActive,
