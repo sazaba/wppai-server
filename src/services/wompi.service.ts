@@ -373,7 +373,6 @@
 //         throw err;
 //     }
 // }
-
 import axios from "axios";
 import crypto from "crypto";
 
@@ -563,7 +562,7 @@ export async function chargeWithToken({
 
 /* ============================================================
    5) Cobro con Payment Source (REUTILIZABLE)
-   ✅ CORREGIDO: Casting a Number()
+   ✅ CORREGIDO: Casting a Number() para evitar error 422
 ============================================================ */
 
 export async function chargeWithPaymentSource({

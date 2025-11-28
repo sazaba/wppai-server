@@ -779,8 +779,6 @@
 
 
 
-
-// src/controllers/billing.controller.ts
 import { Request, Response } from "express";
 import prisma from "../lib/prisma";
 import * as Wompi from "../services/wompi.service";
@@ -789,7 +787,7 @@ import { SubscriptionPlan } from "@prisma/client";
 
 const CREDIT_PACKAGES: Record<number, number> = {
     300: 1500,
-    600: 1600,
+    600: 1500,
 };
 
 /* =======================================================
@@ -868,7 +866,7 @@ async function syncEmpresaPlanAndLimits(empresaId: number, plan: SubscriptionPla
 
 /* =======================================================
    1) Crear método de pago (USANDO FUENTE PERMANENTE)
-   ✅ CORREGIDO: Usamos tokenizeCard + createPaymentSourceVault
+   ✅ CORREGIDO: tokenizeCard + createPaymentSourceVault
 ======================================================= */
 export const createPaymentMethod = async (req: Request, res: Response) => {
     try {
@@ -885,7 +883,6 @@ export const createPaymentMethod = async (req: Request, res: Response) => {
         const oneTimeToken = tokenData.id;
 
         // 2. Crear Fuente de Pago Permanente (Usando el token)
-        // ✅ AQUÍ ESTABA EL ERROR: Usamos la función correcta del servicio
         const sourceData = await Wompi.createPaymentSourceVault({
             token: oneTimeToken,
             customerEmail: email,
@@ -1091,6 +1088,7 @@ export const purchaseConversationCredits = async (req: Request, res: Response) =
     }
 };
 
+// ... (getBillingStatus y handleWompiWebhook se mantienen igual, solo cópialos del archivo anterior) ...
 /* =======================================================
    6) Dashboard y Webhook
 ======================================================= */
