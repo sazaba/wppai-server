@@ -534,6 +534,9 @@ export async function chargeWithToken({
 }
 
 
+/* ============================================================
+   5) Cobro con Payment Source (RECURRENTE) - ✅ FIX FINAL DEFINITIVO
+============================================================ */
 export async function chargeWithPaymentSource({
     paymentSourceId,
     amountInCents,
@@ -554,9 +557,6 @@ export async function chargeWithPaymentSource({
 
     console.log(`💸 [WOMPI] Cobrando con Fuente ID: ${paymentSourceId} | Monto: ${amount}`);
 
-    // 🔥 CORRECCIÓN CRÍTICA:
-    // Para cobrar con una fuente guardada, payment_source_id va en la RAÍZ.
-    // NO se debe enviar 'payment_method'.
     const body = {
         amount_in_cents: amount,
         currency,
@@ -564,9 +564,14 @@ export async function chargeWithPaymentSource({
         reference,
         signature,
         acceptance_token,
-        // 👇 AQUÍ ESTÁ EL CAMBIO: En la raíz y como número
+
+        // 1. El ID de la fuente va en la RAÍZ (como número)
         payment_source_id: Number(paymentSourceId),
-        installments: 1 // Las cuotas también van en la raíz para Payment Sources
+
+        // 2. Las cuotas van DENTRO de payment_method
+        payment_method: {
+            installments: 1
+        }
     };
 
     try {
