@@ -373,6 +373,7 @@
 //         throw err;
 //     }
 // }
+
 import axios from "axios";
 import crypto from "crypto";
 
@@ -394,19 +395,20 @@ type AcceptanceTokens = {
 let acceptanceTokensCache: AcceptanceTokens | null = null;
 
 /* ============================================================
-   1) Obtener Tokens de Aceptación
+   1) Obtener (y cachear) tokens de aceptación
 ============================================================ */
 export async function getAcceptanceTokens(): Promise<AcceptanceTokens> {
     if (acceptanceTokensCache) return acceptanceTokensCache;
 
     console.log("💼 [WOMPI] Obteniendo tokens de aceptación...");
+
     try {
         const res = await axios.get(`${WOMPI_BASE_URL}/merchants/${WOMPI_PUBLIC_KEY}`);
         const presigned = res.data?.data?.presigned_acceptance;
         const personal = res.data?.data?.presigned_personal_data_auth;
 
         if (!presigned?.acceptance_token || !personal?.acceptance_token) {
-            throw new Error("No se pudieron obtener los tokens de aceptación de Wompi");
+            throw new Error("No se pudieron obtener los tokens de aceptación");
         }
 
         acceptanceTokensCache = {
@@ -426,7 +428,7 @@ export async function getAcceptanceToken(): Promise<string> {
 }
 
 /* ============================================================
-   2) Tokenizar Tarjeta (Paso previo)
+   2) Tokenizar Tarjeta
 ============================================================ */
 export async function tokenizeCard(cardData: {
     number: string;
@@ -448,7 +450,7 @@ export async function tokenizeCard(cardData: {
             },
             { headers: { Authorization: `Bearer ${WOMPI_PUBLIC_KEY}` } }
         );
-        return response.data.data; // { id: "tok_...", ... }
+        return response.data.data;
     } catch (err: any) {
         console.error("❌ Error tokenizando tarjeta:", err.response?.data || err.message);
         throw err;
@@ -457,7 +459,6 @@ export async function tokenizeCard(cardData: {
 
 /* ============================================================
    3) Crear Fuente de Pago Permanente (Vault)
-   Esto devuelve un ID numérico (payment_source_id)
 ============================================================ */
 export async function createPaymentSourceVault(data: {
     token: string;
@@ -533,7 +534,7 @@ export async function chargeWithToken({
 }
 
 /* ============================================================
-   5) Cobro con Payment Source (REUTILIZABLE) - FIX 422
+   5) Cobro con Payment Source (REUTILIZABLE) - ✅ FIX 422
 ============================================================ */
 export async function chargeWithPaymentSource({
     paymentSourceId,
@@ -555,18 +556,15 @@ export async function chargeWithPaymentSource({
 
     console.log(`💸 [WOMPI] Cobrando con Fuente ID: ${paymentSourceId} | Monto: ${amount}`);
 
+    // ✨ CORRECCIÓN: Estructura para cobrar Fuentes de Pago
+    // Wompi exige que 'payment_source_id' esté en la RAÍZ, no dentro de 'payment_method'.
+    // Y payment_method NO se envía.
     const body = {
         amount_in_cents: amount,
         currency,
         customer_email: customerEmail,
         reference,
-        payment_method: {
-            type: "CARD",
-            // ⚠️ FIX CRÍTICO: Wompi exige que esto sea Entero. 
-            // Si viene como string "123", fallará con 422.
-            payment_source_id: Number(paymentSourceId),
-            installments: 1,
-        },
+        payment_source_id: Number(paymentSourceId), // ID en la raíz y numérico
         signature,
         acceptance_token,
     };
@@ -577,8 +575,7 @@ export async function chargeWithPaymentSource({
         });
         return response.data;
     } catch (err: any) {
-        // Log detallado para depurar el 422 si ocurre
-        console.error("🔥 WOMPI ERROR DETALLES:", JSON.stringify(err.response?.data, null, 2));
+        console.error("❌ Error cobro payment source:", JSON.stringify(err.response?.data, null, 2));
         throw err;
     }
 }
