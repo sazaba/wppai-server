@@ -533,9 +533,7 @@ export async function chargeWithToken({
     }
 }
 
-/* ============================================================
-   5) Cobro con Payment Source (REUTILIZABLE) - ✅ FIX REAL
-============================================================ */
+
 export async function chargeWithPaymentSource({
     paymentSourceId,
     amountInCents,
@@ -556,20 +554,19 @@ export async function chargeWithPaymentSource({
 
     console.log(`💸 [WOMPI] Cobrando con Fuente ID: ${paymentSourceId} | Monto: ${amount}`);
 
+    // 🔥 CORRECCIÓN CRÍTICA:
+    // Para cobrar con una fuente guardada, payment_source_id va en la RAÍZ.
+    // NO se debe enviar 'payment_method'.
     const body = {
         amount_in_cents: amount,
         currency,
         customer_email: customerEmail,
         reference,
-        payment_method: {
-            type: "CARD",
-            // 🛑 ANTES (Error): payment_source_id: Number(paymentSourceId)
-            // ✅ AHORA (Correcto): La llave DEBE ser "token", y el valor es el ID de la fuente.
-            token: paymentSourceId.toString(),
-            installments: 1,
-        },
         signature,
         acceptance_token,
+        // 👇 AQUÍ ESTÁ EL CAMBIO: En la raíz y como número
+        payment_source_id: Number(paymentSourceId),
+        installments: 1 // Las cuotas también van en la raíz para Payment Sources
     };
 
     try {
@@ -578,7 +575,6 @@ export async function chargeWithPaymentSource({
         });
         return response.data;
     } catch (err: any) {
-        // Mejoramos el log para ver el error completo de Wompi si vuelve a pasar
         console.error("❌ Error cobro payment source:", JSON.stringify(err.response?.data, null, 2));
         throw err;
     }
