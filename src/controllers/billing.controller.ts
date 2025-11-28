@@ -786,8 +786,8 @@ import { SubscriptionPlan } from "@prisma/client";
 
 // Asegúrate de que estos precios coincidan con lo que esperas cobrar
 const CREDIT_PACKAGES: Record<number, number> = {
-    300: 50000,
-    600: 90000,
+    300: 1500,
+    600: 1600,
 };
 
 /* =======================================================
