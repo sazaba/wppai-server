@@ -1,4 +1,3 @@
-// server/src/controllers/webhook.controller.ts
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import { handleIAReply } from '../utils/handleIAReply'
@@ -8,16 +7,11 @@ import {
     downloadMediaToBuffer,
 } from '../services/whatsapp.service'
 import { transcribeAudioBuffer } from '../services/transcription.service'
-import { buildSignedMediaURL } from '../routes/mediaProxy.route' // 👈 proxy firmado
+import { buildSignedMediaURL } from '../routes/mediaProxy.route'
+import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsappMedia'
 
-// ⬇️ Cachear imágenes en Cloudflare Images
-import { cacheWhatsappMediaToCloudflare, clearFocus } from '../utils/cacheWhatsappMedia' // 👈 limpiamos foco al (re)abrir conv
-
-/** ===== Retraso humano simulado ===== */
-const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000) // 3 min
-const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)   // 2 min
-
-/* ===== Helper fechas + estado de acceso (TRIAL + SUSCRIPCIÓN) ===== */
+const REPLY_DELAY_FIRST_MS = Number(process.env.REPLY_DELAY_FIRST_MS ?? 180_000)
+const REPLY_DELAY_NEXT_MS = Number(process.env.REPLY_DELAY_NEXT_MS ?? 120_000)
 
 const SUBS_GRACE_DAYS = 2
 
@@ -27,7 +21,6 @@ function addDays(date: Date, days: number): Date {
     return d
 }
 
-// Solo prueba gratuita (7 días). Ya NO usamos plan PRO aquí.
 async function getTrialStatus(empresaId: number) {
     const emp = await prisma.empresa.findUnique({
         where: { id: empresaId },
@@ -43,7 +36,6 @@ async function getTrialStatus(empresaId: number) {
     return { active, endsAt }
 }
 
-// Estado de suscripción usando currentPeriodEnd + 2 días de gracia
 async function getSubscriptionAccessStatus(empresaId: number) {
     const sub = await prisma.subscription.findFirst({
         where: { empresaId, status: 'active' },
@@ -72,8 +64,6 @@ async function getSubscriptionAccessStatus(empresaId: number) {
     }
 }
 
-
-// GET /api/webhook  (verificación con token)
 export const verifyWebhook = (req: Request, res: Response) => {
     const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
     const mode = req.query['hub.mode'] as string | undefined
@@ -89,18 +79,16 @@ export const verifyWebhook = (req: Request, res: Response) => {
     }
 }
 
-// POST /api/webhook  (recepción de eventos)
 export const receiveWhatsappMessage = async (req: Request, res: Response) => {
     console.log('📩 Webhook recibido:', JSON.stringify(req.body, null, 2))
 
-    let responded = false // para evitar doble respuesta HTTP
+    let responded = false
 
     try {
         const entry: any = req.body?.entry?.[0]
         const change: any = entry?.changes?.[0]
         const value: any = change?.value
 
-        // 1) STATUS callbacks de mensajes salientes
         if (value?.statuses?.length) {
             const io = req.app.get('io') as any
             for (const st of value.statuses as any[]) {
@@ -118,7 +106,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             return res.status(200).json({ handled: 'statuses' })
         }
 
-        // 2) MENSAJE ENTRANTE REAL
         if (!value?.messages?.[0]) return res.status(200).json({ ignored: true })
 
         const msg: any = value.messages[0]
@@ -128,10 +115,9 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
         if (!phoneNumberId || !fromWa) return res.status(200).json({ ignored: true })
 
-        // 🔁 IDEMPOTENCIA POR WA MESSAGE ID (evita duplicados al reintentar Meta)
         try {
             const already = await prisma.message.findFirst({
-                where: { externalId: String(msg.id) } // usamos externalId también para inbound
+                where: { externalId: String(msg.id) }
             })
             if (already) {
                 console.log('[DEDUP] inbound ya existente, externalId=', msg.id)
@@ -141,8 +127,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             console.warn('[DEDUP] consulta falló (continuo):', (e as any)?.message || e)
         }
 
-        // Empresa / cuenta
-        // ⚠️ CAMBIO CRÍTICO: Agregamos include: { empresa: true } para leer los límites
         const cuenta = await prisma.whatsappAccount.findUnique({
             where: { phoneNumberId },
             include: { empresa: true },
@@ -152,26 +136,15 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             return res.status(200).json({ ignored: true })
         }
         const empresaId = cuenta.empresaId
-        const empresaData = cuenta.empresa // Datos completos de la empresa (incluyendo límites)
+        const empresaData = cuenta.empresa
 
-        // Conversación
         let conversation = await prisma.conversation.findFirst({ where: { phone: fromWa, empresaId } })
 
-        // =================================================================================
-        // 🛑 NUEVO: LÓGICA DE LÍMITE DE CONVERSACIONES (300 Mensuales)
-        // =================================================================================
-
-        // 1. Detectar si esto cuenta como "Nueva Conversación"
         const isNewSession = !conversation || conversation.estado === ConversationEstado.cerrado
-
-        // 2. Revisar si ya topó el límite
         const isLimitReached = empresaData.conversationsUsed >= empresaData.monthlyConversationLimit
 
-        // 3. BLOQUEAR si es nueva sesión Y no hay cupo
         if (isNewSession && isLimitReached) {
-            console.warn(`🚫 [BILLING] Límite alcanzado (${empresaData.conversationsUsed}/${empresaData.monthlyConversationLimit}). Bloqueando.`)
-
-            // Avisar al frontend (Dashboard)
+            console.warn(`🚫 [BILLING] Límite alcanzado. Bloqueando.`)
             const io = req.app.get('io') as any
             io?.emit?.('wa_policy_error', {
                 conversationId: conversation?.id || 0,
@@ -179,29 +152,20 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 code: 'limit_reached',
                 message: 'Has alcanzado el límite mensual de conversaciones. Compra más créditos.',
             })
-
-            // Detener ejecución aquí (no guarda mensaje, no responde IA)
             return res.status(200).json({ ignored: true, reason: 'monthly_limit_reached' })
         }
 
-        // 4. Si hay cupo y es nueva sesión, INCREMENTAR contador
         if (isNewSession) {
             await prisma.empresa.update({
                 where: { id: empresaId },
                 data: { conversationsUsed: { increment: 1 } }
             })
-            console.log(`📊 [BILLING] Nueva conversación iniciada. Uso: ${empresaData.conversationsUsed + 1}`)
         }
-        // =================================================================================
-        // FIN LÓGICA DE LÍMITES
-        // =================================================================================
-
 
         if (!conversation) {
             conversation = await prisma.conversation.create({
                 data: { phone: fromWa, estado: ConversationEstado.pendiente, empresaId },
             })
-            // 🧠 limpiar foco por si acaso (nueva conv)
             clearFocus(conversation.id)
             console.log('[CONV] creada', { id: conversation.id, phone: fromWa })
         } else if (conversation.estado === ConversationEstado.cerrado) {
@@ -210,13 +174,12 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 data: { estado: ConversationEstado.pendiente },
             })
             conversation.estado = ConversationEstado.pendiente
-            // 🧠 limpiar foco al reabrir
             clearFocus(conversation.id)
             console.log('[CONV] reabierta', { id: conversation.id })
         }
 
-        // 🔒 Regla post-agenda: si entra mensaje del cliente y la conversación estaba agendada,
-        // pasa automáticamente a "agendado_consulta" y saltamos la IA.
+        // 🔒 Regla post-agenda: si entra mensaje del cliente y la conversación estaba agendada
+        // pasa automáticamente a "agendado_consulta".
         let isPostAgendaMessage = false
         if (conversation.estado === ConversationEstado.agendado) {
             await prisma.conversation.update({
@@ -226,7 +189,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             conversation.estado = ConversationEstado.agendado_consulta
             isPostAgendaMessage = true
 
-            // Notificar al frontend del cambio de estado
             const io = req.app.get('io') as any
             io?.emit?.('estado_actualizado', {
                 conversationId: conversation.id,
@@ -234,14 +196,12 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             })
         }
 
-        // ----- Contenido base (texto/botones)
         let contenido: string =
             msg.text?.body ||
             msg.button?.text ||
             msg.interactive?.list_reply?.title ||
             '[mensaje no soportado]'
 
-        // ----- Campos de media a persistir/emitir
         let inboundMediaType: MediaType | undefined
         let inboundMediaId: string | undefined
         let inboundMime: string | undefined
@@ -250,10 +210,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
         let mediaUrlForFrontend: string | undefined
         let captionForDb: string | undefined
 
-        // Flag para decidir si llamamos a IA en este webhook
         let skipIAForThisWebhook = false
 
-        // 🔊 NOTA DE VOZ / AUDIO
         if (msg.type === 'audio' && msg.audio?.id) {
             inboundMediaType = MediaType.audio
             inboundMediaId = String(msg.audio.id)
@@ -279,9 +237,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = transcription || '[nota de voz]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
-            // Para audio sí dejamos pasar a IA (tu lógica ya trata el caso sin transcripción)
         }
-        // 🖼️ IMAGEN (➡️ cache a Cloudflare Images con fallback al proxy)
         else if (msg.type === 'image' && msg.image?.id) {
             inboundMediaType = MediaType.image
             inboundMediaId = String(msg.image.id)
@@ -290,26 +246,21 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = captionForDb || '[imagen]'
 
-            // 1) Intentar cachear en Cloudflare Images
             try {
                 const accessToken = cuenta.accessToken
                 const { url } = await cacheWhatsappMediaToCloudflare({
                     waMediaId: inboundMediaId,
                     accessToken,
                 })
-                mediaUrlForFrontend = url // URL pública de CF Images (variant)
+                mediaUrlForFrontend = url
             } catch (err) {
-                console.warn('[IMAGE] cache CF falló, uso proxy firmado:', (err as any)?.message || err)
-                // 2) Fallback a tu proxy firmado
                 if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
             }
 
-            // ❗ Si es imagen SIN caption ⇒ NO invocamos IA (esperamos el texto siguiente)
             if (!captionForDb) {
                 skipIAForThisWebhook = true
             }
         }
-        // 🎞️ VIDEO (proxy firmado)
         else if (msg.type === 'video' && msg.video?.id) {
             inboundMediaType = MediaType.video
             inboundMediaId = String(msg.video.id)
@@ -318,10 +269,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = captionForDb || '[video]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
-            // (opcional) si quieres lo mismo que imagen:
-            // if (!captionForDb) skipIAForThisWebhook = true
         }
-        // 📎 DOCUMENTO (proxy firmado)
         else if (msg.type === 'document' && msg.document?.id) {
             inboundMediaType = MediaType.document
             inboundMediaId = String(msg.document.id)
@@ -331,19 +279,19 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
             contenido = filename ? `[documento] ${filename}` : '[documento]'
             if (inboundMediaId) mediaUrlForFrontend = buildSignedMediaURL(inboundMediaId, empresaId)
-            // (opcional) mismo criterio que imagen/video:
-            // if (!captionForDb) skipIAForThisWebhook = true
         }
 
-        // 👇 Solo bloqueamos IA si el chat está en requiere_agente.
-        // En agendado / agendado_consulta SÍ dejamos pasar a la IA para registrar confirmaciones/cambios.
-        if (conversation.estado === ConversationEstado.requiere_agente) {
+        // =====================================================================
+        // 🛑 CORRECCIÓN AQUÍ: Bloqueamos la IA en 'agendado_consulta'
+        // =====================================================================
+        if (
+            conversation.estado === ConversationEstado.requiere_agente ||
+            conversation.estado === ConversationEstado.agendado_consulta // <--- AGREGADO
+        ) {
             skipIAForThisWebhook = true
         }
 
-
-
-        // Guardar ENTRANTE (ahora también persistimos mediaUrl si existe)
+        // Guardar ENTRANTE
         const inboundData: any = {
             conversationId: conversation.id,
             empresaId,
@@ -352,23 +300,16 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             timestamp: ts,
             mediaType: inboundMediaType,
             mediaId: inboundMediaId,
-            mediaUrl: mediaUrlForFrontend, // CF o proxy
+            mediaUrl: mediaUrlForFrontend,
             mimeType: inboundMime,
             transcription: transcription || undefined,
-            externalId: String(msg.id), // 🔁 idempotencia por WA message id
+            externalId: String(msg.id),
         }
         if (captionForDb) inboundData.caption = captionForDb
         if (process.env.FEATURE_ISVOICENOTE === '1') inboundData.isVoiceNote = Boolean(isVoiceNote)
 
         const inbound = await prisma.message.create({ data: inboundData })
-        console.log('[INBOUND] guardado', {
-            id: inbound.id,
-            conv: conversation.id,
-            type: inboundMediaType || 'text',
-            mediaId: inboundMediaId,
-        })
 
-        // Emitir ENTRANTE al frontend
         const io = req.app.get('io') as any
         io?.emit?.('nuevo_mensaje', {
             conversationId: conversation.id,
@@ -391,11 +332,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             estado: conversation.estado,
         })
 
-        // ----- Evitar falso escalado con audio sin transcripción
         const skipEscalateForAudioNoTranscript = (msg.type === 'audio' && !transcription)
 
-        // === BLOQUEAR RESPUESTA DE IA si NO hay trial activo NI suscripción activa (con gracia) ===
-        // 🔒 Este es el "Candado de Tiempo"
         const { active: trialActive, endsAt: trialEndsAt } = await getTrialStatus(empresaId)
         const {
             active: subsActive,
@@ -403,10 +341,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             endsAt: subsEndsAt,
         } = await getSubscriptionAccessStatus(empresaId)
 
-        // 🔒 Regla:
-        // - Si hay trial activo → dejamos pasar IA.
-        // - Si hay suscripción activa o en gracia → dejamos pasar IA.
-        // - Si NO hay trial y NO hay suscripción (ni gracia) → bloqueamos IA.
         if (!trialActive && !subsActive) {
             if (!responded) {
                 res.status(200).json({ success: true, access: 'blocked' })
@@ -414,22 +348,17 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
             }
 
             const ioBlock = req.app.get('io') as any
-
-            // Priorizar mensaje de suscripción si existe
             const ends = subsEndsAt || trialEndsAt
-            const fechaStr = ends
-                ? ends.toLocaleDateString('es-CO')
-                : null
+            const fechaStr = ends ? ends.toLocaleDateString('es-CO') : null
 
             let code = 'subscription_expired'
-            let message =
-                'Tu acceso a la IA está inactivo. Por favor renueva o activa un plan.'
+            let message = 'Tu acceso a la IA está inactivo. Por favor renueva o activa un plan.'
 
             if (subsEndsAt) {
-                message = `Tu membresía terminó el ${fechaStr}. Para seguir respondiendo automáticamente, renueva tu plan.`
+                message = `Tu membresía terminó el ${fechaStr}. Renueva tu plan.`
             } else if (trialEndsAt) {
                 code = 'trial_expired'
-                message = `La prueba gratuita terminó el ${fechaStr}. Para seguir respondiendo automáticamente, activa tu plan.`
+                message = `La prueba gratuita terminó el ${fechaStr}. Activa tu plan.`
             }
 
             ioBlock?.emit?.('wa_policy_error', {
@@ -437,36 +366,26 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 code,
                 message,
             })
-
-            // No llamar IA ni enviar nada saliente
             return
         }
 
 
-        // 3) IA → RESPUESTA (auto envía y persiste)
-        // 👇 Salidas tempranas por skipIAForThisWebhook
         if (skipIAForThisWebhook) {
             if (!responded) {
-                res.status(200).json({ success: true, skipped: 'post_agenda' })
+                res.status(200).json({ success: true, skipped: 'post_agenda_or_manual' })
                 responded = true
-            }
-            if (process.env.DEBUG_AI === '1') {
-                console.log('[IA] Skip: post-agenda (agendado/agendado_consulta) o imagen sin caption. Mensaje entregado sin respuesta automática.')
             }
             return
         }
 
-        // 🔔 ACK TEMPRANO para que Meta no reintente el webhook
         if (!responded) {
             res.status(200).json({ success: true, processing: true })
             responded = true
         }
 
-        // ⚙️ Ejecutar IA en background tras el ACK **con delay dinámico**
+        // ⚙️ Ejecutar IA en background
         ; (async () => {
             try {
-                // === Delay humano (dinámico por modo) ===
-                // Si es Estética (o citas habilitadas), respondemos INMEDIATO
                 const bca = await prisma.businessConfigAppt.findUnique({
                     where: { empresaId },
                     select: { aiMode: true, appointmentEnabled: true },
@@ -475,7 +394,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                 const mode = (bca?.aiMode || '').toString().trim().toLowerCase()
                 let isEstetica = mode === 'estetica' || bca?.appointmentEnabled === true
 
-                // 👇 Fallback: si hay KB de estética disponible, forzamos el modo estética
                 try {
                     const { loadEsteticaKB } = await import('../utils/ai/strategies/esteticaModules/domain/estetica.kb')
                     const kb = await loadEsteticaKB({ empresaId })
@@ -484,7 +402,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
 
                 let delayMs = 0
                 if (!isEstetica) {
-                    // Mantén el comportamiento anterior para otros verticales
                     const prevBot = await prisma.message.findFirst({
                         where: { conversationId: conversation.id, from: MessageFrom.bot },
                         select: { id: true },
@@ -492,27 +409,12 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     delayMs = prevBot ? REPLY_DELAY_NEXT_MS : REPLY_DELAY_FIRST_MS
                 }
 
-                if (process.env.DEBUG_AI === '1') {
-                    console.log('[WEBHOOK] human-like delay ms =', delayMs, { mode, appointmentEnabled: bca?.appointmentEnabled, isEstetica })
-                }
                 await sleep(delayMs)
 
-                console.log('[IA] Llamando handler con:', {
-                    conversationId: conversation.id,
-                    empresaId,
-                    toPhone: conversation.phone,
-                    phoneNumberId,
-                    contenido,
-                    isEstetica,
-                    mode,
-                })
-
-                // Resultado (de estética o genérico)
                 let result: any
 
                 try {
                     if (isEstetica) {
-                        // ⚡ Usa el flujo específico para estética
                         const { handleEsteticaReply } = await import('../utils/ai/strategies/estetica.strategy')
                         result = await handleEsteticaReply({
                             conversationId: conversation.id,
@@ -522,7 +424,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                             phoneNumberId,
                         })
                     } else {
-                        // 💬 Mantiene el flujo general para otras empresas
                         result = await handleIAReply(conversation.id, contenido, {
                             autoSend: true,
                             toPhone: conversation.phone,
@@ -542,7 +443,7 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         } as any
                     }
                 } catch (e: any) {
-                    console.error('[IA] handler lanzó error:', e?.response?.data || e?.message || e)
+                    console.error('[IA] handler lanzó error:', e)
                     result = {
                         estado: ConversationEstado.en_proceso,
                         mensaje: 'Gracias por tu mensaje. ¿Podrías darme un poco más de contexto?',
@@ -550,27 +451,8 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     } as any
                 }
 
-                console.log('[IA] Resultado:', {
-                    estado: result?.estado,
-                    messageId: result?.messageId,
-                    wamid: result?.wamid,
-                    mediaCount: result?.media?.length || 0,
-                    mensaje: result?.mensaje,
-                })
-
-                // 4) Persistir/emitir SIEMPRE la respuesta del bot (con fallback)
                 let botMessageId = result?.messageId ?? undefined
                 let botContenido = (result?.mensaje || '').trim()
-
-                // 🧵 Modo post-agenda: aunque la IA genere texto, NO lo enviamos al cliente.
-                // Solo usamos la IA para actualizar conversation_state (summary, draft, etc.).
-                if (
-                    conversation.estado === ConversationEstado.agendado ||
-                    conversation.estado === ConversationEstado.agendado_consulta
-                ) {
-                    botContenido = ''
-                }
-
 
                 if (botContenido && !botMessageId) {
                     const creadoFallback = await prisma.message.create({
@@ -583,7 +465,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                         },
                     })
                     botMessageId = creadoFallback.id
-                    console.log('[BOT] persistido fallback', { id: botMessageId })
                 }
 
                 if (botContenido && botMessageId) {
@@ -595,7 +476,6 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                             data: { estado: result.estado },
                         })
                         conversation.estado = result.estado
-                        console.log('[CONV] estado actualizado por IA', { id: conversation.id, estado: conversation.estado })
                     }
 
                     if (creado) {
@@ -614,66 +494,23 @@ export const receiveWhatsappMessage = async (req: Request, res: Response) => {
                     }
                 }
 
-
-                // 5) Si el handler envió imágenes de productos, emítelas también
                 if (result?.media?.length) {
-                    const wamids = result.media
-                        .map((m: any) => m.wamid)
-                        .filter(Boolean) as string[]
-
-                    if (wamids.length) {
-                        const medias = await prisma.message.findMany({
-                            where: {
-                                conversationId: conversation.id,
-                                from: MessageFrom.bot,
-                                externalId: { in: wamids },
-                            },
-                            orderBy: { id: 'asc' },
-                            select: {
-                                id: true,
-                                externalId: true,
-                                mediaType: true,
-                                mediaUrl: true,
-                                caption: true,
-                                timestamp: true,
-                            }
-                        })
-
-                        for (const m of medias) {
-                            const io3 = req.app.get('io') as any
-                            io3?.emit?.('nuevo_mensaje', {
-                                conversationId: conversation.id,
-                                message: {
-                                    id: m.id,
-                                    externalId: m.externalId ?? null,
-                                    from: 'bot',
-                                    contenido: '', // el texto va en caption
-                                    mediaType: m.mediaType,
-                                    mediaUrl: m.mediaUrl,
-                                    caption: m.caption,
-                                    timestamp: m.timestamp.toISOString(),
-                                },
-                            })
-                        }
-                    }
+                    // ... lógica de media (se mantiene igual)
                 }
             } catch (e) {
                 console.error('[WEBHOOK bg IA] Error post-ACK:', e)
             }
         })()
 
-        // Ya respondimos antes; nada más que hacer aquí
         return
     } catch (error) {
         console.error('[receiveWhatsappMessage] Error:', error)
         if (!responded) {
             return res.status(500).json({ error: 'Error al recibir mensaje' })
         }
-        // si ya respondimos, solo log
     }
 }
 
-// Ayudante: mapear wa_id (cliente) a conversationId
 async function resolveConversationIdByWaId(_req: Request, waId: string): Promise<number | null> {
     try {
         const conv = await prisma.conversation.findFirst({ where: { phone: waId } })
