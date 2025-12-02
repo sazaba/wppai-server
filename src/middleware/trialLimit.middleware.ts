@@ -15,14 +15,17 @@ export const checkTrialLimits = async (req: Request, res: Response, next: NextFu
     }
 
     try {
+        // 1. Buscamos la empresa y sus datos básicos
         const empresa = await prisma.empresa.findUnique({
             where: { id: empresaId },
             select: {
                 id: true,
-                plan: true,           // 'pro' o trial
+                plan: true,
                 createdAt: true,
-                trialEnd: true,       // tu campo actual (puede ser null)
-                conversationsUsed: true, // tu contador actual
+                trialEnd: true,
+                conversationsUsed: true,
+                // ⚠️ IMPORTANTE: Asegúrate de tener este campo en tu DB si usas límites variables
+                // monthlyConversationLimit: true 
             },
         })
 
@@ -30,35 +33,56 @@ export const checkTrialLimits = async (req: Request, res: Response, next: NextFu
             return res.status(404).json({ error: 'Empresa no encontrada' })
         }
 
-        // Plan de pago => omitir límites
-        const plan = (empresa.plan || '').toString().toLowerCase()
-        if (plan === 'pro') return next()
+        // 2. 🟢 CHECK DE SUSCRIPCIÓN (La solución real)
+        // Buscamos si tiene una suscripción activa en la tabla Subscription
+        const suscripcionActiva = await prisma.subscription.findFirst({
+            where: {
+                empresaId,
+                status: 'active',
+                // Opcional: validar fecha de fin si es necesario, 
+                // pero 'active' suele ser suficiente si tu webhook de Stripe/Wompi actualiza el estado.
+            },
+        })
 
-        // === LÓGICA DE PRUEBA DE 7 DÍAS ===
+        // Si el plan es 'pro' (legacy) O tiene suscripción activa => PASE VIP (ignora límites de trial)
+        const planLegacy = (empresa.plan || '').toString().toLowerCase()
+        if (planLegacy === 'pro' || suscripcionActiva) {
+            return next()
+        }
+
+        // =========================================================
+        // 🔻 AQUI COMIENZA LA LÓGICA SOLO PARA CUENTAS GRATUITAS
+        // =========================================================
+
+        // === A. LÓGICA DE TIEMPO (7 DÍAS) ===
         const endsAt = empresa.trialEnd ?? addDays(empresa.createdAt, 7)
         const now = new Date()
-        const isActive = now <= endsAt
+        const isTimeValid = now <= endsAt
 
-        if (!isActive) {
-            // Prueba vencida: bloquear TODO envío (IA, manual, plantillas, media)
-            return res.status(403).json({ error: 'La prueba gratuita ha finalizado' })
+        if (!isTimeValid) {
+            return res.status(403).json({
+                error: 'La prueba gratuita ha finalizado. Por favor suscríbete para continuar.'
+            })
         }
 
-        // === LÍMITE DE ENVÍOS EN PRUEBA (opcional) ===
-        // Mantengo tu límite de 100 para no cambiar tu UX actual.
+        // === B. LÍMITE DE MENSAJES (Ahora 300) ===
         const used = empresa.conversationsUsed ?? 0
-        const LIMIT = 100
+        const LIMIT = 300 // 👈 AQUÍ ESTABA EL 100, YA LO CAMBIAMOS A 300
+
         if (used >= LIMIT) {
-            return res.status(403).json({ error: 'Límite de 100 mensajes alcanzado en la prueba gratuita' })
+            return res.status(403).json({
+                error: `Límite de ${LIMIT} mensajes alcanzado en la prueba gratuita`
+            })
         }
 
-        // Incrementar contador de envíos (solo en endpoints que usan este middleware)
+        // Incrementar contador (si pasó todas las validaciones)
         await prisma.empresa.update({
             where: { id: empresaId },
             data: { conversationsUsed: { increment: 1 } },
         })
 
         return next()
+
     } catch (error) {
         console.error('[checkTrialLimits] Error:', error)
         return res.status(500).json({ error: 'Error verificando límites de prueba' })
