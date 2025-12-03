@@ -142,3 +142,79 @@ export const resetCompanyPassword = async (req: Request, res: Response) => {
         return res.status(500).json({ error: 'No se pudo restablecer la contraseña' })
     }
 }
+
+// DELETE /api/superadmin/companies/:id
+export const deleteCompany = async (req: Request, res: Response) => {
+    const { id } = req.params
+    const empresaId = Number(id)
+
+    try {
+        // 🔒 Seguridad Doble
+        const requestUser = (req as any).user
+        if (!isSuperAdmin(requestUser?.email)) {
+            return res.status(403).json({ error: 'Requiere privilegios de SuperAdmin' })
+        }
+
+        if (!empresaId) {
+            return res.status(400).json({ error: 'ID de empresa inválido' })
+        }
+
+        // Ejecutamos todo en una transacción para garantizar integridad
+        await prisma.$transaction(async (tx) => {
+
+            // 1. Eliminar datos operativos de Estética/Citas
+            await tx.appointmentReminderLog.deleteMany({ where: { appointment: { empresaId } } })
+            await tx.appointment.deleteMany({ where: { empresaId } })
+            await tx.appointmentException.deleteMany({ where: { empresaId } })
+            await tx.appointmentHour.deleteMany({ where: { empresaId } })
+            await tx.esteticaProcedure.deleteMany({ where: { empresaId } })
+            await tx.reminderRule.deleteMany({ where: { empresaId } })
+            await tx.staff.deleteMany({ where: { empresaId } })
+            await tx.businessConfigAppt.deleteMany({ where: { empresaId } })
+
+            // 2. Eliminar datos de E-commerce (Pedidos y Productos)
+            // Primero los items de ordenes de esta empresa
+            await tx.orderItem.deleteMany({ where: { order: { empresaId } } })
+            await tx.paymentReceipt.deleteMany({ where: { order: { empresaId } } })
+            await tx.order.deleteMany({ where: { empresaId } })
+
+            // Productos e imágenes
+            await tx.productImage.deleteMany({ where: { product: { empresaId } } })
+            await tx.product.deleteMany({ where: { empresaId } })
+
+            // 3. Eliminar Chat y Mensajería
+            // Primero mensajes
+            await tx.message.deleteMany({ where: { empresaId } })
+            // Estados de conversación
+            await tx.conversationState.deleteMany({ where: { conversation: { empresaId } } })
+            // Conversaciones
+            await tx.conversation.deleteMany({ where: { empresaId } })
+            // Plantillas
+            await tx.messageTemplate.deleteMany({ where: { empresaId } })
+            // Configuración de WhatsApp
+            await tx.whatsappAccount.deleteMany({ where: { empresaId } })
+
+            // 4. Eliminar Configuración Base
+            await tx.businessConfig.deleteMany({ where: { empresaId } })
+
+            // 5. Eliminar Facturación
+            await tx.subscriptionPayment.deleteMany({ where: { empresaId } })
+            await tx.conversationPurchase.deleteMany({ where: { empresaId } })
+            await tx.paymentMethod.deleteMany({ where: { empresaId } })
+            await tx.subscription.deleteMany({ where: { empresaId } })
+
+            // 6. Eliminar Usuarios
+            await tx.usuario.deleteMany({ where: { empresaId } })
+
+            // 7. Finalmente, eliminar la Empresa
+            await tx.empresa.delete({ where: { id: empresaId } })
+        })
+
+        console.log(`[SuperAdmin] 🗑️ Empresa ID ${empresaId} y todos sus datos eliminados por ${requestUser.email}`)
+        return res.json({ ok: true, message: 'Empresa eliminada correctamente' })
+
+    } catch (error) {
+        console.error('[SuperAdmin] Error deleting company:', error)
+        return res.status(500).json({ error: 'No se pudo eliminar la empresa. Revisa los logs del servidor.' })
+    }
+}

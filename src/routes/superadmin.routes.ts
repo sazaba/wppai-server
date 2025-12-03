@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { getAllCompanies, resetCompanyPassword } from '../controllers/superadmin.controller'
+import { deleteCompany, getAllCompanies, resetCompanyPassword } from '../controllers/superadmin.controller'
 import { verificarJWT } from '../middleware/auth.middleware'
 
 const router = Router()
@@ -32,5 +32,7 @@ router.get('/companies', getAllCompanies)
 
 // Restablecer contraseña de un usuario específico
 router.post('/reset-password', resetCompanyPassword)
+
+router.delete('/companies/:id', verificarJWT, requireSuperAdmin, deleteCompany)
 
 export default router
