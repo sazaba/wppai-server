@@ -10,22 +10,17 @@ const isSuperAdmin = (email?: string) => {
 // GET /api/superadmin/companies
 export const getAllCompanies = async (req: Request, res: Response) => {
     try {
-        // 🔒 CANDADO DE SEGURIDAD (Doble verificación)
-        // Asumimos que tu middleware de auth llena req.user
         const requestUser = (req as any).user
         if (!isSuperAdmin(requestUser?.email)) {
-            console.warn(`⚠️ Acceso denegado a getAllCompanies por: ${requestUser?.email}`)
             return res.status(403).json({ error: 'Requiere privilegios de SuperAdmin' })
         }
 
         const empresas = await prisma.empresa.findMany({
             include: {
-                // 1. Usuario Admin (Para ver info y resetear pass)
                 usuarios: {
                     where: { rol: 'admin' },
                     select: { id: true, email: true, rol: true }
                 },
-                // 2. Suscripción Activa (Para ver vencimiento)
                 subscriptions: {
                     where: { status: { in: ['active', 'past_due'] } },
                     orderBy: { createdAt: 'desc' },
@@ -34,18 +29,15 @@ export const getAllCompanies = async (req: Request, res: Response) => {
                         plan: true
                     }
                 },
-                // 3. Último pago (Para saber si ya pagó)
                 subscriptionPayments: {
                     orderBy: { createdAt: 'desc' },
                     take: 1,
                     select: { status: true, paidAt: true, amount: true }
                 },
-                // 4. Compras de Paquetes (Histórico de créditos comprados)
                 conversationPurchases: {
                     where: { status: 'paid' },
                     select: { creditsAmount: true }
                 },
-                // 5. Conteo total histórico
                 _count: {
                     select: { conversaciones: true }
                 }
@@ -53,16 +45,11 @@ export const getAllCompanies = async (req: Request, res: Response) => {
             orderBy: { createdAt: 'desc' }
         })
 
-        // Mapeamos la data para que el frontend la reciba limpia y calculada
         const data = empresas.map(emp => {
             const activeSub = emp.subscriptions[0]
             const adminUser = emp.usuarios[0]
             const lastPayment = emp.subscriptionPayments[0]
-
-            // Cálculo de restantes
             const remaining = Math.max(0, emp.monthlyConversationLimit - emp.conversationsUsed)
-
-            // Total de conversaciones extra compradas en la historia
             const totalPurchasedCredits = emp.conversationPurchases.reduce((acc, curr) => acc + curr.creditsAmount, 0)
 
             return {
@@ -70,30 +57,21 @@ export const getAllCompanies = async (req: Request, res: Response) => {
                 nombre: emp.nombre,
                 plan: emp.plan,
                 estado: emp.estado,
-
-                // Métricas de Uso y Créditos
                 conversationsUsed: emp.conversationsUsed,
                 monthlyConversationLimit: emp.monthlyConversationLimit,
                 conversationsRemaining: remaining,
                 totalConversationsHistory: emp._count.conversaciones,
                 totalPurchasedCredits,
-
-                // Estado del último pago
                 lastPayment: lastPayment ? {
                     status: lastPayment.status,
                     date: lastPayment.paidAt,
                     amount: lastPayment.amount
                 } : null,
-
                 createdAt: emp.createdAt,
-
-                // Info de Usuario
                 adminUser: adminUser ? {
                     id: adminUser.id,
                     email: adminUser.email
                 } : null,
-
-                // Membresía / Vencimiento
                 subscription: activeSub ? {
                     status: activeSub.status,
                     currentPeriodEnd: activeSub.currentPeriodEnd,
@@ -112,10 +90,8 @@ export const getAllCompanies = async (req: Request, res: Response) => {
 // POST /api/superadmin/reset-password
 export const resetCompanyPassword = async (req: Request, res: Response) => {
     try {
-        // 🔒 CANDADO DE SEGURIDAD (Doble verificación)
         const requestUser = (req as any).user
         if (!isSuperAdmin(requestUser?.email)) {
-            console.warn(`⚠️ Acceso denegado a resetPassword por: ${requestUser?.email}`)
             return res.status(403).json({ error: 'Requiere privilegios de SuperAdmin' })
         }
 
@@ -133,8 +109,7 @@ export const resetCompanyPassword = async (req: Request, res: Response) => {
             data: { password: hashedPassword }
         })
 
-        console.log(`[SuperAdmin] 🔐 Contraseña restablecida para usuario ID ${userId} por el SuperAdmin ${requestUser.email}`)
-
+        console.log(`[SuperAdmin] 🔐 Contraseña restablecida para usuario ID ${userId}`)
         return res.json({ ok: true, message: 'Contraseña actualizada correctamente' })
 
     } catch (error) {
@@ -149,7 +124,6 @@ export const deleteCompany = async (req: Request, res: Response) => {
     const empresaId = Number(id)
 
     try {
-        // 🔒 Seguridad Doble
         const requestUser = (req as any).user
         if (!isSuperAdmin(requestUser?.email)) {
             return res.status(403).json({ error: 'Requiere privilegios de SuperAdmin' })
@@ -159,10 +133,10 @@ export const deleteCompany = async (req: Request, res: Response) => {
             return res.status(400).json({ error: 'ID de empresa inválido' })
         }
 
-        // Ejecutamos todo en una transacción para garantizar integridad
+        // CORRECCIÓN: Aumentamos el timeout a 60 segundos (60000ms) para evitar el error P2028
         await prisma.$transaction(async (tx) => {
 
-            // 1. Eliminar datos operativos de Estética/Citas
+            // 1. Estética/Citas
             await tx.appointmentReminderLog.deleteMany({ where: { appointment: { empresaId } } })
             await tx.appointment.deleteMany({ where: { empresaId } })
             await tx.appointmentException.deleteMany({ where: { empresaId } })
@@ -172,45 +146,40 @@ export const deleteCompany = async (req: Request, res: Response) => {
             await tx.staff.deleteMany({ where: { empresaId } })
             await tx.businessConfigAppt.deleteMany({ where: { empresaId } })
 
-            // 2. Eliminar datos de E-commerce (Pedidos y Productos)
-            // Primero los items de ordenes de esta empresa
+            // 2. E-commerce
             await tx.orderItem.deleteMany({ where: { order: { empresaId } } })
             await tx.paymentReceipt.deleteMany({ where: { order: { empresaId } } })
             await tx.order.deleteMany({ where: { empresaId } })
-
-            // Productos e imágenes
             await tx.productImage.deleteMany({ where: { product: { empresaId } } })
             await tx.product.deleteMany({ where: { empresaId } })
 
-            // 3. Eliminar Chat y Mensajería
-            // Primero mensajes
+            // 3. Chat y Mensajería
             await tx.message.deleteMany({ where: { empresaId } })
-            // Estados de conversación
             await tx.conversationState.deleteMany({ where: { conversation: { empresaId } } })
-            // Conversaciones
             await tx.conversation.deleteMany({ where: { empresaId } })
-            // Plantillas
             await tx.messageTemplate.deleteMany({ where: { empresaId } })
-            // Configuración de WhatsApp
             await tx.whatsappAccount.deleteMany({ where: { empresaId } })
 
-            // 4. Eliminar Configuración Base
+            // 4. Configuración
             await tx.businessConfig.deleteMany({ where: { empresaId } })
 
-            // 5. Eliminar Facturación
+            // 5. Facturación
             await tx.subscriptionPayment.deleteMany({ where: { empresaId } })
             await tx.conversationPurchase.deleteMany({ where: { empresaId } })
             await tx.paymentMethod.deleteMany({ where: { empresaId } })
             await tx.subscription.deleteMany({ where: { empresaId } })
 
-            // 6. Eliminar Usuarios
+            // 6. Usuarios
             await tx.usuario.deleteMany({ where: { empresaId } })
 
-            // 7. Finalmente, eliminar la Empresa
+            // 7. Empresa
             await tx.empresa.delete({ where: { id: empresaId } })
+        }, {
+            timeout: 60000, // 60 segundos de tolerancia
+            maxWait: 10000  // 10 segundos esperando turno
         })
 
-        console.log(`[SuperAdmin] 🗑️ Empresa ID ${empresaId} y todos sus datos eliminados por ${requestUser.email}`)
+        console.log(`[SuperAdmin] 🗑️ Empresa ID ${empresaId} eliminada con éxito`)
         return res.json({ ok: true, message: 'Empresa eliminada correctamente' })
 
     } catch (error) {
