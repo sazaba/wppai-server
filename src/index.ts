@@ -18,6 +18,7 @@ import mediaProxyRouter from './routes/mediaProxy.route'
 import ordersRouter from "./routes/orders.routes"
 import paymentsRouter from "./routes/payments.routes"
 import registerRoutes from './routes/whatsapp.register.routes'
+import superadminRoutes from './routes/superadmin.routes'
 // Agenda 
 import appointmentsRoutes from './routes/appointments.routes'
 import appointmentHoursRoutes from './routes/appointmentHours.routes'
@@ -160,6 +161,7 @@ app.use(mediaProxyRouter)
 app.use("/api/orders", ordersRouter)
 app.use("/api/payments", paymentsRouter)
 app.use("/api/billing", billingRoutes);
+app.use('/api/superadmin', superadminRoutes)
 
 
 
