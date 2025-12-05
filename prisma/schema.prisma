@@ -208,6 +208,7 @@ model Empresa {
   ReminderRule         ReminderRule[]
   Staff                Staff[]
   AppointmentException AppointmentException[]
+  testModels            TestModel[]
 
   @@map("empresa")
 }
@@ -933,3 +934,14 @@ model ConversationPurchase {
   @@index([empresaId, status])
   @@map("conversation_purchase")
 }
+
+
+model TestModel {
+  id        Int      @id @default(autoincrement())
+  nombre    String
+  empresaId Int
+  Empresa   Empresa  @relation(fields: [empresaId], references: [id])
+
+  createdAt DateTime @default(now())
+}
+

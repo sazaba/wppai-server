@@ -4,3 +4,7 @@ node_modules
 .env.prod
 
 /generated/prisma
+
+env
+
+env.prod
