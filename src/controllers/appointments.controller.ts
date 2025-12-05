@@ -125,7 +125,6 @@ async function ensureWithinBusinessHours(opts: {
 }
 
 /* ===================== Config runtime (Appt > Legacy) ===================== */
-/* ===================== Config runtime (Appt > Legacy) ===================== */
 async function loadApptRuntimeConfig(empresaId: number) {
     const [cfgAppt, cfgLegacy] = await Promise.all([
         prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
@@ -141,6 +140,20 @@ async function loadApptRuntimeConfig(empresaId: number) {
         }),
     ]);
 
+    // Lógica de seguridad para evitar bloqueos por mala configuración:
+
+    // 1. Si maxAdvanceDays es 0 o null, usamos 60 días por defecto.
+    let maxAdvanceD = cfgAppt?.appointmentMaxAdvanceDays ?? null; // Corrección de tipo
+    if (!maxAdvanceD || maxAdvanceD === 0) {
+        maxAdvanceD = 60;
+    }
+
+    // 2. Si allowSameDayBooking es nulo, permitimos por defecto.
+    const allowSameDay = cfgAppt?.allowSameDayBooking ?? true;
+
+    // 3. Min Notice: si es null, 0 (sin espera).
+    const minNoticeH = cfgAppt?.appointmentMinNoticeHours ?? 0;
+
     return {
         appointmentEnabled:
             (cfgAppt?.appointmentEnabled ?? cfgLegacy?.appointmentEnabled) ?? false,
@@ -150,23 +163,22 @@ async function loadApptRuntimeConfig(empresaId: number) {
         bufferMin:
             (cfgAppt?.appointmentBufferMin ?? cfgLegacy?.appointmentBufferMin) ?? 10,
 
-        // ✅ CORRECCIÓN 1: Si minNoticeH es null, forzamos 0 para permitir agendar "ya".
-        // Si en tu DB tienes 24, cámbialo a 0 o 1, o fuerza el 0 aquí para probar:
-        minNoticeH: cfgAppt?.appointmentMinNoticeHours ?? 0,
+        minNoticeH,
+        maxAdvanceD,
+        allowSameDay,
 
-        maxAdvanceD: cfgAppt?.appointmentMaxAdvanceDays ?? null,
+        // ⬇️ CORRECCIÓN DE TIPOS AQUÍ (?? null)
+        bookingWindowDays: (cfgAppt?.bookingWindowDays === 0)
+            ? null
+            : (cfgAppt?.bookingWindowDays ?? null),
 
-        // ✅ CORRECCIÓN 2: Forzamos true por defecto si no está definido
-        allowSameDay: cfgAppt?.allowSameDayBooking ?? true,
-
-        bookingWindowDays: cfgAppt?.bookingWindowDays ?? null,
         maxDailyAppointments: cfgAppt?.maxDailyAppointments ?? null,
 
+        // Caches opcionales
         locationName: cfgAppt?.locationName ?? null,
         defaultServiceDurationMin: cfgAppt?.defaultServiceDurationMin ?? null,
     };
 }
-
 
 /* ===================== Summary / ConversationState helpers ===================== */
 
@@ -190,8 +202,6 @@ async function getConversationStateData(conversationId: number | null | undefine
 
 /* ===================== Reglas de ventana / excepciones / overlap ===================== */
 
-/* ===================== Reglas de ventana / excepciones / overlap ===================== */
-
 function violatesNoticeAndWindow(
     cfg: {
         minNoticeH: number | null;
@@ -203,44 +213,43 @@ function violatesNoticeAndWindow(
 ) {
     const now = new Date();
 
-    // 1. Validación: No permitir fechas en el pasado
-    if (startAt < now) {
-        return true; // Bloquea si intentan agendar hace 5 minutos
-    }
-
-    // 2. Validación: Mismo día
-    // Usamos toDateString() que compara día calendario local del servidor
-    const sameDay = startAt.toDateString() === now.toDateString();
-
-    // Si la config PROHIBE mismo día y es hoy, bloqueamos.
-    if (!cfg.allowSameDay && sameDay) {
+    // 1. Validar pasado con tolerancia de 5 minutos (para evitar errores por latencia)
+    const diffMs = startAt.getTime() - now.getTime();
+    if (diffMs < -5 * 60 * 1000) {
+        // Solo falla si es más antiguo que 5 min en el pasado
         return true;
     }
 
-    // 3. Validación: Tiempo mínimo de aviso (minNoticeH)
-    // Calculamos diferencia en horas
-    const hoursDiff = (startAt.getTime() - now.getTime()) / 3_600_000;
+    // 2. Validar mismo día
+    // Usamos toString para comparar fechas locales de servidor, es básico pero funciona
+    const sameDay = startAt.toDateString() === now.toDateString();
 
-    // Si existe minNoticeH (ej: 2 horas) y faltan solo 1.5 horas, bloqueamos.
-    // NOTA: Si quieres que 'allowSameDay' tenga prioridad sobre 'minNoticeH',
-    // descomenta el "&& !sameDay" en la condición.
+    // Solo bloqueamos si es el mismo día Y la config explícitamente dice FALSE
+    if (sameDay && cfg.allowSameDay === false) {
+        return true;
+    }
+
+    // 3. Validar tiempo mínimo de aviso (minNoticeH)
+    // Convertimos diferencia a horas
+    const hoursDiff = diffMs / 3_600_000;
+
     if (cfg.minNoticeH != null && cfg.minNoticeH > 0) {
-        if (hoursDiff < cfg.minNoticeH) {
+        // Solo validamos si hoursDiff es positivo (futuro) y menor al aviso
+        if (hoursDiff > 0 && hoursDiff < cfg.minNoticeH) {
             return true;
         }
     }
 
-    // 4. Validación: Máximo avance (bookingWindowDays o maxAdvanceD)
-    const maxD =
-        cfg.bookingWindowDays != null
-            ? cfg.bookingWindowDays
-            : cfg.maxAdvanceD != null
-                ? cfg.maxAdvanceD
-                : null;
+    // 4. Validar anticipación máxima (maxAdvanceD o bookingWindowDays)
+    const maxD = cfg.bookingWindowDays ?? cfg.maxAdvanceD;
 
-    if (maxD != null) {
+    if (maxD != null && maxD > 0) {
+        // maxD días en milisegundos
         const maxMs = maxD * 24 * 3_600_000;
-        if (startAt.getTime() - now.getTime() > maxMs) return true;
+        // Si la cita es más allá del límite permitido
+        if (diffMs > maxMs) {
+            return true;
+        }
     }
 
     return false;
