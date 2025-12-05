@@ -116,6 +116,28 @@ export async function upsertApptConfig(req: Request, res: Response) {
         ? (incomingVertical as any)
         : ("custom" as any);
 
+    // --- 🛡️ LÓGICA DE PROTECCIÓN (Hard-Fix para evitar bloqueos) ---
+
+    // 1. allowSameDayBooking: Si viene false (o undefined), lo forzamos a TRUE.
+    //    Solo permitimos false si explícitamente quisieras bloquear hoy, 
+    //    pero para tu caso de uso actual, es mejor forzar true por defecto.
+    let safeSameDay = toBool(body.allowSameDayBooking);
+    if (!safeSameDay) {
+        safeSameDay = true; // Forzamos activado si venía apagado
+    }
+
+    // 2. maxAdvanceDays: Si viene 0 o null, lo forzamos a 90 días.
+    let safeMaxAdvance = numOrNull(body.appointmentMaxAdvanceDays);
+    if (!safeMaxAdvance || safeMaxAdvance === 0) {
+        safeMaxAdvance = 90; // Forzamos 90 días si venía 0 o vacío
+    }
+
+    // 3. minNoticeHours: Si viene null, lo dejamos null (o 0) para no bloquear.
+    let safeMinNotice = numOrNull(body.appointmentMinNoticeHours);
+    if (safeMinNotice === null) {
+        safeMinNotice = 0; // Forzamos 0 horas de espera
+    }
+
     // ⚠️ Defaults seguros para TODOS los campos no-null del modelo
     const safePayload = {
         // -------- base / requeridos por el schema (con defaults)
@@ -133,10 +155,11 @@ export async function upsertApptConfig(req: Request, res: Response) {
         appointmentReminders:
             body.appointmentReminders === undefined ? true : toBool(body.appointmentReminders),
 
-        // -------- reglas operativas (opcionales)
-        appointmentMinNoticeHours: numOrNull(body.appointmentMinNoticeHours),
-        appointmentMaxAdvanceDays: numOrNull(body.appointmentMaxAdvanceDays),
-        allowSameDayBooking: toBool(body.allowSameDayBooking),
+        // -------- reglas operativas (CON PROTECCIÓN APLICADA)
+        appointmentMinNoticeHours: safeMinNotice,
+        appointmentMaxAdvanceDays: safeMaxAdvance,
+        allowSameDayBooking: safeSameDay,
+
         requireClientConfirmation:
             body.requireClientConfirmation === undefined
                 ? true
@@ -211,77 +234,6 @@ export async function upsertApptConfig(req: Request, res: Response) {
     }
 }
 
-
-// export async function upsertApptConfig(req: Request, res: Response) {
-//     const empresaId =
-//         getEmpresaId(req) || Number(req.params.empresaId || req.body.empresaId);
-
-//     if (!empresaId || Number.isNaN(empresaId)) {
-//         return res.status(400).json({ ok: false, error: "empresaId requerido" });
-//     }
-
-//     const payload = {
-//         aiMode: (req.body.aiMode ?? "estetica") as "ecommerce" | "agente" | "estetica" | "appts",
-//         appointmentEnabled: req.body.appointmentEnabled as boolean | undefined,
-//         appointmentVertical: req.body.appointmentVertical,
-//         appointmentVerticalCustom: req.body.appointmentVerticalCustom ?? null,
-//         appointmentTimezone: req.body.appointmentTimezone as string | undefined,
-//         appointmentBufferMin: req.body.appointmentBufferMin as number | undefined,
-//         appointmentPolicies: req.body.appointmentPolicies ?? null,
-//         appointmentReminders: req.body.appointmentReminders as boolean | undefined,
-
-//         appointmentMinNoticeHours: req.body.appointmentMinNoticeHours ?? null,
-//         appointmentMaxAdvanceDays: req.body.appointmentMaxAdvanceDays ?? null,
-//         allowSameDayBooking: req.body.allowSameDayBooking as boolean | undefined,
-//         requireClientConfirmation: req.body.requireClientConfirmation as boolean | undefined,
-//         cancellationAllowedHours: req.body.cancellationAllowedHours ?? null,
-//         rescheduleAllowedHours: req.body.rescheduleAllowedHours ?? null,
-//         defaultServiceDurationMin: req.body.defaultServiceDurationMin ?? null,
-
-//         servicesText: req.body.servicesText ?? null,
-//         services: req.body.services ?? null,
-
-//         locationName: req.body.locationName ?? null,
-//         locationAddress: req.body.locationAddress ?? null,
-//         locationMapsUrl: req.body.locationMapsUrl ?? null,
-//         parkingInfo: req.body.parkingInfo ?? null,
-//         virtualMeetingLink: req.body.virtualMeetingLink ?? null,
-//         instructionsArrival: req.body.instructionsArrival ?? null,
-
-//         cancellationWindowHours: req.body.cancellationWindowHours ?? null,
-//         noShowPolicy: req.body.noShowPolicy ?? null,
-//         depositRequired: req.body.depositRequired as boolean | undefined,
-//         depositAmount: req.body.depositAmount ?? null,
-//         maxDailyAppointments: req.body.maxDailyAppointments ?? null,
-//         bookingWindowDays: req.body.bookingWindowDays ?? null,
-//         blackoutDates: req.body.blackoutDates ?? null,
-//         overlapStrategy: req.body.overlapStrategy ?? null,
-
-//         reminderSchedule: req.body.reminderSchedule ?? null,
-//         reminderTemplateId: req.body.reminderTemplateId ?? null,
-//         postBookingMessage: req.body.postBookingMessage ?? null,
-//         prepInstructionsPerSvc: req.body.prepInstructionsPerSvc ?? null,
-
-//         requireWhatsappOptIn: req.body.requireWhatsappOptIn as boolean | undefined,
-//         allowSensitiveTopics: req.body.allowSensitiveTopics as boolean | undefined,
-//         minClientAge: req.body.minClientAge ?? null,
-
-//         kbBusinessOverview: req.body.kbBusinessOverview ?? null,
-//         kbFAQs: req.body.kbFAQs ?? null,
-//         kbServiceNotes: req.body.kbServiceNotes ?? null,
-//         kbEscalationRules: req.body.kbEscalationRules ?? null,
-//         kbDisclaimers: req.body.kbDisclaimers ?? null,
-//         kbMedia: req.body.kbMedia ?? null,
-//         kbFreeText: req.body.kbFreeText ?? null,
-//     };
-
-//     const data = await prisma.businessConfigAppt.upsert({
-//         where: { empresaId },
-//         update: payload,
-//         create: { empresaId, ...payload },
-//     });
-//     return res.json({ ok: true, data });
-// }
 
 /** ========= AppointmentHour ========= */
 
