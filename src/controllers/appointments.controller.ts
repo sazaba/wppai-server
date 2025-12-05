@@ -125,6 +125,7 @@ async function ensureWithinBusinessHours(opts: {
 }
 
 /* ===================== Config runtime (Appt > Legacy) ===================== */
+/* ===================== Config runtime (Appt > Legacy) ===================== */
 async function loadApptRuntimeConfig(empresaId: number) {
     const [cfgAppt, cfgLegacy] = await Promise.all([
         prisma.businessConfigAppt.findUnique({ where: { empresaId } }),
@@ -149,16 +150,18 @@ async function loadApptRuntimeConfig(empresaId: number) {
         bufferMin:
             (cfgAppt?.appointmentBufferMin ?? cfgLegacy?.appointmentBufferMin) ?? 10,
 
-        // Reglas nuevas (opcionales)
-        minNoticeH: cfgAppt?.appointmentMinNoticeHours ?? null,
+        // ✅ CORRECCIÓN 1: Si minNoticeH es null, forzamos 0 para permitir agendar "ya".
+        // Si en tu DB tienes 24, cámbialo a 0 o 1, o fuerza el 0 aquí para probar:
+        minNoticeH: cfgAppt?.appointmentMinNoticeHours ?? 0,
+
         maxAdvanceD: cfgAppt?.appointmentMaxAdvanceDays ?? null,
+
+        // ✅ CORRECCIÓN 2: Forzamos true por defecto si no está definido
         allowSameDay: cfgAppt?.allowSameDayBooking ?? true,
 
-        // ⬇️ NUEVO: reglas del formulario que pediste activar
         bookingWindowDays: cfgAppt?.bookingWindowDays ?? null,
         maxDailyAppointments: cfgAppt?.maxDailyAppointments ?? null,
 
-        // Caches opcionales
         locationName: cfgAppt?.locationName ?? null,
         defaultServiceDurationMin: cfgAppt?.defaultServiceDurationMin ?? null,
     };
@@ -187,6 +190,8 @@ async function getConversationStateData(conversationId: number | null | undefine
 
 /* ===================== Reglas de ventana / excepciones / overlap ===================== */
 
+/* ===================== Reglas de ventana / excepciones / overlap ===================== */
+
 function violatesNoticeAndWindow(
     cfg: {
         minNoticeH: number | null;
@@ -197,24 +202,47 @@ function violatesNoticeAndWindow(
     startAt: Date
 ) {
     const now = new Date();
+
+    // 1. Validación: No permitir fechas en el pasado
+    if (startAt < now) {
+        return true; // Bloquea si intentan agendar hace 5 minutos
+    }
+
+    // 2. Validación: Mismo día
+    // Usamos toDateString() que compara día calendario local del servidor
     const sameDay = startAt.toDateString() === now.toDateString();
-    if (!cfg.allowSameDay && sameDay) return true;
 
+    // Si la config PROHIBE mismo día y es hoy, bloqueamos.
+    if (!cfg.allowSameDay && sameDay) {
+        return true;
+    }
+
+    // 3. Validación: Tiempo mínimo de aviso (minNoticeH)
+    // Calculamos diferencia en horas
     const hoursDiff = (startAt.getTime() - now.getTime()) / 3_600_000;
-    if (cfg.minNoticeH != null && hoursDiff < cfg.minNoticeH) return true;
 
-    // Máximo avance por dos vías: maxAdvanceD (viejo) o bookingWindowDays (nuevo)
+    // Si existe minNoticeH (ej: 2 horas) y faltan solo 1.5 horas, bloqueamos.
+    // NOTA: Si quieres que 'allowSameDay' tenga prioridad sobre 'minNoticeH',
+    // descomenta el "&& !sameDay" en la condición.
+    if (cfg.minNoticeH != null && cfg.minNoticeH > 0) {
+        if (hoursDiff < cfg.minNoticeH) {
+            return true;
+        }
+    }
+
+    // 4. Validación: Máximo avance (bookingWindowDays o maxAdvanceD)
     const maxD =
-        cfg.maxAdvanceD != null
-            ? cfg.maxAdvanceD
-            : cfg.bookingWindowDays != null
-                ? cfg.bookingWindowDays
+        cfg.bookingWindowDays != null
+            ? cfg.bookingWindowDays
+            : cfg.maxAdvanceD != null
+                ? cfg.maxAdvanceD
                 : null;
 
     if (maxD != null) {
         const maxMs = maxD * 24 * 3_600_000;
         if (startAt.getTime() - now.getTime() > maxMs) return true;
     }
+
     return false;
 }
 
