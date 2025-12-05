@@ -140,19 +140,29 @@ async function loadApptRuntimeConfig(empresaId: number) {
         }),
     ]);
 
-    // Lógica de seguridad para evitar bloqueos por mala configuración:
+    // ✅ LÓGICA DE SEGURIDAD (MODO PERMISIVO)
+    // Esto arregla el problema de los "0" en la base de datos sin borrar nada.
 
-    // 1. Si maxAdvanceDays es 0 o null, usamos 60 días por defecto.
-    let maxAdvanceD = cfgAppt?.appointmentMaxAdvanceDays ?? null; // Corrección de tipo
-    if (!maxAdvanceD || maxAdvanceD === 0) {
-        maxAdvanceD = 60;
+    // 1. Detectar si la configuración de avance está rota (0 o null)
+    const rawMaxAdvance = cfgAppt?.appointmentMaxAdvanceDays ?? null;
+
+    // 2. Corregir maxAdvanceDays (Evitar el bloqueo de "0 días")
+    // Si es 0, asumimos error de configuración y permitimos 90 días.
+    let maxAdvanceD: number | null = rawMaxAdvance;
+    if (rawMaxAdvance === 0) {
+        maxAdvanceD = 90;
     }
 
-    // 2. Si allowSameDayBooking es nulo, permitimos por defecto.
-    const allowSameDay = cfgAppt?.allowSameDayBooking ?? true;
+    // 3. Corregir allowSameDayBooking (Evitar bloqueo de hoy)
+    // Si la DB dice FALSE (0) pero el avance también era 0 (config incompleta),
+    // forzamos TRUE para permitir agendar hoy.
+    let allowSameDay = cfgAppt?.allowSameDayBooking ?? true;
+    if (allowSameDay === false && rawMaxAdvance === 0) {
+        allowSameDay = true;
+    }
 
-    // 3. Min Notice: si es null, 0 (sin espera).
-    const minNoticeH = cfgAppt?.appointmentMinNoticeHours ?? 0;
+    // 4. Min Notice (null safe)
+    const minNoticeH = cfgAppt?.appointmentMinNoticeHours ?? null;
 
     return {
         appointmentEnabled:
@@ -163,11 +173,13 @@ async function loadApptRuntimeConfig(empresaId: number) {
         bufferMin:
             (cfgAppt?.appointmentBufferMin ?? cfgLegacy?.appointmentBufferMin) ?? 10,
 
+        // Usamos los valores corregidos:
         minNoticeH,
         maxAdvanceD,
         allowSameDay,
 
-        // ⬇️ CORRECCIÓN DE TIPOS AQUÍ (?? null)
+        // ⬇️ SOLUCIÓN AL ERROR ROJO DE TYPESCRIPT (?? null)
+        // Si bookingWindowDays es 0, lo forzamos a null para que no bloquee.
         bookingWindowDays: (cfgAppt?.bookingWindowDays === 0)
             ? null
             : (cfgAppt?.bookingWindowDays ?? null),
@@ -179,6 +191,7 @@ async function loadApptRuntimeConfig(empresaId: number) {
         defaultServiceDurationMin: cfgAppt?.defaultServiceDurationMin ?? null,
     };
 }
+
 
 /* ===================== Summary / ConversationState helpers ===================== */
 
@@ -216,35 +229,34 @@ function violatesNoticeAndWindow(
     // 1. Validar pasado con tolerancia de 5 minutos (para evitar errores por latencia)
     const diffMs = startAt.getTime() - now.getTime();
     if (diffMs < -5 * 60 * 1000) {
-        // Solo falla si es más antiguo que 5 min en el pasado
+        // Solo falla si es más antiguo que 5 min en el pasado real
         return true;
     }
 
     // 2. Validar mismo día
-    // Usamos toString para comparar fechas locales de servidor, es básico pero funciona
     const sameDay = startAt.toDateString() === now.toDateString();
 
     // Solo bloqueamos si es el mismo día Y la config explícitamente dice FALSE
+    // (Gracias al fix de arriba, si la config estaba rota, esto ya vendrá en true)
     if (sameDay && cfg.allowSameDay === false) {
         return true;
     }
 
     // 3. Validar tiempo mínimo de aviso (minNoticeH)
-    // Convertimos diferencia a horas
-    const hoursDiff = diffMs / 3_600_000;
-
     if (cfg.minNoticeH != null && cfg.minNoticeH > 0) {
-        // Solo validamos si hoursDiff es positivo (futuro) y menor al aviso
+        // diffMs está en milisegundos, pasamos a horas
+        const hoursDiff = diffMs / 3_600_000;
+        // Solo validamos si es futuro inmediato
         if (hoursDiff > 0 && hoursDiff < cfg.minNoticeH) {
             return true;
         }
     }
 
     // 4. Validar anticipación máxima (maxAdvanceD o bookingWindowDays)
+    //    Si ambos son null, no hay límite.
     const maxD = cfg.bookingWindowDays ?? cfg.maxAdvanceD;
 
     if (maxD != null && maxD > 0) {
-        // maxD días en milisegundos
         const maxMs = maxD * 24 * 3_600_000;
         // Si la cita es más allá del límite permitido
         if (diffMs > maxMs) {
@@ -427,7 +439,9 @@ export async function createAppointment(req: Request, res: Response) {
             return res.status(400).json({ error: "startAt debe ser menor que endAt" });
 
         // === Config combinada (Appt > Legacy) ===
+        // Aquí se ejecuta la lógica permisiva de loadApptRuntimeConfig
         const cfg = await loadApptRuntimeConfig(empresaId);
+
         if (!cfg.appointmentEnabled) {
             return res
                 .status(403)
@@ -447,7 +461,6 @@ export async function createAppointment(req: Request, res: Response) {
         if (dayExcept)
             return res.status(409).json({ error: "Día bloqueado por excepción." });
 
-        // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
         // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
         const violates = violatesNoticeAndWindow(
             {
@@ -510,7 +523,6 @@ export async function createAppointment(req: Request, res: Response) {
 
 
 /* ===================== Update ===================== */
-/* ===================== Update ===================== */
 // PUT /api/appointments/:id
 export async function updateAppointment(req: Request, res: Response) {
     try {
@@ -549,7 +561,6 @@ export async function updateAppointment(req: Request, res: Response) {
             if (dayExcept)
                 return res.status(409).json({ error: "Día bloqueado por excepción." });
 
-            // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
             // 2) Reglas de ventana (minNotice / maxAdvance / same-day / bookingWindowDays)
             const violates = violatesNoticeAndWindow(
                 {
@@ -614,8 +625,6 @@ export async function updateAppointment(req: Request, res: Response) {
                     patch.serviceDurationMin ?? existing.serviceDurationMin,
                 locationNameCache:
                     patch.locationNameCache ?? existing.locationNameCache,
-
-
 
                 // ✅ NUEVO: flag por cita
                 sendReminder24h:
@@ -684,7 +693,7 @@ const saveConfigDtoZ = z.object({
 });
 
 /** GET /api/appointments/config
- *  👉 Responde PLANO: { config, hours, provider } */
+ * 👉 Responde PLANO: { config, hours, provider } */
 export async function getAppointmentConfig(req: Request, res: Response) {
     const empresaId = getEmpresaId(req);
 
@@ -719,7 +728,7 @@ export async function getAppointmentConfig(req: Request, res: Response) {
 }
 
 /** POST /api/appointments/config
- *  👉 Guarda config + hours. Responde { ok: true } */
+ * 👉 Guarda config + hours. Responde { ok: true } */
 export async function saveAppointmentConfig(req: Request, res: Response) {
     console.log("[appointments.config] body:", JSON.stringify(req.body));
     try {
@@ -1172,4 +1181,3 @@ export async function deleteReminderRule(req: Request, res: Response) {
             .json({ error: "Error al eliminar la regla de recordatorio" });
     }
 }
-
