@@ -152,7 +152,7 @@ async function loadApptRuntimeConfig(empresaId: number) {
         // Reglas nuevas (opcionales)
         minNoticeH: cfgAppt?.appointmentMinNoticeHours ?? null,
         maxAdvanceD: cfgAppt?.appointmentMaxAdvanceDays ?? null,
-        allowSameDay: cfgAppt?.allowSameDayBooking ?? false,
+        allowSameDay: cfgAppt?.allowSameDayBooking ?? true,
 
         // ⬇️ NUEVO: reglas del formulario que pediste activar
         bookingWindowDays: cfgAppt?.bookingWindowDays ?? null,
