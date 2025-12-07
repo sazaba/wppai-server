@@ -936,25 +936,20 @@ model ConversationPurchase {
 }
 
 model Client {
-  id        Int      @id @default(autoincrement())
-  empresaId Int
-  name      String
-  phone     String   @db.VarChar(20)
-  
-  // Datos útiles para el CRM
+  id                Int      @id @default(autoincrement())
+  empresaId         Int
+  name              String
+  phone             String
   lastProcedure     String?
-  lastProcedureDate DateTime? @default(now())
-  notes             String?   @db.Text
-  
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  lastProcedureDate DateTime?
+  notes             String?  @db.Text
+  status            String   @default("active") // 'active' | 'trash'
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  empresa   Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  // ✅ ESTA ES LA LÍNEA QUE FALTABA O ESTABA COMENTADA:
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 
-  // Índices:
-  // 1. Unicidad: No duplicar teléfonos dentro de la misma empresa
-  @@unique([empresaId, phone]) 
-  // 2. Búsqueda: Indexar por nombre para el buscador del frontend
-  @@index([empresaId, name])
-  @@map("client")
+  @@unique([empresaId, phone])
+  @@map("client") // Es buena práctica poner el map en minúscula
 }
