@@ -33,6 +33,72 @@ function isInsideRanges(
     const inR2 = r2.s != null && r2.e != null && startMin >= r2.s && endMin <= r2.e;
     return inR1 || inR2;
 }
+/* ===================== Staff Availability Helper ===================== */
+
+// Prisma guarda Json, así que definimos la forma que esperamos
+type StaffSchedule = {
+  day: WeekKey; // "mon", "tue", ...
+  start: string; // "08:00"
+  end: string;   // "17:00"
+  active: boolean;
+}[];
+
+async function ensureStaffAvailability(opts: {
+  staffId: number;
+  start: Date;
+  end: Date;
+  timezone: string;
+}) {
+  const { staffId, start, end, timezone } = opts;
+
+  // 1. Buscamos al Staff y su horario
+  const staff = await prisma.staff.findUnique({
+    where: { id: staffId },
+    select: { availability: true, name: true }
+  });
+
+  if (!staff) return { ok: false, msg: "Profesional no encontrado" };
+  
+  // Si no tiene horario configurado, asumimos que sigue el horario del negocio (Return OK)
+  // O si prefieres que sea estricto: return { ok: false, msg: "El profesional no tiene horario configurado" };
+  if (!staff.availability) return { ok: true }; 
+
+  const schedule = staff.availability as unknown as StaffSchedule;
+  
+  // 2. Calculamos qué día es y los minutos solicitados
+  const dayKey = dayKeyInTZ(start, timezone); // Usamos tu helper existente
+  const startMin = minutesInTZ(start, timezone); // Usamos tu helper existente
+  const endMin = minutesInTZ(end, timezone);
+
+  // 3. Buscamos la regla para ese día
+  const dayRule = schedule.find(s => s.day === dayKey && s.active);
+
+  // Si no hay regla para hoy o active=false, es día libre del staff
+  if (!dayRule) {
+    return { 
+      ok: false, 
+      code: 409, 
+      msg: `El profesional ${staff.name} no trabaja los ${dayKey}.` 
+    };
+  }
+
+  // 4. Validamos rango horario
+  const staffStartMin = toMinutes(dayRule.start);
+  const staffEndMin = toMinutes(dayRule.end);
+
+  if (staffStartMin === null || staffEndMin === null) return { ok: true }; // Config rota, permitimos
+
+  // La cita debe estar TOTALMENTE dentro del horario del staff
+  if (startMin < staffStartMin || endMin > staffEndMin) {
+    return {
+      ok: false,
+      code: 409,
+      msg: `El profesional ${staff.name} solo atiende de ${dayRule.start} a ${dayRule.end} este día.`
+    };
+  }
+
+  return { ok: true };
+}
 
 /* ======== TZ helpers (validación en la zona del negocio) ======== */
 type WeekKey = "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat";
@@ -513,6 +579,17 @@ export async function createAppointment(req: Request, res: Response) {
              if (overlap) {
                  return res.status(409).json({ error: "El profesional seleccionado ya tiene una cita en ese horario." });
              }
+             // 4.1) Validar Horario Laboral del Staff (Turnos)
+             const availabilityCheck = await ensureStaffAvailability({
+                staffId: Number(staffId),
+                start,
+                end,
+                timezone: cfg.timezone
+             });
+             
+             if (!availabilityCheck.ok) {
+                return res.status(409).json({ error: availabilityCheck.msg });
+             }
         }
 
         // 5) Crear cita
@@ -637,6 +714,17 @@ export async function updateAppointment(req: Request, res: Response) {
                 
                 if (overlap) {
                     return res.status(409).json({ error: "El profesional seleccionado ya tiene una cita en ese horario." });
+                }
+                // 4.1) Validar Horario Laboral del Staff (Turnos)
+                const availabilityCheck = await ensureStaffAvailability({
+                    staffId: Number(nextStaffId),
+                    start,
+                    end,
+                    timezone: cfg.timezone
+                });
+                
+                if (!availabilityCheck.ok) {
+                    return res.status(409).json({ error: availabilityCheck.msg });
                 }
             }
         }
