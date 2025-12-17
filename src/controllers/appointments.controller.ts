@@ -1313,3 +1313,4 @@ export async function deleteReminderRule(req: Request, res: Response) {
             .json({ error: "Error al eliminar la regla de recordatorio" });
     }
 }
+

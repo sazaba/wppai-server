@@ -410,16 +410,25 @@ export async function upsertProcedure(req: Request, res: Response) {
 
 /** ========= Staff ========= */
 
+// server/controllers/estetica.controller.ts
+
 export async function listStaff(req: Request, res: Response) {
     const empresaId =
         getEmpresaId(req) || Number(req.params.empresaId || req.query.empresaId);
 
     if (!empresaId || Number.isNaN(empresaId)) {
-        return res.status(400).json({ ok: false, error: "empresaId requerido" });
+        // En caso de error, aquí sí devolvemos objeto con error, el frontend lo capturará en el catch/if !ok
+        return res.status(400).json({ error: "empresaId requerido" });
     }
 
-    const data = await prisma.staff.findMany({ where: { empresaId }, orderBy: { name: "asc" } });
-    res.json({ ok: true, data });
+    const data = await prisma.staff.findMany({ 
+        where: { empresaId }, 
+        orderBy: { name: "asc" } 
+    });
+
+    // ✅ CORRECCIÓN: Devolvemos 'data' directamente (el array)
+    // Antes tenías: res.json({ ok: true, data });
+    return res.json(data);
 }
 
 export async function upsertStaff(req: Request, res: Response) {
@@ -450,7 +459,8 @@ export async function upsertStaff(req: Request, res: Response) {
             data: { empresaId, name, role: roleParsed, active, availability: availabilityJson },
         });
 
-    res.json({ ok: true, data });
+    // ✅ CORRECCIÓN: Devolver el objeto staff puro
+    return res.json(data);
 }
 
 /** ========= Excepciones ========= */
