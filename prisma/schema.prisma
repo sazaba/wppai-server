@@ -144,25 +144,12 @@ enum Weekday {
   sun
 }
 
-
+/// NUEVO: rol del staff (opcional)
 enum StaffRole {
   profesional
   esteticista
   medico
 }
-
-export type Staff = {
-  id: number;
-  name: string;
-  role: string;
-};
-
-export type Block = {
-  id: number;
-  startAt: string; // ISO
-  endAt: string;   // ISO
-  reason: string;
-};
 
 /**
  * ========== Modelos base ==========
