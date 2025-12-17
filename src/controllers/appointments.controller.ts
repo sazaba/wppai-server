@@ -282,8 +282,14 @@ async function hasOverlapWithBuffer(opts: {
     endAt: Date;
     bufferMin: number;
     ignoreId?: number;
+    staffId?: number | null; // <--- NUEVO PARAMETRO
 }) {
-    const { empresaId, startAt, endAt, bufferMin, ignoreId } = opts;
+    const { empresaId, startAt, endAt, bufferMin, ignoreId, staffId } = opts;
+    
+    // Si no hay staffId, no validamos choque específico aquí (se asume validación de capacidad global)
+    // OJO: Si tu lógica de negocio requiere que SIEMPRE se asigne staff, descomenta la siguiente línea:
+    // if (!staffId) return false; 
+
     const startBuf = addMinutes(startAt, -bufferMin);
     const endBuf = addMinutes(endAt, bufferMin);
 
@@ -292,6 +298,9 @@ async function hasOverlapWithBuffer(opts: {
             empresaId,
             ...(ignoreId ? { id: { not: ignoreId } } : {}),
             status: { in: ["pending", "confirmed", "rescheduled"] },
+            // La magia: Si hay staffId, solo buscamos citas de ESE staff.
+            // Si staffId es null, buscamos citas huerfanas (opcional) o lo quitamos para ver capacidad global.
+            ...(staffId ? { staffId } : {}), 
             OR: [{ startAt: { lt: endBuf }, endAt: { gt: startBuf } }],
         },
         select: { id: true },
@@ -358,6 +367,10 @@ export async function listAppointments(req: Request, res: Response) {
             timezone: true,
             createdAt: true,
             updatedAt: true,
+            staffId: true,
+                staff: {
+                    select: { name: true }
+                }
 
         },
     });
@@ -393,7 +406,8 @@ export async function listAppointments(req: Request, res: Response) {
 
         return {
             ...a,
-            summary, // ⬅️ ESTE es el campo que consumirá el frontend
+            summary,
+            staffName: (a as any).staff?.name || null
         };
 
 
@@ -419,11 +433,10 @@ export async function createAppointment(req: Request, res: Response) {
             startAt,
             endAt,
             timezone,
-            procedureId,       // opcional
-            serviceDurationMin, // opcional (cache)
-
-            // ✅ NUEVO: viene desde el ChatInput
+            procedureId,       
+            serviceDurationMin, 
             sendReminder24h,
+            staffId,
         } = req.body;
 
         if (!customerName || !customerPhone || !serviceName || !startAt || !endAt) {
@@ -487,7 +500,22 @@ export async function createAppointment(req: Request, res: Response) {
         });
         if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
 
-        // 4) Crear cita
+       // 4) Solapamiento con BUFFER por STAFF
+        // Solo verificamos choque si se seleccionó un profesional específico
+        if (staffId) {
+             const overlap = await hasOverlapWithBuffer({
+                 empresaId,
+                 startAt: start,
+                 endAt: end,
+                 bufferMin: cfg.bufferMin,
+                 staffId: Number(staffId) // <--- Pasamos el staff
+             });
+             if (overlap) {
+                 return res.status(409).json({ error: "El profesional seleccionado ya tiene una cita en ese horario." });
+             }
+        }
+
+        // 5) Crear cita
         const appt = await prisma.appointment.create({
             data: {
                 empresaId,
@@ -511,6 +539,8 @@ export async function createAppointment(req: Request, res: Response) {
 
                 // ✅ NUEVO: flag por cita
                 sendReminder24h: !!sendReminder24h,
+
+                staffId: staffId ? Number(staffId) : null,
             },
         });
 
@@ -523,6 +553,7 @@ export async function createAppointment(req: Request, res: Response) {
 
 
 /* ===================== Update ===================== */
+// PUT /api/appointments/:id
 // PUT /api/appointments/:id
 export async function updateAppointment(req: Request, res: Response) {
     try {
@@ -543,11 +574,16 @@ export async function updateAppointment(req: Request, res: Response) {
             return res.status(400).json({ error: "startAt debe ser menor que endAt" });
 
         const changedWindow = Boolean(patch.startAt || patch.endAt);
+        
+        // 1. Detectar si cambió el staff (para validar disponibilidad del nuevo)
+        const nextStaffId = patch.staffId !== undefined ? patch.staffId : existing.staffId;
+        const changedStaff = patch.staffId !== undefined && patch.staffId !== existing.staffId;
 
         // Config para buffer/ventanas/cap
         const cfg = await loadApptRuntimeConfig(empresaId);
 
-        if (changedWindow) {
+        // Si cambió el horario O el staff, debemos re-validar todo
+        if (changedWindow || changedStaff) {
             // 1) Horario de atención (en TZ de negocio) + excepción
             const wh = await ensureWithinBusinessHours({
                 empresaId,
@@ -588,16 +624,21 @@ export async function updateAppointment(req: Request, res: Response) {
             });
             if (!cap.ok) return res.status(cap.code!).json({ error: cap.msg });
 
-            // 4) (opcional) Solapamiento con BUFFER (ignorando la propia cita)
-            // const overlap = await hasOverlapWithBuffer({
-            //   empresaId,
-            //   startAt: start,
-            //   endAt: end,
-            //   bufferMin: cfg.bufferMin,
-            //   ignoreId: id,
-            // });
-            // if (overlap)
-            //   return res.status(409).json({ error: "Existe otra cita en ese intervalo" });
+            // 4) Solapamiento con BUFFER por STAFF (Validación nueva)
+            if (nextStaffId) {
+                const overlap = await hasOverlapWithBuffer({
+                    empresaId,
+                    startAt: start,
+                    endAt: end,
+                    bufferMin: cfg.bufferMin,
+                    ignoreId: id, // Ignoramos la cita actual para que no choque consigo misma
+                    staffId: Number(nextStaffId), // Validamos contra el staff destino
+                });
+                
+                if (overlap) {
+                    return res.status(409).json({ error: "El profesional seleccionado ya tiene una cita en ese horario." });
+                }
+            }
         }
 
         const appt = await prisma.appointment.update({
@@ -626,7 +667,12 @@ export async function updateAppointment(req: Request, res: Response) {
                 locationNameCache:
                     patch.locationNameCache ?? existing.locationNameCache,
 
-                // ✅ NUEVO: flag por cita
+                // ✅ Guardamos el Staff asignado
+                staffId: patch.staffId !== undefined 
+                    ? (patch.staffId ? Number(patch.staffId) : null) 
+                    : existing.staffId,
+
+                // ✅ Flag de recordatorio
                 sendReminder24h:
                     patch.sendReminder24h !== undefined
                         ? !!patch.sendReminder24h
@@ -634,14 +680,12 @@ export async function updateAppointment(req: Request, res: Response) {
             },
         });
 
-
         res.json(appt);
     } catch (err: any) {
         console.error("[updateAppointment] ❌", err);
         res.status(err?.status || 500).json({ error: err?.message || "Error interno" });
     }
 }
-
 
 
 /* ===================== CONFIG (GET + POST) ===================== */
