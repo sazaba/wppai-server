@@ -235,6 +235,70 @@ function prettyDayFromKey(dayKey: string): string {
     }
 }
 
+//09/01
+
+// === NUEVO: detectar si la clínica está abierta en el momento del mensaje del cliente ===
+const WEEKDAY_SHORT_TO_KEY: Record<string, string> = {
+    Mon: "mon",
+    Tue: "tue",
+    Wed: "wed",
+    Thu: "thu",
+    Fri: "fri",
+    Sat: "sat",
+    Sun: "sun",
+};
+
+function getZonedDayKeyAndMinutes(at: Date, timeZone: string) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone,
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+    }).formatToParts(at);
+
+    const wd = parts.find(p => p.type === "weekday")?.value || "";
+    const hh = Number(parts.find(p => p.type === "hour")?.value ?? "0");
+    const mm = Number(parts.find(p => p.type === "minute")?.value ?? "0");
+
+    return {
+        dayKey: WEEKDAY_SHORT_TO_KEY[wd] || null,
+        minutes: hh * 60 + mm,
+    };
+}
+
+async function isClinicOpenAt(
+    empresaId: number,
+    at: Date,
+    timeZone?: string | null
+): Promise<boolean> {
+    const tz = timeZone || "America/Bogota";
+    const { dayKey, minutes } = getZonedDayKeyAndMinutes(at, tz);
+    if (!dayKey) return false;
+
+    const row = await prisma.appointmentHour.findFirst({
+        where: { empresaId, day: dayKey as Weekday },
+        select: { isOpen: true, start1: true, end1: true, start2: true, end2: true },
+    });
+
+    if (!row) return false;
+
+    const open = Number(row.isOpen) === 1 || row.isOpen === true;
+    if (!open) return false;
+
+    const spans: Array<[number, number]> = [];
+
+    const s1 = hmToMin(row.start1), e1 = hmToMin(row.end1);
+    if (s1 != null && e1 != null && e1 > s1) spans.push([s1, e1]);
+
+    const s2 = hmToMin(row.start2), e2 = hmToMin(row.end2);
+    if (s2 != null && e2 != null && e2 > s2) spans.push([s2, e2]);
+
+    if (!spans.length) return false;
+
+    return spans.some(([s, e]) => minutes >= s && minutes < e);
+}
+
 
 
 /** Detecta si el mensaje es nota de voz o audio */
@@ -2149,8 +2213,20 @@ export async function handleEsteticaStrategy({
                     : ""),
         ].filter(Boolean).join("\n");
 
-        const slaText = getSlaConfirmText(kb);
-        let cleaned = `Perfecto ✨, dame *${slaText}* mientras *verifico la disponibilidad* para ese horario y te confirmo por aquí.\n\n${piezasBonitas}`;
+        //09/01
+      const phoneForHandoff = toPhone ?? conversacion.phone ?? null;
+
+// OJO: esto mira el MOMENTO en que el cliente escribió (last.timestamp), NO el día que pidió para su cita
+const tz = (kb as any)?.timezone || "America/Bogota";
+const msgAt = last?.timestamp ? new Date(last.timestamp as any) : new Date();
+const clinicOpenNow = await isClinicOpenAt(empresaId, msgAt, tz);
+
+const slaText = getSlaConfirmText(kb);
+
+let cleaned = clinicOpenNow
+    ? `Perfecto ✨, dame *${slaText}* mientras *verifico la disponibilidad* para ese horario y te confirmo por aquí.\n\n${piezasBonitas}`
+    : `¡Listo! Ya tengo tus datos. Nuestro equipo te confirmará el *próximo día hábil*. Gracias por tu paciencia.\n\n${piezasBonitas}`;
+
 
         cleaned = sanitizeGreeting(cleaned, { allowFirstGreeting: false });
         cleaned = cleaned.replace(/\bmi\s+nombre\s+es\s+[A-ZÁÉÍÓÚÑa-záéíóúñü\s]+/gi, "").trim();
@@ -2163,7 +2239,8 @@ export async function handleEsteticaStrategy({
             empresaId,
             texto: clampText(cleaned),
             nuevoEstado: ConversationEstado.requiere_agente,
-            to: toPhone ?? conversacion.phone,
+            //09/01
+           to: phoneForHandoff,
             phoneNumberId,
         });
         if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
