@@ -386,25 +386,58 @@ function nowPlusMin(min: number) {
     return new Date(Date.now() + min * 60_000).toISOString();
 }
 async function loadState(conversationId: number): Promise<AgentState> {
-    const row = await prisma.conversationState.findUnique({
-        where: { conversationId },
-        select: { data: true },
+  const row = await prisma.conversationState.findUnique({
+    where: { conversationId },
+    select: { data: true },
+  });
+
+  // 🔒 Fuente de verdad: si ya existe al menos 1 mensaje del BOT en BD, entonces "greeted" debe ser true
+  // Esto evita "hola" duplicado cuando el state se pierde / expira / no existe aún.
+  let greetedFromHistory = false;
+
+  if (!row) {
+    const anyBotMsg = await prisma.message.findFirst({
+      where: { conversationId, from: MessageFrom.bot },
+      select: { id: true },
     });
-    const raw = (row?.data as any) || {};
-    const data: AgentState = {
-        greeted: !!raw.greeted,
-        lastIntent: raw.lastIntent,
-        lastServiceId: raw.lastServiceId ?? null,
-        lastServiceName: raw.lastServiceName ?? null,
-        draft: raw.draft ?? {},
-        summary: raw.summary ?? undefined,
-        expireAt: raw.expireAt,
-        handoffLocked: !!raw.handoffLocked,
+    greetedFromHistory = !!anyBotMsg;
+  }
+
+  const raw = (row?.data as any) || {};
+  const data: AgentState = {
+    greeted: row ? !!raw.greeted : greetedFromHistory,
+    lastIntent: raw.lastIntent,
+    lastServiceId: raw.lastServiceId ?? null,
+    lastServiceName: raw.lastServiceName ?? null,
+    draft: raw.draft ?? {},
+    summary: raw.summary ?? undefined,
+    expireAt: raw.expireAt,
+    handoffLocked: !!raw.handoffLocked,
+  };
+
+  const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
+
+  // ✅ Si está expirado, NO “reinicies” greeted a false por accidente:
+  if (expired) {
+    // Si el state venía con greeted false pero YA hay mensajes del bot, lo corregimos:
+    if (!data.greeted) {
+      const anyBotMsg = await prisma.message.findFirst({
+        where: { conversationId, from: MessageFrom.bot },
+        select: { id: true },
+      });
+      data.greeted = !!anyBotMsg;
+    }
+
+    return {
+      greeted: data.greeted,
+      handoffLocked: data.handoffLocked,
+      expireAt: nowPlusMin(CONF.MEM_TTL_MIN),
     };
-    const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
-    if (expired) return { greeted: data.greeted, handoffLocked: data.handoffLocked, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
-    return data;
+  }
+
+  return data;
 }
+
 async function saveState(conversationId: number, data: AgentState) {
     const next: AgentState = { ...data, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
     await prisma.conversationState.upsert({
@@ -1866,6 +1899,12 @@ export async function handleEsteticaStrategy({
             } catch { }
         }
         if (tr) userText = tr;
+        // ✅ Si el audio viene como “solo nombre”, conviértelo a gatillo para máxima compatibilidad
+if (userText && userText.trim().split(/\s+/).length <= 2) {
+  const maybe = looksLikeLooseName(userText);
+  if (maybe) userText = `Mi nombre es ${maybe}`;
+}
+
     }
     if (!userText) userText = last?.contenido?.trim() || "";
 

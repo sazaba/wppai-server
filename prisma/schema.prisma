@@ -241,9 +241,12 @@ model Message {
 
   paymentReceipts PaymentReceipt[] // comprobantes que apuntan a este mensaje (opcional)
 
-  @@index([conversationId, timestamp])
+ @@index([conversationId, timestamp])
   @@index([empresaId, conversationId, timestamp])
   @@index([mediaId])
+
+  // ✅ DEDUP real por empresa
+  @@unique([empresaId, externalId])
   @@index([empresaId, externalId])
   @@map("message")
 }
