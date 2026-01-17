@@ -26,6 +26,8 @@ import appointmentsRoutes from './routes/appointments.routes'
 import appointmentHoursRoutes from './routes/appointmentHours.routes'
 import esteticaConfigRoutes from "./routes/estetica.config.routes";
 
+import ecommerceConfigRoutes from './routes/ecommerce.config.routes';
+
 import dashboardRoutes from './routes/dashboard.routes'
 import chatInputRoutes from './routes/chatInput.routes'
 
@@ -172,6 +174,9 @@ app.use('/api/superadmin', superadminRoutes)
 app.use('/api', esteticaConfigRoutes);
 app.use('/api/appointments', appointmentsRoutes)
 app.use('/api/appointment-hours', appointmentHoursRoutes)
+
+// 👇 AGREGA ESTO AQUÍ (🛒 Módulo E-commerce):
+app.use('/api/ecommerce', ecommerceConfigRoutes);
 
 // 404 JSON final
 app.use((req, res) => {

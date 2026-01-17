@@ -10,7 +10,6 @@ datasource db {
 /**
  * ========== Enums ==========
  */
-/// Perfil general de la IA por empresa
 enum AiMode {
   ecommerce
   agente
@@ -18,7 +17,6 @@ enum AiMode {
   appts
 }
 
-/// Especialidad del agente (expandible)
 enum AgentSpecialty {
   generico
   medico
@@ -53,8 +51,8 @@ enum Rol {
 }
 
 enum Plan {
-  gratis // modo actual (usado junto a trialStart / trialEnd)
-  basic // plan de pago mensual base
+  gratis
+  basic
   pro
 }
 
@@ -65,9 +63,9 @@ enum Estado {
 }
 
 enum SubscriptionStatus {
-  active // suscripción activa y al día
-  past_due // tiene pagos pendientes / fallidos
-  canceled // cancelada
+  active
+  past_due
+  canceled
 }
 
 enum BillingInterval {
@@ -96,7 +94,6 @@ enum BusinessType {
   productos
 }
 
-// proveedor de almacenamiento
 enum StorageProvider {
   local
   s3
@@ -122,15 +119,15 @@ enum AppointmentSource {
 
 enum AppointmentVertical {
   none
-  salud // odontología, estética, nutrición, etc.
-  bienestar // spa, peluquería, barbería
-  automotriz // taller, mantenimiento
+  salud
+  bienestar
+  automotriz
   veterinaria
-  fitness // gimnasios, entrenadores
+  fitness
   otros
-  odontologica // Clínica Odontológica
-  estetica // Clínica Estética
-  spa // Spa
+  odontologica
+  estetica
+  spa
   custom
 }
 
@@ -144,7 +141,6 @@ enum Weekday {
   sun
 }
 
-/// NUEVO: rol del staff (opcional)
 enum StaffRole {
   profesional
   esteticista
@@ -154,6 +150,7 @@ enum StaffRole {
 /**
  * ========== Modelos base ==========
  */
+
 model Usuario {
   id        Int      @id @default(autoincrement())
   email     String   @unique
@@ -168,18 +165,18 @@ model Usuario {
 }
 
 model Empresa {
-  id     Int    @id @default(autoincrement())
-  nombre String
-  plan   Plan   @default(gratis)
-  estado Estado @default(inactivo)
+  id      Int    @id @default(autoincrement())
+  nombre  String
+  plan    Plan   @default(gratis)
+  estado  Estado @default(inactivo)
 
   trialStart DateTime?
   trialEnd   DateTime?
 
-  // ✨ NUEVO: Gestión de Créditos
+  // Gestión de Créditos
   conversationsUsed        Int      @default(0)
-  monthlyConversationLimit Int      @default(300) // Límite total (Base + Compras)
-  conversationsCycleStart  DateTime @default(now()) // Fecha de corte para reinicio
+  monthlyConversationLimit Int      @default(300)
+  conversationsCycleStart  DateTime @default(now())
 
   usuarios Usuario[]
 
@@ -193,14 +190,16 @@ model Empresa {
   subscriptions        Subscription[]
   paymentMethods       PaymentMethod[]
   subscriptionPayments SubscriptionPayment[]
-
-  // ✨ NUEVO: Relación con paquetes comprados
   conversationPurchases ConversationPurchase[]
 
-  createdAt            DateTime               @default(now())
-  updatedAt            DateTime               @updatedAt
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+  
+  // Relaciones de contenido
   Message              Message[]
   Product              Product[]
+  
+  // Relaciones de Agenda/Estética
   Appointment          Appointment[]
   AppointmentHour      AppointmentHour[]
   BusinessConfigAppt   BusinessConfigAppt?
@@ -208,7 +207,10 @@ model Empresa {
   ReminderRule         ReminderRule[]
   Staff                Staff[]
   AppointmentException AppointmentException[]
-  Client Client[]
+  Client               Client[]
+
+  // ✨ NUEVO: Configuración de tienda E-commerce
+  BusinessConfigEcommerce BusinessConfigEcommerce?
 
   @@map("empresa")
 }
@@ -229,7 +231,7 @@ model Message {
   mimeType   String?    @db.VarChar(64)
   caption    String?    @db.Text
 
-  // 🔊 Notas de voz
+  // Notas de voz
   isVoiceNote   Boolean? @default(false)
   durationSec   Int?
   transcription String?  @db.Text
@@ -237,16 +239,13 @@ model Message {
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
-  Conversation Conversation @relation(fields: [conversationId], references: [id])
+  Conversation    Conversation     @relation(fields: [conversationId], references: [id])
+  paymentReceipts PaymentReceipt[]
 
-  paymentReceipts PaymentReceipt[] // comprobantes que apuntan a este mensaje (opcional)
-
- @@index([conversationId, timestamp])
+  @@unique([empresaId, externalId])
+  @@index([conversationId, timestamp])
   @@index([empresaId, conversationId, timestamp])
   @@index([mediaId])
-
-  // ✅ DEDUP real por empresa
-  @@unique([empresaId, externalId])
   @@index([empresaId, externalId])
   @@map("message")
 }
@@ -262,29 +261,28 @@ model Conversation {
   empresaId Int
   empresa   Empresa @relation(fields: [empresaId], references: [id])
 
-  orders            Order[] // pedidos creados desde esta conversación
+  orders            Order[]
   Appointment       Appointment[]
   ConversationState ConversationState?
 
-  // 🔎 Índices útiles para dashboard/IA
   @@index([empresaId, estado, createdAt])
   @@index([empresaId, phone])
   @@map("conversation")
 }
 
 model BusinessConfig {
-  id           Int          @id @default(autoincrement())
-  empresaId    Int          @unique
-  nombre       String       @default("")
-  // 🔽 Campos de texto opcionales
-  descripcion  String?      @db.Text
-  servicios    String?      @db.Text
-  faq          String?      @db.Text
-  horarios     String?      @db.Text
+  id        Int      @id @default(autoincrement())
+  empresaId Int      @unique
+  nombre    String   @default("")
+  
+  descripcion String? @db.Text
+  servicios   String? @db.Text
+  faq         String? @db.Text
+  horarios    String? @db.Text
   businessType BusinessType @default(servicios)
-  disclaimers  String?      @db.Text
+  disclaimers String? @db.Text
 
-  // ===== Operación del negocio
+  // Operación del negocio
   enviosInfo           String? @db.Text
   metodosPago          String? @db.Text
   tiendaFisica         Boolean @default(false)
@@ -296,32 +294,31 @@ model BusinessConfig {
   extras               String? @db.Text
   palabrasClaveNegocio String  @default("")
 
-  // ===== Perfil de IA (personalizado)
+  // Perfil de IA
   aiMode           AiMode?
   agentSpecialty   AgentSpecialty @default(generico)
   agentPrompt      String?        @db.Text
   agentScope       String?        @db.Text
   agentDisclaimers String?        @db.Text
 
-  // ===== Pagos (link OPCIONAL + transferencia)
+  // Pagos
   pagoLinkGenerico     String  @default("")
   pagoLinkProductoBase String  @default("")
   pagoNotas            String? @db.Text
+  bancoNombre          String  @default("")
+  bancoTitular         String  @default("")
+  bancoTipoCuenta      String  @default("")
+  bancoNumeroCuenta    String  @default("")
+  bancoDocumento       String  @default("")
+  transferenciaQRUrl   String  @default("")
 
-  bancoNombre        String @default("")
-  bancoTitular       String @default("")
-  bancoTipoCuenta    String @default("")
-  bancoNumeroCuenta  String @default("")
-  bancoDocumento     String @default("")
-  transferenciaQRUrl String @default("")
-
-  // ===== Envíos
+  // Envíos
   envioTipo            String   @default("")
   envioEntregaEstimado String   @default("")
   envioCostoFijo       Decimal?
   envioGratisDesde     Decimal?
 
-  // ===== Post-venta
+  // Post-venta
   facturaElectronicaInfo  String @default("")
   soporteDevolucionesInfo String @default("")
 
@@ -333,12 +330,11 @@ model BusinessConfig {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // ===== Agenda / Citas
+  // Agenda / Citas (Campos Legacy)
   appointmentEnabled   Boolean             @default(false)
   appointmentVertical  AppointmentVertical @default(none)
   appointmentTimezone  String              @default("America/Bogota")
   appointmentBufferMin Int                 @default(10)
-  // appointmentWorkHours Json?  // ❌ eliminado para evitar doble fuente
   appointmentPolicies  String?             @db.Text
   appointmentReminders Boolean             @default(true)
 
@@ -388,8 +384,8 @@ model Product {
   slug            String   @unique
   nombre          String
   descripcion     String   @default("")
-  beneficios      String   @default("") // bullets \n
-  caracteristicas String   @default("") // bullets \n
+  beneficios      String   @default("")
+  caracteristicas String   @default("")
   precioDesde     Decimal?
   disponible      Boolean  @default(true)
   updatedAt       DateTime @updatedAt
@@ -444,11 +440,11 @@ model Order {
   customerName   String?
   city           String?
   address        String?
-  status         String  @default("pending") // pending|paid|shipped|delivered|canceled
+  status         String  @default("pending")
   subtotal       Decimal @default(0)
   shippingCost   Decimal @default(0)
   total          Decimal @default(0)
-  notes          String  @db.Text // TEXT sin default
+  notes          String  @db.Text
 
   items    OrderItem[]
   payments PaymentReceipt[]
@@ -482,14 +478,14 @@ model OrderItem {
 model PaymentReceipt {
   id         Int       @id @default(autoincrement())
   orderId    Int
-  messageId  Int? // WhatsApp Message.id que trajo la imagen (opcional)
+  messageId  Int?
   imageUrl   String    @default("")
   amount     Decimal?
   reference  String    @default("")
-  method     String    @default("") // link|transfer|qr
+  method     String    @default("")
   isVerified Boolean   @default(false)
   verifiedAt DateTime?
-  rawOcrText String    @db.Text // TEXT sin default
+  rawOcrText String    @db.Text
 
   order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   message Message? @relation(fields: [messageId], references: [id])
@@ -501,41 +497,33 @@ model PaymentReceipt {
 }
 
 model Appointment {
-  id             Int               @id @default(autoincrement())
-  empresaId      Int
-  conversationId Int?
-  source         AppointmentSource @default(client)
-  status         AppointmentStatus @default(pending)
-
+  id                  Int               @id @default(autoincrement())
+  empresaId           Int
+  conversationId      Int?
+  source              AppointmentSource @default(client)
+  status              AppointmentStatus @default(pending)
   customerName        String
   customerPhone       String
   serviceName         String
-  notas               String? @db.Text
+  notas               String?           @db.Text
   customerDisplayName String?
   serviceDurationMin  Int?
   locationNameCache   String?
-
-  startAt  DateTime
-  endAt    DateTime
-  timezone String   @default("America/Bogota")
-
-  procedureId       Int?
+  startAt             DateTime
+  endAt               DateTime
+  timezone            String            @default("America/Bogota")
+  procedureId         Int?
+  staffId             Int?
+  sendReminder24h     Boolean           @default(false)
+  
+  // Relaciones
   EsteticaProcedure EsteticaProcedure? @relation(name: "ProcedureToAppointments", fields: [procedureId], references: [id])
+  staff             Staff?             @relation(fields: [staffId], references: [id])
+  empresa           Empresa            @relation(fields: [empresaId], references: [id])
+  conversation      Conversation?      @relation(fields: [conversationId], references: [id])
 
-  // ✅ staff asignado (opcional)
-  staffId Int?
-  staff   Staff? @relation(fields: [staffId], references: [id])
-
-  // ✅ NUEVO: si esta cita debe tener recordatorio 24h antes
-  sendReminder24h Boolean @default(false)
-
-  empresa      Empresa       @relation(fields: [empresaId], references: [id])
-  conversation Conversation? @relation(fields: [conversationId], references: [id])
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  /// 👇 Soft delete
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
   AppointmentReminderLog AppointmentReminderLog[]
@@ -547,7 +535,7 @@ model Appointment {
   @@index([empresaId, status, startAt, customerPhone])
   @@index([deletedAt])
   @@index([empresaId, deletedAt, startAt])
-  @@index([empresaId, staffId]) // útil para consultas por recurso
+  @@index([empresaId, staffId])
   @@map("appointment")
 }
 
@@ -556,114 +544,88 @@ model AppointmentHour {
   empresaId Int
   day       Weekday
   isOpen    Boolean @default(false)
-
-  // Horas en formato "HH:MM" (24h)
-  start1 String? @db.VarChar(5)
-  end1   String? @db.VarChar(5)
-  start2 String? @db.VarChar(5)
-  end2   String? @db.VarChar(5)
-
+  start1    String? @db.VarChar(5)
+  end1      String? @db.VarChar(5)
+  start2    String? @db.VarChar(5)
+  end2      String? @db.VarChar(5)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 
   @@unique([empresaId, day])
   @@index([empresaId, day])
   @@map("appointmenthour")
 }
 
-/// Estetica Base de Datos//
+/**
+ * Estetica Base de Datos
+ */
 
 model BusinessConfigAppt {
-  id        Int     @id @default(autoincrement())
-  empresaId Int     @unique
-  aiMode    AiMode? // 'appointments' recomendado cuando se habilite
-
-  // ===== Flags y parámetros base de agenda
-  appointmentEnabled        Boolean             @default(false)
-  appointmentVertical       AppointmentVertical @default(custom)
-  appointmentVerticalCustom String? // texto libre cuando vertical = custom
-  appointmentTimezone       String              @default("America/Bogota")
-  appointmentBufferMin      Int                 @default(10)
-  appointmentPolicies       String?             @db.Text
-  appointmentReminders      Boolean             @default(true)
-
-  // ===== NUEVO: reglas operativas claras para IA/booking
-  appointmentMinNoticeHours Int?
-  appointmentMaxAdvanceDays Int?
-  allowSameDayBooking       Boolean @default(false)
-  requireClientConfirmation Boolean @default(true)
-  cancellationAllowedHours  Int?
-  rescheduleAllowedHours    Int?
-  defaultServiceDurationMin Int?
-
-  // ===== Servicios
-  servicesText String? @db.Text // textarea libre (1 x línea / comas)
-  services     Json? // ["Limpieza", "Blanqueamiento", ...] (legacy)
-
-  // ===== Logística / ubicación (opcional)
-  locationName        String?
-  locationAddress     String?
-  locationMapsUrl     String?
-  parkingInfo         String? @db.Text
-  virtualMeetingLink  String?
-  instructionsArrival String? @db.Text
-
-  // ===== Reglas operativas (opcional)
-  cancellationWindowHours Int?
-  noShowPolicy            String?  @db.Text
-  depositRequired         Boolean  @default(false)
-  depositAmount           Decimal? @db.Decimal(10, 2)
-  maxDailyAppointments    Int?
-  bookingWindowDays       Int?
-  blackoutDates           Json?
-  overlapStrategy         String? // "strict" | "flexible" (manejado en app)
-
-  // ===== Recordatorios / comunicaciones (opcional)
-  reminderSchedule       Json? // [{offsetHours:24, channel:"whatsapp"}, ...] (legacy)
-  reminderTemplateId     String?
-  postBookingMessage     String? @db.Text
-  prepInstructionsPerSvc Json? // {"Limpieza facial":"Llegar 10 min antes", ...}
-
-  // ===== NUEVO: banderas de consentimiento/compliance
-  requireWhatsappOptIn Boolean @default(true)
-  allowSensitiveTopics Boolean @default(false)
-  minClientAge         Int?
-
-  // ===== Knowledge Base (estructura + libre)
-  kbBusinessOverview String? @db.Text
-  kbFAQs             Json? // [{q:"", a:""}, ...]
-  kbServiceNotes     Json? // {"Servicio":"Notas..."}
-  kbEscalationRules  Json?
-  kbDisclaimers      String? @db.Text
-  kbMedia            Json? // links a PDFs/imagenes
-  kbFreeText         String? @db.Text
-
-  // ===== Relaciones nuevas (conveniencia)
+  id                          Int                 @id @default(autoincrement())
+  empresaId                   Int                 @unique
+  aiMode                      AiMode?
+  appointmentEnabled          Boolean             @default(false)
+  appointmentVertical         AppointmentVertical @default(custom)
+  appointmentVerticalCustom   String?
+  appointmentTimezone         String              @default("America/Bogota")
+  appointmentBufferMin        Int                 @default(10)
+  appointmentPolicies         String?             @db.Text
+  appointmentReminders        Boolean             @default(true)
+  appointmentMinNoticeHours   Int?
+  appointmentMaxAdvanceDays   Int?
+  allowSameDayBooking         Boolean             @default(false)
+  requireClientConfirmation   Boolean             @default(true)
+  cancellationAllowedHours    Int?
+  rescheduleAllowedHours      Int?
+  defaultServiceDurationMin   Int?
+  servicesText                String?             @db.Text
+  services                    Json?
+  locationName                String?
+  locationAddress             String?
+  locationMapsUrl             String?
+  parkingInfo                 String?             @db.Text
+  virtualMeetingLink          String?
+  instructionsArrival         String?             @db.Text
+  cancellationWindowHours     Int?
+  noShowPolicy                String?             @db.Text
+  depositRequired             Boolean             @default(false)
+  depositAmount               Decimal?            @db.Decimal(10, 2)
+  maxDailyAppointments        Int?
+  bookingWindowDays           Int?
+  blackoutDates               Json?
+  overlapStrategy             String?
+  reminderSchedule            Json?
+  reminderTemplateId          String?
+  postBookingMessage          String?             @db.Text
+  prepInstructionsPerSvc      Json?
+  requireWhatsappOptIn        Boolean             @default(true)
+  allowSensitiveTopics        Boolean             @default(false)
+  minClientAge                Int?
+  kbBusinessOverview          String?             @db.Text
+  kbFAQs                      Json?
+  kbServiceNotes              Json?
+  kbEscalationRules           Json?
+  kbDisclaimers               String?             @db.Text
+  kbMedia                     Json?
+  kbFreeText                  String?             @db.Text
+  
   EsteticaProcedure EsteticaProcedure[]
   ReminderRule      ReminderRule[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  Empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 
   @@map("businessconfig_appt")
 }
 
-/**
- * ========== Nuevos modelos para Estética ==========
- */
-
-/// Catálogo de procedimientos habilitados por empresa (normalizado)
 model EsteticaProcedure {
-  id           Int     @id @default(autoincrement())
-  empresaId    Int
-  configApptId Int
-  name         String
-  enabled      Boolean @default(true)
-
+  id                 Int      @id @default(autoincrement())
+  empresaId          Int
+  configApptId       Int
+  name               String
+  enabled            Boolean  @default(true)
   aliases            Json?
   durationMin        Int?
   requiresAssessment Boolean  @default(false)
@@ -671,52 +633,40 @@ model EsteticaProcedure {
   priceMax           Decimal? @db.Decimal(10, 2)
   depositRequired    Boolean  @default(false)
   depositAmount      Decimal? @db.Decimal(10, 2)
+  prepInstructions   String?  @db.Text
+  postCare           String?  @db.Text
+  contraindications  String?  @db.Text
+  notes              String?  @db.Text
+  pageUrl            String?
+  requiredStaffIds   Json?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
-  prepInstructions  String? @db.Text
-  postCare          String? @db.Text
-  contraindications String? @db.Text
-  notes             String? @db.Text
-  pageUrl           String?
-
-  // NUEVO: staff requerido (IDs válidos de Staff)
-  requiredStaffIds Json?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // 🔽 relaciones en minúscula
   empresa            Empresa            @relation(fields: [empresaId], references: [id], onDelete: Cascade)
   businessConfigAppt BusinessConfigAppt @relation(fields: [configApptId], references: [id], onDelete: Cascade)
-
-  Appointment Appointment[] @relation(name: "ProcedureToAppointments")
+  Appointment        Appointment[]      @relation(name: "ProcedureToAppointments")
 
   @@index([empresaId])
   @@index([configApptId])
   @@map("estetica_procedure")
 }
 
-/// Reglas de recordatorio ligadas a MessageTemplate (WABA)
 model ReminderRule {
-  id           Int     @id @default(autoincrement())
-  empresaId    Int
-  configApptId Int
-  active       Boolean @default(true)
-  offsetHours  Int     @default(24) // horas antes de la cita
-
-  // vínculo fuerte a plantilla WABA existente
+  id                Int             @id @default(autoincrement())
+  empresaId         Int
+  configApptId      Int
+  active            Boolean         @default(true)
+  offsetHours       Int             @default(24)
   messageTemplateId Int
   templateName      String
-  templateLang      String @default("es")
+  templateLang      String          @default("es")
   templateParams    Json?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // 🔽 relaciones en minúscula
   empresa            Empresa            @relation(fields: [empresaId], references: [id], onDelete: Cascade)
   businessConfigAppt BusinessConfigAppt @relation(fields: [configApptId], references: [id], onDelete: Cascade)
   messageTemplate    MessageTemplate    @relation(fields: [messageTemplateId], references: [id], onDelete: Restrict)
-
   appointmentReminderLogs AppointmentReminderLog[]
 
   @@index([empresaId])
@@ -725,27 +675,21 @@ model ReminderRule {
   @@map("reminder_rule")
 }
 
-/// Log de envíos de recordatorio (auditoría y reintentos)
 model AppointmentReminderLog {
-  id             Int      @id @default(autoincrement())
+  id             Int           @id @default(autoincrement())
   appointmentId  Int
   reminderRuleId Int?
-  sentAt         DateTime @default(now())
-  channel        String   @default("whatsapp")
-  status         String   @default("sent") // sent|failed|queued
-  error          String?  @db.Text
-
-  appointment  Appointment   @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
-  reminderRule ReminderRule? @relation(fields: [reminderRuleId], references: [id])
+  sentAt         DateTime      @default(now())
+  channel        String        @default("whatsapp")
+  status         String        @default("sent")
+  error          String?       @db.Text
+  appointment    Appointment   @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  reminderRule   ReminderRule? @relation(fields: [reminderRuleId], references: [id])
 
   @@index([appointmentId])
   @@index([reminderRuleId])
   @@map("appointment_reminder_log")
 }
-
-/**
- * ========== NUEVO: Recursos y Excepciones ==========
- */
 
 model Staff {
   id           Int       @id @default(autoincrement())
@@ -753,14 +697,10 @@ model Staff {
   name         String
   role         StaffRole @default(esteticista)
   active       Boolean   @default(true)
-  availability Json? // [{weekday:1,start:"09:00",end:"13:00"}]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  // ✅ Relación inversa (opcional pero útil)
+  availability Json?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  empresa      Empresa   @relation(fields: [empresaId], references: [id], onDelete: Cascade)
   appointments Appointment[]
 
   @@index([empresaId])
@@ -772,14 +712,11 @@ model AppointmentException {
   empresaId Int
   date      DateTime
   reason    String?
-
-  // NUEVO (opcionales)
-  isOpen Boolean? @default(true)
-  start1 String?  @db.VarChar(5) // "09:00"
-  end1   String?  @db.VarChar(5)
-  start2 String?  @db.VarChar(5)
-  end2   String?  @db.VarChar(5)
-
+  isOpen    Boolean? @default(true)
+  start1    String?  @db.VarChar(5)
+  end1      String?  @db.VarChar(5)
+  start2    String?  @db.VarChar(5)
+  end2      String?  @db.VarChar(5)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
@@ -789,13 +726,12 @@ model AppointmentException {
 }
 
 model ConversationState {
-  id             Int      @id @default(autoincrement())
-  conversationId Int      @unique
+  id             Int          @id @default(autoincrement())
+  conversationId Int          @unique
   data           Json
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   @@index([updatedAt])
   @@map("conversation_state")
@@ -808,46 +744,39 @@ model CronMeta {
   @@map("cron_meta")
 }
 
-//payments////
+/**
+ * ========== Subscripciones / Payments ==========
+ */
 
 model SubscriptionPlan {
-  id       Int             @id @default(autoincrement())
-  name     String
-  code     String          @unique
-  price    Decimal         @db.Decimal(10, 2)
-  interval BillingInterval @default(monthly)
-  isActive Boolean         @default(true)
-
-  // ✨ NUEVO: Configuración de límites y periodo de gracia
-  gracePeriodDays Int @default(2) // Días extra antes de cortar servicio
-  monthlyCredits  Int @default(300) // Cantidad base de conversaciones del plan
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  subscriptions Subscription[]
+  id               Int             @id @default(autoincrement())
+  name             String
+  code             String          @unique
+  price            Decimal         @db.Decimal(10, 2)
+  interval         BillingInterval @default(monthly)
+  isActive         Boolean         @default(true)
+  gracePeriodDays  Int             @default(2)
+  monthlyCredits   Int             @default(300)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  subscriptions    Subscription[]
 
   @@map("subscription_plan")
 }
 
 model Subscription {
-  id        Int                @id @default(autoincrement())
-  empresaId Int
-  planId    Int
-  status    SubscriptionStatus @default(active)
-
-  currentPeriodStart DateTime
-  currentPeriodEnd   DateTime
-
-  cancelAtPeriodEnd Boolean   @default(false)
-  canceledAt        DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  empresa Empresa          @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  plan    SubscriptionPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
-
+  id                   Int                 @id @default(autoincrement())
+  empresaId            Int
+  planId               Int
+  status               SubscriptionStatus  @default(active)
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+  cancelAtPeriodEnd    Boolean             @default(false)
+  canceledAt           DateTime?
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  empresa              Empresa             @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  plan                 SubscriptionPlan    @relation(fields: [planId], references: [id], onDelete: Restrict)
   paymentMethods       PaymentMethod[]
   subscriptionPayments SubscriptionPayment[]
 
@@ -860,31 +789,20 @@ model PaymentMethod {
   empresaId      Int
   subscriptionId Int?
   type           PaymentMethodType @default(card)
-
-  /// 🔹 NUEVO: id del payment_source de Wompi (3DS)
-  wompiSourceId String? @unique
-
-  /// 🔹 Token legacy (ya no se usa para cobros, pero lo dejamos opcional)
-  wompiToken String? @db.VarChar(191)
-
-  brand    String? @db.VarChar(32) // VISA, MC, etc
-  lastFour String? @db.VarChar(4)
-  expMonth String? @db.VarChar(2)
-  expYear  String? @db.VarChar(4)
-
-  /// 🔹 NUEVOS: para auditoría / facturación
-  cardHolder String? @db.VarChar(191)
-  email      String? @db.VarChar(191)
-  status     String? @db.VarChar(32) // AVAILABLE, PENDING, REJECTED, etc.
-
-  isDefault Boolean @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  empresa      Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
-
+  wompiSourceId  String?           @unique
+  wompiToken     String?           @db.VarChar(191)
+  brand          String?           @db.VarChar(32)
+  lastFour       String?           @db.VarChar(4)
+  expMonth       String?           @db.VarChar(2)
+  expYear        String?           @db.VarChar(4)
+  cardHolder     String?           @db.VarChar(191)
+  email          String?           @db.VarChar(191)
+  status         String?           @db.VarChar(32)
+  isDefault      Boolean           @default(true)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  empresa        Empresa           @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  subscription   Subscription?     @relation(fields: [subscriptionId], references: [id])
   subscriptionPayments SubscriptionPayment[]
 
   @@index([empresaId, isDefault])
@@ -892,47 +810,38 @@ model PaymentMethod {
 }
 
 model SubscriptionPayment {
-  id              Int  @id @default(autoincrement())
-  empresaId       Int
-  subscriptionId  Int
-  paymentMethodId Int?
-
+  id                 Int           @id @default(autoincrement())
+  empresaId          Int
+  subscriptionId     Int
+  paymentMethodId    Int?
   wompiTransactionId String?       @db.VarChar(191)
   amount             Decimal       @db.Decimal(10, 2)
   status             PaymentStatus @default(pending)
   paidAt             DateTime?
   errorMessage       String?       @db.Text
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  empresa       Empresa        @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  subscription  Subscription   @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-  paymentMethod PaymentMethod? @relation(fields: [paymentMethodId], references: [id])
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  empresa            Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  subscription       Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  paymentMethod      PaymentMethod? @relation(fields: [paymentMethodId], references: [id])
 
   @@index([empresaId, status, createdAt])
   @@map("subscription_payment")
 }
 
 model ConversationPurchase {
-  id        Int @id @default(autoincrement())
-  empresaId Int
-
-  creditsAmount Int // Ej: 300, 600
-  pricePaid     Decimal @db.Decimal(10, 2)
-
+  id                 Int           @id @default(autoincrement())
+  empresaId          Int
+  creditsAmount      Int
+  pricePaid          Decimal       @db.Decimal(10, 2)
   wompiTransactionId String?       @db.VarChar(191)
   status             PaymentStatus @default(pending)
   errorMessage       String?       @db.Text
-
-  // Control de aplicación de créditos
-  isApplied Boolean   @default(false)
-  appliedAt DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  isApplied          Boolean       @default(false)
+  appliedAt          DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  empresa            Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 
   @@index([empresaId, status])
   @@map("conversation_purchase")
@@ -946,13 +855,48 @@ model Client {
   lastProcedure     String?
   lastProcedureDate DateTime?
   notes             String?  @db.Text
-  status            String   @default("active") // 'active' | 'trash'
+  status            String   @default("active")
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
-
-  // ✅ ESTA ES LA LÍNEA QUE FALTABA O ESTABA COMENTADA:
-  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  empresa           Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 
   @@unique([empresaId, phone])
-  @@map("client") // Es buena práctica poner el map en minúscula
+  @@map("client")
+}
+
+/**
+ * ========== Configuración E-commerce (NUEVO) ==========
+ */
+
+model BusinessConfigEcommerce {
+  id        Int      @id @default(autoincrement())
+  empresaId Int      @unique
+  isActive  Boolean  @default(false)
+
+  // Identidad
+  storeName       String?
+  currency        String  @default("COP")
+  
+  // Knowledge Base: Logística (Respuestas IA)
+  shippingCost           String? 
+  deliveryTimeEstimate   String?
+  pickupAddress          String? @db.Text
+  
+  // Knowledge Base: Pagos (Respuestas IA)
+  manualPaymentInfo    String? @db.Text
+  
+  // Cierre (El 90% Manual)
+  aiSellingStyle       String  @default("asesor")
+  closingInstructions  String? @db.Text 
+
+  // Políticas
+  returnPolicy         String? @db.Text
+  warrantyPolicy       String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@map("business_config_ecommerce")
 }
