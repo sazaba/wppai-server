@@ -84,3 +84,21 @@ export const updateEcommerceConfig = async (req: Request, res: Response) => {
     return res.status(500).json({ error: 'Error interno al guardar configuración de tienda' })
   }
 }
+
+// DELETE: Borrar configuración de tienda
+export const deleteEcommerceConfig = async (req: Request, res: Response) => {
+  try {
+    const empresaId = (req as any).user?.empresaId
+    if (!empresaId) return res.status(401).json({ error: 'No autorizado' })
+
+    // Borramos la configuración (Por la relación Cascade, esto debería borrar dependencias si las hubiera)
+    await prisma.businessConfigEcommerce.deleteMany({
+      where: { empresaId: Number(empresaId) }
+    })
+
+    return res.json({ success: true, message: 'Tienda eliminada' })
+  } catch (error) {
+    console.error('Error borrando tienda:', error)
+    return res.status(500).json({ error: 'Error al eliminar tienda' })
+  }
+}
