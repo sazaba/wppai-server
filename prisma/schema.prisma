@@ -872,6 +872,7 @@ model BusinessConfigEcommerce {
   id        Int      @id @default(autoincrement())
   empresaId Int      @unique
   isActive  Boolean  @default(false)
+  aiMode    AiMode?  @default(ecommerce)
 
   // Identidad
   storeName       String?
