@@ -1,32 +1,24 @@
 // src/utils/mailer.ts
-import nodemailer from 'nodemailer'
+import { Resend } from 'resend'
 
-const port = Number(process.env.SMTP_PORT) || 587
-
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: port,
-  secure: port === 465, // true para 465, false para otros
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-  // --- LA SOLUCIÓN MÁGICA ---
-  // Forzamos el uso de IPv4. Muchos servidores en la nube fallan
-  // al intentar resolver smtp.gmail.com por IPv6, causando el timeout.
-  family: 4, 
-} as nodemailer.TransportOptions)
+// Inicializamos Resend con la clave de entorno
+// Si falla al iniciar es porque falta la variable, pero no romperá la app aquí.
+const resend = new Resend(process.env.RESEND_API_KEY)
 
 export const enviarCorreoVerificacion = async (email: string, token: string) => {
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
   const url = `${frontendUrl}/activar-cuenta?token=${token}`
 
-  console.log(`[Mailer] Intentando enviar a ${email} por puerto ${port} (IPv4)...`)
+  console.log(`[Resend] Enviando correo a ${email}...`)
 
   try {
-    const info = await transporter.sendMail({
-      from: '"Wasaaa Soporte" <no-reply@wasaaa.com>',
-      to: email,
+    const data = await resend.emails.send({
+      // ⚠️ IMPORTANTE: Si no has verificado tu dominio en Resend,
+      // DEBES usar 'onboarding@resend.dev' como remitente.
+      // Cuando verifiques tu dominio, cámbialo a 'soporte@wasaaa.com'
+      from: 'Wasaaa <onboarding@resend.dev>',
+      
+      to: [email],
       subject: 'Activa tu cuenta en Wasaaa 🚀',
       html: `
         <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px; margin: 0 auto; background-color: #f4f4f5; border-radius: 10px;">
@@ -42,9 +34,13 @@ export const enviarCorreoVerificacion = async (email: string, token: string) => 
         </div>
       `,
     })
-    console.log('[Mailer] ¡Éxito! Correo enviado ID:', info.messageId)
-  } catch (error: any) {
-    console.error('[Mailer] Error final enviando correo:', error.message)
-    // No lanzamos error para no romper la app, pero queda en logs
+
+    if (data.error) {
+      console.error('[Resend] Error devuelto por la API:', data.error)
+    } else {
+      console.log('[Resend] Correo enviado exitosamente ID:', data.data?.id)
+    }
+  } catch (error) {
+    console.error('[Resend] Error de conexión:', error)
   }
 }
