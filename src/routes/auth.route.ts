@@ -3,6 +3,7 @@ import { Router } from 'express'
 import {
     registrar,
     login,
+    activarCuenta, // <--- NUEVO
     authCallback,
     exchangeCode,
     getWabasAndPhones,
@@ -14,6 +15,7 @@ const router = Router()
 // Públicas
 router.post('/register', registrar)
 router.post('/login', login)
+router.post('/activate', activarCuenta) // <--- NUEVA RUTA DE ACTIVACIÓN
 
 // OAuth públicas
 router.get('/whatsapp', iniciarOAuthMeta)   // → /api/auth/whatsapp

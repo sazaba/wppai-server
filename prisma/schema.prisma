@@ -7,9 +7,686 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-/**
- * ========== Enums ==========
- */
+model Usuario {
+  id                Int      @id @default(autoincrement())
+  email             String   @unique
+  password          String
+  rol               Rol
+  empresaId         Int
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  cuentaConfirmada  Boolean  @default(false)
+  tokenConfirmacion String?
+  empresa           Empresa  @relation(fields: [empresaId], references: [id])
+
+  @@index([empresaId], map: "usuario_empresaId_fkey")
+  @@map("usuario")
+}
+
+model Empresa {
+  id                       Int                      @id @default(autoincrement())
+  nombre                   String
+  plan                     Plan                     @default(gratis)
+  estado                   Estado                   @default(inactivo)
+  createdAt                DateTime                 @default(now())
+  updatedAt                DateTime                 @updatedAt
+  conversationsUsed        Int                      @default(0)
+  trialEnd                 DateTime?
+  trialStart               DateTime?
+  monthlyConversationLimit Int                      @default(300)
+  conversationsCycleStart  DateTime                 @default(now())
+  Appointment              Appointment[]
+  AppointmentException     AppointmentException[]
+  AppointmentHour          AppointmentHour[]
+  BusinessConfigEcommerce  BusinessConfigEcommerce?
+  configuracion            BusinessConfig?
+  BusinessConfigAppt       BusinessConfigAppt?
+  Client                   Client[]
+  conversaciones           Conversation[]
+  conversationPurchases    ConversationPurchase[]
+  EsteticaProcedure        EsteticaProcedure[]
+  Message                  Message[]
+  messageTemplates         MessageTemplate[]
+  orders                   Order[]
+  paymentMethods           PaymentMethod[]
+  Product                  Product[]
+  ReminderRule             ReminderRule[]
+  Staff                    Staff[]
+  subscriptions            Subscription[]
+  subscriptionPayments     SubscriptionPayment[]
+  usuarios                 Usuario[]
+  cuentaWhatsapp           WhatsappAccount?
+
+  @@map("empresa")
+}
+
+model Message {
+  id              Int              @id @default(autoincrement())
+  conversationId  Int
+  from            MessageFrom
+  contenido       String           @db.Text
+  timestamp       DateTime         @default(now())
+  caption         String?          @db.Text
+  empresaId       Int
+  externalId      String?          @unique
+  mediaId         String?          @db.VarChar(128)
+  mediaType       MediaType?
+  mediaUrl        String?          @db.Text
+  mimeType        String?          @db.VarChar(64)
+  transcription   String?          @db.Text
+  updatedAt       DateTime         @default(dbgenerated("('0000-00-00 00:00:00.000')")) @updatedAt
+  durationSec     Int?
+  isVoiceNote     Boolean?         @default(false)
+  Conversation    Conversation     @relation(fields: [conversationId], references: [id])
+  empresa         Empresa          @relation(fields: [empresaId], references: [id])
+  paymentReceipts PaymentReceipt[]
+
+  @@index([conversationId, timestamp])
+  @@index([empresaId, conversationId, timestamp])
+  @@index([mediaId])
+  @@index([empresaId, externalId])
+  @@map("message")
+}
+
+model Conversation {
+  id                Int                @id @default(autoincrement())
+  phone             String
+  nombre            String?
+  estado            ConversationEstado @default(pendiente)
+  createdAt         DateTime           @default(now())
+  empresaId         Int
+  Appointment       Appointment[]
+  empresa           Empresa            @relation(fields: [empresaId], references: [id])
+  ConversationState ConversationState?
+  mensajes          Message[]
+  orders            Order[]
+
+  @@index([empresaId, estado, createdAt])
+  @@index([empresaId, phone])
+  @@map("conversation")
+}
+
+model BusinessConfig {
+  id                      Int                 @id @default(autoincrement())
+  nombre                  String              @default("")
+  descripcion             String?             @db.Text
+  servicios               String?             @db.Text
+  faq                     String?             @db.Text
+  horarios                String?             @db.Text
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+  empresaId               Int                 @unique
+  businessType            BusinessType        @default(servicios)
+  disclaimers             String?             @db.Text
+  escalarPalabrasClave    String              @default("")
+  escalarPorReintentos    Int                 @default(0)
+  escalarSiNoConfia       Boolean             @default(true)
+  canalesAtencion         String?             @db.Text
+  direccionTienda         String              @default("")
+  enviosInfo              String?             @db.Text
+  extras                  String?             @db.Text
+  metodosPago             String?             @db.Text
+  palabrasClaveNegocio    String              @default("")
+  politicasDevolucion     String?             @db.Text
+  politicasGarantia       String?             @db.Text
+  promocionesInfo         String?             @db.Text
+  tiendaFisica            Boolean             @default(false)
+  bancoDocumento          String              @default("")
+  bancoNombre             String              @default("")
+  bancoNumeroCuenta       String              @default("")
+  bancoTipoCuenta         String              @default("")
+  bancoTitular            String              @default("")
+  envioCostoFijo          Decimal?
+  envioEntregaEstimado    String              @default("")
+  envioGratisDesde        Decimal?
+  envioTipo               String              @default("")
+  facturaElectronicaInfo  String              @default("")
+  pagoLinkGenerico        String              @default("")
+  pagoLinkProductoBase    String              @default("")
+  pagoNotas               String?             @db.Text
+  soporteDevolucionesInfo String              @default("")
+  transferenciaQRUrl      String              @default("")
+  agentDisclaimers        String?             @db.Text
+  agentPrompt             String?             @db.Text
+  agentScope              String?             @db.Text
+  agentSpecialty          AgentSpecialty      @default(generico)
+  aiMode                  AiMode?
+  appointmentBufferMin    Int                 @default(10)
+  appointmentEnabled      Boolean             @default(false)
+  appointmentPolicies     String?             @db.Text
+  appointmentReminders    Boolean             @default(true)
+  appointmentTimezone     String              @default("America/Bogota")
+  appointmentVertical     AppointmentVertical @default(none)
+  Empresa                 Empresa             @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@map("businessconfig")
+}
+
+model WhatsappAccount {
+  id                 Int      @id @default(autoincrement())
+  phoneNumberId      String   @unique @db.VarChar(64)
+  accessToken        String   @db.Text
+  empresaId          Int      @unique
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  businessId         String?  @db.VarChar(64)
+  wabaId             String   @db.VarChar(64)
+  displayPhoneNumber String?  @db.VarChar(32)
+  empresa            Empresa  @relation(fields: [empresaId], references: [id])
+
+  @@index([wabaId])
+  @@map("whatsappaccount")
+}
+
+model MessageTemplate {
+  id           Int            @id @default(autoincrement())
+  nombre       String         @db.VarChar(100)
+  idioma       String         @db.VarChar(10)
+  categoria    String         @db.VarChar(50)
+  cuerpo       String         @db.Text
+  estado       String         @default("pendiente")
+  variables    Int            @default(0)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  empresaId    Int
+  empresa      Empresa        @relation(fields: [empresaId], references: [id])
+  ReminderRule ReminderRule[]
+
+  @@unique([empresaId, nombre, idioma])
+  @@map("messagetemplate")
+}
+
+model Product {
+  id              Int            @id @default(autoincrement())
+  empresaId       Int
+  slug            String         @unique
+  nombre          String
+  descripcion     String         @default("")
+  beneficios      String         @default("")
+  caracteristicas String         @default("")
+  precioDesde     Decimal?
+  disponible      Boolean        @default(true)
+  updatedAt       DateTime       @updatedAt
+  createdAt       DateTime       @default(now())
+  OrderItem       OrderItem[]
+  empresa         Empresa        @relation(fields: [empresaId], references: [id])
+  imagenes        ProductImage[]
+
+  @@index([empresaId, nombre])
+  @@map("product")
+}
+
+model ProductImage {
+  id              Int             @id @default(autoincrement())
+  productId       Int
+  url             String          @default("") @db.VarChar(2048)
+  alt             String          @default("")
+  createdAt       DateTime        @default(now())
+  height          Int?
+  isPrimary       Boolean         @default(false)
+  mediaCachedAt   DateTime?
+  mimeType        String?         @db.VarChar(64)
+  objectKey       String?         @db.VarChar(255)
+  provider        StorageProvider @default(external)
+  sizeBytes       Int?
+  sortOrder       Int             @default(0)
+  updatedAt       DateTime        @default(dbgenerated("('0000-00-00 00:00:00.000')")) @updatedAt
+  whatsappMediaId String?         @db.VarChar(128)
+  width           Int?
+  imageId         String          @db.VarChar(128)
+  product         Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([provider, objectKey])
+  @@index([whatsappMediaId])
+  @@map("productimage")
+}
+
+/// *
+///  * ========== Pedidos & Pagos ==========
+model Order {
+  id             Int              @id @default(autoincrement())
+  empresaId      Int
+  conversationId Int
+  customerPhone  String
+  customerName   String?
+  city           String?
+  address        String?
+  status         String           @default("pending")
+  subtotal       Decimal          @default(0.000000000000000000000000000000)
+  shippingCost   Decimal          @default(0.000000000000000000000000000000)
+  total          Decimal          @default(0.000000000000000000000000000000)
+  notes          String           @db.Text
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  Conversation   Conversation     @relation(fields: [conversationId], references: [id])
+  empresa        Empresa          @relation(fields: [empresaId], references: [id])
+  items          OrderItem[]
+  payments       PaymentReceipt[]
+
+  @@index([empresaId, conversationId, status])
+  @@index([conversationId], map: "order_conversationId_fkey")
+  @@map("order")
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int
+  productId Int
+  name      String
+  price     Decimal @default(0.000000000000000000000000000000)
+  qty       Int     @default(1)
+  total     Decimal @default(0.000000000000000000000000000000)
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product   Product @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+  @@index([productId], map: "orderitem_productId_fkey")
+  @@map("orderitem")
+}
+
+model PaymentReceipt {
+  id         Int       @id @default(autoincrement())
+  orderId    Int
+  messageId  Int?
+  imageUrl   String    @default("")
+  amount     Decimal?
+  reference  String    @default("")
+  method     String    @default("")
+  isVerified Boolean   @default(false)
+  verifiedAt DateTime?
+  rawOcrText String    @db.Text
+  createdAt  DateTime  @default(now())
+  message    Message?  @relation(fields: [messageId], references: [id])
+  order      Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, isVerified])
+  @@index([messageId], map: "paymentreceipt_messageId_fkey")
+  @@map("paymentreceipt")
+}
+
+model Appointment {
+  id                     Int                      @id @default(autoincrement())
+  empresaId              Int
+  conversationId         Int?
+  source                 AppointmentSource        @default(client)
+  status                 AppointmentStatus        @default(pending)
+  customerName           String
+  customerPhone          String
+  serviceName            String
+  notas                  String?                  @db.Text
+  startAt                DateTime
+  endAt                  DateTime
+  timezone               String                   @default("America/Bogota")
+  createdAt              DateTime                 @default(now())
+  updatedAt              DateTime                 @updatedAt
+  procedureId            Int?
+  staffId                Int?
+  customerDisplayName    String?
+  locationNameCache      String?
+  serviceDurationMin     Int?
+  deletedAt              DateTime?                @db.DateTime(0)
+  sendReminder24h        Boolean                  @default(false)
+  conversation           Conversation?            @relation(fields: [conversationId], references: [id])
+  empresa                Empresa                  @relation(fields: [empresaId], references: [id])
+  EsteticaProcedure      EsteticaProcedure?       @relation("ProcedureToAppointments", fields: [procedureId], references: [id])
+  staff                  Staff?                   @relation(fields: [staffId], references: [id])
+  AppointmentReminderLog AppointmentReminderLog[]
+
+  @@index([empresaId, startAt, endAt])
+  @@index([empresaId, status, startAt])
+  @@index([conversationId])
+  @@index([empresaId, customerPhone, startAt])
+  @@index([empresaId, status, startAt, customerPhone])
+  @@index([deletedAt])
+  @@index([empresaId, staffId])
+  @@index([procedureId], map: "appointment_procedureId_fkey")
+  @@index([staffId], map: "appointment_staffId_fkey")
+  @@map("appointment")
+}
+
+model AppointmentHour {
+  id        Int      @id @default(autoincrement())
+  empresaId Int
+  day       Weekday
+  isOpen    Boolean  @default(false)
+  start1    String?  @db.VarChar(5)
+  end1      String?  @db.VarChar(5)
+  start2    String?  @db.VarChar(5)
+  end2      String?  @db.VarChar(5)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@unique([empresaId, day])
+  @@index([empresaId, day])
+  @@map("appointmenthour")
+}
+
+model BusinessConfigAppt {
+  id                        Int                 @id @default(autoincrement())
+  empresaId                 Int                 @unique
+  aiMode                    AiMode?
+  appointmentEnabled        Boolean             @default(false)
+  appointmentVertical       AppointmentVertical @default(custom)
+  appointmentVerticalCustom String?
+  appointmentTimezone       String              @default("America/Bogota")
+  appointmentBufferMin      Int                 @default(10)
+  appointmentPolicies       String?             @db.Text
+  appointmentReminders      Boolean             @default(true)
+  servicesText              String?             @db.Text
+  services                  String?             @db.LongText
+  locationName              String?
+  locationAddress           String?
+  locationMapsUrl           String?
+  parkingInfo               String?             @db.Text
+  virtualMeetingLink        String?
+  instructionsArrival       String?             @db.Text
+  cancellationWindowHours   Int?
+  noShowPolicy              String?             @db.Text
+  depositRequired           Boolean             @default(false)
+  depositAmount             Decimal?            @db.Decimal(10, 2)
+  maxDailyAppointments      Int?
+  bookingWindowDays         Int?
+  blackoutDates             String?             @db.LongText
+  overlapStrategy           String?
+  reminderSchedule          String?             @db.LongText
+  reminderTemplateId        String?
+  postBookingMessage        String?             @db.Text
+  prepInstructionsPerSvc    String?             @db.LongText
+  kbBusinessOverview        String?             @db.Text
+  kbFAQs                    String?             @db.LongText
+  kbServiceNotes            String?             @db.LongText
+  kbEscalationRules         String?             @db.LongText
+  kbDisclaimers             String?             @db.Text
+  kbMedia                   String?             @db.LongText
+  kbFreeText                String?             @db.Text
+  createdAt                 DateTime            @default(now())
+  updatedAt                 DateTime            @updatedAt
+  allowSameDayBooking       Boolean             @default(false)
+  allowSensitiveTopics      Boolean             @default(false)
+  appointmentMaxAdvanceDays Int?
+  appointmentMinNoticeHours Int?
+  cancellationAllowedHours  Int?
+  defaultServiceDurationMin Int?
+  minClientAge              Int?
+  requireClientConfirmation Boolean             @default(true)
+  requireWhatsappOptIn      Boolean             @default(true)
+  rescheduleAllowedHours    Int?
+  Empresa                   Empresa             @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  EsteticaProcedure         EsteticaProcedure[]
+  ReminderRule              ReminderRule[]
+
+  @@map("businessconfig_appt")
+}
+
+model EsteticaProcedure {
+  id                 Int                @id @default(autoincrement())
+  empresaId          Int
+  configApptId       Int
+  name               String
+  enabled            Boolean            @default(true)
+  aliases            String?            @db.LongText
+  durationMin        Int?
+  requiresAssessment Boolean            @default(false)
+  priceMin           Decimal?           @db.Decimal(10, 2)
+  priceMax           Decimal?           @db.Decimal(10, 2)
+  depositRequired    Boolean            @default(false)
+  depositAmount      Decimal?           @db.Decimal(10, 2)
+  prepInstructions   String?            @db.Text
+  postCare           String?            @db.Text
+  contraindications  String?            @db.Text
+  notes              String?            @db.Text
+  pageUrl            String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  requiredStaffIds   String?            @db.LongText
+  Appointment        Appointment[]      @relation("ProcedureToAppointments")
+  businessConfigAppt BusinessConfigAppt @relation(fields: [configApptId], references: [id], onDelete: Cascade)
+  empresa            Empresa            @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId])
+  @@index([configApptId])
+  @@map("estetica_procedure")
+}
+
+model ReminderRule {
+  id                      Int                      @id @default(autoincrement())
+  empresaId               Int
+  configApptId            Int
+  active                  Boolean                  @default(true)
+  offsetHours             Int                      @default(24)
+  messageTemplateId       Int
+  templateName            String
+  templateLang            String                   @default("es")
+  templateParams          String?                  @db.LongText
+  createdAt               DateTime                 @default(now())
+  updatedAt               DateTime                 @updatedAt
+  appointmentReminderLogs AppointmentReminderLog[]
+  businessConfigAppt      BusinessConfigAppt       @relation(fields: [configApptId], references: [id], onDelete: Cascade)
+  empresa                 Empresa                  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  messageTemplate         MessageTemplate          @relation(fields: [messageTemplateId], references: [id])
+
+  @@index([empresaId])
+  @@index([configApptId])
+  @@index([messageTemplateId])
+  @@map("reminder_rule")
+}
+
+model AppointmentReminderLog {
+  id             Int           @id @default(autoincrement())
+  appointmentId  Int
+  reminderRuleId Int?
+  sentAt         DateTime      @default(now())
+  channel        String        @default("whatsapp")
+  status         String        @default("sent")
+  error          String?       @db.Text
+  appointment    Appointment   @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  reminderRule   ReminderRule? @relation(fields: [reminderRuleId], references: [id])
+
+  @@index([appointmentId])
+  @@index([reminderRuleId])
+  @@map("appointment_reminder_log")
+}
+
+model Staff {
+  id           Int           @id @default(autoincrement())
+  empresaId    Int
+  name         String
+  role         StaffRole     @default(esteticista)
+  active       Boolean       @default(true)
+  availability String?       @db.LongText
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  appointments Appointment[]
+  empresa      Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId])
+  @@map("staff")
+}
+
+model AppointmentException {
+  id        Int      @id @default(autoincrement())
+  empresaId Int
+  date      DateTime
+  reason    String?
+  isOpen    Boolean? @default(true)
+  start1    String?  @db.VarChar(5)
+  end1      String?  @db.VarChar(5)
+  start2    String?  @db.VarChar(5)
+  end2      String?  @db.VarChar(5)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId, date])
+  @@map("appointment_exception")
+}
+
+model ConversationState {
+  id             Int          @id @default(autoincrement())
+  conversationId Int          @unique
+  data           String       @db.LongText
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @default(now()) @updatedAt
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([updatedAt])
+  @@map("conversation_state")
+}
+
+model CronMeta {
+  keyName String   @id @map("key_name") @db.VarChar(100)
+  lastRun DateTime @map("last_run") @db.DateTime(0)
+
+  @@map("cron_meta")
+}
+
+model SubscriptionPlan {
+  id              Int             @id @default(autoincrement())
+  name            String
+  code            String          @unique
+  price           Decimal         @db.Decimal(10, 2)
+  interval        BillingInterval @default(monthly)
+  isActive        Boolean         @default(true)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @default(now()) @updatedAt
+  gracePeriodDays Int             @default(2)
+  monthlyCredits  Int             @default(300)
+  subscriptions   Subscription[]
+
+  @@map("subscription_plan")
+}
+
+model Subscription {
+  id                   Int                   @id @default(autoincrement())
+  empresaId            Int
+  planId               Int
+  status               SubscriptionStatus    @default(active)
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+  cancelAtPeriodEnd    Boolean               @default(false)
+  canceledAt           DateTime?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @default(now()) @updatedAt
+  paymentMethods       PaymentMethod[]
+  empresa              Empresa               @relation(fields: [empresaId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  plan                 SubscriptionPlan      @relation(fields: [planId], references: [id], onUpdate: Restrict)
+  subscriptionPayments SubscriptionPayment[]
+
+  @@index([empresaId, status])
+  @@index([planId], map: "subscription_planId_fkey")
+  @@map("subscription")
+}
+
+model PaymentMethod {
+  id                   Int                   @id @default(autoincrement())
+  empresaId            Int
+  subscriptionId       Int?
+  type                 PaymentMethodType     @default(card)
+  wompiSourceId        String?               @unique
+  wompiToken           String?
+  brand                String?               @db.VarChar(32)
+  lastFour             String?               @db.VarChar(4)
+  expMonth             String?               @db.VarChar(2)
+  expYear              String?               @db.VarChar(4)
+  cardHolder           String?
+  email                String?
+  status               String?               @db.VarChar(32)
+  isDefault            Boolean               @default(true)
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @default(now()) @updatedAt
+  empresa              Empresa               @relation(fields: [empresaId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  subscription         Subscription?         @relation(fields: [subscriptionId], references: [id], onUpdate: Restrict)
+  subscriptionPayments SubscriptionPayment[]
+
+  @@index([empresaId, isDefault])
+  @@index([subscriptionId], map: "payment_method_subscriptionId_fkey")
+  @@map("payment_method")
+}
+
+model SubscriptionPayment {
+  id                 Int            @id @default(autoincrement())
+  empresaId          Int
+  subscriptionId     Int
+  paymentMethodId    Int?
+  wompiTransactionId String?
+  amount             Decimal        @db.Decimal(10, 2)
+  status             PaymentStatus  @default(pending)
+  paidAt             DateTime?
+  errorMessage       String?        @db.Text
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @default(now()) @updatedAt
+  empresa            Empresa        @relation(fields: [empresaId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  paymentMethod      PaymentMethod? @relation(fields: [paymentMethodId], references: [id], onUpdate: Restrict)
+  subscription       Subscription   @relation(fields: [subscriptionId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+
+  @@index([empresaId, status, createdAt])
+  @@index([paymentMethodId], map: "subscription_payment_paymentMethodId_fkey")
+  @@index([subscriptionId], map: "subscription_payment_subscriptionId_fkey")
+  @@map("subscription_payment")
+}
+
+model ConversationPurchase {
+  id                 Int           @id @default(autoincrement())
+  empresaId          Int
+  creditsAmount      Int
+  pricePaid          Decimal       @db.Decimal(10, 2)
+  wompiTransactionId String?
+  status             PaymentStatus @default(pending)
+  errorMessage       String?       @db.Text
+  isApplied          Boolean       @default(false)
+  appliedAt          DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  empresa            Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId, status])
+  @@map("conversation_purchase")
+}
+
+model Client {
+  id                Int       @id @default(autoincrement())
+  empresaId         Int
+  name              String
+  phone             String    @db.VarChar(20)
+  lastProcedure     String?
+  lastProcedureDate DateTime? @default(now())
+  notes             String?   @db.Text
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @default(now()) @updatedAt
+  status            String    @default("active") @db.VarChar(20)
+  empresa           Empresa   @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@unique([empresaId, phone])
+  @@index([empresaId, name])
+  @@map("client")
+}
+
+model BusinessConfigEcommerce {
+  id                   Int      @id @default(autoincrement())
+  empresaId            Int      @unique
+  isActive             Boolean  @default(false)
+  storeName            String?
+  currency             String   @default("COP")
+  shippingCost         String?
+  deliveryTimeEstimate String?
+  pickupAddress        String?  @db.Text
+  manualPaymentInfo    String?  @db.Text
+  aiSellingStyle       String   @default("asesor")
+  closingInstructions  String?  @db.Text
+  returnPolicy         String?  @db.Text
+  warrantyPolicy       String?  @db.Text
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  aiMode               AiMode?  @default(ecommerce)
+  Empresa              Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@map("business_config_ecommerce")
+}
+
+/// *
+///  * ========== Enums ==========
 enum AiMode {
   ecommerce
   agente
@@ -145,759 +822,4 @@ enum StaffRole {
   profesional
   esteticista
   medico
-}
-
-/**
- * ========== Modelos base ==========
- */
-
-model Usuario {
-  id        Int      @id @default(autoincrement())
-  email     String   @unique
-  password  String
-  rol       Rol
-  empresaId Int
-  empresa   Empresa  @relation(fields: [empresaId], references: [id])
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@map("usuario")
-}
-
-model Empresa {
-  id      Int    @id @default(autoincrement())
-  nombre  String
-  plan    Plan   @default(gratis)
-  estado  Estado @default(inactivo)
-
-  trialStart DateTime?
-  trialEnd   DateTime?
-
-  // Gestión de Créditos
-  conversationsUsed        Int      @default(0)
-  monthlyConversationLimit Int      @default(300)
-  conversationsCycleStart  DateTime @default(now())
-
-  usuarios Usuario[]
-
-  configuracion    BusinessConfig?
-  conversaciones   Conversation[]
-  cuentaWhatsapp   WhatsappAccount?
-  messageTemplates MessageTemplate[]
-
-  orders Order[]
-
-  subscriptions        Subscription[]
-  paymentMethods       PaymentMethod[]
-  subscriptionPayments SubscriptionPayment[]
-  conversationPurchases ConversationPurchase[]
-
-  createdAt            DateTime                @default(now())
-  updatedAt            DateTime                @updatedAt
-  
-  // Relaciones de contenido
-  Message              Message[]
-  Product              Product[]
-  
-  // Relaciones de Agenda/Estética
-  Appointment          Appointment[]
-  AppointmentHour      AppointmentHour[]
-  BusinessConfigAppt   BusinessConfigAppt?
-  EsteticaProcedure    EsteticaProcedure[]
-  ReminderRule         ReminderRule[]
-  Staff                Staff[]
-  AppointmentException AppointmentException[]
-  Client               Client[]
-
-  // ✨ NUEVO: Configuración de tienda E-commerce
-  BusinessConfigEcommerce BusinessConfigEcommerce?
-
-  @@map("empresa")
-}
-
-model Message {
-  id             Int         @id @default(autoincrement())
-  conversationId Int
-  from           MessageFrom
-  contenido      String      @db.Text
-  timestamp      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
-
-  // Cloud API
-  externalId String?    @unique
-  mediaType  MediaType?
-  mediaId    String?    @db.VarChar(128)
-  mediaUrl   String?    @db.Text
-  mimeType   String?    @db.VarChar(64)
-  caption    String?    @db.Text
-
-  // Notas de voz
-  isVoiceNote   Boolean? @default(false)
-  durationSec   Int?
-  transcription String?  @db.Text
-
-  empresaId Int
-  empresa   Empresa @relation(fields: [empresaId], references: [id])
-
-  Conversation    Conversation     @relation(fields: [conversationId], references: [id])
-  paymentReceipts PaymentReceipt[]
-
-  @@unique([empresaId, externalId])
-  @@index([conversationId, timestamp])
-  @@index([empresaId, conversationId, timestamp])
-  @@index([mediaId])
-  @@index([empresaId, externalId])
-  @@map("message")
-}
-
-model Conversation {
-  id        Int                @id @default(autoincrement())
-  phone     String
-  nombre    String?
-  estado    ConversationEstado @default(pendiente)
-  mensajes  Message[]
-  createdAt DateTime           @default(now())
-
-  empresaId Int
-  empresa   Empresa @relation(fields: [empresaId], references: [id])
-
-  orders            Order[]
-  Appointment       Appointment[]
-  ConversationState ConversationState?
-
-  @@index([empresaId, estado, createdAt])
-  @@index([empresaId, phone])
-  @@map("conversation")
-}
-
-model BusinessConfig {
-  id        Int      @id @default(autoincrement())
-  empresaId Int      @unique
-  nombre    String   @default("")
-  
-  descripcion String? @db.Text
-  servicios   String? @db.Text
-  faq         String? @db.Text
-  horarios    String? @db.Text
-  businessType BusinessType @default(servicios)
-  disclaimers String? @db.Text
-
-  // Operación del negocio
-  enviosInfo           String? @db.Text
-  metodosPago          String? @db.Text
-  tiendaFisica         Boolean @default(false)
-  direccionTienda      String  @default("")
-  politicasDevolucion  String? @db.Text
-  politicasGarantia    String? @db.Text
-  promocionesInfo      String? @db.Text
-  canalesAtencion      String? @db.Text
-  extras               String? @db.Text
-  palabrasClaveNegocio String  @default("")
-
-  // Perfil de IA
-  aiMode           AiMode?
-  agentSpecialty   AgentSpecialty @default(generico)
-  agentPrompt      String?        @db.Text
-  agentScope       String?        @db.Text
-  agentDisclaimers String?        @db.Text
-
-  // Pagos
-  pagoLinkGenerico     String  @default("")
-  pagoLinkProductoBase String  @default("")
-  pagoNotas            String? @db.Text
-  bancoNombre          String  @default("")
-  bancoTitular         String  @default("")
-  bancoTipoCuenta      String  @default("")
-  bancoNumeroCuenta    String  @default("")
-  bancoDocumento       String  @default("")
-  transferenciaQRUrl   String  @default("")
-
-  // Envíos
-  envioTipo            String   @default("")
-  envioEntregaEstimado String   @default("")
-  envioCostoFijo       Decimal?
-  envioGratisDesde     Decimal?
-
-  // Post-venta
-  facturaElectronicaInfo  String @default("")
-  soporteDevolucionesInfo String @default("")
-
-  // Escalamiento
-  escalarSiNoConfia    Boolean @default(true)
-  escalarPalabrasClave String  @default("")
-  escalarPorReintentos Int     @default(0)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // Agenda / Citas (Campos Legacy)
-  appointmentEnabled   Boolean             @default(false)
-  appointmentVertical  AppointmentVertical @default(none)
-  appointmentTimezone  String              @default("America/Bogota")
-  appointmentBufferMin Int                 @default(10)
-  appointmentPolicies  String?             @db.Text
-  appointmentReminders Boolean             @default(true)
-
-  Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  @@map("businessconfig")
-}
-
-model WhatsappAccount {
-  id                 Int      @id @default(autoincrement())
-  phoneNumberId      String   @unique @db.VarChar(64)
-  wabaId             String   @db.VarChar(64)
-  businessId         String?  @db.VarChar(64)
-  accessToken        String   @db.Text
-  displayPhoneNumber String?  @db.VarChar(32)
-  empresaId          Int      @unique
-  empresa            Empresa  @relation(fields: [empresaId], references: [id])
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-
-  @@index([wabaId])
-  @@map("whatsappaccount")
-}
-
-model MessageTemplate {
-  id        Int      @id @default(autoincrement())
-  nombre    String   @db.VarChar(100)
-  idioma    String   @db.VarChar(10)
-  categoria String   @db.VarChar(50)
-  cuerpo    String   @db.Text
-  estado    String   @default("pendiente")
-  variables Int      @default(0)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  empresaId    Int
-  empresa      Empresa        @relation(fields: [empresaId], references: [id])
-  ReminderRule ReminderRule[]
-
-  @@unique([empresaId, nombre, idioma])
-  @@map("messagetemplate")
-}
-
-model Product {
-  id              Int      @id @default(autoincrement())
-  empresaId       Int
-  slug            String   @unique
-  nombre          String
-  descripcion     String   @default("")
-  beneficios      String   @default("")
-  caracteristicas String   @default("")
-  precioDesde     Decimal?
-  disponible      Boolean  @default(true)
-  updatedAt       DateTime @updatedAt
-  createdAt       DateTime @default(now())
-
-  imagenes  ProductImage[]
-  empresa   Empresa        @relation(fields: [empresaId], references: [id])
-  OrderItem OrderItem[]
-
-  @@index([empresaId, nombre])
-  @@map("product")
-}
-
-model ProductImage {
-  id        Int @id @default(autoincrement())
-  productId Int
-
-  imageId   String          @db.VarChar(128)
-  url       String          @default("") @db.VarChar(2048)
-  alt       String          @default("")
-  provider  StorageProvider @default(external)
-  isPrimary Boolean         @default(false)
-  sortOrder Int             @default(0)
-
-  objectKey       String?   @db.VarChar(255)
-  mimeType        String?   @db.VarChar(64)
-  sizeBytes       Int?
-  width           Int?
-  height          Int?
-  whatsappMediaId String?   @db.VarChar(128)
-  mediaCachedAt   DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
-
-  @@index([productId])
-  @@index([provider, objectKey])
-  @@index([whatsappMediaId])
-  @@map("productimage")
-}
-
-/**
- * ========== Pedidos & Pagos ==========
- */
-model Order {
-  id             Int     @id @default(autoincrement())
-  empresaId      Int
-  conversationId Int
-  customerPhone  String
-  customerName   String?
-  city           String?
-  address        String?
-  status         String  @default("pending")
-  subtotal       Decimal @default(0)
-  shippingCost   Decimal @default(0)
-  total          Decimal @default(0)
-  notes          String  @db.Text
-
-  items    OrderItem[]
-  payments PaymentReceipt[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  empresa      Empresa      @relation(fields: [empresaId], references: [id])
-  Conversation Conversation @relation(fields: [conversationId], references: [id])
-
-  @@index([empresaId, conversationId, status])
-  @@map("order")
-}
-
-model OrderItem {
-  id        Int     @id @default(autoincrement())
-  orderId   Int
-  productId Int
-  name      String
-  price     Decimal @default(0)
-  qty       Int     @default(1)
-  total     Decimal @default(0)
-
-  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  product Product @relation(fields: [productId], references: [id])
-
-  @@index([orderId])
-  @@map("orderitem")
-}
-
-model PaymentReceipt {
-  id         Int       @id @default(autoincrement())
-  orderId    Int
-  messageId  Int?
-  imageUrl   String    @default("")
-  amount     Decimal?
-  reference  String    @default("")
-  method     String    @default("")
-  isVerified Boolean   @default(false)
-  verifiedAt DateTime?
-  rawOcrText String    @db.Text
-
-  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  message Message? @relation(fields: [messageId], references: [id])
-
-  createdAt DateTime @default(now())
-
-  @@index([orderId, isVerified])
-  @@map("paymentreceipt")
-}
-
-model Appointment {
-  id                  Int               @id @default(autoincrement())
-  empresaId           Int
-  conversationId      Int?
-  source              AppointmentSource @default(client)
-  status              AppointmentStatus @default(pending)
-  customerName        String
-  customerPhone       String
-  serviceName         String
-  notas               String?           @db.Text
-  customerDisplayName String?
-  serviceDurationMin  Int?
-  locationNameCache   String?
-  startAt             DateTime
-  endAt               DateTime
-  timezone            String            @default("America/Bogota")
-  procedureId         Int?
-  staffId             Int?
-  sendReminder24h     Boolean           @default(false)
-  
-  // Relaciones
-  EsteticaProcedure EsteticaProcedure? @relation(name: "ProcedureToAppointments", fields: [procedureId], references: [id])
-  staff             Staff?             @relation(fields: [staffId], references: [id])
-  empresa           Empresa            @relation(fields: [empresaId], references: [id])
-  conversation      Conversation?      @relation(fields: [conversationId], references: [id])
-
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  deletedAt DateTime?
-
-  AppointmentReminderLog AppointmentReminderLog[]
-
-  @@index([empresaId, startAt, endAt])
-  @@index([empresaId, status, startAt])
-  @@index([conversationId])
-  @@index([empresaId, customerPhone, startAt])
-  @@index([empresaId, status, startAt, customerPhone])
-  @@index([deletedAt])
-  @@index([empresaId, deletedAt, startAt])
-  @@index([empresaId, staffId])
-  @@map("appointment")
-}
-
-model AppointmentHour {
-  id        Int     @id @default(autoincrement())
-  empresaId Int
-  day       Weekday
-  isOpen    Boolean @default(false)
-  start1    String? @db.VarChar(5)
-  end1      String? @db.VarChar(5)
-  start2    String? @db.VarChar(5)
-  end2      String? @db.VarChar(5)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  @@unique([empresaId, day])
-  @@index([empresaId, day])
-  @@map("appointmenthour")
-}
-
-/**
- * Estetica Base de Datos
- */
-
-model BusinessConfigAppt {
-  id                          Int                 @id @default(autoincrement())
-  empresaId                   Int                 @unique
-  aiMode                      AiMode?
-  appointmentEnabled          Boolean             @default(false)
-  appointmentVertical         AppointmentVertical @default(custom)
-  appointmentVerticalCustom   String?
-  appointmentTimezone         String              @default("America/Bogota")
-  appointmentBufferMin        Int                 @default(10)
-  appointmentPolicies         String?             @db.Text
-  appointmentReminders        Boolean             @default(true)
-  appointmentMinNoticeHours   Int?
-  appointmentMaxAdvanceDays   Int?
-  allowSameDayBooking         Boolean             @default(false)
-  requireClientConfirmation   Boolean             @default(true)
-  cancellationAllowedHours    Int?
-  rescheduleAllowedHours      Int?
-  defaultServiceDurationMin   Int?
-  servicesText                String?             @db.Text
-  services                    Json?
-  locationName                String?
-  locationAddress             String?
-  locationMapsUrl             String?
-  parkingInfo                 String?             @db.Text
-  virtualMeetingLink          String?
-  instructionsArrival         String?             @db.Text
-  cancellationWindowHours     Int?
-  noShowPolicy                String?             @db.Text
-  depositRequired             Boolean             @default(false)
-  depositAmount               Decimal?            @db.Decimal(10, 2)
-  maxDailyAppointments        Int?
-  bookingWindowDays           Int?
-  blackoutDates               Json?
-  overlapStrategy             String?
-  reminderSchedule            Json?
-  reminderTemplateId          String?
-  postBookingMessage          String?             @db.Text
-  prepInstructionsPerSvc      Json?
-  requireWhatsappOptIn        Boolean             @default(true)
-  allowSensitiveTopics        Boolean             @default(false)
-  minClientAge                Int?
-  kbBusinessOverview          String?             @db.Text
-  kbFAQs                      Json?
-  kbServiceNotes              Json?
-  kbEscalationRules           Json?
-  kbDisclaimers               String?             @db.Text
-  kbMedia                     Json?
-  kbFreeText                  String?             @db.Text
-  
-  EsteticaProcedure EsteticaProcedure[]
-  ReminderRule      ReminderRule[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  Empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  @@map("businessconfig_appt")
-}
-
-model EsteticaProcedure {
-  id                 Int      @id @default(autoincrement())
-  empresaId          Int
-  configApptId       Int
-  name               String
-  enabled            Boolean  @default(true)
-  aliases            Json?
-  durationMin        Int?
-  requiresAssessment Boolean  @default(false)
-  priceMin           Decimal? @db.Decimal(10, 2)
-  priceMax           Decimal? @db.Decimal(10, 2)
-  depositRequired    Boolean  @default(false)
-  depositAmount      Decimal? @db.Decimal(10, 2)
-  prepInstructions   String?  @db.Text
-  postCare           String?  @db.Text
-  contraindications  String?  @db.Text
-  notes              String?  @db.Text
-  pageUrl            String?
-  requiredStaffIds   Json?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-
-  empresa            Empresa            @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  businessConfigAppt BusinessConfigAppt @relation(fields: [configApptId], references: [id], onDelete: Cascade)
-  Appointment        Appointment[]      @relation(name: "ProcedureToAppointments")
-
-  @@index([empresaId])
-  @@index([configApptId])
-  @@map("estetica_procedure")
-}
-
-model ReminderRule {
-  id                Int             @id @default(autoincrement())
-  empresaId         Int
-  configApptId      Int
-  active            Boolean         @default(true)
-  offsetHours       Int             @default(24)
-  messageTemplateId Int
-  templateName      String
-  templateLang      String          @default("es")
-  templateParams    Json?
-  createdAt         DateTime        @default(now())
-  updatedAt         DateTime        @updatedAt
-
-  empresa            Empresa            @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  businessConfigAppt BusinessConfigAppt @relation(fields: [configApptId], references: [id], onDelete: Cascade)
-  messageTemplate    MessageTemplate    @relation(fields: [messageTemplateId], references: [id], onDelete: Restrict)
-  appointmentReminderLogs AppointmentReminderLog[]
-
-  @@index([empresaId])
-  @@index([configApptId])
-  @@index([messageTemplateId])
-  @@map("reminder_rule")
-}
-
-model AppointmentReminderLog {
-  id             Int           @id @default(autoincrement())
-  appointmentId  Int
-  reminderRuleId Int?
-  sentAt         DateTime      @default(now())
-  channel        String        @default("whatsapp")
-  status         String        @default("sent")
-  error          String?       @db.Text
-  appointment    Appointment   @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
-  reminderRule   ReminderRule? @relation(fields: [reminderRuleId], references: [id])
-
-  @@index([appointmentId])
-  @@index([reminderRuleId])
-  @@map("appointment_reminder_log")
-}
-
-model Staff {
-  id           Int       @id @default(autoincrement())
-  empresaId    Int
-  name         String
-  role         StaffRole @default(esteticista)
-  active       Boolean   @default(true)
-  availability Json?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  empresa      Empresa   @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  appointments Appointment[]
-
-  @@index([empresaId])
-  @@map("staff")
-}
-
-model AppointmentException {
-  id        Int      @id @default(autoincrement())
-  empresaId Int
-  date      DateTime
-  reason    String?
-  isOpen    Boolean? @default(true)
-  start1    String?  @db.VarChar(5)
-  end1      String?  @db.VarChar(5)
-  start2    String?  @db.VarChar(5)
-  end2      String?  @db.VarChar(5)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  @@index([empresaId, date])
-  @@map("appointment_exception")
-}
-
-model ConversationState {
-  id             Int          @id @default(autoincrement())
-  conversationId Int          @unique
-  data           Json
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-
-  @@index([updatedAt])
-  @@map("conversation_state")
-}
-
-model CronMeta {
-  keyName String   @id @map("key_name")
-  lastRun DateTime @map("last_run")
-
-  @@map("cron_meta")
-}
-
-/**
- * ========== Subscripciones / Payments ==========
- */
-
-model SubscriptionPlan {
-  id               Int             @id @default(autoincrement())
-  name             String
-  code             String          @unique
-  price            Decimal         @db.Decimal(10, 2)
-  interval         BillingInterval @default(monthly)
-  isActive         Boolean         @default(true)
-  gracePeriodDays  Int             @default(2)
-  monthlyCredits   Int             @default(300)
-  createdAt        DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
-  subscriptions    Subscription[]
-
-  @@map("subscription_plan")
-}
-
-model Subscription {
-  id                   Int                 @id @default(autoincrement())
-  empresaId            Int
-  planId               Int
-  status               SubscriptionStatus  @default(active)
-  currentPeriodStart   DateTime
-  currentPeriodEnd     DateTime
-  cancelAtPeriodEnd    Boolean             @default(false)
-  canceledAt           DateTime?
-  createdAt            DateTime            @default(now())
-  updatedAt            DateTime            @updatedAt
-  empresa              Empresa             @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  plan                 SubscriptionPlan    @relation(fields: [planId], references: [id], onDelete: Restrict)
-  paymentMethods       PaymentMethod[]
-  subscriptionPayments SubscriptionPayment[]
-
-  @@index([empresaId, status])
-  @@map("subscription")
-}
-
-model PaymentMethod {
-  id             Int               @id @default(autoincrement())
-  empresaId      Int
-  subscriptionId Int?
-  type           PaymentMethodType @default(card)
-  wompiSourceId  String?           @unique
-  wompiToken     String?           @db.VarChar(191)
-  brand          String?           @db.VarChar(32)
-  lastFour       String?           @db.VarChar(4)
-  expMonth       String?           @db.VarChar(2)
-  expYear        String?           @db.VarChar(4)
-  cardHolder     String?           @db.VarChar(191)
-  email          String?           @db.VarChar(191)
-  status         String?           @db.VarChar(32)
-  isDefault      Boolean           @default(true)
-  createdAt      DateTime          @default(now())
-  updatedAt      DateTime          @updatedAt
-  empresa        Empresa           @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  subscription   Subscription?     @relation(fields: [subscriptionId], references: [id])
-  subscriptionPayments SubscriptionPayment[]
-
-  @@index([empresaId, isDefault])
-  @@map("payment_method")
-}
-
-model SubscriptionPayment {
-  id                 Int           @id @default(autoincrement())
-  empresaId          Int
-  subscriptionId     Int
-  paymentMethodId    Int?
-  wompiTransactionId String?       @db.VarChar(191)
-  amount             Decimal       @db.Decimal(10, 2)
-  status             PaymentStatus @default(pending)
-  paidAt             DateTime?
-  errorMessage       String?       @db.Text
-  createdAt          DateTime      @default(now())
-  updatedAt          DateTime      @updatedAt
-  empresa            Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-  subscription       Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-  paymentMethod      PaymentMethod? @relation(fields: [paymentMethodId], references: [id])
-
-  @@index([empresaId, status, createdAt])
-  @@map("subscription_payment")
-}
-
-model ConversationPurchase {
-  id                 Int           @id @default(autoincrement())
-  empresaId          Int
-  creditsAmount      Int
-  pricePaid          Decimal       @db.Decimal(10, 2)
-  wompiTransactionId String?       @db.VarChar(191)
-  status             PaymentStatus @default(pending)
-  errorMessage       String?       @db.Text
-  isApplied          Boolean       @default(false)
-  appliedAt          DateTime?
-  createdAt          DateTime      @default(now())
-  updatedAt          DateTime      @updatedAt
-  empresa            Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  @@index([empresaId, status])
-  @@map("conversation_purchase")
-}
-
-model Client {
-  id                Int      @id @default(autoincrement())
-  empresaId         Int
-  name              String
-  phone             String
-  lastProcedure     String?
-  lastProcedureDate DateTime?
-  notes             String?  @db.Text
-  status            String   @default("active")
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
-  empresa           Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  @@unique([empresaId, phone])
-  @@map("client")
-}
-
-/**
- * ========== Configuración E-commerce (NUEVO) ==========
- */
-
-model BusinessConfigEcommerce {
-  id        Int      @id @default(autoincrement())
-  empresaId Int      @unique
-  isActive  Boolean  @default(false)
-  aiMode    AiMode?  @default(ecommerce)
-
-  // Identidad
-  storeName       String?
-  currency        String  @default("COP")
-  
-  // Knowledge Base: Logística (Respuestas IA)
-  shippingCost           String? 
-  deliveryTimeEstimate   String?
-  pickupAddress          String? @db.Text
-  
-  // Knowledge Base: Pagos (Respuestas IA)
-  manualPaymentInfo    String? @db.Text
-  
-  // Cierre (El 90% Manual)
-  aiSellingStyle       String  @default("asesor")
-  closingInstructions  String? @db.Text 
-
-  // Políticas
-  returnPolicy         String? @db.Text
-  warrantyPolicy       String? @db.Text
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  Empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
-
-  @@map("business_config_ecommerce")
 }

@@ -3,12 +3,14 @@ import axios from 'axios'
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import bcrypt from 'bcrypt'
+import { v4 as uuidv4 } from 'uuid' // <--- NUEVO: Para generar el token único
 import { generarToken } from '../utils/jwt'
+import { enviarCorreoVerificacion } from '../utils/mailer' // <--- NUEVO: Importamos el mailer
 
 const GRAPH = 'https://graph.facebook.com/v20.0'
 
 /* =============================================================================
- * AUTH APP (LOGIN / REGISTER)
+ * AUTH APP (LOGIN / REGISTER / ACTIVATE)
  * ========================================================================== */
 
 export const login = async (req: Request, res: Response) => {
@@ -25,8 +27,16 @@ export const login = async (req: Request, res: Response) => {
         const ok = await bcrypt.compare(password, usuario.password)
         if (!ok) return res.status(401).json({ error: 'Contraseña incorrecta' })
 
+        // --- NUEVO BLOQUE DE VALIDACIÓN ---
+        if (!usuario.cuentaConfirmada) {
+            return res.status(403).json({ 
+                error: 'Debes activar tu cuenta. Revisa tu correo electrónico para verificarla.' 
+            })
+        }
+        // ----------------------------------
+
         if (!usuario.empresa || usuario.empresa.estado !== 'activo') {
-            return res.status(403).json({ error: 'La empresa aún no está activa. Debes completar el pago.' })
+            return res.status(403).json({ error: 'La empresa aún no está activa o el periodo de prueba ha finalizado.' })
         }
 
         const token = generarToken({
@@ -51,37 +61,54 @@ export const registrar = async (req: Request, res: Response) => {
 
     try {
         const hashed = await bcrypt.hash(password, 10)
+        
+        // --- NUEVO: Generar token de confirmación ---
+        const tokenConfirmacion = uuidv4() 
+        // --------------------------------------------
 
         // ▲ TRIAL de 7 días (parametrizable por env TRIAL_DAYS)
         const ahora = new Date()
         const trialDays = Number(process.env.TRIAL_DAYS ?? 7)
         const finPrueba = new Date(ahora.getTime() + trialDays * 24 * 60 * 60 * 1000)
 
-        const empresa = await prisma.empresa.create({
-            data: {
-                nombre: nombreEmpresa,
-                estado: 'activo',
-                plan: 'gratis',        // ▲ plan gratuito por defecto
-                trialStart: ahora,     // ▲ inicio del trial
-                trialEnd: finPrueba,   // ▲ fin del trial (7 días por defecto)
-                conversationsUsed: 0,  // ▲ contador en 0
-                usuarios: {
-                    create: { email, password: hashed, rol: 'admin' },
+        // Usamos transacción para asegurar consistencia
+        await prisma.$transaction(async (tx) => {
+             await tx.empresa.create({
+                data: {
+                    nombre: nombreEmpresa,
+                    estado: 'activo', // Se crea activa, pero el usuario no puede entrar hasta confirmar mail
+                    plan: 'gratis',
+                    trialStart: ahora,
+                    trialEnd: finPrueba,
+                    conversationsUsed: 0,
+                    usuarios: {
+                        create: { 
+                            email, 
+                            password: hashed, 
+                            rol: 'admin',
+                            // --- NUEVOS CAMPOS ---
+                            cuentaConfirmada: false, 
+                            tokenConfirmacion: tokenConfirmacion
+                            // ---------------------
+                        },
+                    },
                 },
-                // 👇 OUTBOUND REMOVIDO: ya no se crea outboundConfig por defecto
-            },
-            include: { usuarios: true },
+            })
         })
 
-        const u = empresa.usuarios[0]
-        const token = generarToken({
-            id: u.id,
-            email: u.email,
-            rol: u.rol,
-            empresaId: empresa.id,
+        // --- NUEVO: Enviar el correo ---
+        try {
+            await enviarCorreoVerificacion(email, tokenConfirmacion)
+        } catch (mailError) {
+            console.error('Error enviando correo de verificación:', mailError)
+            // No detenemos el proceso, pero queda registro en log
+        }
+
+        // --- IMPORTANTE: Ya no devolvemos TOKEN JWT, solo mensaje ---
+        return res.status(201).json({ 
+            message: 'Usuario registrado. Por favor revisa tu correo para activar la cuenta.' 
         })
 
-        return res.status(201).json({ token, empresaId: empresa.id })
     } catch (e: any) {
         // Manejo de email duplicado (P2002)
         if (e?.code === 'P2002' && e?.meta?.target?.includes('email')) {
@@ -92,8 +119,37 @@ export const registrar = async (req: Request, res: Response) => {
     }
 }
 
+// --- NUEVA FUNCIÓN: ACTIVAR CUENTA ---
+export const activarCuenta = async (req: Request, res: Response) => {
+    const { token } = req.body
+    if (!token) return res.status(400).json({ error: 'Token requerido' })
+
+    try {
+        const usuario = await prisma.usuario.findFirst({
+            where: { tokenConfirmacion: token }
+        })
+
+        if (!usuario) {
+            return res.status(400).json({ error: 'Token inválido o expirado' })
+        }
+
+        await prisma.usuario.update({
+            where: { id: usuario.id },
+            data: {
+                cuentaConfirmada: true,
+                tokenConfirmacion: null // Limpiamos el token
+            }
+        })
+
+        return res.json({ message: 'Cuenta activada correctamente' })
+    } catch (e) {
+        console.error('[activarCuenta] Error:', e)
+        return res.status(500).json({ error: 'Error activando cuenta' })
+    }
+}
+
 /* =============================================================================
- * OAUTH META (FLUJO ÚNICO)
+ * OAUTH META (FLUJO ÚNICO) - SIN CAMBIOS
  * ========================================================================== */
 
 // 1) Iniciar OAuth (redirige a Meta con redirect_uri FIJO del backend)
@@ -172,7 +228,7 @@ export const exchangeCode = async (req: Request, res: Response) => {
 }
 
 /* =============================================================================
- * LISTAR BUSINESSES → WABAs → PHONES (para el CallbackPage)
+ * LISTAR BUSINESSES → WABAs → PHONES (para el CallbackPage) - SIN CAMBIOS
  * ========================================================================== */
 
 // GET /api/auth/wabas?token=...&debug=1
