@@ -3,9 +3,9 @@ import axios from 'axios'
 import { Request, Response } from 'express'
 import prisma from '../lib/prisma'
 import bcrypt from 'bcrypt'
-import { v4 as uuidv4 } from 'uuid' // <--- NUEVO: Para generar el token único
+import { v4 as uuidv4 } from 'uuid' 
 import { generarToken } from '../utils/jwt'
-import { enviarCorreoVerificacion } from '../utils/mailer' // <--- NUEVO: Importamos el mailer
+import { enviarCorreoVerificacion } from '../utils/mailer' 
 
 const GRAPH = 'https://graph.facebook.com/v20.0'
 
@@ -27,13 +27,12 @@ export const login = async (req: Request, res: Response) => {
         const ok = await bcrypt.compare(password, usuario.password)
         if (!ok) return res.status(401).json({ error: 'Contraseña incorrecta' })
 
-        // --- NUEVO BLOQUE DE VALIDACIÓN ---
+        // --- VALIDACIÓN DE CUENTA ---
         if (!usuario.cuentaConfirmada) {
             return res.status(403).json({ 
                 error: 'Debes activar tu cuenta. Revisa tu correo electrónico para verificarla.' 
             })
         }
-        // ----------------------------------
 
         if (!usuario.empresa || usuario.empresa.estado !== 'activo') {
             return res.status(403).json({ error: 'La empresa aún no está activa o el periodo de prueba ha finalizado.' })
@@ -62,21 +61,20 @@ export const registrar = async (req: Request, res: Response) => {
     try {
         const hashed = await bcrypt.hash(password, 10)
         
-        // --- NUEVO: Generar token de confirmación ---
+        // Generar token de confirmación
         const tokenConfirmacion = uuidv4() 
-        // --------------------------------------------
 
-        // ▲ TRIAL de 7 días (parametrizable por env TRIAL_DAYS)
+        // Configuración del Trial
         const ahora = new Date()
         const trialDays = Number(process.env.TRIAL_DAYS ?? 7)
         const finPrueba = new Date(ahora.getTime() + trialDays * 24 * 60 * 60 * 1000)
 
-        // Usamos transacción para asegurar consistencia
+        // Crear Empresa y Usuario
         await prisma.$transaction(async (tx) => {
              await tx.empresa.create({
                 data: {
                     nombre: nombreEmpresa,
-                    estado: 'activo', // Se crea activa, pero el usuario no puede entrar hasta confirmar mail
+                    estado: 'activo', 
                     plan: 'gratis',
                     trialStart: ahora,
                     trialEnd: finPrueba,
@@ -86,31 +84,26 @@ export const registrar = async (req: Request, res: Response) => {
                             email, 
                             password: hashed, 
                             rol: 'admin',
-                            // --- NUEVOS CAMPOS ---
                             cuentaConfirmada: false, 
                             tokenConfirmacion: tokenConfirmacion
-                            // ---------------------
                         },
                     },
                 },
             })
         })
 
-        // --- NUEVO: Enviar el correo ---
-        try {
-            await enviarCorreoVerificacion(email, tokenConfirmacion)
-        } catch (mailError) {
-            console.error('Error enviando correo de verificación:', mailError)
-            // No detenemos el proceso, pero queda registro en log
-        }
+        // --- CORRECCIÓN CRÍTICA: ENVÍO ASÍNCRONO ---
+        // Quitamos el 'await' para que no bloquee la respuesta al frontend.
+        // Se ejecuta en segundo plano.
+        enviarCorreoVerificacion(email, tokenConfirmacion)
+            .catch((err) => console.error('[Background Mailer] Error:', err));
 
-        // --- IMPORTANTE: Ya no devolvemos TOKEN JWT, solo mensaje ---
+        // Respondemos INMEDIATAMENTE
         return res.status(201).json({ 
             message: 'Usuario registrado. Por favor revisa tu correo para activar la cuenta.' 
         })
 
     } catch (e: any) {
-        // Manejo de email duplicado (P2002)
         if (e?.code === 'P2002' && e?.meta?.target?.includes('email')) {
             return res.status(409).json({ error: 'El email ya está registrado' })
         }
@@ -119,7 +112,6 @@ export const registrar = async (req: Request, res: Response) => {
     }
 }
 
-// --- NUEVA FUNCIÓN: ACTIVAR CUENTA ---
 export const activarCuenta = async (req: Request, res: Response) => {
     const { token } = req.body
     if (!token) return res.status(400).json({ error: 'Token requerido' })
@@ -137,7 +129,7 @@ export const activarCuenta = async (req: Request, res: Response) => {
             where: { id: usuario.id },
             data: {
                 cuentaConfirmada: true,
-                tokenConfirmacion: null // Limpiamos el token
+                tokenConfirmacion: null 
             }
         })
 
@@ -148,28 +140,24 @@ export const activarCuenta = async (req: Request, res: Response) => {
     }
 }
 
-/* =============================================================================
- * OAUTH META (FLUJO ÚNICO) - SIN CAMBIOS
- * ========================================================================== */
+// ... (El resto de funciones OAuth Meta se mantienen igual, no hace falta pegarlas si no las tocaste, pero aquí están para completar el archivo si lo vas a reemplazar todo)
 
-// 1) Iniciar OAuth (redirige a Meta con redirect_uri FIJO del backend)
 export const iniciarOAuthMeta = (req: Request, res: Response) => {
     const APP_ID = process.env.META_APP_ID!
-    const REDIRECT_URI = process.env.META_REDIRECT_URI! // callback del BACKEND registrado en Meta
+    const REDIRECT_URI = process.env.META_REDIRECT_URI! 
     const version = 'v20.0'
-    const auth_type = (req.query.auth_type as string) || '' // ej: rerequest
+    const auth_type = (req.query.auth_type as string) || '' 
 
     const scope = [
         'business_management',
         'whatsapp_business_management',
         'whatsapp_business_messaging',
-        // 'pages_show_list' // opcional
     ].join(',')
 
     const url =
         `https://www.facebook.com/${version}/dialog/oauth` +
         `?client_id=${APP_ID}` +
-        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` + // FIJO
+        `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
         `&response_type=code` +
         `&scope=${encodeURIComponent(scope)}` +
         (auth_type ? `&auth_type=${encodeURIComponent(auth_type)}` : '')
@@ -177,20 +165,19 @@ export const iniciarOAuthMeta = (req: Request, res: Response) => {
     return res.redirect(url)
 }
 
-// 2) Callback del BACKEND: intercambia code -> access_token y redirige al FRONT fijo
 export const authCallback = async (req: Request, res: Response) => {
     const { code } = req.query
     if (!code) return res.status(400).json({ error: 'Falta el parámetro code' })
 
     try {
-        const REDIRECT_URI = process.env.META_REDIRECT_URI!        // el mismo de arriba
-        const FRONT_CALLBACK = process.env.FRONT_CALLBACK_URL      // e.g. https://wasaaa.com/dashboard/callback
+        const REDIRECT_URI = process.env.META_REDIRECT_URI!
+        const FRONT_CALLBACK = process.env.FRONT_CALLBACK_URL
 
         const tokenRes = await axios.get(`${GRAPH}/oauth/access_token`, {
             params: {
                 client_id: process.env.META_APP_ID,
                 client_secret: process.env.META_APP_SECRET,
-                redirect_uri: REDIRECT_URI, // DEBE coincidir EXACTO
+                redirect_uri: REDIRECT_URI,
                 code
             },
             headers: { 'Content-Type': 'application/json' }
@@ -205,7 +192,6 @@ export const authCallback = async (req: Request, res: Response) => {
     }
 }
 
-// POST /api/auth/exchange-code  → (Opcional si el front recibe ?code)
 export const exchangeCode = async (req: Request, res: Response) => {
     const { code } = req.body
     if (!code) return res.status(400).json({ error: 'Missing code' })
@@ -227,17 +213,11 @@ export const exchangeCode = async (req: Request, res: Response) => {
     }
 }
 
-/* =============================================================================
- * LISTAR BUSINESSES → WABAs → PHONES (para el CallbackPage) - SIN CAMBIOS
- * ========================================================================== */
-
-// GET /api/auth/wabas?token=...&debug=1
 export const getWabasAndPhones = async (req: Request, res: Response) => {
     const token = (req.query.token as string) || ''
     const debug = String(req.query.debug || '') === '1'
     if (!token) return res.status(400).json({ error: 'Missing user access token' })
 
-    // helper axios con token por defecto
     const api = axios.create({
         baseURL: GRAPH,
         params: { access_token: token },
@@ -247,7 +227,6 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
     const diagnostics: any = debug ? {} : undefined
 
     try {
-        // 1) Validar permisos requeridos
         const permsResp = await api.get('/me/permissions')
         const granted: string[] = (permsResp.data?.data || [])
             .filter((p: any) => p.status === 'granted')
@@ -261,7 +240,6 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
             return res.status(403).json({ error: `Missing permissions: ${missing.join(', ')}`, diagnostics })
         }
 
-        // 2) Listar negocios donde el usuario tiene rol
         let businesses: Array<{ id: string; name: string }> = []
         try {
             const bizResp = await api.get('/me/businesses', { params: { fields: 'id,name' } })
@@ -273,7 +251,6 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
 
         const items: Array<{ waba: any; phones: any[] }> = []
 
-        // 3) Para cada negocio, obtener sus WABAs y teléfonos (llamadas atómicas)
         for (const biz of businesses) {
             try {
                 const wabasResp = await api.get(`/${biz.id}/owned_whatsapp_business_accounts`, {
@@ -307,7 +284,6 @@ export const getWabasAndPhones = async (req: Request, res: Response) => {
             }
         }
 
-        // 4) Fallback: algunos setups no exponen businesses pero sí WABAs directas
         if (!items.length) {
             try {
                 const ownWabas = await api.get('/me/owned_whatsapp_business_accounts', { params: { fields: 'id,name' } })

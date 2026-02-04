@@ -1,29 +1,26 @@
-// wppai-server/src/utils/mailer.ts
+// src/utils/mailer.ts
 import nodemailer from 'nodemailer'
 
-// Configuración del transporte (SMTP)
-// Asegúrate de tener estas variables en tu archivo .env
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: Number(process.env.SMTP_PORT) || 465,
-  secure: true, // true para puerto 465, false para otros (587)
+  port: Number(process.env.SMTP_PORT) || 465, 
+  secure: true, // true para puerto 465, false para 587
   auth: {
-    user: process.env.SMTP_USER, // Tu correo
-    pass: process.env.SMTP_PASS, // Tu contraseña de aplicación (App Password)
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
   },
 })
 
 export const enviarCorreoVerificacion = async (email: string, token: string) => {
-  // Ajusta la URL para que apunte a tu Frontend
-  // Si estás en desarrollo local suele ser http://localhost:3000
+  // Asegúrate de que FRONTEND_URL esté definido en Render
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
   const url = `${frontendUrl}/activar-cuenta?token=${token}`
 
-  console.log(`[Mailer] Enviando correo a ${email} con link: ${url}`)
+  console.log(`[Mailer] Preparando correo para ${email}...`)
 
   try {
-    await transporter.sendMail({
-      from: '"Soporte Wasaaa 👻" <no-reply@wasaaa.com>',
+    const info = await transporter.sendMail({
+      from: '"Wasaaa Soporte" <no-reply@wasaaa.com>',
       to: email,
       subject: 'Activa tu cuenta en Wasaaa 🚀',
       html: `
@@ -36,14 +33,14 @@ export const enviarCorreoVerificacion = async (email: string, token: string) => 
             <a href="${url}" style="background-color: #4F46E5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">Activar mi Cuenta</a>
           </div>
 
-          <p style="color: #777; font-size: 12px; text-align: center;">Si no creaste esta cuenta, puedes ignorar este mensaje.</p>
+          <p style="color: #777; font-size: 12px; text-align: center;">Si no creaste esta cuenta, ignora este mensaje.</p>
         </div>
       `,
     })
-    console.log('[Mailer] Correo enviado exitosamente')
+    console.log('[Mailer] Correo enviado ID:', info.messageId)
   } catch (error) {
-    console.error('[Mailer] Error enviando correo:', error)
-    // No lanzamos el error para no romper el registro si falla el correo,
-    // pero idealmente deberías manejarlo.
+    console.error('[Mailer] Error FATAL enviando correo:', error)
+    // Aquí solo logueamos porque la función se llama sin await
+    throw error
   }
 }
