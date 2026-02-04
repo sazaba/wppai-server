@@ -5,7 +5,7 @@ import prisma from '../lib/prisma'
 import bcrypt from 'bcrypt'
 import { v4 as uuidv4 } from 'uuid' 
 import { generarToken } from '../utils/jwt'
-import { enviarCorreoVerificacion } from '../utils/mailer' 
+import { enviarCorreoVerificacion, enviarCorreoRecuperacion } from '../utils/mailer' 
 
 const GRAPH = 'https://graph.facebook.com/v20.0'
 
@@ -60,11 +60,8 @@ export const registrar = async (req: Request, res: Response) => {
 
     try {
         const hashed = await bcrypt.hash(password, 10)
-        
-        // Generar token de confirmación
         const tokenConfirmacion = uuidv4() 
 
-        // Configuración del Trial
         const ahora = new Date()
         const trialDays = Number(process.env.TRIAL_DAYS ?? 7)
         const finPrueba = new Date(ahora.getTime() + trialDays * 24 * 60 * 60 * 1000)
@@ -92,13 +89,10 @@ export const registrar = async (req: Request, res: Response) => {
             })
         })
 
-        // --- CORRECCIÓN CRÍTICA: ENVÍO ASÍNCRONO ---
-        // Quitamos el 'await' para que no bloquee la respuesta al frontend.
-        // Se ejecuta en segundo plano.
+        // --- ENVÍO EN SEGUNDO PLANO ---
         enviarCorreoVerificacion(email, tokenConfirmacion)
             .catch((err) => console.error('[Background Mailer] Error:', err));
 
-        // Respondemos INMEDIATAMENTE
         return res.status(201).json({ 
             message: 'Usuario registrado. Por favor revisa tu correo para activar la cuenta.' 
         })
@@ -140,7 +134,87 @@ export const activarCuenta = async (req: Request, res: Response) => {
     }
 }
 
-// ... (El resto de funciones OAuth Meta se mantienen igual, no hace falta pegarlas si no las tocaste, pero aquí están para completar el archivo si lo vas a reemplazar todo)
+/* =============================================================================
+ * RECUPERACIÓN DE CONTRASEÑA (OLVIDÉ MI CONTRASEÑA)
+ * ========================================================================== */
+
+// 1. SOLICITAR (El usuario pone su email)
+export const solicitarRecuperacion = async (req: Request, res: Response) => {
+    const { email } = req.body
+    if (!email) return res.status(400).json({ error: 'Email requerido' })
+
+    try {
+        const usuario = await prisma.usuario.findUnique({ where: { email } })
+        
+        // Si no existe, no damos error para no filtrar correos, pero retornamos éxito simulado
+        if (!usuario) {
+             return res.json({ message: 'Si el correo está registrado, recibirás instrucciones.' })
+        }
+
+        // Generar token y fecha de expiración (1 hora)
+        const resetToken = uuidv4()
+        const resetTokenExpiry = new Date(Date.now() + 3600000) 
+
+        // Guardar en DB
+        await prisma.usuario.update({
+            where: { id: usuario.id },
+            data: { resetToken, resetTokenExpiry }
+        })
+
+        // Enviar correo (background)
+        enviarCorreoRecuperacion(email, resetToken)
+            .catch(err => console.error('[ForgotPwd] Error mailer:', err))
+
+        return res.json({ message: 'Si el correo está registrado, recibirás instrucciones.' })
+
+    } catch (e) {
+        console.error('[solicitarRecuperacion] Error:', e)
+        return res.status(500).json({ error: 'Error interno del servidor' })
+    }
+}
+
+// 2. RESETEAR (El usuario viene del link con el token y nueva password)
+export const resetearPassword = async (req: Request, res: Response) => {
+    const { token, newPassword } = req.body
+    if (!token || !newPassword) return res.status(400).json({ error: 'Datos incompletos' })
+
+    try {
+        // Buscar usuario con ese token y que NO haya expirado
+        const usuario = await prisma.usuario.findFirst({
+            where: {
+                resetToken: token,
+                resetTokenExpiry: { gt: new Date() } // gt = mayor que ahora
+            }
+        })
+
+        if (!usuario) {
+            return res.status(400).json({ error: 'El enlace es inválido o ha expirado.' })
+        }
+
+        // Hashear la nueva contraseña
+        const hashedPassword = await bcrypt.hash(newPassword, 10)
+
+        // Actualizar password y limpiar token
+        await prisma.usuario.update({
+            where: { id: usuario.id },
+            data: {
+                password: hashedPassword,
+                resetToken: null,
+                resetTokenExpiry: null
+            }
+        })
+
+        return res.json({ message: 'Contraseña actualizada correctamente' })
+
+    } catch (e) {
+        console.error('[resetearPassword] Error:', e)
+        return res.status(500).json({ error: 'Error al cambiar contraseña' })
+    }
+}
+
+/* =============================================================================
+ * OAUTH META - SIN CAMBIOS
+ * ========================================================================== */
 
 export const iniciarOAuthMeta = (req: Request, res: Response) => {
     const APP_ID = process.env.META_APP_ID!

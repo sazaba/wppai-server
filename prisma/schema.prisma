@@ -17,6 +17,10 @@ model Usuario {
   updatedAt         DateTime @updatedAt
   cuentaConfirmada  Boolean  @default(false)
   tokenConfirmacion String?
+
+  resetToken       String?   @unique @db.VarChar(191) // Token para recuperar
+  resetTokenExpiry DateTime? // Fecha de expiración del token
+  
   empresa           Empresa  @relation(fields: [empresaId], references: [id])
 
   @@index([empresaId], map: "usuario_empresaId_fkey")
