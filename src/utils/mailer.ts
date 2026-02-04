@@ -1,10 +1,13 @@
 // src/utils/mailer.ts
 import nodemailer from 'nodemailer'
 
+const port = Number(process.env.SMTP_PORT) || 465
+
+// En puerto 465 usamos secure: true. En 587 usamos secure: false (STARTTLS)
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: Number(process.env.SMTP_PORT) || 465, 
-  secure: true, // true para puerto 465, false para 587
+  port: port,
+  secure: port === 465, 
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
@@ -16,7 +19,7 @@ export const enviarCorreoVerificacion = async (email: string, token: string) => 
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000'
   const url = `${frontendUrl}/activar-cuenta?token=${token}`
 
-  console.log(`[Mailer] Preparando correo para ${email}...`)
+  console.log(`[Mailer] Preparando correo para ${email} por puerto ${port}...`)
 
   try {
     const info = await transporter.sendMail({
@@ -40,7 +43,6 @@ export const enviarCorreoVerificacion = async (email: string, token: string) => 
     console.log('[Mailer] Correo enviado ID:', info.messageId)
   } catch (error) {
     console.error('[Mailer] Error FATAL enviando correo:', error)
-    // Aquí solo logueamos porque la función se llama sin await
-    throw error
+    // No lanzamos el error para no romper el flujo del controlador
   }
 }
