@@ -2,7 +2,6 @@
 import { Resend } from 'resend'
 
 // Inicializamos Resend con la clave de entorno
-// Si falla al iniciar es porque falta la variable, pero no romperá la app aquí.
 const resend = new Resend(process.env.RESEND_API_KEY)
 
 export const enviarCorreoVerificacion = async (email: string, token: string) => {
@@ -13,10 +12,10 @@ export const enviarCorreoVerificacion = async (email: string, token: string) => 
 
   try {
     const data = await resend.emails.send({
-      // ⚠️ IMPORTANTE: Si no has verificado tu dominio en Resend,
-      // DEBES usar 'onboarding@resend.dev' como remitente.
-      // Cuando verifiques tu dominio, cámbialo a 'soporte@wasaaa.com'
-      from: 'Wasaaa <onboarding@resend.dev>',
+      // ✅ VERSIÓN PRODUCCIÓN:
+      // Aquí puedes poner cualquier prefijo antes de @wasaaa.com 
+      // (ej: soporte, hola, no-reply, notificaciones)
+      from: 'Soporte Wasaaa <soporte@wasaaa.com>',
       
       to: [email],
       subject: 'Activa tu cuenta en Wasaaa 🚀',
