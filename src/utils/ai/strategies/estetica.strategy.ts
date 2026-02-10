@@ -391,10 +391,27 @@ async function loadState(conversationId: number): Promise<AgentState> {
     select: { data: true },
   });
 
-  // 🔒 Fuente de verdad: si ya existe al menos 1 mensaje del BOT en BD, entonces "greeted" debe ser true
-  // Esto evita "hola" duplicado cuando el state se pierde / expira / no existe aún.
-  let greetedFromHistory = false;
+  // CORRECCIÓN CRÍTICA: Parsear el string que viene de la BD
+  let raw: any = {};
+  
+  if (row?.data) {
+      if (typeof row.data === 'string') {
+          try {
+              raw = JSON.parse(row.data);
+          } catch (e) {
+              console.error("Error parseando estado JSON:", e);
+              raw = {};
+          }
+      } else {
+          // Por si acaso en el futuro cambias el schema a Json nativo
+          raw = row.data;
+      }
+  }
 
+  // --- El resto de la función sigue igual ---
+  
+  // Lógica de greeted
+  let greetedFromHistory = false;
   if (!row) {
     const anyBotMsg = await prisma.message.findFirst({
       where: { conversationId, from: MessageFrom.bot },
@@ -403,9 +420,8 @@ async function loadState(conversationId: number): Promise<AgentState> {
     greetedFromHistory = !!anyBotMsg;
   }
 
-  const raw = (row?.data as any) || {};
   const data: AgentState = {
-    greeted: row ? !!raw.greeted : greetedFromHistory,
+    greeted: raw.greeted !== undefined ? raw.greeted : greetedFromHistory, // Usamos raw parseado
     lastIntent: raw.lastIntent,
     lastServiceId: raw.lastServiceId ?? null,
     lastServiceName: raw.lastServiceName ?? null,
@@ -417,9 +433,7 @@ async function loadState(conversationId: number): Promise<AgentState> {
 
   const expired = data.expireAt ? Date.now() > Date.parse(data.expireAt) : true;
 
-  // ✅ Si está expirado, NO “reinicies” greeted a false por accidente:
   if (expired) {
-    // Si el state venía con greeted false pero YA hay mensajes del bot, lo corregimos:
     if (!data.greeted) {
       const anyBotMsg = await prisma.message.findFirst({
         where: { conversationId, from: MessageFrom.bot },
@@ -437,33 +451,20 @@ async function loadState(conversationId: number): Promise<AgentState> {
 
   return data;
 }
-
 async function saveState(conversationId: number, data: AgentState) {
-    // 1. Asegurar que conversationId sea un entero válido
     const cId = Number(conversationId);
-    if (isNaN(cId) || cId === 0) {
-        console.error("[saveState] Error: conversationId inválido", conversationId);
-        return; // O lanzar error según tu lógica
-    }
+    if (isNaN(cId) || cId === 0) return;
 
     const next: AgentState = { ...data, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
 
-    // 2. Higienización de JSON (Truco para eliminar undefined y asegurar serialización)
-    // Esto previene que Prisma falle si hay propiedades indefinidas dentro de 'draft'
-    const safeData = JSON.parse(JSON.stringify(next));
+    // CORRECCIÓN CRÍTICA: Convertimos el objeto a STRING antes de guardar
+    const dataString = JSON.stringify(next);
 
-    try {
-        await prisma.conversationState.upsert({
-            where: { conversationId: cId },
-            create: { conversationId: cId, data: safeData },
-            update: { data: safeData },
-        });
-    } catch (error) {
-        // 3. Log explícito para ver qué dato está rompiendo la BD
-        console.error("[saveState] FALLO CRÍTICO AL GUARDAR ESTADO:", error);
-        console.error("[saveState] Payload intentado:", JSON.stringify(safeData, null, 2));
-        throw error; // Re-lanzar para que no se pierda el error
-    }
+    await prisma.conversationState.upsert({
+        where: { conversationId: cId },
+        create: { conversationId: cId, data: dataString }, // Enviamos String
+        update: { data: dataString },                      // Enviamos String
+    });
 }
 async function patchState(conversationId: number, patch: Partial<AgentState>) {
     const prev = await loadState(conversationId);
