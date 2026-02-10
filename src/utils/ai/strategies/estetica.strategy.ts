@@ -2667,23 +2667,28 @@ export async function handleEsteticaReply(args: {
                 // Emitimos el evento al frontend
                 // Usamos "message:new" que es el estándar común.
                 // Si tu frontend usa otro nombre (ej: "receive_message"), cámbialo aquí.
-                io?.emit("message:new", {
+               io?.emit("nuevo_mensaje", {
                     conversationId: conversationId,
                     id: resultadoBot.messageId,
-                    content: resultadoBot.mensaje,
                     from: "bot", 
-                    type: "text",
-                    timestamp: new Date()
+                    // El frontend busca 'contenido' o 'body', NO 'content'
+                    contenido: resultadoBot.mensaje, 
+                    timestamp: new Date(),
+                    
+                    // Campos opcionales para evitar errores en el front
+                    mediaUrl: null,
+                    isVoiceNote: false
                 });
                 
                 // También emitimos update de conversación por si acaso
-                io?.emit("conversation:update", {
+               io?.emit("chat_actualizado", {
                     id: conversationId,
-                    lastMessage: resultadoBot.mensaje,
-                    unreadCount: 0
+                    estado: resultadoBot.estado || "respondido",
+                    mensaje: resultadoBot.mensaje, // Para que se lea en la preview
+                    fecha: new Date()
                 });
 
-                console.log(`[DEBOUNCE] 🚀 Socket emitido para chat ${conversationId}`);
+                console.log(`[DEBOUNCE] 🚀 Socket 'nuevo_mensaje' emitido para chat ${conversationId}`);
             }
 
         } catch (err) {
