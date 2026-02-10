@@ -991,7 +991,7 @@ async function buildOrReuseSummary(args: {
     if (payments.length) lines.push(`${icon("pay")} Pagos: ${payments.join(" • ")}`);
 
     // === SERVICIOS con staff asignado (legible) ===
-    // === SERVICIOS con staff asignado + depósito por procedimiento (legible) ===
+  // === SERVICIOS con staff asignado (legible) ===
     if ((kb.procedures ?? []).length) {
         const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
 
@@ -1003,7 +1003,19 @@ async function buildOrReuseSummary(args: {
 
             const durTxt = p.durationMin ? `${p.durationMin}min` : "N/A";
             const priceTxt = p.priceMin ? `desde ${formatCOP(p.priceMin)}` : "";
-            const staffReq = (p.requiredStaffIds ?? []).map(id => staffById.get(id)).filter(Boolean) as string[];
+
+            // --- CORRECCIÓN DE SEGURIDAD AQUÍ ---
+            let rawIds: any = p.requiredStaffIds;
+            // Si viene como string "1,2", lo convertimos a array
+            if (typeof rawIds === 'string') rawIds = rawIds.split(',').map((s: string) => s.trim());
+            // Si viene como número, lo envolvemos
+            else if (typeof rawIds === 'number') rawIds = [rawIds];
+            // Si no es array, fallback a vacío
+            if (!Array.isArray(rawIds)) rawIds = [];
+
+            const staffReq = rawIds.map((id: any) => staffById.get(id)).filter(Boolean) as string[];
+            // ------------------------------------
+
             const staffTxt = staffReq.length ? staffReq.join(", ") : "— sin asignar —";
 
             // Depósito por procedimiento
@@ -1049,6 +1061,7 @@ async function buildOrReuseSummary(args: {
     }
 
     // 2) Catálogo con duración, staff y depósito por procedimiento (para la IA)
+  // 2) Catálogo con duración, staff y depósito por procedimiento (para la IA)
     if ((kb.procedures ?? []).length) {
         const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
 
@@ -1060,7 +1073,15 @@ async function buildOrReuseSummary(args: {
             const dur = (p.durationMin != null ? p.durationMin : (kb.defaultServiceDurationMin ?? null));
             const durTxt = dur != null ? `${dur}min` : "NA";
 
-            const staffReq = (p.requiredStaffIds ?? []).map(id => staffById.get(id)).filter(Boolean) as string[];
+            // --- CORRECCIÓN DE SEGURIDAD AQUÍ ---
+            let rawIds: any = p.requiredStaffIds;
+            if (typeof rawIds === 'string') rawIds = rawIds.split(',').map((s: string) => s.trim());
+            else if (typeof rawIds === 'number') rawIds = [rawIds];
+            if (!Array.isArray(rawIds)) rawIds = [];
+
+            const staffReq = rawIds.map((id: any) => staffById.get(id)).filter(Boolean) as string[];
+            // ------------------------------------
+
             const staffTxt = staffReq.length ? staffReq.join(", ") : "libre";
 
             const priceTxt = p.priceMin != null ? `${Number(p.priceMin)}` : "NA";
