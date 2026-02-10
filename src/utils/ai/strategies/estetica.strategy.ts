@@ -16,6 +16,8 @@ import {
     resolveServiceName,
     type EsteticaKB,
 } from "./esteticaModules/domain/estetica.kb";
+// Ajusta la ruta (../..) según dónde esté tu archivo server.ts o index.ts
+import { io } from "../../../index"; // o "../../../server"
 
 /* ==== CONFIG ==== */
 type Conf = {
@@ -2650,18 +2652,32 @@ export async function handleEsteticaReply(args: {
 
         console.log(`[DEBOUNCE] Chat ${conversationId}: Ejecutando estrategia tras espera.`);
 
-        try {
-            // NOTA IMPORTANTE: Pasamos mensajeArg como "" (vacío).
-            // Esto obliga a handleEsteticaStrategy a buscar el ÚLTIMO mensaje real en la BD 
-            // (prisma.message.findFirst). Así, si llegaron 5 mensajes, la IA leerá 
-            // el último como trigger y los anteriores como historial.
-            await handleEsteticaStrategy({
+ try {
+            // 1. Ejecutamos la estrategia y CAPTURAMOS el resultado en una variable
+            const resultadoBot = await handleEsteticaStrategy({
                 chatId: conversationId,
                 empresaId,
-                mensajeArg: "", 
+                mensajeArg: "", // Forzamos lectura acumulada de la BD
                 toPhone,
                 phoneNumberId,
             });
+
+            // 2. Si el bot generó una respuesta, AVISAMOS AL FRONTEND
+            if (resultadoBot && resultadoBot.mensaje) {
+                
+                // Emitimos el evento para que el chat se actualice en tiempo real
+                io.emit("message:new", {
+                    conversationId: conversationId, // ID del chat
+                    id: resultadoBot.messageId,     // ID del mensaje en BD
+                    content: resultadoBot.mensaje,
+                    from: "bot", 
+                    type: "text",
+                    timestamp: new Date()
+                });
+
+                console.log(`[DEBOUNCE] 🚀 Socket emitido para chat ${conversationId}: "${resultadoBot.mensaje.substring(0, 20)}..."`);
+            }
+
         } catch (err) {
             console.error(`[DEBOUNCE] Error ejecutando estrategia diferida para ${conversationId}:`, err);
         }

@@ -81,7 +81,7 @@ const app = express()
 const server = http.createServer(app)
 const socketPath = sanitizePath(process.env.SOCKET_IO_PATH, '/socket.io')
 
-const io = new Server(server, {
+export const io = new Server(server, {
     path: socketPath,
     cors: {
         origin: (origin, cb) => {
