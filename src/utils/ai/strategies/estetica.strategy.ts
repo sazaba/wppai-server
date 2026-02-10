@@ -50,7 +50,8 @@ const CONF: Conf = {
 
 
 };
-const AGREGATION_WAIT_MS = 15000;
+// === CONFIG DE AGRUPACIÓN ===
+const IA_AGREGATION_MS = 20000; // 20 seg (o 90000 para 1.5 min si tienes VPS)
 const IMAGE_WAIT_MS = 1000;
 const IMAGE_CARRY_MS = 60_000;
 const IMAGE_LOOKBACK_MS = 300_000;
@@ -1887,97 +1888,87 @@ export async function handleEsteticaStrategy({
 
     // let userText = (mensajeArg || "").trim();
 
-    // === ⏳ ESTRATEGIA DE AGRUPACIÓN (DEBOUNCE) ===
-    // 1. Esperamos el tiempo definido para dar chance al usuario de enviar más notas/texto
-    await sleep(AGREGATION_WAIT_MS);
+    // 1. ⏳ PAUSA TÁCTICA: Esperamos para ver si llegan más mensajes (Ráfaga)
+    await sleep(IA_AGREGATION_MS);
 
-    // 2. Verificamos si llegó un mensaje MÁS NUEVO mientras dormíamos
-    // (Si el usuario siguió escribiendo, este proceso es viejo y debe morir)
-    const checkFreshness = await prisma.message.findFirst({
+    // 2. 🔍 VERIFICACIÓN: ¿Llegó algo más nuevo mientras dormíamos?
+    const freshCheck = await prisma.message.findFirst({
         where: { conversationId: chatId, from: MessageFrom.client },
-        orderBy: { timestamp: "desc" },
-        select: { timestamp: true }
+        orderBy: { timestamp: 'desc' },
+        select: { id: true, timestamp: true }
     });
 
-    const timeSinceLast = Date.now() - new Date(checkFreshness?.timestamp || 0).getTime();
-    
-    // Si el último mensaje es MUY reciente (menos del 80% del tiempo de espera),
-    // significa que hay otro proceso "más nuevo" ejecutándose. Nos apagamos.
-    if (timeSinceLast < (AGREGATION_WAIT_MS * 0.8)) {
-        return null; 
+    // Si el último mensaje en BD es MUCHO más nuevo que nuestro inicio (margen de 2s),
+    // significa que este proceso es viejo y hay uno nuevo corriendo. Nos apagamos.
+    const timeDiff = Date.now() - (freshCheck?.timestamp.getTime() || 0);
+    if (timeDiff < (IA_AGREGATION_MS - 2000)) {
+        return null; // 🤫 Silencio, dejamos que el proceso más reciente responda.
     }
 
-    // 3. Somos el proceso ganador. Recogemos TODOS los mensajes no respondidos.
-    // Buscamos el último del BOT para saber desde dónde empezar a leer.
+    // 3. 📦 AGRUPACIÓN: Recolectar todo lo no respondido
+    // Buscamos la última vez que habló el bot para no leer historia antigua
     const lastBotMsg = await prisma.message.findFirst({
         where: { conversationId: chatId, from: MessageFrom.bot },
-        orderBy: { timestamp: "desc" },
+        orderBy: { timestamp: 'desc' },
         select: { timestamp: true }
     });
-    const cutoffDate = lastBotMsg?.timestamp || new Date(0);
 
-    // Traemos el lote de mensajes nuevos del cliente
-    const batchMessages = await prisma.message.findMany({
-        where: { 
-            conversationId: chatId, 
+    // Definimos ventana de tiempo: desde el último bot O hace 5 minutos (para no traer historia de ayer)
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
+    const cutoffTime = lastBotMsg?.timestamp && lastBotMsg.timestamp > fiveMinAgo 
+        ? lastBotMsg.timestamp 
+        : fiveMinAgo;
+
+    // Traemos los mensajes del cliente recientes
+    const unrepliedMsgs = await prisma.message.findMany({
+        where: {
+            conversationId: chatId,
             from: MessageFrom.client,
-            timestamp: { gt: cutoffDate }
+            timestamp: { gt: cutoffTime }
         },
-        orderBy: { timestamp: "asc" }, // Orden cronológico para leerlo con sentido
-        select: {
-            id: true,
-            contenido: true,
-            mediaType: true,
-            mediaUrl: true,
-            caption: true,
-            mimeType: true,
-            isVoiceNote: true,
-            transcription: true,
-            timestamp: true,
-        },
+        orderBy: { timestamp: 'asc' } // Orden cronológico para leerlo natural
     });
 
-    if (batchMessages.length === 0) return null; // Falsa alarma, no hay nada.
+    if (!unrepliedMsgs.length) return null;
 
-    // Usamos el último mensaje para la metadata (fotos, timestamps)
-    const last = batchMessages[batchMessages.length - 1];
+    // El "last" oficial para metadatos (fotos, timestamps) es el último de la lista
+    const last = unrepliedMsgs[unrepliedMsgs.length - 1];
 
-    // Chequeo de seguridad final de doble respuesta
+    // Anti-doble respuesta final (por si acaso)
     if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp)) return null;
 
-    // 4. Construimos el texto unificado (Texto + Transcripciones + Captions)
-    let collectedTextParts: string[] = [];
+    // 4. 📝 CONSTRUCCIÓN DEL TEXTO UNIFICADO
+    let textParts: string[] = [];
 
-    for (const msg of batchMessages) {
-        let textPart = (msg.contenido || "").trim();
+    for (const msg of unrepliedMsgs) {
+        let txt = (msg.contenido || "").trim();
 
-        // Transcribir audios en el lote si faltan
+        // Lógica de Audio (igual a tu original)
         if (isVoiceInbound(msg)) {
             let tr = msg.transcription?.trim() || "";
             if (!tr && msg.mediaUrl) {
                 try {
                     const { data } = await axios.get(msg.mediaUrl, { responseType: "arraybuffer" });
                     tr = await transcribeAudioBuffer(Buffer.from(data), "audio.ogg");
-                    if (tr) {
-                        await prisma.message.update({ where: { id: msg.id }, data: { transcription: tr } });
-                    }
-                } catch (e) {}
+                    if (tr) await prisma.message.update({ where: { id: msg.id }, data: { transcription: tr } });
+                } catch {}
             }
-            if (tr) textPart = tr;
+            if (tr) txt = tr;
         }
 
-        // Agregar caption de imagen si no está incluido
-        if (msg.caption && !textPart.includes(msg.caption)) {
-            textPart += ` ${msg.caption}`;
+        // Agregar caption de foto si no está duplicado
+        if (msg.caption && !txt.includes(msg.caption)) {
+            txt += ` ${msg.caption}`;
         }
 
-        if (textPart) collectedTextParts.push(textPart);
+        if (txt) textParts.push(txt);
     }
 
-    // Unimos todo con saltos de línea. Esto es lo que leerá la IA.
-    let userText = collectedTextParts.join("\n").trim();
-    
-    // Parche: Si es "solo nombre" (ej: nota de voz corta diciendo "Juan Perez"), formatear
+    // Unimos las ideas con saltos de línea para que la IA entienda el contexto completo
+    let userText = textParts.join("\n").trim();
+    if (!userText) userText = (mensajeArg || "").trim();
+
+    // 5. PARCHE "SOLO NOMBRE" (Tu lógica original aplicada al bloque entero)
     if (userText && userText.split(/\s+/).length <= 2) {
         const maybe = looksLikeLooseName(userText);
         if (maybe) userText = `Mi nombre es ${maybe}`;
