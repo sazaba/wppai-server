@@ -439,12 +439,31 @@ async function loadState(conversationId: number): Promise<AgentState> {
 }
 
 async function saveState(conversationId: number, data: AgentState) {
+    // 1. Asegurar que conversationId sea un entero válido
+    const cId = Number(conversationId);
+    if (isNaN(cId) || cId === 0) {
+        console.error("[saveState] Error: conversationId inválido", conversationId);
+        return; // O lanzar error según tu lógica
+    }
+
     const next: AgentState = { ...data, expireAt: nowPlusMin(CONF.MEM_TTL_MIN) };
-    await prisma.conversationState.upsert({
-        where: { conversationId },
-        create: { conversationId, data: next as any },
-        update: { data: next as any },
-    });
+
+    // 2. Higienización de JSON (Truco para eliminar undefined y asegurar serialización)
+    // Esto previene que Prisma falle si hay propiedades indefinidas dentro de 'draft'
+    const safeData = JSON.parse(JSON.stringify(next));
+
+    try {
+        await prisma.conversationState.upsert({
+            where: { conversationId: cId },
+            create: { conversationId: cId, data: safeData },
+            update: { data: safeData },
+        });
+    } catch (error) {
+        // 3. Log explícito para ver qué dato está rompiendo la BD
+        console.error("[saveState] FALLO CRÍTICO AL GUARDAR ESTADO:", error);
+        console.error("[saveState] Payload intentado:", JSON.stringify(safeData, null, 2));
+        throw error; // Re-lanzar para que no se pierda el error
+    }
 }
 async function patchState(conversationId: number, patch: Partial<AgentState>) {
     const prev = await loadState(conversationId);
