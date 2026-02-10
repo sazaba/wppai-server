@@ -50,7 +50,7 @@ const CONF: Conf = {
 
 
 };
-
+const AGREGATION_WAIT_MS = 15000;
 const IMAGE_WAIT_MS = 1000;
 const IMAGE_CARRY_MS = 60_000;
 const IMAGE_LOOKBACK_MS = 300_000;
@@ -1867,9 +1867,84 @@ export async function handleEsteticaStrategy({
 
 
 
-    const last = await prisma.message.findFirst({
+//     const last = await prisma.message.findFirst({
+//         where: { conversationId: chatId, from: MessageFrom.client },
+//         orderBy: { timestamp: "desc" },
+//         select: {
+//             id: true,
+//             contenido: true,
+//             mediaType: true,
+//             mediaUrl: true,
+//             caption: true,
+//             mimeType: true,
+//             isVoiceNote: true,
+//             transcription: true,
+//             timestamp: true,
+//         },
+//     });
+//     if (last?.id && seenInboundRecently(last.id)) return null;
+//     if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp)) return null;
+
+//     let userText = (mensajeArg || "").trim();
+
+//     // Voz → transcribir
+//     if (!userText && isVoiceInbound(last || {})) {
+//         let tr = last?.transcription?.trim() || "";
+//         if (!tr && last?.mediaUrl) {
+//             try {
+//                 const { data } = await axios.get(last.mediaUrl, { responseType: "arraybuffer" });
+//                 tr = await transcribeAudioBuffer(Buffer.from(data), "audio.ogg");
+//                 if (tr)
+//                     await prisma.message.update({ where: { id: last.id }, data: { transcription: tr } });
+//             } catch { }
+//         }
+//         if (tr) userText = tr;
+//         // ✅ Si el audio viene como “solo nombre”, conviértelo a gatillo para máxima compatibilidad
+// if (userText && userText.trim().split(/\s+/).length <= 2) {
+//   const maybe = looksLikeLooseName(userText);
+//   if (maybe) userText = `Mi nombre es ${maybe}`;
+// }
+
+//     }
+//     if (!userText) userText = last?.contenido?.trim() || "";
+
+// === ⏳ ESTRATEGIA DE AGRUPACIÓN (BUFFER DE MENSAJES) ===
+    
+    // 1. Esperamos para ver si el usuario envía más notas de voz o textos seguidos
+    await sleep(AGREGATION_WAIT_MS);
+
+    // 2. Verificamos si llegó un mensaje MÁS NUEVO mientras dormíamos
+    const checkFreshness = await prisma.message.findFirst({
         where: { conversationId: chatId, from: MessageFrom.client },
         orderBy: { timestamp: "desc" },
+        select: { timestamp: true }
+    });
+
+    // Si el último mensaje es MUY reciente (menos del tiempo de espera), significa que 
+    // otro proceso se disparó después de este y está esperando. 
+    // Abortamos ESTE proceso para que responda el proceso del último mensaje recibido.
+    const timeSinceLast = Date.now() - new Date(checkFreshness?.timestamp || 0).getTime();
+    if (timeSinceLast < (AGREGATION_WAIT_MS * 0.8)) {
+        return null; // Silencio táctico: dejamos que el hilo más nuevo responda
+    }
+
+    // 3. Si pasamos aquí, somos el proceso "ganador". Recogemos TODO lo no respondido.
+    // Buscamos el último mensaje del BOT para saber desde dónde leer.
+    const lastBotMsg = await prisma.message.findFirst({
+        where: { conversationId: chatId, from: MessageFrom.bot },
+        orderBy: { timestamp: "desc" },
+        select: { timestamp: true }
+    });
+    const cutoffDate = lastBotMsg?.timestamp || new Date(0);
+
+    // Traemos TODOS los mensajes del cliente desde la última respuesta del bot
+    const batchMessages = await prisma.message.findMany({
+        where: { 
+            conversationId: chatId, 
+            from: MessageFrom.client,
+            timestamp: { gt: cutoffDate }
+        },
+        orderBy: { timestamp: "asc" }, // Orden cronológico para leerlo con sentido
         select: {
             id: true,
             contenido: true,
@@ -1882,31 +1957,52 @@ export async function handleEsteticaStrategy({
             timestamp: true,
         },
     });
-    if (last?.id && seenInboundRecently(last.id)) return null;
+
+    if (batchMessages.length === 0) return null; // Nada que responder
+
+    // El "last" será el último del grupo (para mantener compatibilidad con tu lógica de imágenes/contexto)
+    const last = batchMessages[batchMessages.length - 1];
+    
+    // Anti-doble respuesta final
     if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp)) return null;
 
-    let userText = (mensajeArg || "").trim();
+    // 4. Procesamos y concatenamos el texto de TODOS los mensajes
+    let collectedTextParts: string[] = [];
 
-    // Voz → transcribir
-    if (!userText && isVoiceInbound(last || {})) {
-        let tr = last?.transcription?.trim() || "";
-        if (!tr && last?.mediaUrl) {
-            try {
-                const { data } = await axios.get(last.mediaUrl, { responseType: "arraybuffer" });
-                tr = await transcribeAudioBuffer(Buffer.from(data), "audio.ogg");
-                if (tr)
-                    await prisma.message.update({ where: { id: last.id }, data: { transcription: tr } });
-            } catch { }
+    for (const msg of batchMessages) {
+        let textPart = (msg.contenido || "").trim();
+
+        // Si es audio y no tiene transcripción, intentamos transcribir aquí
+        if (isVoiceInbound(msg)) {
+            let tr = msg.transcription?.trim() || "";
+            if (!tr && msg.mediaUrl) {
+                try {
+                    const { data } = await axios.get(msg.mediaUrl, { responseType: "arraybuffer" });
+                    tr = await transcribeAudioBuffer(Buffer.from(data), "audio.ogg");
+                    if (tr) {
+                        await prisma.message.update({ where: { id: msg.id }, data: { transcription: tr } });
+                    }
+                } catch (e) { console.error("Error transcribiendo en batch", e); }
+            }
+            if (tr) textPart = tr;
         }
-        if (tr) userText = tr;
-        // ✅ Si el audio viene como “solo nombre”, conviértelo a gatillo para máxima compatibilidad
-if (userText && userText.trim().split(/\s+/).length <= 2) {
-  const maybe = looksLikeLooseName(userText);
-  if (maybe) userText = `Mi nombre es ${maybe}`;
-}
 
+        // Si tiene caption (texto debajo de imagen), lo agregamos
+        if (msg.caption && !textPart.includes(msg.caption)) {
+            textPart += ` ${msg.caption}`;
+        }
+
+        if (textPart) collectedTextParts.push(textPart);
     }
-    if (!userText) userText = last?.contenido?.trim() || "";
+
+    // Unimos todo con saltos de línea para que la IA entienda que son varias ideas
+    let userText = collectedTextParts.join("\n");
+
+    // Lógica de "Solo Nombre" (Aplicada al texto total)
+    if (userText && userText.trim().split(/\s+/).length <= 2) {
+        const maybe = looksLikeLooseName(userText);
+        if (maybe) userText = `Mi nombre es ${maybe}`;
+    }
 
     const kb = await loadEsteticaKB({ empresaId });
     if (!kb) {
