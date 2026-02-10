@@ -2559,6 +2559,19 @@ let cleaned = clinicOpenNow
 }
 
 /* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR ===== */
+// ... (Todo tu código anterior sigue igual hasta llegar a handleEsteticaReply) ...
+
+/* ================================================================================= */
+/* ===== BUFFER / DEBOUNCE SYSTEM (Para esperar 90s y agrupar mensajes) ===== */
+/* ================================================================================= */
+
+// Mapa en memoria para guardar los temporizadores de cada chat activo
+const executionTimers = new Map<number, NodeJS.Timeout>();
+
+// Tiempo de espera en milisegundos (90 segundos)
+const BUFFER_DELAY_MS = 90_000; 
+
+/* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR (MODIFICADO) ===== */
 export async function handleEsteticaReply(args: {
     chatId?: number;
     conversationId?: number;
@@ -2577,7 +2590,7 @@ export async function handleEsteticaReply(args: {
         chatId,
         conversationId: conversationIdArg,
         empresaId,
-        contenido,
+        contenido, // Este contenido es del mensaje actual, pero si esperamos, usaremos el último de la BD
         toPhone,
         phoneNumberId,
     } = args;
@@ -2585,22 +2598,48 @@ export async function handleEsteticaReply(args: {
     const conversationId = conversationIdArg ?? chatId;
     if (!conversationId) return { estado: "pendiente", mensaje: "" };
 
-    const res = await handleEsteticaStrategy({
-        chatId: conversationId,
-        empresaId,
-        mensajeArg: (contenido || "").trim(),
-        toPhone,
-        phoneNumberId,
-    });
+    // 1. Si ya había un temporizador corriendo para este chat, LO CANCELAMOS.
+    //    Esto significa: "Espera, ha llegado otro mensaje, reinicia la cuenta atrás".
+    if (executionTimers.has(conversationId)) {
+        console.log(`[DEBOUNCE] Chat ${conversationId}: Mensaje nuevo detectado. Reiniciando timer de ${BUFFER_DELAY_MS}ms.`);
+        clearTimeout(executionTimers.get(conversationId));
+    }
 
-    if (!res) return { estado: "pendiente", mensaje: "" };
+    // 2. Programamos la ejecución de la estrategia para dentro de 90 segundos
+    const timer = setTimeout(async () => {
+        // Limpiamos el mapa porque ya se va a ejecutar
+        executionTimers.delete(conversationId);
 
+        console.log(`[DEBOUNCE] Chat ${conversationId}: Ejecutando estrategia tras espera.`);
+
+        try {
+            // NOTA IMPORTANTE: Pasamos mensajeArg como "" (vacío).
+            // Esto obliga a handleEsteticaStrategy a buscar el ÚLTIMO mensaje real en la BD 
+            // (prisma.message.findFirst). Así, si llegaron 5 mensajes, la IA leerá 
+            // el último como trigger y los anteriores como historial.
+            await handleEsteticaStrategy({
+                chatId: conversationId,
+                empresaId,
+                mensajeArg: "", 
+                toPhone,
+                phoneNumberId,
+            });
+        } catch (err) {
+            console.error(`[DEBOUNCE] Error ejecutando estrategia diferida para ${conversationId}:`, err);
+        }
+
+    }, BUFFER_DELAY_MS);
+
+    // Guardamos el timer en memoria
+    executionTimers.set(conversationId, timer);
+
+    // 3. RETORNAMOS INMEDIATAMENTE para que el Webhook de Meta no de timeout.
+    //    Le decimos al sistema "en_proceso" para que sepa que recibimos el mensaje,
+    //    pero no devolvemos texto todavía. La respuesta real saldrá asíncronamente
+    //    dentro del timeout usando sendBotReply (que ya tienes implementado).
     return {
-        estado: (res.estado as any) || ConversationEstado.respondido,
-        mensaje: res.mensaje || "",
-        messageId: res.messageId,
-        wamid: res.wamid,
-        media: res.media || [],
+        estado: "en_proceso", 
+        mensaje: "", // No enviamos nada síncrono
+        media: [],
     };
-    ///new
 }
