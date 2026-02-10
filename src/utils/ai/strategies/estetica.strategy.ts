@@ -16,8 +16,8 @@ import {
     resolveServiceName,
     type EsteticaKB,
 } from "./esteticaModules/domain/estetica.kb";
-// Ajusta la ruta (../..) según dónde esté tu archivo server.ts o index.ts
-import { io } from "../../../index"; // o "../../../server"
+
+
 
 /* ==== CONFIG ==== */
 type Conf = {
@@ -2612,6 +2612,7 @@ const executionTimers = new Map<number, NodeJS.Timeout>();
 const BUFFER_DELAY_MS = 15_000;
 
 /* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR (MODIFICADO) ===== */
+/* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR (MODIFICADO) ===== */
 export async function handleEsteticaReply(args: {
     chatId?: number;
     conversationId?: number;
@@ -2630,7 +2631,7 @@ export async function handleEsteticaReply(args: {
         chatId,
         conversationId: conversationIdArg,
         empresaId,
-        contenido, // Este contenido es del mensaje actual, pero si esperamos, usaremos el último de la BD
+        contenido, 
         toPhone,
         phoneNumberId,
     } = args;
@@ -2638,62 +2639,64 @@ export async function handleEsteticaReply(args: {
     const conversationId = conversationIdArg ?? chatId;
     if (!conversationId) return { estado: "pendiente", mensaje: "" };
 
-    // 1. Si ya había un temporizador corriendo para este chat, LO CANCELAMOS.
-    //    Esto significa: "Espera, ha llegado otro mensaje, reinicia la cuenta atrás".
+    // 1. Cancelar timer anterior (Debounce)
     if (executionTimers.has(conversationId)) {
-        console.log(`[DEBOUNCE] Chat ${conversationId}: Mensaje nuevo detectado. Reiniciando timer de ${BUFFER_DELAY_MS}ms.`);
+        console.log(`[DEBOUNCE] Chat ${conversationId}: Reiniciando timer.`);
         clearTimeout(executionTimers.get(conversationId));
     }
 
-    // 2. Programamos la ejecución de la estrategia para dentro de 90 segundos
+    // 2. Programar ejecución diferida
     const timer = setTimeout(async () => {
-        // Limpiamos el mapa porque ya se va a ejecutar
         executionTimers.delete(conversationId);
+        
+        try {
+            // === IMPORTACIÓN DINÁMICA (Rompe el ciclo de dependencias) ===
+            // Ajusta el nombre del archivo si no es 'index'. Ej: '../../../server' o '../../../app'
+            const { io } = await import("../../../index"); 
+            // ============================================================
 
-        console.log(`[DEBOUNCE] Chat ${conversationId}: Ejecutando estrategia tras espera.`);
-
- try {
-            // 1. Ejecutamos la estrategia y CAPTURAMOS el resultado en una variable
             const resultadoBot = await handleEsteticaStrategy({
                 chatId: conversationId,
                 empresaId,
-                mensajeArg: "", // Forzamos lectura acumulada de la BD
+                mensajeArg: "", // Forzamos lectura acumulada
                 toPhone,
                 phoneNumberId,
             });
 
-            // 2. Si el bot generó una respuesta, AVISAMOS AL FRONTEND
             if (resultadoBot && resultadoBot.mensaje) {
-                
-                // Emitimos el evento para que el chat se actualice en tiempo real
-                io.emit("message:new", {
-                    conversationId: conversationId, // ID del chat
-                    id: resultadoBot.messageId,     // ID del mensaje en BD
+                // Emitimos el evento al frontend
+                // Usamos "message:new" que es el estándar común.
+                // Si tu frontend usa otro nombre (ej: "receive_message"), cámbialo aquí.
+                io?.emit("message:new", {
+                    conversationId: conversationId,
+                    id: resultadoBot.messageId,
                     content: resultadoBot.mensaje,
                     from: "bot", 
                     type: "text",
                     timestamp: new Date()
                 });
+                
+                // También emitimos update de conversación por si acaso
+                io?.emit("conversation:update", {
+                    id: conversationId,
+                    lastMessage: resultadoBot.mensaje,
+                    unreadCount: 0
+                });
 
-                console.log(`[DEBOUNCE] 🚀 Socket emitido para chat ${conversationId}: "${resultadoBot.mensaje.substring(0, 20)}..."`);
+                console.log(`[DEBOUNCE] 🚀 Socket emitido para chat ${conversationId}`);
             }
 
         } catch (err) {
-            console.error(`[DEBOUNCE] Error ejecutando estrategia diferida para ${conversationId}:`, err);
+            console.error(`[DEBOUNCE] Error estrategia:`, err);
         }
 
     }, BUFFER_DELAY_MS);
 
-    // Guardamos el timer en memoria
     executionTimers.set(conversationId, timer);
 
-    // 3. RETORNAMOS INMEDIATAMENTE para que el Webhook de Meta no de timeout.
-    //    Le decimos al sistema "en_proceso" para que sepa que recibimos el mensaje,
-    //    pero no devolvemos texto todavía. La respuesta real saldrá asíncronamente
-    //    dentro del timeout usando sendBotReply (que ya tienes implementado).
     return {
         estado: "en_proceso", 
-        mensaje: "", // No enviamos nada síncrono
+        mensaje: "", 
         media: [],
     };
 }
