@@ -1926,28 +1926,66 @@ export async function handleEsteticaStrategy({
     if (last?.id && seenInboundRecently(last.id)) return null;
     if (last?.timestamp && shouldSkipDoubleReply(chatId, last.timestamp)) return null;
 
+    // ================== INICIO BLOQUE NUEVO ==================
     let userText = (mensajeArg || "").trim();
 
-    // Voz → transcribir
+    // Si userText viene vacío (porque es ejecución diferida del Debounce),
+    // buscamos TODOS los mensajes pendientes en la BD.
+    if (!userText) {
+        // 1. ¿Cuándo habló el BOT por última vez?
+        const lastBotMsg = await prisma.message.findFirst({
+            where: { conversationId: chatId, from: MessageFrom.bot },
+            orderBy: { timestamp: 'desc' }
+        });
+        
+        // Fecha de corte: si nunca habló, traemos todo desde el inicio (fecha 0)
+        const cutOffDate = lastBotMsg ? new Date(lastBotMsg.timestamp as any) : new Date(0);
+
+        // 2. Traemos TODOS los mensajes del cliente POSTERIORES a esa fecha
+        const pendingMsgs = await prisma.message.findMany({
+            where: {
+                conversationId: chatId,
+                from: MessageFrom.client,
+                timestamp: { gt: cutOffDate } // gt = mayor que (después de)
+            },
+            orderBy: { timestamp: 'asc' }, // Orden cronológico para leerlo como una historia
+            select: { contenido: true, transcription: true }
+        });
+
+        // 3. Unimos los textos con punto y espacio.
+        // La IA recibirá: "Hola. Quiero saber precios. Y si duele el botox."
+        if (pendingMsgs.length > 0) {
+            userText = pendingMsgs
+                .map(m => (m.transcription || m.contenido || "").trim())
+                .filter(Boolean)
+                .join(". "); 
+        }
+    }
+
+    // Fallback de seguridad (si no encontró nada o falló la lógica anterior)
+    // Mantenemos la lógica de voz básica por si acaso, pero usando 'last' que ya obtuviste arriba
     if (!userText && isVoiceInbound(last || {})) {
-        let tr = last?.transcription?.trim() || "";
-        if (!tr && last?.mediaUrl) {
+         let tr = last?.transcription?.trim() || "";
+         // Intento rápido de transcripción si no estaba hecha (opcional, ya que el webhook suele traerla)
+         if (!tr && last?.mediaUrl) {
             try {
                 const { data } = await axios.get(last.mediaUrl, { responseType: "arraybuffer" });
                 tr = await transcribeAudioBuffer(Buffer.from(data), "audio.ogg");
-                if (tr)
-                    await prisma.message.update({ where: { id: last.id }, data: { transcription: tr } });
-            } catch { }
-        }
-        if (tr) userText = tr;
-        // ✅ Si el audio viene como “solo nombre”, conviértelo a gatillo para máxima compatibilidad
-if (userText && userText.trim().split(/\s+/).length <= 2) {
-  const maybe = looksLikeLooseName(userText);
-  if (maybe) userText = `Mi nombre es ${maybe}`;
-}
-
+                if (tr) await prisma.message.update({ where: { id: last!.id }, data: { transcription: tr } });
+            } catch {}
+         }
+         userText = tr;
     }
+
+    // Último recurso: leer el contenido del último mensaje individual
     if (!userText) userText = last?.contenido?.trim() || "";
+    
+    // Corrección para audios que son solo nombre (mantenemos tu lógica)
+    if (userText && userText.trim().split(/\s+/).length <= 2) {
+        const maybe = looksLikeLooseName(userText);
+        if (maybe) userText = `Mi nombre es ${maybe}`;
+    }
+    // ================== FIN BLOQUE NUEVO ==================
 
     const kb = await loadEsteticaKB({ empresaId });
     if (!kb) {
@@ -2569,7 +2607,7 @@ let cleaned = clinicOpenNow
 const executionTimers = new Map<number, NodeJS.Timeout>();
 
 // Tiempo de espera en milisegundos (90 segundos)
-const BUFFER_DELAY_MS = 90_000; 
+const BUFFER_DELAY_MS = 15_000;
 
 /* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR (MODIFICADO) ===== */
 export async function handleEsteticaReply(args: {
