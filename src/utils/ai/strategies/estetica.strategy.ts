@@ -774,7 +774,6 @@ function getSlaConfirmText(kb: EsteticaKB) {
 
 
 // variable reutilizable para evitar "Cannot redeclare block-scoped variable 'summary'"
-// variable reutilizable para evitar "Cannot redeclare block-scoped variable 'summary'"
 let summaryText: string = "";
 
 async function buildOrReuseSummary(args: {
@@ -788,45 +787,77 @@ async function buildOrReuseSummary(args: {
     const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
     if (fresh) return cached.summary!.text;
 
-    // === OPTIMIZACIÓN: Usamos el horario que YA viene en el KB ===
+    // === Horario desde KB ===
     const rawDays = kb.weeklyHours || [];
 
-    // Normaliza, ordena y arma tramos por día (usa rawDays de memoria)
+    // --- LÓGICA DE COMPACTACIÓN INTELIGENTE (Agrupa días con mismo horario) ---
     type DayRow = { day: string; isOpen: number | boolean; start1?: string | null; end1?: string | null; start2?: string | null; end2?: string | null };
     
     function formatDaysCompact(rows: DayRow[]) {
         if (!rows?.length) return "";
 
-        // Ordena según L..D
+        // 1. Mapa para agrupar: Clave="9:00am-5:00pm", Valor=["Lun", "Mar"...]
+        const scheduleMap = new Map<string, string[]>();
+        
+        // Diccionario corto para renderizar
+        const SHORT_LABELS: Record<string, string> = { 
+            mon: "Lun", tue: "Mar", wed: "Mié", thu: "Jue", fri: "Vie", sat: "Sáb", sun: "Dom" 
+        };
+
+        // Ordenamos los días de la semana
         const sorted = rows
             .slice()
             .sort((a, b) => (DAY_ORDER[a.day] || 99) - (DAY_ORDER[b.day] || 99));
-
-        const parts: string[] = [];
 
         for (const r of sorted) {
             const open = Number(r.isOpen) === 1 || r.isOpen === true;
             if (!open) continue;
 
             const spans: string[] = [];
-
             const s1 = hmToMin(r.start1), e1 = hmToMin(r.end1);
-            if (s1 != null && e1 != null && e1 > s1) {
-                spans.push(`${minToLabel(s1)}–${minToLabel(e1)}`);
-            }
+            if (s1 != null && e1 != null && e1 > s1) spans.push(`${minToLabel(s1)}–${minToLabel(e1)}`);
 
             const s2 = hmToMin(r.start2), e2 = hmToMin(r.end2);
-            if (s2 != null && e2 != null && e2 > s2) {
-                spans.push(`${minToLabel(s2)}–${minToLabel(e2)}`);
-            }
+            if (s2 != null && e2 != null && e2 > s2) spans.push(`${minToLabel(s2)}–${minToLabel(e2)}`);
 
             if (spans.length) {
-                const label = DAY_LABEL[r.day] || r.day;
-                parts.push(`${label} ${spans.join(", ")}`);
+                // Creamos la "firma" del horario, ej: "09:00am–01:00pm"
+                const signature = spans.join(" y ");
+                const label = SHORT_LABELS[r.day] || r.day;
+                
+                const group = scheduleMap.get(signature) || [];
+                group.push(label);
+                scheduleMap.set(signature, group);
             }
         }
 
-        return parts.join("; ");
+        // 2. Construir líneas agrupadas (ej: "Lun-Vie: ...")
+        const outputLines: string[] = [];
+        
+        // Helper para saber si un array de días es consecutivo
+        const ALL_DAYS_ORDER = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
+        
+        for (const [time, days] of scheduleMap.entries()) {
+            let dayStr = "";
+            
+            // Si son más de 2 días, intentamos ver si son consecutivos para usar guion "-"
+            if (days.length >= 3) {
+                const firstIndex = ALL_DAYS_ORDER.indexOf(days[0]);
+                const lastIndex = ALL_DAYS_ORDER.indexOf(days[days.length - 1]);
+                // Si la distancia entre el primero y el último es igual a la cantidad de días - 1, son consecutivos
+                if (lastIndex - firstIndex === days.length - 1) {
+                    dayStr = `${days[0]}-${days[days.length - 1]}`; // Ej: "Lun-Vie"
+                } else {
+                    dayStr = days.join(", ");
+                }
+            } else {
+                dayStr = days.join(", "); // Ej: "Lun, Mié"
+            }
+
+            outputLines.push(`${dayStr}: ${time}`);
+        }
+
+        return outputLines.join("\n"); // Usamos salto de línea para que se lea mejor en el resumen
     }
 
     let hoursLineFromDB = formatDaysCompact(rawDays as DayRow[]);
@@ -834,7 +865,7 @@ async function buildOrReuseSummary(args: {
     // Pagos
     const payments = paymentMethodsFromKB(kb);
 
-    // Historial compacto (Única consulta a DB necesaria aquí porque es dinámico)
+    // Historial
     const msgs = await prisma.message.findMany({
         where: { conversationId },
         orderBy: { timestamp: "desc" },
@@ -850,13 +881,13 @@ async function buildOrReuseSummary(args: {
     let hoursLine: string | null = null;
     if (hoursLineFromDB) hoursLine = hoursLineFromDB;
 
-    // Fallback con freeText del KB
+    // Fallback con freeText
     if (!hoursLine && kb.freeText) {
         const m = String(kb.freeText).match(/🕒\s*Horario:\s*([^\n]+)/i);
         if (m) hoursLine = m[1].trim();
     }
 
-    // FAQs (Vienen del KB)
+    // FAQs
     const faqsArr = (kb.faqs || []).slice(0, 5);
 
     function icon(label: "biz" | "tz" | "rules" | "log" | "pol" | "pay" | "svc" | "hrs" | "faq" | "note" | "hist") {
@@ -868,7 +899,7 @@ async function buildOrReuseSummary(args: {
     lines.push(`${icon("biz")} *${kb.businessName || "Clínica estética"}*`);
     lines.push(`${icon("tz")} Zona horaria: ${kb.timezone}`);
 
-    // Reglas desde KB
+    // Reglas
     const rulesArr = [
         `Agenda: ${kb.appointmentEnabled ? "habilitada" : "deshabilitada"}`,
         kb.bufferMin != null ? `Buffer: ${kb.bufferMin} min` : "",
@@ -878,7 +909,7 @@ async function buildOrReuseSummary(args: {
     ].filter(Boolean);
     if (rulesArr.length) lines.push(`${icon("rules")} ${rulesArr.join(" · ")}`);
 
-    // Ubicación desde KB
+    // Ubicación
     const logArr = [
         kb.location?.name ? `Sede: ${kb.location.name}` : "",
         kb.location?.address ? `Dir: ${kb.location.address}` : "",
@@ -888,7 +919,7 @@ async function buildOrReuseSummary(args: {
     ].filter(Boolean);
     if (logArr.length) lines.push(`${icon("log")} ${logArr.join(" · ")}`);
 
-    // Políticas desde KB
+    // Políticas
     if (kb.noShowPolicy || kb.globalDepositRequired) {
         const pols = [
             kb.noShowPolicy ? `No-show: ${softTrim(kb.noShowPolicy, 120)}` : "",
@@ -899,7 +930,7 @@ async function buildOrReuseSummary(args: {
 
     if (payments.length) lines.push(`${icon("pay")} Pagos: ${payments.join(" • ")}`);
 
-    // === SERVICIOS ===
+    // Servicios
     if ((kb.procedures ?? []).length) {
         const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
         const svcLines: string[] = [];
@@ -928,7 +959,8 @@ async function buildOrReuseSummary(args: {
         lines.push(svcLines.join("\n"));
     }
 
-    if (hoursLine) lines.push(`${icon("hrs")} Horario: ${hoursLine}`);
+    // Aquí usamos saltos de línea explícitos para el horario
+    if (hoursLine) lines.push(`${icon("hrs")} Horarios:\n${hoursLine}`);
 
     if (faqsArr.length) {
         lines.push(`💬 *FAQs rápidas*`);
@@ -940,7 +972,7 @@ async function buildOrReuseSummary(args: {
     if (kb.businessOverview) lines.push(`📝 ${softTrim(kb.businessOverview, 260)}`);
     if (kb.freeText) lines.push(`📝 ${softTrim(kb.freeText, 260)}`);
 
-    // === META DATA IA ===
+    // Meta IA
     if ((kb.staff ?? []).length) {
         const staffMeta: string[] = [];
         staffMeta.push("=== STAFF ===");
@@ -991,7 +1023,6 @@ async function buildOrReuseSummary(args: {
     });
     return compact;
 }
-
 /* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
 /* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
 function overlayAgenda(summary: string, draft?: AgentState["draft"]): string {
