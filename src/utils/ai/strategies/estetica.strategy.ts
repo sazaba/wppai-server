@@ -120,11 +120,16 @@ function markActuallyReplied(conversationId: number, clientTs: Date) {
 }
 
 // Convierte "HH:MM" a minutos desde medianoche (ej.: "13:30" -> 810)
+// Convierte "HH:MM" o "HH:MM:SS" a minutos
 function hmToMin(hm?: string | null): number | null {
     if (!hm) return null;
-    const m = /^(\d{1,2}):(\d{2})$/.exec(hm.trim());
+    // Regex mejorado: acepta segundos opcionales (?::\d{2})? y espacios
+    const m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(hm.trim());
     if (!m) return null;
-    const h = Number(m[1]), mi = Number(m[2]);
+    
+    const h = Number(m[1]);
+    const mi = Number(m[2]);
+    
     if (isNaN(h) || isNaN(mi)) return null;
     return h * 60 + mi;
 }
@@ -2469,21 +2474,16 @@ let cleaned = clinicOpenNow
     };
 }
 
-/* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR ===== */
-// ... (Todo tu código anterior sigue igual hasta llegar a handleEsteticaReply) ...
-
 /* ================================================================================= */
-/* ===== BUFFER / DEBOUNCE SYSTEM (Para esperar 90s y agrupar mensajes) ===== */
+/* ===== BUFFER / DEBOUNCE SYSTEM (Para esperar 15s y agrupar mensajes) ===== */
 /* ================================================================================= */
 
-// Mapa en memoria para guardar los temporizadores de cada chat activo
+// Mapa en memoria para guardar los temporizadores
 const executionTimers = new Map<number, NodeJS.Timeout>();
 
-// Tiempo de espera en milisegundos (90 segundos)
+// Tiempo de espera (15 segundos)
 const BUFFER_DELAY_MS = 15_000;
 
-/* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR (MODIFICADO) ===== */
-/* ===== WRAPPER COMPATIBLE CON EL ORQUESTADOR (MODIFICADO) ===== */
 export async function handleEsteticaReply(args: {
     chatId?: number;
     conversationId?: number;
@@ -2502,64 +2502,60 @@ export async function handleEsteticaReply(args: {
         chatId,
         conversationId: conversationIdArg,
         empresaId,
-        contenido, 
         toPhone,
         phoneNumberId,
     } = args;
 
-    const conversationId = conversationIdArg ?? chatId;
-    if (!conversationId) return { estado: "pendiente", mensaje: "" };
+    // 1. Asegurar que el ID sea numérico para que el Map funcione bien
+    const rawId = conversationIdArg ?? chatId;
+    if (!rawId) return { estado: "pendiente", mensaje: "" };
+    
+    const conversationId = Number(rawId); 
 
-    // 1. Cancelar timer anterior (Debounce)
+    // 2. Cancelar timer anterior (Debounce)
     if (executionTimers.has(conversationId)) {
-        console.log(`[DEBOUNCE] Chat ${conversationId}: Reiniciando timer.`);
+        console.log(`[DEBOUNCE] ⏳ Chat ${conversationId}: Mensaje seguido detectado. Reiniciando timer...`);
         clearTimeout(executionTimers.get(conversationId));
+        executionTimers.delete(conversationId);
     }
 
-    // 2. Programar ejecución diferida
+    // 3. Programar ejecución diferida
     const timer = setTimeout(async () => {
         executionTimers.delete(conversationId);
+        console.log(`[DEBOUNCE] ✅ Chat ${conversationId}: Ejecutando respuesta acumulada.`);
         
         try {
-            // === IMPORTACIÓN DINÁMICA (Rompe el ciclo de dependencias) ===
-            // Ajusta el nombre del archivo si no es 'index'. Ej: '../../../server' o '../../../app'
+            // Importación dinámica
             const { io } = await import("../../../index"); 
-            // ============================================================
 
             const resultadoBot = await handleEsteticaStrategy({
                 chatId: conversationId,
                 empresaId,
-                mensajeArg: "", // Forzamos lectura acumulada
+                mensajeArg: "", // IMPORTANTE: Enviamos vacío para forzar la lectura de BD acumulada
                 toPhone,
                 phoneNumberId,
             });
 
             if (resultadoBot && resultadoBot.mensaje) {
-                // Emitimos el evento al frontend
-                // Usamos "message:new" que es el estándar común.
-                // Si tu frontend usa otro nombre (ej: "receive_message"), cámbialo aquí.
+                // Emitir al frontend
                io?.emit("nuevo_mensaje", {
                     conversationId: conversationId,
                     id: resultadoBot.messageId,
                     from: "bot", 
-                    // El frontend busca 'contenido' o 'body', NO 'content'
                     contenido: resultadoBot.mensaje, 
                     timestamp: new Date(),
-                    
-                    // Campos opcionales para evitar errores en el front
                     mediaUrl: null,
                     isVoiceNote: false
                 });
                 
-                // También emitimos update de conversación por si acaso
                io?.emit("chat_actualizado", {
                     id: conversationId,
                     estado: resultadoBot.estado || "respondido",
-                    mensaje: resultadoBot.mensaje, // Para que se lea en la preview
+                    mensaje: resultadoBot.mensaje,
                     fecha: new Date()
                 });
 
-                console.log(`[DEBOUNCE] 🚀 Socket 'nuevo_mensaje' emitido para chat ${conversationId}`);
+                console.log(`[DEBOUNCE] 🚀 Socket emitido para chat ${conversationId}`);
             }
 
         } catch (err) {
