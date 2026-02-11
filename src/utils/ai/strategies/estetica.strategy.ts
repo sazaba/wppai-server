@@ -207,20 +207,16 @@ function detectDayKeyFromText(text?: string | null): string | null {
 }
 
 // Consulta en BD si ese día tiene agenda abierta (al menos un tramo horario)
-async function isDayOpenInAgenda(empresaId: number, dayKey: string): Promise<boolean> {
-    const row = await prisma.appointmentHour.findFirst({
-        where: { empresaId, day: dayKey as Weekday },
-        select: { isOpen: true, start1: true, end1: true, start2: true, end2: true },
-    });
-
+function isDayOpenInAgenda(kb: EsteticaKB, dayKey: string): boolean {
+    const row = kb.weeklyHours.find(h => h.day === dayKey);
     if (!row) return false;
 
-    const open = Number(row.isOpen) === 1 || row.isOpen === true;
+    const open = row.isOpen;
     const hasSpan =
         (row.start1 && row.end1 && row.start1.trim() && row.end1.trim()) ||
         (row.start2 && row.end2 && row.start2.trim() && row.end2.trim());
 
-    return open && !!hasSpan;
+    return !!(open && hasSpan);
 }
 
 // Versión "bonita" del nombre del día para responder al cliente
@@ -269,24 +265,18 @@ function getZonedDayKeyAndMinutes(at: Date, timeZone: string) {
     };
 }
 
-async function isClinicOpenAt(
-    empresaId: number,
-    at: Date,
-    timeZone?: string | null
-): Promise<boolean> {
-    const tz = timeZone || "America/Bogota";
+function isClinicOpenAt(
+    kb: EsteticaKB,
+    at: Date
+): boolean {
+    const tz = kb.timezone || "America/Bogota";
     const { dayKey, minutes } = getZonedDayKeyAndMinutes(at, tz);
     if (!dayKey) return false;
 
-    const row = await prisma.appointmentHour.findFirst({
-        where: { empresaId, day: dayKey as Weekday },
-        select: { isOpen: true, start1: true, end1: true, start2: true, end2: true },
-    });
-
+    const row = kb.weeklyHours.find(h => h.day === dayKey);
     if (!row) return false;
 
-    const open = Number(row.isOpen) === 1 || row.isOpen === true;
-    if (!open) return false;
+    if (!row.isOpen) return false;
 
     const spans: Array<[number, number]> = [];
 
@@ -300,7 +290,6 @@ async function isClinicOpenAt(
 
     return spans.some(([s, e]) => minutes >= s && minutes < e);
 }
-
 
 
 /** Detecta si el mensaje es nota de voz o audio */
@@ -780,6 +769,7 @@ function getSlaConfirmText(kb: EsteticaKB) {
 
 
 // variable reutilizable para evitar "Cannot redeclare block-scoped variable 'summary'"
+// variable reutilizable para evitar "Cannot redeclare block-scoped variable 'summary'"
 let summaryText: string = "";
 
 async function buildOrReuseSummary(args: {
@@ -793,46 +783,12 @@ async function buildOrReuseSummary(args: {
     const fresh = cached.summary && Date.now() < Date.parse(cached.summary.expiresAt);
     if (fresh) return cached.summary!.text;
 
-    // Solo config general; NADA de appointmentHours/Exceptions
-    const apptCfg = await prisma.businessConfigAppt.findUnique({
-        where: { empresaId },
-        select: {
-            appointmentEnabled: true,
-            appointmentTimezone: true,
-            appointmentBufferMin: true,
-            appointmentMinNoticeHours: true,
-            appointmentMaxAdvanceDays: true,
-            allowSameDayBooking: true,
-            defaultServiceDurationMin: true,
-            appointmentPolicies: true,
-            locationName: true,
-            locationAddress: true,
-            locationMapsUrl: true,
-            parkingInfo: true,
-            instructionsArrival: true,
-            noShowPolicy: true,
-            depositRequired: true,
-            depositAmount: true,
-            servicesText: true,
-            services: true,
-            kbBusinessOverview: true,
-            kbFAQs: true,
-            kbServiceNotes: true,
-            kbEscalationRules: true,
-            kbDisclaimers: true,
-            kbMedia: true,
-            kbFreeText: true,
-        },
-    });
+    // === OPTIMIZACIÓN: Usamos el horario que YA viene en el KB ===
+    const rawDays = kb.weeklyHours || [];
 
-    // === Horario desde BD (tu esquema: day,isOpen,start1,end1,start2,end2) ===
-    const rawDays = await prisma.appointmentHour.findMany({
-        where: { empresaId },
-        select: { day: true, isOpen: true, start1: true, end1: true, start2: true, end2: true },
-    });
-
-    // Normaliza, ordena y arma tramos por día
+    // Normaliza, ordena y arma tramos por día (usa rawDays de memoria)
     type DayRow = { day: string; isOpen: number | boolean; start1?: string | null; end1?: string | null; start2?: string | null; end2?: string | null };
+    
     function formatDaysCompact(rows: DayRow[]) {
         if (!rows?.length) return "";
 
@@ -870,10 +826,10 @@ async function buildOrReuseSummary(args: {
 
     let hoursLineFromDB = formatDaysCompact(rawDays as DayRow[]);
 
-    // Pagos (opcional)
+    // Pagos
     const payments = paymentMethodsFromKB(kb);
 
-    // Historial compacto
+    // Historial compacto (Única consulta a DB necesaria aquí porque es dinámico)
     const msgs = await prisma.message.findMany({
         where: { conversationId },
         orderBy: { timestamp: "desc" },
@@ -885,118 +841,62 @@ async function buildOrReuseSummary(args: {
         .map((m) => `${m.from === MessageFrom.client ? "U" : "A"}: ${softTrim(m.contenido || "", 100)}`)
         .join(" | ");
 
-    // Intento de extraer un horario "tal cual" desde KB/config, sin calcular
-    // Horario con prioridad BD → KB → kbFreeText (sin “calcular”, sólo formateo)
+    // Horario final
     let hoursLine: string | null = null;
-
-    // 1) BD (formateado con DAY_LABEL + minToLabel)
     if (hoursLineFromDB) hoursLine = hoursLineFromDB;
 
-    // 2) KB (simple o general), si BD no trajo nada
-    if (!hoursLine) {
-        const hoursFromKB = (kb as any).hoursSimple || (kb as any).hours || null;
-        if (hoursFromKB) hoursLine = String(hoursFromKB).trim();
-    }
-
-    // 3) kbFreeText (patrón "🕒 Horario: ...") como respaldo
-    if (!hoursLine && apptCfg?.kbFreeText) {
-        const m = String(apptCfg.kbFreeText).match(/🕒\s*Horario:\s*([^\n]+)/i);
+    // Fallback con freeText del KB
+    if (!hoursLine && kb.freeText) {
+        const m = String(kb.freeText).match(/🕒\s*Horario:\s*([^\n]+)/i);
         if (m) hoursLine = m[1].trim();
     }
 
-    // FAQs (mismo parser que ya tenías)
-    type FAQ = { q: string; a: string };
-    function parseMaybeJson<T = any>(val: any): T | any {
-        if (typeof val === "string") { try { return JSON.parse(val); } catch { } }
-        return val;
-    }
-    function toFaqArray(src: any): FAQ[] {
-        const v = parseMaybeJson(src);
-        if (!v) return [];
-        if (Array.isArray(v)) {
-            if (v.length && typeof v[0] === "string") {
-                return v.map((s: string) => {
-                    const [q, a] = String(s).split("|");
-                    return { q: (q || "").trim(), a: (a || "").trim() };
-                }).filter(f => f.q && f.a);
-            }
-            if (v.length && typeof v[0] === "object") {
-                return v.map((o: any) => ({
-                    q: String(o?.q || "").trim(),
-                    a: String(o?.a || "").trim(),
-                })).filter(f => f.q && f.a);
-            }
-        }
-        if (typeof v === "object") {
-            return Object.entries(v).map(([q, a]) => ({
-                q: String(q).trim(),
-                a: String(a ?? "").trim(),
-            })).filter(f => f.q && f.a);
-        }
-        if (typeof v === "string") {
-            return v.split(/\r?\n/).map(l => {
-                const [q, a] = l.split("|");
-                return { q: (q || "").trim(), a: (a || "").trim() };
-            }).filter(f => f.q && f.a);
-        }
-        return [];
-    }
-    const faqsFromCfg = toFaqArray(apptCfg?.kbFAQs);
-    const faqsFromKB1 = toFaqArray((kb as any).kbFAQs);
-    const faqsFromKB2 = toFaqArray((kb as any).faqs);
-    const seen = new Set<string>();
-    const faqsArr = [...faqsFromCfg, ...faqsFromKB1, ...faqsFromKB2]
-        .filter(f => f && f.q && f.a)
-        .filter(f => {
-            const k = f.q.trim().toLowerCase();
-            if (seen.has(k)) return false;
-            seen.add(k);
-            return true;
-        });
+    // FAQs (Vienen del KB)
+    const faqsArr = (kb.faqs || []).slice(0, 5);
 
     function icon(label: "biz" | "tz" | "rules" | "log" | "pol" | "pay" | "svc" | "hrs" | "faq" | "note" | "hist") {
         const map = { biz: "🏥", tz: "🌐", rules: "📋", log: "📍", pol: "🧾", pay: "💳", svc: "✨", hrs: "🕒", faq: "💬", note: "📝", hist: "🧠" } as const;
         return map[label];
     }
 
-    const S = apptCfg || ({} as any);
     const lines: string[] = [];
     lines.push(`${icon("biz")} *${kb.businessName || "Clínica estética"}*`);
-    lines.push(`${icon("tz")} Zona horaria: ${S.appointmentTimezone || kb.timezone}`);
+    lines.push(`${icon("tz")} Zona horaria: ${kb.timezone}`);
 
+    // Reglas desde KB
     const rulesArr = [
-        S.appointmentEnabled != null ? `Agenda: ${S.appointmentEnabled ? "habilitada" : "deshabilitada"}` : "",
-        (S.appointmentBufferMin ?? kb.bufferMin) != null ? `Buffer: ${S.appointmentBufferMin ?? kb.bufferMin} min` : "",
-        S.allowSameDayBooking != null ? `Mismo día: ${S.allowSameDayBooking ? "sí" : "no"}` : "",
-        S.appointmentMinNoticeHours != null ? `Anticipación: ${S.appointmentMinNoticeHours} h` : "",
-        S.appointmentMaxAdvanceDays != null ? `Hasta: ${S.appointmentMaxAdvanceDays} días` : "",
+        `Agenda: ${kb.appointmentEnabled ? "habilitada" : "deshabilitada"}`,
+        kb.bufferMin != null ? `Buffer: ${kb.bufferMin} min` : "",
+        `Mismo día: ${kb.allowSameDay ? "sí" : "no"}`,
+        kb.minNoticeHours != null ? `Anticipación: ${kb.minNoticeHours} h` : "",
+        kb.maxAdvanceDays != null ? `Hasta: ${kb.maxAdvanceDays} días` : "",
     ].filter(Boolean);
     if (rulesArr.length) lines.push(`${icon("rules")} ${rulesArr.join(" · ")}`);
 
+    // Ubicación desde KB
     const logArr = [
-        S.locationName ? `Sede: ${S.locationName}` : "",
-        S.locationAddress ? `Dir: ${S.locationAddress}` : "",
-        S.locationMapsUrl ? `Mapa: ${S.locationMapsUrl}` : "",
-        S.parkingInfo ? `Parqueadero: ${softTrim(S.parkingInfo, 120)}` : "",
-        S.instructionsArrival ? `Ingreso: ${softTrim(S.instructionsArrival, 120)}` : "",
+        kb.location?.name ? `Sede: ${kb.location.name}` : "",
+        kb.location?.address ? `Dir: ${kb.location.address}` : "",
+        kb.location?.mapsUrl ? `Mapa: ${kb.location.mapsUrl}` : "",
+        kb.location?.parkingInfo ? `Parqueadero: ${softTrim(kb.location.parkingInfo, 120)}` : "",
+        kb.location?.arrivalInstructions ? `Ingreso: ${softTrim(kb.location.arrivalInstructions, 120)}` : "",
     ].filter(Boolean);
     if (logArr.length) lines.push(`${icon("log")} ${logArr.join(" · ")}`);
 
-    if (S.noShowPolicy || S.depositRequired != null) {
+    // Políticas desde KB
+    if (kb.noShowPolicy || kb.globalDepositRequired) {
         const pols = [
-            S.noShowPolicy ? `No-show: ${softTrim(S.noShowPolicy, 120)}` : "",
-            S.depositRequired ? `Depósito: ${S.depositAmount ? formatCOP(Number(S.depositAmount)) : "sí"}` : "Depósito: no",
+            kb.noShowPolicy ? `No-show: ${softTrim(kb.noShowPolicy, 120)}` : "",
+            kb.globalDepositRequired ? `Depósito: ${kb.globalDepositAmount ? formatCOP(Number(kb.globalDepositAmount)) : "sí"}` : "Depósito: no",
         ].filter(Boolean);
         lines.push(`${icon("pol")} ${pols.join(" · ")}`);
     }
 
     if (payments.length) lines.push(`${icon("pay")} Pagos: ${payments.join(" • ")}`);
 
-    // === SERVICIOS con staff asignado (legible) ===
-  // === SERVICIOS con staff asignado (legible) ===
+    // === SERVICIOS ===
     if ((kb.procedures ?? []).length) {
         const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
-
         const svcLines: string[] = [];
         svcLines.push(`${icon("svc")} *Servicios y personal asignado:*`);
 
@@ -1006,99 +906,71 @@ async function buildOrReuseSummary(args: {
             const durTxt = p.durationMin ? `${p.durationMin}min` : "N/A";
             const priceTxt = p.priceMin ? `desde ${formatCOP(p.priceMin)}` : "";
 
-            // --- CORRECCIÓN DE SEGURIDAD AQUÍ ---
             let rawIds: any = p.requiredStaffIds;
-            // Si viene como string "1,2", lo convertimos a array
             if (typeof rawIds === 'string') rawIds = rawIds.split(',').map((s: string) => s.trim());
-            // Si viene como número, lo envolvemos
             else if (typeof rawIds === 'number') rawIds = [rawIds];
-            // Si no es array, fallback a vacío
             if (!Array.isArray(rawIds)) rawIds = [];
 
             const staffReq = rawIds.map((id: any) => staffById.get(id)).filter(Boolean) as string[];
-            // ------------------------------------
-
             const staffTxt = staffReq.length ? staffReq.join(", ") : "— sin asignar —";
-
-            // Depósito por procedimiento
-            const depFlag = p.depositRequired ? "sí" : "no";
+            
             const depTxt = p.depositRequired
                 ? (p.depositAmount != null ? ` · Depósito: ${formatCOP(Number(p.depositAmount))}` : " · Depósito: sí")
                 : "";
 
             svcLines.push(`• ${p.name} (${durTxt}${priceTxt ? `, ${priceTxt}` : ""}) → 👩‍⚕️ ${staffTxt}${depTxt}`);
         }
-
         lines.push(svcLines.join("\n"));
     }
-
-
 
     if (hoursLine) lines.push(`${icon("hrs")} Horario: ${hoursLine}`);
 
     if (faqsArr.length) {
         lines.push(`💬 *FAQs rápidas*`);
-        for (const f of faqsArr.slice(0, 5)) {
+        for (const f of faqsArr) {
             lines.push(`• ${softTrim(f.q, 60)} → ${softTrim(f.a, 140)}`);
         }
     }
 
-    if (S.kbBusinessOverview) lines.push(`📝 ${softTrim(S.kbBusinessOverview, 260)}`);
-    if (S.kbFreeText) lines.push(`📝 ${softTrim(S.kbFreeText, 260)}`);
+    if (kb.businessOverview) lines.push(`📝 ${softTrim(kb.businessOverview, 260)}`);
+    if (kb.freeText) lines.push(`📝 ${softTrim(kb.freeText, 260)}`);
 
-    // === META solo para la IA (no visible al cliente) ===
-    // Colócalo antes de "🧠 Historial: ..."
-
-    // 1) Staff general (compacto)
+    // === META DATA IA ===
     if ((kb.staff ?? []).length) {
         const staffMeta: string[] = [];
         staffMeta.push("=== STAFF ===");
         for (const s of kb.staff) {
-            // formatea rol en minúsculas legibles
-            const role = String(s.role || "").toLowerCase();
-            staffMeta.push(`- id=${s.id}; name=${s.name}; role=${role}; active=${s.active ? "1" : "0"}`);
+            staffMeta.push(`- id=${s.id}; name=${s.name}; role=${String(s.role || "").toLowerCase()}; active=${s.active ? "1" : "0"}`);
         }
         staffMeta.push("=== FIN_STAFF ===");
         lines.push(staffMeta.join("\n"));
     }
 
-    // 2) Catálogo con duración, staff y depósito por procedimiento (para la IA)
-  // 2) Catálogo con duración, staff y depósito por procedimiento (para la IA)
     if ((kb.procedures ?? []).length) {
         const staffById = new Map((kb.staff ?? []).map(s => [s.id, s.name]));
-
         const catMeta: string[] = [];
         catMeta.push("=== CATALOGO_DETALLE ===");
         for (const p of kb.procedures) {
             if (p?.enabled === false) continue;
-
-            const dur = (p.durationMin != null ? p.durationMin : (kb.defaultServiceDurationMin ?? null));
-            const durTxt = dur != null ? `${dur}min` : "NA";
-
-            // --- CORRECCIÓN DE SEGURIDAD AQUÍ ---
+            
             let rawIds: any = p.requiredStaffIds;
             if (typeof rawIds === 'string') rawIds = rawIds.split(',').map((s: string) => s.trim());
             else if (typeof rawIds === 'number') rawIds = [rawIds];
             if (!Array.isArray(rawIds)) rawIds = [];
-
+            
             const staffReq = rawIds.map((id: any) => staffById.get(id)).filter(Boolean) as string[];
-            // ------------------------------------
-
             const staffTxt = staffReq.length ? staffReq.join(", ") : "libre";
-
+            
+            const dur = (p.durationMin != null ? p.durationMin : (kb.defaultServiceDurationMin ?? null));
             const priceTxt = p.priceMin != null ? `${Number(p.priceMin)}` : "NA";
-
-            // 🔹 Depósito por procedimiento
             const depReq = p.depositRequired ? 1 : 0;
             const depAmt = p.depositAmount != null ? `${Number(p.depositAmount)}` : "NA";
 
-            catMeta.push(`- proc=${p.name}; dur=${durTxt}; staff=${staffTxt}; priceMinCOP=${priceTxt}; depositRequired=${depReq}; depositAmountCOP=${depAmt}`);
+            catMeta.push(`- proc=${p.name}; dur=${dur != null ? dur + "min" : "NA"}; staff=${staffTxt}; priceMinCOP=${priceTxt}; depositRequired=${depReq}; depositAmountCOP=${depAmt}`);
         }
         catMeta.push("=== FIN_CATALOGO ===");
         lines.push(catMeta.join("\n"));
     }
-
-
 
     lines.push(`🧠 Historial: ${history || "—"}`);
 
@@ -1114,7 +986,6 @@ async function buildOrReuseSummary(args: {
     });
     return compact;
 }
-
 
 /* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
 /* === OVERLAY: inyecta piezas de agenda (procedimiento, nombre, fecha) en el summary sin romper el caché === */
@@ -2282,7 +2153,7 @@ export async function handleEsteticaStrategy({
     if (newDraft.whenText) {
         const dayKey = detectDayKeyFromText(newDraft.whenText);
         if (dayKey) {
-            const isOpen = await isDayOpenInAgenda(empresaId, dayKey);
+            const isOpen = isDayOpenInAgenda(kb, dayKey);
 
             // Si el día no está abierto en appointmentHour → avisar al cliente y NO hacer handoff
             if (!isOpen) {
@@ -2339,7 +2210,7 @@ export async function handleEsteticaStrategy({
 // OJO: esto mira el MOMENTO en que el cliente escribió (last.timestamp), NO el día que pidió para su cita
 const tz = (kb as any)?.timezone || "America/Bogota";
 const msgAt = last?.timestamp ? new Date(last.timestamp as any) : new Date();
-const clinicOpenNow = await isClinicOpenAt(empresaId, msgAt, tz);
+const clinicOpenNow = isClinicOpenAt(kb, msgAt);
 
 const slaText = getSlaConfirmText(kb);
 

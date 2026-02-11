@@ -1,11 +1,7 @@
-
 // utils/ai/strategies/esteticaModules/domain/estetica.kb.ts
 import prisma from "../../../../../lib/prisma";
 import type { AppointmentVertical, StaffRole } from "@prisma/client";
 
-
-
-// Helper seguro (arriba del archivo o en utils):
 function toArraySafe<T = any>(val: any): T[] {
     if (!val) return [];
     if (Array.isArray(val)) return val as T[];
@@ -18,7 +14,6 @@ function toArraySafe<T = any>(val: any): T[] {
     return [];
 }
 
-/** ==== Util precio COP ==== */
 export function formatCOP(value?: number | null): string | null {
     if (value == null || isNaN(Number(value))) return null;
     return new Intl.NumberFormat("es-CO", {
@@ -28,10 +23,8 @@ export function formatCOP(value?: number | null): string | null {
     }).format(Number(value));
 }
 
-/** Regex robusto para montos en COP tipo $120.000 / 120.000 COP / $ 1.200.000 */
 export const MONEY_RE = /\b(?:COP\s*)?\$?\s?\d{1,3}(?:\.\d{3})+(?:,\d+)?\s?(?:COP)?\b/gi;
 
-/** KB del negocio para la vertical de estética (con info operativa y catálogo) */
 export type EsteticaKB = {
     empresaId: number;
     vertical: AppointmentVertical | "custom";
@@ -41,6 +34,15 @@ export type EsteticaKB = {
     policies?: string | null;
     faqs?: Array<{ q: string; a: string }>;
 
+    // === NUEVOS CAMPOS TEXTO/CONFIG ===
+    businessOverview?: string | null; // kbBusinessOverview
+    freeText?: string | null;         // kbFreeText
+    noShowPolicy?: string | null;
+    globalDepositRequired: boolean;
+    globalDepositAmount?: number | null;
+    appointmentEnabled: boolean;
+    // ==================================
+
     location?: {
         name?: string | null;
         address?: string | null;
@@ -49,13 +51,11 @@ export type EsteticaKB = {
         arrivalInstructions?: string | null;
     };
 
-    // Config operativa
     allowSameDay: boolean;
     minNoticeHours?: number | null;
     maxAdvanceDays?: number | null;
     defaultServiceDurationMin?: number | null;
 
-    // Staff disponible (básico)
     staff: Array<{
         id: number;
         name: string;
@@ -63,18 +63,25 @@ export type EsteticaKB = {
         active: boolean;
     }>;
 
-    // Excepciones (solo meta para prompt/razonamiento)
     exceptions: Array<{
-        dateISO: string; // YYYY-MM-DD
-        isOpen: boolean | null; // si false => cerrado ese día
-        start1?: string | null; // "HH:MM"
+        dateISO: string;
+        isOpen: boolean | null;
+        start1?: string | null;
         end1?: string | null;
         start2?: string | null;
         end2?: string | null;
         reason?: string | null;
     }>;
 
-    // Procedimientos habilitados
+    weeklyHours: Array<{
+        day: string;
+        isOpen: boolean;
+        start1?: string | null;
+        end1?: string | null;
+        start2?: string | null;
+        end2?: string | null;
+    }>;
+
     procedures: Array<{
         id: number;
         name: string;
@@ -82,7 +89,7 @@ export type EsteticaKB = {
         aliases: string[];
         durationMin?: number | null;
         requiresAssessment: boolean;
-        priceMin?: number | null; // Mostrar “Desde $X” si no es null
+        priceMin?: number | null;
         priceMax?: number | null;
         depositRequired: boolean;
         depositAmount?: number | null;
@@ -103,15 +110,17 @@ type LoadKBInput = {
 export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | null> {
     const { empresaId, vertical = "estetica" as AppointmentVertical } = params;
 
-    const [empresa, apptCfg, procedures, staff, exceptions] = await Promise.all([
+    const [empresa, apptCfg, procedures, staff, exceptions, rawHours] = await Promise.all([
         prisma.empresa.findUnique({
             where: { id: empresaId },
             select: { id: true, nombre: true },
         }),
         prisma.businessConfigAppt.findUnique({
             where: { empresaId },
+            // Seleccionamos TODO lo que usaba la estrategia
             select: {
                 appointmentVertical: true,
+                appointmentEnabled: true, // Nuevo
                 appointmentTimezone: true,
                 appointmentBufferMin: true,
                 appointmentPolicies: true,
@@ -119,6 +128,13 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
                 appointmentMinNoticeHours: true,
                 appointmentMaxAdvanceDays: true,
                 defaultServiceDurationMin: true,
+                
+                // Textos y Políticas
+                kbBusinessOverview: true, // Nuevo
+                kbFreeText: true,         // Nuevo
+                noShowPolicy: true,       // Nuevo
+                depositRequired: true,    // Nuevo (global)
+                depositAmount: true,      // Nuevo (global)
 
                 locationName: true,
                 locationAddress: true,
@@ -141,14 +157,16 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
             where: { empresaId },
             orderBy: { date: "asc" },
         }),
+        prisma.appointmentHour.findMany({
+            where: { empresaId },
+        }),
     ]);
 
     if (!empresa || !apptCfg) return null;
-    // === FAQs desde businessConfigAppt (parse seguro) ===
+
     const faqsFromCfg = toArraySafe<{ q?: string; a?: string }>(apptCfg.kbFAQs)
         .filter(f => (f?.q || "").trim() && (f?.a || "").trim())
         .map(f => ({ q: String(f.q).trim(), a: String(f.a).trim() }));
-
 
     return {
         empresaId,
@@ -159,6 +177,13 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
         policies: apptCfg.appointmentPolicies ?? null,
         faqs: faqsFromCfg,
 
+        // Mapeo de nuevos campos
+        businessOverview: apptCfg.kbBusinessOverview,
+        freeText: apptCfg.kbFreeText,
+        noShowPolicy: apptCfg.noShowPolicy,
+        globalDepositRequired: !!apptCfg.depositRequired,
+        globalDepositAmount: apptCfg.depositAmount ? Number(apptCfg.depositAmount) : null,
+        appointmentEnabled: apptCfg.appointmentEnabled ?? true,
 
         allowSameDay: !!apptCfg.allowSameDayBooking,
         minNoticeHours: apptCfg.appointmentMinNoticeHours ?? null,
@@ -185,6 +210,14 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
             reason: e.reason ?? null,
         })),
 
+        weeklyHours: rawHours.map(h => ({
+            day: h.day,
+            isOpen: Number(h.isOpen) === 1 || h.isOpen === true,
+            start1: h.start1,
+            end1: h.end1,
+            start2: h.start2,
+            end2: h.end2,
+        })),
 
         procedures: procedures.map((p) => ({
             id: p.id,
@@ -193,7 +226,7 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
             aliases: Array.isArray(p.aliases) ? (p.aliases as string[]) : [],
             durationMin: p.durationMin ?? null,
             requiresAssessment: p.requiresAssessment ?? false,
-            priceMin: p.priceMin != null ? Number(p.priceMin) : null, // <- Decimal a number
+            priceMin: p.priceMin != null ? Number(p.priceMin) : null,
             priceMax: p.priceMax != null ? Number(p.priceMax) : null,
             depositRequired: p.depositRequired ?? false,
             depositAmount: p.depositAmount != null ? Number(p.depositAmount) : null,
@@ -203,12 +236,10 @@ export async function loadEsteticaKB(params: LoadKBInput): Promise<EsteticaKB | 
             notes: p.notes ?? null,
             pageUrl: p.pageUrl ?? null,
             requiredStaffIds: (p.requiredStaffIds as number[] | null) ?? null,
-
         })),
     };
 }
 
-/** Resolver nombre/alias de servicio (case-insensitive, acentos tolerantes) */
 export function resolveServiceName(
     kb: EsteticaKB,
     userText: string
@@ -220,11 +251,9 @@ export function resolveServiceName(
             .replace(/\p{Diacritic}/gu, "");
 
     const text = norm(userText);
-    // match por nombre
     for (const p of kb.procedures) {
         if (text.includes(norm(p.name))) return { procedure: p, matched: p.name };
     }
-    // match por alias
     for (const p of kb.procedures) {
         for (const a of p.aliases || []) {
             if (a && text.includes(norm(a))) return { procedure: p, matched: a };
@@ -233,7 +262,6 @@ export function resolveServiceName(
     return { procedure: null, matched: null };
 }
 
-/** Etiqueta “Desde $X (COP)” usando priceMin */
 export function serviceDisplayPrice(proc: { priceMin?: number | null }): string | null {
     const f = formatCOP(proc?.priceMin ?? null);
     return f ? `${f} (COP)` : null;
