@@ -2154,13 +2154,13 @@ export async function handleEsteticaStrategy({
     }
 
 
-    // ==== VALIDAR QUE EL DÍA SOLICITADO EXISTA EN EL HORARIO ====
+ // ==== VALIDAR QUE EL DÍA SOLICITADO EXISTA EN EL HORARIO ====
     if (newDraft.whenText) {
         const dayKey = detectDayKeyFromText(newDraft.whenText);
         if (dayKey) {
             const isOpen = isDayOpenInAgenda(kb, dayKey);
 
-            // Si el día no está abierto en appointmentHour → avisar al cliente y NO hacer handoff
+            // Si el día no está abierto en appointmentHour → avisar al cliente
             if (!isOpen) {
                 const diaBonito = prettyDayFromKey(dayKey);
 
@@ -2178,8 +2178,18 @@ export async function handleEsteticaStrategy({
 
                 if (last?.timestamp) markActuallyReplied(chatId, last.timestamp);
 
-                // No bloqueamos la IA ni cambiamos a "requiere_agente":
-                // dejamos que el cliente proponga otro día.
+                // 🔥 CORRECCIÓN CLAVE AQUÍ 🔥
+                // Como el día no es válido, lo borramos INMEDIATAMENTE del borrador (draft).
+                // Así, si el usuario pregunta "¿Y los lunes?", el bot no seguirá pensando en el "domingo".
+                await patchState(chatId, {
+                    draft: {
+                        ...newDraft,
+                        whenText: undefined,
+                        whenISO: undefined,
+                        whenPreview: undefined
+                    }
+                });
+
                 return {
                     estado: ConversationEstado.respondido,
                     mensaje: saved.texto,
