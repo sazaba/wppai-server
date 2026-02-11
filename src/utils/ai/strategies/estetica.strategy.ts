@@ -2483,13 +2483,14 @@ let cleaned = clinicOpenNow
         media: [],
     };
 }
-
 /* ================================================================================= */
-/* ===== BUFFER / DEBOUNCE SYSTEM (Para esperar 15s y agrupar mensajes) ===== */
+/* ===== BUFFER / DEBOUNCE SYSTEM (Persistente Global) ===== */
 /* ================================================================================= */
 
-// Mapa en memoria para guardar los temporizadores
-const executionTimers = new Map<number, NodeJS.Timeout>();
+// 1. Anclaje Global para que el mapa sobreviva a recargas o serverless warm-boots
+const globalForTimers = global as unknown as { esteticaTimers: Map<number, NodeJS.Timeout> };
+const executionTimers = globalForTimers.esteticaTimers || new Map<number, NodeJS.Timeout>();
+if (process.env.NODE_ENV !== "production") globalForTimers.esteticaTimers = executionTimers;
 
 // Tiempo de espera (15 segundos)
 const BUFFER_DELAY_MS = 15_000;
@@ -2516,13 +2517,13 @@ export async function handleEsteticaReply(args: {
         phoneNumberId,
     } = args;
 
-    // 1. Asegurar que el ID sea numérico para que el Map funcione bien
+    // 1. Asegurar ID numérico consistente
     const rawId = conversationIdArg ?? chatId;
     if (!rawId) return { estado: "pendiente", mensaje: "" };
     
     const conversationId = Number(rawId); 
 
-    // 2. Cancelar timer anterior (Debounce)
+    // 2. Cancelar timer anterior (Si existe en el mapa global)
     if (executionTimers.has(conversationId)) {
         console.log(`[DEBOUNCE] ⏳ Chat ${conversationId}: Mensaje seguido detectado. Reiniciando timer...`);
         clearTimeout(executionTimers.get(conversationId));
@@ -2535,19 +2536,20 @@ export async function handleEsteticaReply(args: {
         console.log(`[DEBOUNCE] ✅ Chat ${conversationId}: Ejecutando respuesta acumulada.`);
         
         try {
-            // Importación dinámica
+            // Importación dinámica para evitar ciclos
             const { io } = await import("../../../index"); 
 
+            // Llamamos a la estrategia con mensaje vacío para forzar la lectura de todos los pendientes en BD
             const resultadoBot = await handleEsteticaStrategy({
                 chatId: conversationId,
                 empresaId,
-                mensajeArg: "", // IMPORTANTE: Enviamos vacío para forzar la lectura de BD acumulada
+                mensajeArg: "", 
                 toPhone,
                 phoneNumberId,
             });
 
             if (resultadoBot && resultadoBot.mensaje) {
-                // Emitir al frontend
+                // Emitir al frontend (Socket)
                io?.emit("nuevo_mensaje", {
                     conversationId: conversationId,
                     id: resultadoBot.messageId,
@@ -2574,8 +2576,10 @@ export async function handleEsteticaReply(args: {
 
     }, BUFFER_DELAY_MS);
 
+    // Guardar timer en el mapa global
     executionTimers.set(conversationId, timer);
 
+    // Retornamos "en_proceso" para que el controlador sepa que estamos pensando
     return {
         estado: "en_proceso", 
         mensaje: "", 
