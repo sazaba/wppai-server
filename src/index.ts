@@ -5,6 +5,8 @@ import http from 'http'
 import { Server } from 'socket.io'
 import compression from 'compression'
 
+
+
 // Rutas
 import configRoutes from './routes/config.routes'
 import webhookRoutes from './routes/webhook.route'
@@ -20,6 +22,7 @@ import paymentsRouter from "./routes/payments.routes"
 import registerRoutes from './routes/whatsapp.register.routes'
 import superadminRoutes from './routes/superadmin.routes'
 import clientRoutes from './routes/client.routes';
+import demoBookingRoutes from './routes/demoBooking.routes';
 
 // Agenda 
 import appointmentsRoutes from './routes/appointments.routes'
@@ -155,6 +158,7 @@ app.use('/api', dashboardRoutes)
 app.use('/api', chatInputRoutes)
 app.use("/api/wompi", wompiRouter);
 app.use('/api/clients', clientRoutes);
+app.use('/api/demo-booking', demoBookingRoutes);
 
 // 🔐 Rutas protegidas
 app.use('/api/products', productRoutes)

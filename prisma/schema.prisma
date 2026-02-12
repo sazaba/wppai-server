@@ -689,6 +689,21 @@ model BusinessConfigEcommerce {
   @@map("business_config_ecommerce")
 }
 
+model DemoBooking {
+  id          Int      @id @default(autoincrement())
+  name        String
+  email       String
+  phone       String
+  scheduledAt DateTime // Fecha y hora combinada de la cita
+  status      String   @default("pending") // pending, completed, cancelled
+  createdAt   DateTime @default(now())
+
+  @@index([email])
+  @@index([scheduledAt])
+  @@map("demo_booking")
+}
+
+
 /// *
 ///  * ========== Enums ==========
 enum AiMode {
@@ -827,3 +842,4 @@ enum StaffRole {
   esteticista
   medico
 }
+
