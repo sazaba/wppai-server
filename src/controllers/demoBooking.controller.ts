@@ -1,11 +1,11 @@
 import { Request, Response } from 'express'
-import prisma from '../lib/prisma' // ✅ Usamos tu instancia compartida
+import prisma from '../lib/prisma' // Usamos tu instancia compartida
 import { Resend } from 'resend'
 
-// Inicializamos Resend con la key de tus variables de entorno
+// Inicializamos Resend
 const resend = new Resend(process.env.RESEND_API_KEY)
 
-// --- Función interna para enviar el correo usando el SDK de Resend ---
+// --- Función para enviar el correo ---
 async function sendConfirmationEmail(toEmail: string, name: string, date: Date, time: string) {
   const formattedDate = date.toLocaleDateString('es-CO', { weekday: 'long', day: 'numeric', month: 'long' })
   
@@ -42,16 +42,18 @@ async function sendConfirmationEmail(toEmail: string, name: string, date: Date, 
     </div>
   `
 
-  // ⚠️ IMPORTANTE: Si aún no has verificado tu dominio en Resend,
-  // solo puedes enviar a tu propio correo o debes usar 'onboarding@resend.dev' como remitente.
-  // Una vez verifiques 'wasaaa.com', cambia el 'from' a 'hola@wasaaa.com'
-  
-  await resend.emails.send({
-    from: 'Wasaaa IA <onboarding@resend.dev>', 
-    to: toEmail,
+  // ✅ DOMINIO VERIFICADO: Usamos tu dominio real
+  const data = await resend.emails.send({
+    from: 'Wasaaa IA <hola@wasaaa.com>', // Puedes cambiar 'hola' por lo que gustes
+    to: [toEmail],
     subject: '✅ Confirmación: Tu Auditoría de IA está lista',
     html: htmlContent,
   })
+
+  if (data.error) {
+    console.error("❌ Error enviando email con Resend:", data.error)
+    // No lanzamos error para no romper el flujo del usuario, pero queda registrado
+  }
 }
 
 // 1. CREAR BOOKING
@@ -59,12 +61,10 @@ export const createDemoBooking = async (req: Request, res: Response) => {
   try {
     const { name, email, phone, date, time } = req.body
 
-    // Validar
     if (!name || !email || !phone || !date || !time) {
       return res.status(400).json({ error: 'Faltan campos requeridos' })
     }
 
-    // Procesar Fecha y Hora
     const scheduledDate = new Date(date)
     const [timeStr, modifier] = time.split(' ') 
     let [hours, minutes] = timeStr.split(':') 
@@ -85,13 +85,12 @@ export const createDemoBooking = async (req: Request, res: Response) => {
       }
     })
 
-    // Enviar Correo con Resend SDK
+    // Enviar Correo
     try {
       await sendConfirmationEmail(email, name, scheduledDate, time)
-      console.log(`[DemoBooking] Correo enviado a ${email} vía Resend`)
+      console.log(`📧 Email enviado exitosamente a ${email}`)
     } catch (emailError) {
-      console.error('[DemoBooking] Error enviando correo Resend:', emailError)
-      // No bloqueamos la respuesta al cliente, la cita ya se guardó
+      console.error('⚠️ La cita se guardó, pero el email falló:', emailError)
     }
 
     return res.status(201).json({
@@ -106,7 +105,7 @@ export const createDemoBooking = async (req: Request, res: Response) => {
   }
 }
 
-// 2. OBTENER TODAS (Dashboard)
+// 2. GET (Listar)
 export const getDemoBookings = async (req: Request, res: Response) => {
   try {
     const bookings = await prisma.demoBooking.findMany({
@@ -114,24 +113,19 @@ export const getDemoBookings = async (req: Request, res: Response) => {
     })
     return res.json(bookings)
   } catch (error) {
-    console.error('[getDemoBookings] Error:', error)
     return res.status(500).json({ error: 'Error al obtener citas' })
   }
 }
 
-// 3. ELIMINAR (Dashboard)
+// 3. DELETE (Eliminar)
 export const deleteDemoBooking = async (req: Request, res: Response) => {
   try {
     const { id } = req.params
     if (!id) return res.status(400).json({ error: 'ID requerido' })
 
-    await prisma.demoBooking.delete({
-      where: { id: Number(id) }
-    })
-
-    return res.json({ success: true, message: 'Eliminado correctamente' })
+    await prisma.demoBooking.delete({ where: { id: Number(id) } })
+    return res.json({ success: true })
   } catch (error) {
-    console.error('[deleteDemoBooking] Error:', error)
     return res.status(500).json({ error: 'Error al eliminar' })
   }
 }

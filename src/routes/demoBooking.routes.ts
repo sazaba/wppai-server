@@ -10,7 +10,7 @@ const router = Router()
 // POST: Crear nueva demo (Público, usado por la landing)
 router.post('/', createDemoBooking)
 
-// GET: Ver todas las demos (Deberías proteger esto con autenticación en el futuro)
+// GET: Ver todas las demos
 router.get('/', getDemoBookings)
 
 // DELETE: Borrar una demo por ID
