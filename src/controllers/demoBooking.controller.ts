@@ -1,9 +1,10 @@
 import { Request, Response } from 'express'
-import prisma from '../lib/prisma' // Usamos tu instancia compartida
+import prisma from '../lib/prisma' // Tu instancia compartida
 import { Resend } from 'resend'
 
-// Inicializamos Resend
+// --- CONFIGURACIÓN ---
 const resend = new Resend(process.env.RESEND_API_KEY)
+const GOOGLE_MEET_LINK = "https://meet.google.com/usn-pmjp-mxw" // 🔗 TU ENLACE FIJO AQUÍ
 
 // --- Función para enviar el correo ---
 async function sendConfirmationEmail(toEmail: string, name: string, date: Date, time: string) {
@@ -18,19 +19,23 @@ async function sendConfirmationEmail(toEmail: string, name: string, date: Date, 
       <div style="background-color: #fff; padding: 30px; border-radius: 0 0 10px 10px; border: 1px solid #e5e7eb;">
         <h2 style="color: #111; margin-top: 0;">¡Hola ${name}! 👋</h2>
         <p style="color: #4b5563; font-size: 16px; line-height: 1.5;">
-          Tu solicitud para la <strong>Auditoría de Crecimiento con IA</strong> ha sido confirmada correctamente.
+          Tu auditoría ha sido agendada. Aquí tienes los detalles de conexión:
         </p>
         
         <div style="background-color: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #06b6d4;">
-          <p style="margin: 5px 0; font-size: 14px; color: #6b7280; text-transform: uppercase; font-weight: bold;">Fecha</p>
-          <p style="margin: 0 0 15px 0; font-size: 18px; color: #111; font-weight: bold;">${formattedDate}</p>
+          <p style="margin: 5px 0; font-size: 14px; color: #6b7280; text-transform: uppercase; font-weight: bold;">Cuándo</p>
+          <p style="margin: 0 0 15px 0; font-size: 18px; color: #111; font-weight: bold;">${formattedDate} - ${time}</p>
           
-          <p style="margin: 5px 0; font-size: 14px; color: #6b7280; text-transform: uppercase; font-weight: bold;">Hora</p>
-          <p style="margin: 0; font-size: 18px; color: #111; font-weight: bold;">${time}</p>
+          <p style="margin: 5px 0; font-size: 14px; color: #6b7280; text-transform: uppercase; font-weight: bold;">Dónde</p>
+          <p style="margin: 0;">
+            <a href="${GOOGLE_MEET_LINK}" style="background-color: #06b6d4; color: #fff; text-decoration: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; font-size: 14px; display: inline-block;">
+              Unirse a Google Meet 📹
+            </a>
+          </p>
         </div>
 
-        <p style="color: #4b5563; font-size: 16px;">
-          Un experto de nuestro equipo te contactará por WhatsApp a este número para coordinar el acceso a la videollamada.
+        <p style="color: #6b7280; font-size: 14px;">
+          Te recomendamos conectarte 2 minutos antes.
         </p>
         
         <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 30px 0;">
@@ -42,18 +47,12 @@ async function sendConfirmationEmail(toEmail: string, name: string, date: Date, 
     </div>
   `
 
-  // ✅ DOMINIO VERIFICADO: Usamos tu dominio real
-  const data = await resend.emails.send({
-    from: 'Wasaaa IA <hola@wasaaa.com>', // Puedes cambiar 'hola' por lo que gustes
+  await resend.emails.send({
+    from: 'Wasaaa IA <hola@wasaaa.com>',
     to: [toEmail],
-    subject: '✅ Confirmación: Tu Auditoría de IA está lista',
+    subject: '✅ Confirmación y Link de Acceso: Auditoría IA',
     html: htmlContent,
   })
-
-  if (data.error) {
-    console.error("❌ Error enviando email con Resend:", data.error)
-    // No lanzamos error para no romper el flujo del usuario, pero queda registrado
-  }
 }
 
 // 1. CREAR BOOKING
@@ -65,6 +64,7 @@ export const createDemoBooking = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Faltan campos requeridos' })
     }
 
+    // Procesar fecha y hora
     const scheduledDate = new Date(date)
     const [timeStr, modifier] = time.split(' ') 
     let [hours, minutes] = timeStr.split(':') 
@@ -73,6 +73,17 @@ export const createDemoBooking = async (req: Request, res: Response) => {
     if (hoursInt === 12) hoursInt = 0
     if (modifier === 'PM') hoursInt = hoursInt + 12
     scheduledDate.setHours(hoursInt, parseInt(minutes), 0, 0)
+
+    // --- 🔒 BLOQUEO: Verificar si ya existe ---
+    const existing = await prisma.demoBooking.findFirst({
+      where: {
+        scheduledAt: scheduledDate
+      }
+    })
+
+    if (existing) {
+      return res.status(409).json({ error: 'Este horario ya no está disponible. Por favor elige otro.' })
+    }
 
     // Guardar en DB
     const newBooking = await prisma.demoBooking.create({
@@ -88,9 +99,9 @@ export const createDemoBooking = async (req: Request, res: Response) => {
     // Enviar Correo
     try {
       await sendConfirmationEmail(email, name, scheduledDate, time)
-      console.log(`📧 Email enviado exitosamente a ${email}`)
+      console.log(`📧 Email enviado a ${email}`)
     } catch (emailError) {
-      console.error('⚠️ La cita se guardó, pero el email falló:', emailError)
+      console.error('⚠️ Error enviando email:', emailError)
     }
 
     return res.status(201).json({
