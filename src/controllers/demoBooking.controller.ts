@@ -140,3 +140,23 @@ export const deleteDemoBooking = async (req: Request, res: Response) => {
     return res.status(500).json({ error: 'Error al eliminar' })
   }
 }
+export const updateDemoBooking = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params
+    const { status } = req.body // Esperamos recibir { status: 'contacted' }
+
+    if (!id || !status) {
+      return res.status(400).json({ error: 'Faltan datos' })
+    }
+
+    const updatedBooking = await prisma.demoBooking.update({
+      where: { id: Number(id) },
+      data: { status }
+    })
+
+    return res.json({ success: true, data: updatedBooking })
+  } catch (error) {
+    console.error('Error actualizando booking:', error)
+    return res.status(500).json({ error: 'No se pudo actualizar' })
+  }
+}
