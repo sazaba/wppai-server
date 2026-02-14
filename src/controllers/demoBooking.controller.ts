@@ -1,12 +1,13 @@
 import { Request, Response } from 'express'
-import prisma from '../lib/prisma' // Tu instancia compartida
+import prisma from '../lib/prisma' 
 import { Resend } from 'resend'
 
 // --- CONFIGURACIÓN ---
 const resend = new Resend(process.env.RESEND_API_KEY)
-const GOOGLE_MEET_LINK = "https://meet.google.com/usn-pmjp-mxw" // 🔗 TU ENLACE FIJO AQUÍ
+const GOOGLE_MEET_LINK = "https://meet.google.com/usn-pmjp-mxw"
+const MY_EMAIL = "wasaaa2026@gmail.com" // <--- 🔔 PON TU CORREO AQUÍ
 
-// --- Función para enviar el correo ---
+// 1. CORREO PARA EL CLIENTE (Confirmación)
 async function sendConfirmationEmail(toEmail: string, name: string, date: Date, time: string) {
   const formattedDate = date.toLocaleDateString('es-CO', { weekday: 'long', day: 'numeric', month: 'long' })
   
@@ -55,7 +56,37 @@ async function sendConfirmationEmail(toEmail: string, name: string, date: Date, 
   })
 }
 
-// 1. CREAR BOOKING
+// 2. CORREO PARA TI (Alerta de Nuevo Lead) - NUEVA FUNCIÓN
+async function sendAdminAlert(data: { name: string, email: string, phone: string, date: Date, time: string }) {
+    const formattedDate = data.date.toLocaleDateString('es-CO', { weekday: 'long', day: 'numeric', month: 'long' })
+    
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404; border-radius: 8px;">
+        <h2 style="margin-top: 0;">🚀 ¡Nuevo Prospecto Agendado!</h2>
+        <p>Alguien acaba de agendar una demo desde la web.</p>
+        
+        <ul style="background-color: #fff; padding: 15px 30px; border-radius: 5px; border: 1px solid #e2e3e5; color: #333;">
+            <li><strong>Nombre:</strong> ${data.name}</li>
+            <li><strong>Email:</strong> ${data.email}</li>
+            <li><strong>Teléfono:</strong> ${data.phone}</li>
+            <li><strong>Fecha:</strong> ${formattedDate}</li>
+            <li><strong>Hora:</strong> ${data.time}</li>
+        </ul>
+
+        <p style="margin-bottom: 0;">Prepara la reunión. ¡A vender!</p>
+      </div>
+    `
+  
+    await resend.emails.send({
+      from: 'Wasaaa Alertas <alertas@wasaaa.com>', // Puedes usar el mismo 'hola@' si prefieres
+      to: [MY_EMAIL],
+      subject: `🤑 Nuevo Lead: ${data.name}`,
+      html: htmlContent,
+    })
+  }
+
+// --- CONTROLLERS ---
+
 export const createDemoBooking = async (req: Request, res: Response) => {
   try {
     const { name, email, phone, date, time } = req.body
@@ -96,12 +127,19 @@ export const createDemoBooking = async (req: Request, res: Response) => {
       }
     })
 
-    // Enviar Correo
+    // --- ENVIAR CORREOS (En paralelo para no bloquear) ---
     try {
-      await sendConfirmationEmail(email, name, scheduledDate, time)
-      console.log(`📧 Email enviado a ${email}`)
+      await Promise.all([
+        // 1. Correo al Cliente
+        sendConfirmationEmail(email, name, scheduledDate, time),
+        // 2. Correo a TI (Admin)
+        sendAdminAlert({ name, email, phone, date: scheduledDate, time })
+      ])
+      
+      console.log(`📧 Emails enviados (Cliente y Admin)`)
     } catch (emailError) {
-      console.error('⚠️ Error enviando email:', emailError)
+      console.error('⚠️ Error enviando emails:', emailError)
+      // No fallamos la request si el email falla, pero lo logueamos
     }
 
     return res.status(201).json({
@@ -140,10 +178,12 @@ export const deleteDemoBooking = async (req: Request, res: Response) => {
     return res.status(500).json({ error: 'Error al eliminar' })
   }
 }
+
+// 4. UPDATE (Actualizar estado)
 export const updateDemoBooking = async (req: Request, res: Response) => {
   try {
     const { id } = req.params
-    const { status } = req.body // Esperamos recibir { status: 'contacted' }
+    const { status } = req.body 
 
     if (!id || !status) {
       return res.status(400).json({ error: 'Faltan datos' })
