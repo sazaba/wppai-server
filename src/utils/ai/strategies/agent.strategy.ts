@@ -351,10 +351,10 @@ export async function handleAgentReply(args: {
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
 
-    // ⏳ Retraso humano simulado (si lo usas en strategy)
-    const delayMs = await computeReplyDelayMs(chatId)
-    if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
-    await sleep(delayMs)
+    // // ⏳ Retraso humano simulado (si lo usas en strategy)
+    // const delayMs = await computeReplyDelayMs(chatId)
+    // if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
+    // await sleep(delayMs)
 
     // 10) Persistir y responder
     const saved = await persistBotReply({
@@ -473,10 +473,10 @@ async function answerWithLLM(opts: {
     texto = clampConcise(texto, IA_MAX_LINES, IA_MAX_CHARS)
     texto = formatConcise(texto, IA_MAX_LINES, IA_MAX_CHARS, IA_ALLOW_EMOJI)
 
-    // ⏳ Retraso humano simulado (si lo usas en strategy)
-    const delayMs = await computeReplyDelayMs(chatId)
-    if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
-    await sleep(delayMs)
+    // // ⏳ Retraso humano simulado (si lo usas en strategy)
+    // const delayMs = await computeReplyDelayMs(chatId)
+    // if (process.env.DEBUG_AI === '1') console.log('[AGENT] reply delay(ms)=', delayMs)
+    // await sleep(delayMs)
 
     const saved = await persistBotReply({
         conversationId: chatId,
