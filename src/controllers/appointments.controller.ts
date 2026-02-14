@@ -59,19 +59,29 @@ async function ensureStaffAvailability(opts: {
 
   if (!staff) return { ok: false, msg: "Profesional no encontrado" };
   
-  // Si no tiene horario configurado, asumimos que sigue el horario del negocio (Return OK)
-  // O si prefieres que sea estricto: return { ok: false, msg: "El profesional no tiene horario configurado" };
+  // Si no tiene horario configurado (null/undefined), asumimos horario del negocio
   if (!staff.availability) return { ok: true }; 
 
   const schedule = staff.availability as unknown as StaffSchedule;
   
+  // ✅ FIX: Validar que realmente sea un array antes de usar .find()
+  if (!Array.isArray(schedule)) {
+    console.warn(`[ensureStaffAvailability] Horario corrupto para Staff ID ${staffId}:`, schedule);
+    // Opción A: Dejar pasar (asumir horario general)
+    return { ok: true };
+    // Opción B: Bloquear (descomentar si prefieres estricto)
+    // return { ok: false, msg: "Error en la configuración de horario del profesional." };
+  }
+
   // 2. Calculamos qué día es y los minutos solicitados
-  const dayKey = dayKeyInTZ(start, timezone); // Usamos tu helper existente
-  const startMin = minutesInTZ(start, timezone); // Usamos tu helper existente
+  const dayKey = dayKeyInTZ(start, timezone); 
+  const startMin = minutesInTZ(start, timezone); 
   const endMin = minutesInTZ(end, timezone);
 
   // 3. Buscamos la regla para ese día
+  // Ahora es seguro usar .find()
   const dayRule = schedule.find(s => s.day === dayKey && s.active);
+
 
   // Si no hay regla para hoy o active=false, es día libre del staff
   if (!dayRule) {
